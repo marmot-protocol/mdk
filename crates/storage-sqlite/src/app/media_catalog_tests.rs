@@ -623,3 +623,89 @@ fn republishing_a_slots_content_keeps_its_reference() {
     assert_eq!(store.file_state(&id).unwrap(), Some(FileState::Ready));
     assert_eq!(read(&store, &id, 4), b"same");
 }
+
+/// Regression for #3798: `page` must clamp limits above `i64::MAX` instead of
+/// wrapping `usize::MAX as i64` into SQLite's unbounded `LIMIT -1`.
+#[test]
+fn page_clamps_usize_max_limit_instead_of_negative_sqlite_limit() {
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    use std::cell::RefCell;
+
+    thread_local! {
+        static TRACED_SQL: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+    fn record_media_files_sql(event: TraceEvent<'_>) {
+        if let TraceEvent::Stmt(stmt, _) = event
+            && let Some(expanded) = stmt.expanded_sql()
+            && expanded.contains("FROM media_files")
+        {
+            TRACED_SQL.with_borrow_mut(|sqls| sqls.push(expanded));
+        }
+    }
+
+    let harness = SqliteHarness::memory();
+    let store = MediaStore::new(harness.root(), harness.catalog());
+    let id = publish(&harness, &store, 0, b"bounded");
+
+    TRACED_SQL.with_borrow_mut(Vec::clear);
+    harness.storage.lock().unwrap().trace_v2(
+        TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(record_media_files_sql),
+    );
+
+    let rows = harness.catalog().page(None, usize::MAX).unwrap();
+    harness
+        .storage
+        .lock()
+        .unwrap()
+        .trace_v2(TraceEventCodes::empty(), None);
+    assert_eq!(rows, vec![(id, FileState::Ready)]);
+    let sqls = TRACED_SQL.with_borrow(Clone::clone);
+    let expected_limit = format!("LIMIT {}", i64::try_from(usize::MAX).unwrap_or(i64::MAX));
+    assert!(
+        sqls.iter().any(|sql| sql.ends_with(&expected_limit)),
+        "expected clamped non-negative LIMIT ({expected_limit}), traced: {sqls:?}"
+    );
+    assert!(
+        sqls.iter().all(|sql| !sql.contains("LIMIT -")),
+        "page must never issue a negative SQLite LIMIT: {sqls:?}"
+    );
+    assert!(harness.catalog().page(None, 0).unwrap().is_empty());
+}
+
+/// Regression for #3798: catalog operations retry transient `SQLITE_BUSY`
+/// contention and preserve busy classification across `media_storage_error`.
+#[test]
+fn catalog_operations_retry_on_busy_and_preserve_busy_classification() {
+    use crate::protocol::storage::write_contention::{Release, SharedDatabase};
+
+    let db = SharedDatabase::new();
+    let store = db.open();
+    let catalog = SqliteMediaCatalog::new(store.app_storage());
+    let file = NewFile {
+        id: FileId([0x77; 16]),
+        key: media_store::FileKey::from_bytes([0x88; 32]),
+        category: Category::Retained,
+        byte_len: 12,
+        digest: [0x99; 32],
+        created_at: NOW,
+    };
+
+    let hold = db.hold_write_lock(Release::AfterAFailedAttempt, |_| {});
+    catalog
+        .insert_pending(&file)
+        .expect("insert_pending should retry past transient SQLITE_BUSY");
+    hold.join();
+    assert_eq!(
+        catalog.file_state(file.id).unwrap(),
+        Some(FileState::Pending)
+    );
+
+    let mapped_catalog = catalog_error(StorageError::Busy("database is locked".into()));
+    let roundtripped = media_storage_error(media_store::MediaError::from(mapped_catalog));
+    assert!(
+        matches!(&roundtripped, StorageError::Busy(detail) if !detail.contains("database is locked")),
+        "busy classification must survive media_storage_error without leaking raw SQLite text: {roundtripped:?}"
+    );
+    assert!(roundtripped.is_transient());
+}

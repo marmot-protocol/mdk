@@ -138,6 +138,11 @@ impl SqliteAppStorage {
             ));
         }
         pause();
+        let prior_auto_vacuum: i64 = conn
+            .query_row("SELECT auto_vacuum FROM pragma_auto_vacuum()", [], |r| {
+                r.get(0)
+            })
+            .storage()?;
         // A close (a host about to suspend) must not wait out the copy, and
         // may begin at any moment, even before the copy starts: the VACUUM
         // polls the close latch as it runs, stops once a close has begun,
@@ -145,17 +150,33 @@ impl SqliteAppStorage {
         let closing = self.connection.closing_probe();
         conn.progress_handler(CLOSE_POLL_OPS, Some(closing))
             .storage()?;
-        let vacuumed = conn
-            .execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")
-            .and_then(|()| conn.vacuum())
+        let vacuumed = (|| -> rusqlite::Result<()> {
+            if prior_auto_vacuum != AUTO_VACUUM_INCREMENTAL {
+                conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
+            }
+            conn.vacuum()
+        })();
+        let cleared_handler = conn
+            .progress_handler(CLOSE_POLL_OPS, None::<fn() -> bool>)
             .storage();
-        conn.progress_handler(CLOSE_POLL_OPS, None::<fn() -> bool>)
-            .storage()?;
-        if vacuumed.is_err() {
-            // Drop the pending mode change with the failed copy.
-            let _ = conn.execute_batch("PRAGMA auto_vacuum=NONE;");
+        if let Err(err) = vacuumed {
+            if prior_auto_vacuum != AUTO_VACUUM_INCREMENTAL {
+                let restore = match prior_auto_vacuum {
+                    1 => "PRAGMA auto_vacuum=FULL;",
+                    _ => "PRAGMA auto_vacuum=NONE;",
+                };
+                let _ = conn.execute_batch(restore);
+            }
+            if err.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
+                && self.connection.is_closing()
+            {
+                return Err(StorageError::Closed(
+                    "database compaction cancelled by close".into(),
+                ));
+            }
+            return Err(crate::base::codec::map_sqlite_error(err));
         }
-        vacuumed?;
+        cleared_handler?;
         // The WAL now holds the whole copy; fold it back and truncate it.
         self.truncate_wal_locked(&conn)
     }

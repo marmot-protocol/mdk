@@ -150,11 +150,12 @@ fn a_close_stops_a_compaction_that_has_not_started_copying() {
     paused_rx.recv().unwrap();
     fixture.store.closer().begin_close();
     let closing = std::time::Instant::now();
-    // The interrupted `VACUUM`, not the earlier closing check.
+    // The interrupted `VACUUM`, not the earlier closing check, must still
+    // classify as `StorageError::Closed`.
     let stopped = compacting.join().unwrap();
     assert!(
-        matches!(&stopped, Err(StorageError::Backend(m)) if m.contains("interrupted")),
-        "the copy stopped: {stopped:?}"
+        matches!(&stopped, Err(StorageError::Closed(_))),
+        "close-interrupted compaction must classify as Closed: {stopped:?}"
     );
     fixture.store.close().unwrap();
     assert!(closing.elapsed() < std::time::Duration::from_secs(5));
@@ -243,4 +244,54 @@ fn a_new_database_starts_incremental() {
     reopened.close().unwrap();
     let again = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     assert!(!again.app_storage().database_space().unwrap().incremental);
+}
+
+/// Regression for #3798: a failed `VACUUM` must preserve the connection's
+/// prior `auto_vacuum` mode instead of unconditionally resetting it to `NONE`.
+#[test]
+fn failed_compaction_preserves_prior_auto_vacuum_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.sqlite");
+    let key = key();
+    let store = SqliteAccountStorage::open_encrypted_with_options(
+        &path,
+        &key,
+        crate::SqliteStorageOptions {
+            busy_timeout_ms: 0,
+            ..crate::SqliteStorageOptions::default()
+        },
+    )
+    .unwrap();
+    let app = store.app_storage();
+    assert!(app.database_space().unwrap().incremental);
+
+    let blocker = rusqlite::Connection::open(&path).unwrap();
+    crate::open_hardened_sqlcipher(&blocker, &key, crate::SqlCipherHardening::cipher_only())
+        .unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+    // Case 1: already incremental -> failed VACUUM must not stage a pending
+    // `auto_vacuum = NONE` switch that a subsequent `VACUUM` would commit.
+    let err = app.compact_database().unwrap_err();
+    assert!(matches!(err, StorageError::Busy(_)), "{err:?}");
+    blocker.execute_batch("ROLLBACK;").unwrap();
+    store.lock().unwrap().vacuum().unwrap();
+    assert!(
+        app.database_space().unwrap().incremental,
+        "failed compact_database must not downgrade an incremental database to auto_vacuum=NONE"
+    );
+
+    // Case 2: non-incremental -> failed VACUUM must drop its pending
+    // `auto_vacuum = INCREMENTAL` switch so a plain `VACUUM` keeps `NONE`.
+    app.make_non_incremental_for_test().unwrap();
+    assert!(!app.database_space().unwrap().incremental);
+    blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let err = app.compact_database().unwrap_err();
+    assert!(matches!(err, StorageError::Busy(_)), "{err:?}");
+    blocker.execute_batch("ROLLBACK;").unwrap();
+    store.lock().unwrap().vacuum().unwrap();
+    assert!(
+        !app.database_space().unwrap().incremental,
+        "failed compact_database must restore non-incremental auto_vacuum mode"
+    );
 }

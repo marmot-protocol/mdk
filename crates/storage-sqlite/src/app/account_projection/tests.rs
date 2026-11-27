@@ -4278,7 +4278,13 @@ fn retried_past_a_held_write_lock<T>(
 fn push_token_apply_retries_concurrent_writer_contention() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("push-token-contention.sqlite");
-    let store = open_plaintext_file(&path, SqliteStorageOptions::default());
+    let store = open_plaintext_file(
+        &path,
+        SqliteStorageOptions {
+            busy_timeout_ms: 1,
+            ..SqliteStorageOptions::default()
+        },
+    );
     let writer = store.app_storage();
     let group_id = "aa".repeat(32);
     let member_id = "bb".repeat(32);
@@ -4294,6 +4300,59 @@ fn push_token_apply_retries_concurrent_writer_contention() {
     });
     assert!(applied.expect("tombstone apply retries after transient contention"));
     assert!(writer.group_push_tokens(&group_id).unwrap().is_empty());
+}
+
+/// Regression for #3798: `apply_group_push_token` and
+/// `apply_group_push_token_tombstone` must begin with `BEGIN IMMEDIATE` so
+/// concurrent WAL writers wait via `busy_timeout`/busy handler instead of
+/// failing immediately on a deferred read-to-write lock upgrade.
+#[test]
+fn push_token_apply_takes_immediate_write_lock_under_wal_contention() {
+    use crate::protocol::storage::write_contention::{Release, SharedDatabase};
+
+    let db = SharedDatabase::new();
+    let store = db.open();
+    let writer = store.app_storage();
+    let group_id = "aa".repeat(32);
+    let member_id = "bb".repeat(32);
+
+    // Dirty the WAL in a concurrent `BEGIN IMMEDIATE` transaction so a deferred
+    // reader attempting a write upgrade hits `SQLITE_BUSY_SNAPSHOT` without
+    // invoking the busy handler, whereas `BEGIN IMMEDIATE` waits via the busy
+    // handler until the holder commits.
+    let hold = db.hold_write_lock(Release::WhenTheStoreWaits, |holder| {
+        holder
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO account_groups(group_id_hex, endpoint, updated_at) VALUES('cc', '', 1)",
+                [],
+            )
+            .unwrap();
+    });
+    assert!(
+        writer
+            .apply_group_push_token(&push_token(&group_id, &member_id, 100, "d1"))
+            .expect("BEGIN IMMEDIATE waits via busy handler")
+    );
+    hold.join();
+
+    let hold = db.hold_write_lock(Release::WhenTheStoreWaits, |holder| {
+        holder
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE account_groups SET updated_at = 2 WHERE group_id_hex = 'cc'",
+                [],
+            )
+            .unwrap();
+    });
+    assert!(
+        writer
+            .apply_group_push_token_tombstone(&push_tombstone(&group_id, &member_id, 0, 200, "r1"))
+            .expect("BEGIN IMMEDIATE waits via busy handler")
+    );
+    hold.join();
 }
 
 #[test]

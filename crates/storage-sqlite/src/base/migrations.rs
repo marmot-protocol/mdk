@@ -164,7 +164,7 @@ mod upgrade_v0_10_4_tests;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 #[path = "migrations/0073_message_draft_revisions.rs"]
 mod migration_0073_message_draft_revisions;
@@ -1793,7 +1793,9 @@ CREATE TABLE IF NOT EXISTS cgka_database_origin (
 /// between this commit and the first migration's finds the ledger still empty
 /// and writes nothing new.
 fn record_empty_creation(connection: &mut Connection) -> StorageResult<()> {
-    let tx = connection.transaction().storage()?;
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .storage()?;
     tx.execute(
         "INSERT OR IGNORE INTO cgka_database_origin (id)
          SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM cgka_schema_migrations)",
@@ -1883,7 +1885,9 @@ fn reconcile_legacy_migration_names(
         return Ok(());
     }
 
-    let tx = connection.transaction().storage()?;
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .storage()?;
     add_column_if_missing(&tx, "app_events", "source_epoch", "INTEGER")?;
     add_column_if_missing(&tx, "message_timeline", "source_epoch", "INTEGER")?;
     tx.execute(
@@ -1955,7 +1959,10 @@ fn apply_migration(connection: &mut Connection, migration: &Migration) -> Storag
     let mut mode =
         MigrationForeignKeys::new(connection, !migration.suspend_foreign_keys.is_empty())?;
     let result = (|| {
-        let tx = mode.connection.transaction().storage()?;
+        let tx = mode
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .storage()?;
         (migration.apply)(&tx)?;
         for table in migration.suspend_foreign_keys {
             let violations: i64 = tx
@@ -2074,6 +2081,86 @@ mod tests {
     const TEST_DATABASE_KEY: &str = "storage format migration crash key";
     const V0_9_12_FIXTURE_KEY: &str = "mdk storage v1 fixture key";
     const V0_9_12_FIXTURE: &[u8] = include_bytes!("../../fixtures/storage-v1-v0.9.12.bin");
+
+    /// Regression for #3798: migration transactions (`record_empty_creation` and
+    /// `apply_migration`) must use `BEGIN IMMEDIATE` so a read-then-write body
+    /// waits on `busy_timeout`/busy handler under concurrent WAL writes instead
+    /// of aborting immediately with `SQLITE_BUSY_SNAPSHOT`.
+    #[test]
+    fn migration_runner_transactions_take_immediate_write_lock_under_wal_contention() {
+        use std::cell::RefCell;
+        use std::sync::mpsc;
+
+        thread_local! {
+            static HANDSHAKE: RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> =
+                const { RefCell::new(None) };
+        }
+        fn release_on_busy(_calls: i32) -> bool {
+            HANDSHAKE.with_borrow_mut(|pair| {
+                if let Some((release_tx, done_rx)) = pair.take() {
+                    let _ = release_tx.send(());
+                    let _ = done_rx.recv_timeout(Duration::from_secs(5));
+                }
+            });
+            true
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("migration-immediate.sqlite");
+        let mut conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE lock_probe(v INTEGER);")
+            .unwrap();
+        ensure_migration_table(&conn).unwrap();
+        conn.busy_handler(Some(release_on_busy)).unwrap();
+
+        let mut run_with_wal_writer = |op: &mut dyn FnMut(&mut Connection) -> StorageResult<()>| {
+            let (held_tx, held_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            HANDSHAKE.set(Some((release_tx, done_rx)));
+            let holder_path = path.clone();
+            let holder = thread::spawn(move || {
+                let holder_conn = Connection::open(&holder_path).unwrap();
+                holder_conn
+                    .execute_batch("BEGIN IMMEDIATE; INSERT INTO lock_probe VALUES (1);")
+                    .unwrap();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                holder_conn.execute_batch("COMMIT;").unwrap();
+                let _ = done_tx.send(());
+            });
+            held_rx.recv().unwrap();
+            let result = op(&mut conn);
+            let leftover = HANDSHAKE.take();
+            let contended = leftover.is_none();
+            if let Some((release_tx, _)) = leftover {
+                let _ = release_tx.send(());
+            }
+            holder.join().unwrap();
+            assert!(
+                contended,
+                "migration transaction must wait on the busy handler via BEGIN IMMEDIATE; result={result:?}"
+            );
+            result.expect("BEGIN IMMEDIATE should succeed once concurrent WAL writer commits");
+        };
+
+        run_with_wal_writer(&mut |c| record_empty_creation(c));
+
+        let read_then_write = Migration {
+            version: 1,
+            name: "0001_read_then_write_probe",
+            suspend_foreign_keys: &[],
+            apply: |tx| {
+                let _: i64 = tx
+                    .query_row("SELECT count(*) FROM lock_probe", [], |r| r.get(0))
+                    .storage()?;
+                tx.execute("INSERT INTO lock_probe VALUES (2)", [])
+                    .storage()?;
+                Ok(())
+            },
+        };
+        run_with_wal_writer(&mut |c| apply_migration(c, &read_then_write));
+    }
 
     /// A database records that it was created empty before its first migration
     /// commits, so opens that end before or after that migration leave the

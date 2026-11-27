@@ -3021,7 +3021,9 @@ impl SqliteAppStorage {
     pub fn apply_group_push_token(&self, token: &AccountGroupPushToken) -> StorageResult<bool> {
         retry_on_busy(|| {
             let mut conn = self.lock()?;
-            let tx = conn.transaction().storage()?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .storage()?;
             let incoming = (token.owner_ts, token.record_digest.as_str());
             let key = PushTokenKey {
                 group_id_hex: &token.group_id_hex,
@@ -3087,7 +3089,9 @@ impl SqliteAppStorage {
     ) -> StorageResult<bool> {
         retry_on_busy(|| {
             let mut conn = self.lock()?;
-            let tx = conn.transaction().storage()?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .storage()?;
             let incoming = (tombstone.owner_ts, tombstone.record_digest.as_str());
             let key = PushTokenKey {
                 group_id_hex: &tombstone.group_id_hex,

@@ -73,6 +73,10 @@ impl SqliteAccountStorage {
         let group_id = hex::decode(group_id_hex).map_err(|error| {
             StorageError::Serialization(format!("invalid local group id: {error}"))
         })?;
+        // Normalize once so all app tables, media-secret retirement, and
+        // deletion frontiers match canonical lowercase hex consistently.
+        let group_id_hex = hex::encode(&group_id);
+        let group_id_hex = group_id_hex.as_str();
 
         let newly_deleted = retry_on_busy(|| {
             let mut conn = self.lock()?;
@@ -252,7 +256,7 @@ impl SqliteAccountStorage {
                                 local_group_deletion_frontiers.pending_confirmation
                             )",
                         params![
-                            hex::encode(&group_id),
+                            group_id_hex,
                             message_insert_order,
                             prior_nostr_routes_json,
                             pending_confirmation,
@@ -269,7 +273,7 @@ impl SqliteAccountStorage {
                     )?;
                     tx.execute_cached(
                         "DELETE FROM local_group_deletion_frontiers WHERE group_id_hex = ?1",
-                        params![hex::encode(&group_id)],
+                        params![group_id_hex],
                     )
                     .storage()?;
                     deleted = deleted.saturating_add(

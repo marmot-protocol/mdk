@@ -192,3 +192,77 @@ fn commit_outcome_records_go_with_a_forgotten_or_terminal_group_and_outlive_an_a
         );
     }
 }
+
+/// Regression for #3798: uppercase or mixed-case `group_id_hex` inputs must
+/// normalize to lowercase once before deleting across all app tables and
+/// recording the deletion frontier.
+#[test]
+fn delete_local_group_data_and_forget_normalize_uppercase_group_id_hex() {
+    let store = SqliteAccountStorage::in_memory_for_test().unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO cgka_groups(id, epoch, record) VALUES(x'aabb', 1, x'00'), (x'ccdd', 1, x'00');
+             INSERT INTO account_groups(group_id_hex, endpoint, updated_at)
+             VALUES('aabb', '', 0), ('ccdd', '', 0);
+             INSERT INTO app_events(group_id_hex, message_id_hex, direction, sender, plaintext, kind, tags_json, recorded_at, received_at)
+             VALUES('aabb', 'm1', 'received', 's', 'secret', 9, '[]', 1, 1);
+             INSERT INTO chat_list_rows(group_id_hex, updated_at) VALUES('aabb', 1), ('ccdd', 1);
+             INSERT INTO encrypted_media_epoch_secrets(group_id_hex, component_id, source_epoch, secret, created_at_unix_seconds)
+             VALUES('aabb', 0, 1, x'0102', 1);
+             INSERT INTO device_groups(group_id_hex, trust, key_package_ref_hex, recorded_at)
+             VALUES('ccdd', 'untrusted', NULL, 1);
+             INSERT INTO message_drafts(group_id_hex, content, created_at_ms, updated_at_ms)
+             VALUES('ccdd', 'draft', 1, 1);
+             INSERT INTO chat_pin_positions(group_id_hex, ordinal) VALUES('ccdd', 1);",
+        )
+        .unwrap();
+
+    let wiped = store.delete_local_group_data("AABB").unwrap();
+    assert!(wiped.did_delete(), "uppercase wipe must delete app rows");
+    for table in [
+        "account_groups",
+        "app_events",
+        "chat_list_rows",
+        "encrypted_media_epoch_secrets",
+    ] {
+        assert_eq!(
+            count(
+                &store,
+                &format!("SELECT count(*) FROM {table} WHERE group_id_hex = 'aabb'")
+            ),
+            0,
+            "{table} still retained rows after uppercase delete_local_group_data"
+        );
+    }
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM local_group_deletion_frontiers WHERE group_id_hex = 'aabb'"
+        ),
+        1
+    );
+
+    assert!(
+        store
+            .forget_group_local_data("CcDd", cgka_traits::Timestamp(10))
+            .unwrap()
+    );
+    for table in [
+        "account_groups",
+        "chat_list_rows",
+        "device_groups",
+        "message_drafts",
+        "chat_pin_positions",
+    ] {
+        assert_eq!(
+            count(
+                &store,
+                &format!("SELECT count(*) FROM {table} WHERE group_id_hex = 'ccdd'")
+            ),
+            0,
+            "{table} still retained rows after mixed-case forget_group_local_data"
+        );
+    }
+}

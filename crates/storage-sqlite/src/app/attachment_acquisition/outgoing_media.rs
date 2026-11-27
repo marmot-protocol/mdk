@@ -520,6 +520,11 @@ fn storage_from_catalog(error: media_store::CatalogError) -> StorageError {
         media_store::CatalogError::Capacity => {
             StorageError::Capacity("media catalog is full".into())
         }
+        media_store::CatalogError::Backend(message)
+            if message == crate::app::media_catalog::CATALOG_BUSY_DETAIL =>
+        {
+            StorageError::Busy(message)
+        }
         media_store::CatalogError::Backend(message) => StorageError::Backend(message),
     }
 }
