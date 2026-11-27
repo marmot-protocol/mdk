@@ -1911,8 +1911,12 @@ def selftest(
             break
     if job_ref is None:
         problems.append("no completed ci.yml job found in the last 10 hosted Canary runs")
-    elif not (github.job_log(*job_ref) or "").strip():
-        problems.append(f"hosted job log came back empty (run {job_ref[0]}, job {job_ref[1]})")
+    else:
+        log = github.job_log(*job_ref)
+        if log is None:
+            problems.append(f"hosted job log fetch failed (run {job_ref[0]}, job {job_ref[1]})")
+        elif not log.strip():
+            problems.append(f"hosted job log came back empty (run {job_ref[0]}, job {job_ref[1]})")
 
     sha = resolve_commit(repo_dir, "origin/master")
     if sha is None:
