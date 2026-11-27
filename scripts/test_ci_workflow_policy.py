@@ -1793,6 +1793,24 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
         script = workflow_step("canary.yml", "Resolve Canary target and packaging trigger")
         fake_gh = textwrap.dedent("""\
             gh() {
+              local endpoint=""
+              for arg in "$@"; do
+                case "$arg" in
+                  repos/*) endpoint="$arg" ;;
+                esac
+              done
+              if [[ -n "${FAKE_GH_LOG:-}" ]]; then
+                printf '%s\\n' "$*" >> "$FAKE_GH_LOG"
+              fi
+              if [[ "$endpoint" == *"/jobs"* ]]; then
+                if [[ "$FAKE_JOBS_JSON" == "error" ]]; then return 1; fi
+                if [[ "$FAKE_JOBS_JSON" == "error_body" ]]; then
+                  printf '{"message":"Internal Server Error"}\\n'
+                  return 1
+                fi
+                printf '%s\\n' "$FAKE_JOBS_JSON"
+                return 0
+              fi
               if [[ "$FAKE_RUNS_JSON" == "error" ]]; then return 1; fi
               if [[ "$FAKE_RUNS_JSON" == "error_body" ]]; then
                 printf '{"message":"Internal Server Error"}\\n'
@@ -1851,16 +1869,29 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
             # Simulate bare-metal Canary already sitting at c2.
             git("update-ref", "refs/remotes/origin/canary", c2)
 
-            def run_plan(checkout_sha, runs, force="false", force_bp="false"):
+            def job(name, conclusion="success", status="completed"):
+                return {"name": name, "status": status, "conclusion": conclusion}
+
+            def run_plan(checkout_sha, runs, force="false", force_bp="false", jobs="error"):
                 git("checkout", "-q", checkout_sha)
                 out = repo / "gh_out"
+                gh_log = repo / "gh_calls.log"
                 out.unlink(missing_ok=True)
+                gh_log.unlink(missing_ok=True)
                 if isinstance(runs, str):
                     runs_json = runs
                 elif isinstance(runs, dict):
                     runs_json = json.dumps(runs)
                 else:
                     runs_json = json.dumps({"workflow_runs": runs})
+                if isinstance(jobs, str):
+                    jobs_json = jobs
+                elif isinstance(jobs, list) and jobs and all(isinstance(p, dict) and "jobs" in p for p in jobs):
+                    jobs_json = json.dumps(jobs)
+                elif isinstance(jobs, dict):
+                    jobs_json = json.dumps(jobs)
+                else:
+                    jobs_json = json.dumps([{"jobs": jobs}])
                 subprocess.run(
                     ["bash", "-c", fake_gh + script],
                     cwd=repo,
@@ -1872,18 +1903,55 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
                         "REPO": "marmot-protocol/mdk",
                         "RUN_ID": "999",
                         "FAKE_RUNS_JSON": runs_json,
+                        "FAKE_JOBS_JSON": jobs_json,
+                        "FAKE_GH_LOG": str(gh_log),
                         "FORCE": force,
                         "FORCE_BINDINGS_PROFILE": force_bp,
                         "GITHUB_OUTPUT": str(out),
                     },
                 )
-                return dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+                result = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+                result["_gh_calls"] = gh_log.read_text().splitlines() if gh_log.exists() else []
+                return result
 
-            def green(sha, run_id=100, updated_at="2026-11-26T15:00:00Z"):
-                return {"id": run_id, "head_sha": sha, "conclusion": "success", "updated_at": updated_at}
+            def green(sha, run_id=100, updated_at="2026-11-26T15:00:00Z", run_attempt=1):
+                return {
+                    "id": run_id,
+                    "run_attempt": run_attempt,
+                    "head_sha": sha,
+                    "conclusion": "success",
+                    "updated_at": updated_at,
+                }
 
-            def failed(sha, run_id=101, updated_at="2026-11-26T15:30:00Z"):
-                return {"id": run_id, "head_sha": sha, "conclusion": "failure", "updated_at": updated_at}
+            def failed(sha, run_id=101, updated_at="2026-11-26T15:30:00Z", run_attempt=1):
+                return {
+                    "id": run_id,
+                    "run_attempt": run_attempt,
+                    "head_sha": sha,
+                    "conclusion": "failure",
+                    "updated_at": updated_at,
+                }
+
+            ci_only_failed_jobs = [
+                job("Plan Canary batch", "success"),
+                job("Full cross-platform CI (6 shards) / Relay runtime tests (1/2)", "failure"),
+                job("Full cross-platform CI (6 shards) / Required CI", "failure"),
+                job("Record Canary summary", "failure"),
+            ]
+            packaging_failed_jobs = [
+                job("Plan Canary batch", "success"),
+                job("Full cross-platform CI (6 shards) / Required CI", "success"),
+                job("MarmotKit Release Profile / Resolve exact candidate identity", "success"),
+                job("MarmotKit Release Profile / Build Apple candidate input (ios-device)", "failure"),
+                job("Record Canary summary", "failure"),
+            ]
+            packaging_passed_ci_failed_jobs = [
+                job("Plan Canary batch", "success"),
+                job("Full cross-platform CI (6 shards) / Relay runtime tests (1/2)", "failure"),
+                job("MarmotKit Release Profile / Resolve exact candidate identity", "success"),
+                job("MarmotKit Release Profile / Build Apple candidate input (ios-device)", "success"),
+                job("Record Canary summary", "failure"),
+            ]
 
             # Unchanged master whose latest completed run succeeded skips quickly.
             self.assertEqual(run_plan(c1, [green(c1)])["should_run"], "false")
@@ -1893,26 +1961,107 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
             # Manual run_bindings_profile=true also bypasses early skip on an already-green SHA.
             forced_bp = run_plan(c1, [green(c1)], force="false", force_bp="true")
             self.assertEqual((forced_bp["should_run"], forced_bp["run_bindings_profile"]), ("true", "true"))
-            # An older green run followed by a newer failed run on the same SHA must NOT skip
+            # Core-only diff whose previous attempt failed in CI only does NOT force packaging on retry.
+            core_ci_retry = run_plan(
+                c1,
+                [failed(c1, 102, run_attempt=2), green(c0, 100)],
+                jobs=ci_only_failed_jobs,
+            )
+            self.assertEqual((core_ci_retry["should_run"], core_ci_retry["run_bindings_profile"]), ("true", "false"))
+            self.assertTrue(
+                any("repos/marmot-protocol/mdk/actions/runs/102/attempts/2/jobs?per_page=100" in c for c in core_ci_retry["_gh_calls"]),
+                core_ci_retry["_gh_calls"],
+            )
+            # An older green run followed by a newer failed packaging run on the same SHA must NOT skip
             # and must retry packaging rather than letting the older green run bury the failure.
-            failed_after_green = run_plan(c1, [failed(c1, 102), green(c1, 100)])
+            failed_bp_after_green = run_plan(
+                c1,
+                [failed(c1, 102), green(c1, 100)],
+                jobs=packaging_failed_jobs,
+            )
             self.assertEqual(
-                (failed_after_green["should_run"], failed_after_green["run_bindings_profile"]),
+                (failed_bp_after_green["should_run"], failed_bp_after_green["run_bindings_profile"]),
                 ("true", "true"),
             )
+            # If a newer failed run on an already-green SHA passed packaging and only failed CI,
+            # the retry reruns CI without repeating 60-minute packaging.
+            failed_ci_bp_passed = run_plan(
+                c1,
+                [failed(c1, 102), green(c1, 100)],
+                jobs=packaging_passed_ci_failed_jobs,
+            )
+            self.assertEqual(
+                (failed_ci_bp_passed["should_run"], failed_ci_bp_passed["run_bindings_profile"]),
+                ("true", "false"),
+            )
             # A rerun of an older run ID sits behind a newer ID in GitHub's creation-ordered list,
-            # but has a newer updated_at; ordering by completion recency must not skip it.
-            rerun_failed_behind_newer_green = run_plan(
+            # but has a newer updated_at; ordering by completion recency must inspect its exact attempt.
+            rerun_failed_bp = run_plan(
                 c1,
                 [
                     green(c1, 105, updated_at="2026-11-26T15:10:00Z"),
-                    failed(c1, 100, updated_at="2026-11-26T15:45:00Z"),
+                    failed(c1, 100, updated_at="2026-11-26T15:45:00Z", run_attempt=2),
                 ],
+                jobs=packaging_failed_jobs,
             )
             self.assertEqual(
-                (rerun_failed_behind_newer_green["should_run"], rerun_failed_behind_newer_green["run_bindings_profile"]),
+                (rerun_failed_bp["should_run"], rerun_failed_bp["run_bindings_profile"]),
                 ("true", "true"),
             )
+            self.assertTrue(
+                any("repos/marmot-protocol/mdk/actions/runs/100/attempts/2/jobs?per_page=100" in c for c in rerun_failed_bp["_gh_calls"]),
+                rerun_failed_bp["_gh_calls"],
+            )
+            rerun_failed_ci_only = run_plan(
+                c1,
+                [
+                    green(c1, 105, updated_at="2026-11-26T15:10:00Z"),
+                    failed(c1, 100, updated_at="2026-11-26T15:45:00Z", run_attempt=2),
+                ],
+                jobs=ci_only_failed_jobs,
+            )
+            self.assertEqual(
+                (rerun_failed_ci_only["should_run"], rerun_failed_ci_only["run_bindings_profile"]),
+                ("true", "false"),
+            )
+            # Multi-page jobs response still catches a packaging failure on page 2.
+            paginated_bp_fail = run_plan(
+                c1,
+                [failed(c1, 102), green(c0, 100)],
+                jobs=[
+                    {"jobs": [job("Plan Canary batch", "success"), job("Full cross-platform CI (6 shards) / Required CI", "failure")]},
+                    {"jobs": [job("MarmotKit Release Profile / Build Apple candidate input (ios-device)", "failure"), job("Record Canary summary", "failure")]},
+                ],
+            )
+            self.assertEqual((paginated_bp_fail["should_run"], paginated_bp_fail["run_bindings_profile"]), ("true", "true"))
+            # Uninspectable, cancelled, plan-failed, or zero-job packaging failures fail safe to retrying packaging.
+            for unsafe_jobs in (
+                "error",
+                "error_body",
+                {"message": "bad payload"},
+                [],
+                [job("Plan Canary batch", "failure")],
+                [
+                    job("Plan Canary batch", "success"),
+                    job("Full cross-platform CI (6 shards) / Required CI", "failure"),
+                    job("Record Canary summary", "cancelled"),
+                ],
+                [
+                    job("Plan Canary batch", "success"),
+                    job("Full cross-platform CI (6 shards) / Required CI", "success"),
+                    job("Record Canary summary", "failure"),
+                ],
+            ):
+                with self.subTest(unsafe_jobs=unsafe_jobs):
+                    res = run_plan(c1, [failed(c1, 102), green(c0, 100)], jobs=unsafe_jobs)
+                    self.assertEqual((res["should_run"], res["run_bindings_profile"]), ("true", "true"))
+            # Binding diff whose latest attempt failed in CI only STILL requires packaging because c1..c2 touched bindings.
+            binding_ci_retry = run_plan(
+                c2,
+                [failed(c2, 102), green(c1, 100)],
+                jobs=ci_only_failed_jobs,
+            )
+            self.assertEqual((binding_ci_retry["should_run"], binding_ci_retry["run_bindings_profile"]), ("true", "true"))
             # Core-only diff runs CI without heavy macOS bindings-profile packaging.
             core = run_plan(c1, [green(c0)])
             self.assertEqual((core["should_run"], core["run_bindings_profile"]), ("true", "false"))
