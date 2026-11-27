@@ -1539,7 +1539,10 @@ impl AppClient {
                 publication.redeliver_at = now.saturating_add(WELCOME_REDELIVER_SECS);
             }
             for id in undelivered {
-                if let Err(error) = self.redeliver_welcome(&hex::encode(id.as_slice())).await {
+                if let Err(error) = self
+                    .redeliver_welcome_internal(&hex::encode(id.as_slice()))
+                    .await
+                {
                     tracing::debug!(
                         target: TARGET,
                         method = "follow_link_publications",

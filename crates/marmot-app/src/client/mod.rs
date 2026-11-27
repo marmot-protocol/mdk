@@ -8079,8 +8079,20 @@ impl AppClient {
     /// Re-publish a welcome that a confirmed create/invite failed to deliver,
     /// from the copy the engine stored at wrap time — no re-commit (mdk#352).
     /// Clears the pending record only once the welcome is accepted; a repeated
-    /// failure leaves it queued for a later retry.
+    /// failure leaves it queued for a later retry. Rejects Welcomes belonging
+    /// to groups the host may not see (such as the internal device group).
     pub async fn redeliver_welcome(
+        &mut self,
+        message_id_hex: &str,
+    ) -> Result<SendSummary, AppError> {
+        let message_id = cgka_traits::MessageId::new(hex::decode(message_id_hex)?);
+        self.require_host_visible_welcome(&message_id)?;
+        self.redeliver_welcome_internal(message_id_hex).await
+    }
+
+    /// Internal redelivery seam for device-pairing link maintenance, which owns
+    /// the device group's own founding/linking Welcome retries.
+    pub(super) async fn redeliver_welcome_internal(
         &mut self,
         message_id_hex: &str,
     ) -> Result<SendSummary, AppError> {
@@ -8119,6 +8131,22 @@ impl AppClient {
         observed
             .run_async(Box::pin(work), marmot_observability::confirmed_or_failure)
             .await
+    }
+
+    fn require_host_visible_welcome(
+        &self,
+        message_id: &cgka_traits::MessageId,
+    ) -> Result<(), AppError> {
+        use cgka_traits::storage::{MessageStorage as _, StorageError};
+
+        let record = self
+            .app
+            .account_storage(&self.state.label)?
+            .get_message(message_id)?;
+        if !self.host_may_see_group(&record.group_id) {
+            return Err(AppError::Storage(StorageError::NotFound));
+        }
+        Ok(())
     }
 }
 

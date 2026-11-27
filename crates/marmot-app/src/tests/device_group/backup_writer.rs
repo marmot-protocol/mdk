@@ -545,6 +545,7 @@ async fn a_dropped_backup_is_deleted_later_unless_the_pointer_lists_it_again() {
     relay
         .unfinished_directory_reads
         .store(false, Ordering::SeqCst);
+    due_now(&phone);
     deletes_due_now(&phone, &key);
     phone.drive_backup_pass().await;
     assert_eq!(
@@ -586,8 +587,9 @@ async fn a_head_that_does_not_match_its_locator_keeps_its_backup() {
     assert!(condemned(&phone, &key).is_empty());
 }
 
-/// A new pointer replaces the one its pass fetched, though another device
-/// whose clock runs a day ahead made that one.
+/// A new pointer replaces the one its pass fetched when the fetched pointer's
+/// clock skew is within the allowed future skew window, and refuses excessive
+/// future skew without signing or advancing the replaceable floor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_pointer_postdates_the_one_it_replaces() {
     let blossom = local_blossom();
@@ -596,15 +598,592 @@ async fn a_new_pointer_postdates_the_one_it_replaces() {
     phone.drive_backup_pass().await;
     let mut first = pointer(&relay, &key);
     first[0].written_at -= 2 * DAY;
-    let ahead = unix_now_seconds() + DAY;
+    let ahead = unix_now_seconds() + 60;
     publish_pointer_at(&devices.laptop, &relay, &key, first.clone(), ahead).await;
 
     due_now(&phone);
-    phone.drive_backup_pass().await;
+    assert_eq!(phone.drive_backup_pass().await, None);
     let event = pointer_event(&relay, &key).unwrap();
     assert!(event.created_at > ahead);
     let listed = BackupPointer::open(&event.content, &key).unwrap().backups;
     assert_eq!(ids(&listed[1..]), ids(&first));
+
+    // A pointer dated far into the future must not be propagated.
+    let mut skewed = listed;
+    for entry in &mut skewed {
+        entry.written_at -= 2 * DAY;
+    }
+    let far_ahead = unix_now_seconds() + DAY;
+    publish_pointer_at(&devices.laptop, &relay, &key, skewed, far_ahead).await;
+    let published_before = pointers_published(&relay);
+    let blobs_before = held(&blossom);
+    let floor_before = devices
+        .phone_app
+        .account_home()
+        .replaceable_record_floors("alice")
+        .unwrap()
+        .get(&KIND_BACKUP_POINTER)
+        .copied()
+        .unwrap_or(0);
+
+    due_now(&phone);
+    assert_eq!(
+        phone.drive_backup_pass().await,
+        Some("device_group_refused")
+    );
+    assert_eq!(
+        pointers_published(&relay),
+        published_before,
+        "excessive future skew must not publish a replacement pointer"
+    );
+    assert_eq!(
+        held(&blossom),
+        blobs_before,
+        "excessive future skew must not upload blobs for an unpublishable pass"
+    );
+    assert!(condemned(&phone, &key).is_empty());
+    let floor_after = devices
+        .phone_app
+        .account_home()
+        .replaceable_record_floors("alice")
+        .unwrap()
+        .get(&KIND_BACKUP_POINTER)
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        floor_after, floor_before,
+        "excessive future skew must not poison replaceable_record_floors"
+    );
+}
+
+/// A far-future cached or persisted replaceable-record floor must refuse a
+/// backup pass under rotated recovery words (where discovery returns no
+/// pointer) without uploading blobs, invoking the signer, publishing, or
+/// advancing the floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn far_future_floor_blocks_rotated_recovery_key_without_upload_sign_or_advance() {
+    use crate::backup_archive::backup_address;
+    use nostr_sdk::prelude::{Event, PublicKey, UnsignedEvent};
+    use transport_nostr_peeler::{
+        MarmotNostrSigner, MarmotSignerError, NostrTransportEvent, SignerFuture,
+    };
+
+    #[derive(Debug)]
+    struct PanicSigner;
+    impl MarmotNostrSigner for PanicSigner {
+        fn get_public_key(&self) -> SignerFuture<'_, Result<PublicKey, MarmotSignerError>> {
+            panic!("signer must not be invoked when floor exceeds future skew bound");
+        }
+        fn sign_event(
+            &self,
+            _unsigned: UnsignedEvent,
+        ) -> SignerFuture<'_, Result<Event, MarmotSignerError>> {
+            panic!("signer must not be invoked when floor exceeds future skew bound");
+        }
+        fn nip04_encrypt<'a>(
+            &'a self,
+            _public_key: &'a PublicKey,
+            _content: &'a str,
+        ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
+            panic!("unexpected nip04_encrypt");
+        }
+        fn nip04_decrypt<'a>(
+            &'a self,
+            _public_key: &'a PublicKey,
+            _payload: &'a str,
+        ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
+            panic!("unexpected nip04_decrypt");
+        }
+        fn nip44_encrypt<'a>(
+            &'a self,
+            _public_key: &'a PublicKey,
+            _content: &'a str,
+        ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
+            panic!("unexpected nip44_encrypt");
+        }
+        fn nip44_decrypt<'a>(
+            &'a self,
+            _public_key: &'a PublicKey,
+            _payload: &'a str,
+        ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
+            panic!("unexpected nip44_decrypt");
+        }
+    }
+
+    let blossom = local_blossom();
+    let (devices, _chat, old_words) = lone_writer(&blossom).await;
+    let (mut phone, relay) = (devices.phone, devices.relay);
+    let far_ahead = unix_now_seconds() + DAY;
+    // Simulate a previously authored far-future pointer, populating both the
+    // in-memory cache and persisted `replaceable_record_floors`.
+    publish_pointer_at(&phone, &relay, &old_words.public, Vec::new(), far_ahead).await;
+
+    // Rotate recovery words so relay discovery at the new address is empty.
+    let rotated = confirm_words(&mut phone).await;
+    assert!(pointer_event(&relay, &rotated.public).is_none());
+
+    let published_before = pointers_published(&relay);
+    let blobs_before = held(&blossom);
+    let floor_before = devices
+        .phone_app
+        .account_home()
+        .replaceable_record_floors("alice")
+        .unwrap()
+        .get(&KIND_BACKUP_POINTER)
+        .copied()
+        .unwrap_or(0);
+    assert!(floor_before >= far_ahead);
+
+    due_now(&phone);
+    assert_eq!(
+        phone.drive_backup_pass().await,
+        Some("device_group_refused")
+    );
+    assert_eq!(
+        held(&blossom),
+        blobs_before,
+        "far-future floor must block uploads before write_backup"
+    );
+    assert!(
+        storage(&phone.app).backup_runs().unwrap().is_empty(),
+        "far-future floor must not record a backup run"
+    );
+    assert_eq!(
+        pointers_published(&relay),
+        published_before,
+        "far-future floor must not publish a replacement pointer"
+    );
+    let floor_after_pass = devices
+        .phone_app
+        .account_home()
+        .replaceable_record_floors("alice")
+        .unwrap()
+        .get(&KIND_BACKUP_POINTER)
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        floor_after_pass, floor_before,
+        "far-future floor must not advance during a refused pass"
+    );
+
+    // Also verify the atomic sign-time guard refuses without invoking the
+    // signer or advancing the persisted floor.
+    let summary = devices.phone_app.account_home().account("alice").unwrap();
+    let now = unix_now_seconds();
+    let unsigned = NostrTransportEvent::new_unsigned_at(
+        summary.account_id_hex.clone(),
+        KIND_BACKUP_POINTER,
+        vec![vec!["d".to_owned(), backup_address(&rotated.public)]],
+        "ciphertext".to_owned(),
+        now,
+    );
+    let err = devices
+        .phone_app
+        .sign_replaceable_identity_event_bounded(
+            "alice",
+            Arc::new(PanicSigner),
+            &unsigned,
+            now + 5 * 60,
+            |_| AppError::DeviceGroupRefused("backup_pointer_clock_skew"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AppError::DeviceGroupRefused("backup_pointer_clock_skew")
+        ),
+        "expected backup_pointer_clock_skew, got {err:?}"
+    );
+    let floor_after_sign = devices
+        .phone_app
+        .account_home()
+        .replaceable_record_floors("alice")
+        .unwrap()
+        .get(&KIND_BACKUP_POINTER)
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        floor_after_sign, floor_before,
+        "bounded signer refusal must not advance replaceable_record_floors"
+    );
+}
+
+/// An unauthenticated BackupIndex (encrypted under another recovery key or
+/// tampered) is rejected by `read_index` and never condemns or triggers
+/// BUD-01 DELETE signing for its listed blobs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unauthenticated_backup_index_never_condemns_or_deletes_blobs() {
+    use crate::backup_archive::{BlobLocator, MAX_POINTER_BACKUPS};
+
+    let blossom = local_blossom();
+    let (devices, _chat, words) = lone_writer(&blossom).await;
+    let (mut phone, relay, key) = (devices.phone, devices.relay, words.public);
+
+    let victim_bytes = b"victim blob on configured server".to_vec();
+    let victim_hash = hex::encode(Sha256::digest(&victim_bytes));
+    blossom
+        .blobs
+        .lock()
+        .unwrap()
+        .insert(victim_hash.clone(), victim_bytes.clone());
+    let wrong_public = cgka_engine::recovery_key::derive_recovery_key_pair(
+        &RustCrypto::default(),
+        &[0x99; RECOVERY_ENTROPY_LEN],
+    )
+    .unwrap()
+    .public;
+    let mut unauth_index = BackupIndex::new(100, &slot_of(&phone));
+    unauth_index.small_state = Some(BlobLocator {
+        sha256: victim_hash.clone(),
+        size: victim_bytes.len() as u64,
+        server: blossom.url.clone(),
+    });
+    let unauth_id = [0xee; 16];
+    let unauth_head = BackupHead::seal(
+        unauth_id,
+        &ArchiveKey::generate(),
+        &wrong_public,
+        &unauth_index,
+    )
+    .unwrap()
+    .encode();
+    let unauth_head_hash = hex::encode(Sha256::digest(&unauth_head));
+    let unauth_head_len = unauth_head.len() as u64;
+    blossom
+        .blobs
+        .lock()
+        .unwrap()
+        .insert(unauth_head_hash.clone(), unauth_head);
+    let mut full_listing = Vec::new();
+    for index in 1..=MAX_POINTER_BACKUPS as u8 {
+        let id = [index; 16];
+        let head = BackupHead::seal(
+            id,
+            &ArchiveKey::generate(),
+            &key,
+            &BackupIndex::new(1_000 + u64::from(index), &slot_of(&phone)),
+        )
+        .unwrap()
+        .encode();
+        let head_hash = hex::encode(Sha256::digest(&head));
+        let head_len = head.len() as u64;
+        blossom
+            .blobs
+            .lock()
+            .unwrap()
+            .insert(head_hash.clone(), head);
+        full_listing.push(PointerEntry::new(
+            &id,
+            1_000 + u64::from(index),
+            BlobLocator {
+                sha256: head_hash,
+                size: head_len,
+                server: blossom.url.clone(),
+            },
+        ));
+    }
+    // Replace the oldest slot with the unauthenticated head so adding one new
+    // backup forces it past MAX_POINTER_BACKUPS and into `dropped`.
+    full_listing[0] = PointerEntry::new(
+        &unauth_id,
+        100,
+        BlobLocator {
+            sha256: unauth_head_hash,
+            size: unauth_head_len,
+            server: blossom.url.clone(),
+        },
+    );
+    publish_pointer(&phone, &relay, &key, full_listing).await;
+
+    due_now(&phone);
+    phone.drive_backup_pass().await;
+    assert!(
+        !condemned(&phone, &key).contains(&victim_hash),
+        "blobs from an unauthenticated BackupIndex must never be condemned"
+    );
+    deletes_due_now(&phone, &key);
+    phone.drive_backup_pass().await;
+    assert!(
+        blossom.blobs.lock().unwrap().contains_key(&victim_hash),
+        "victim blob named only in an unauthenticated BackupIndex must never be deleted"
+    );
+}
+
+/// Partial relay discovery (`any_complete` only, where one relay completes empty
+/// while another holding the active pointer does not complete) must fail the pass
+/// without deleting live blobs, condemning blobs, or publishing a truncated pointer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_relay_discovery_never_condemns_deletes_or_truncates_pointer() {
+    let blossom = local_blossom();
+    let (mut devices, _chat, words) = lone_writer(&blossom).await;
+    devices.phone.drive_backup_pass().await;
+    let first = pointer(&devices.relay, &words.public).remove(0);
+    let live_blobs = held(&blossom);
+    // Condemn one of the live backup's blobs as if an older pass queued it:
+    // on an authoritative pointer listing `first`, it would be spared, whereas
+    // an empty partial view would have deleted it!
+    let live_blob_hash = first.head.sha256.clone();
+    let live_backup_id: [u8; 16] = hex::decode(&first.id).unwrap().try_into().unwrap();
+    storage(&devices.phone_app)
+        .condemn_backup_blobs(
+            &words.public,
+            &live_backup_id,
+            &[(live_blob_hash.clone(), blossom.url.clone())],
+            1,
+            0,
+        )
+        .unwrap();
+    // Age the live pointer so a pass would also try to write and publish a new
+    // pointer if it accepted the empty partial view.
+    age_backups(&devices.phone, &devices.relay, &words.public, 2 * DAY).await;
+
+    let account = devices.phone_app.account_home().account("alice").unwrap();
+    let directory = devices.phone_app.directory();
+    let mut entry = directory
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .unwrap_or_else(|| directory.empty_directory_record_for_test(&account.account_id_hex));
+    entry.relay_lists.nip65.created_at = unix_now_seconds();
+    entry.relay_lists.nip65.relays = vec![
+        "wss://completed-empty.example".into(),
+        "wss://unfinished-pointer.example".into(),
+    ];
+    entry.relay_lists.refresh();
+    directory.save_directory_entry_for_test(&entry).unwrap();
+
+    devices.phone.app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        None,
+        devices.relay.clone(),
+        Arc::new(restore::PartialPointerView {
+            relay: devices.relay.clone(),
+            visible: false,
+            any_completed: true,
+        }),
+        false,
+    );
+
+    let published_before = pointers_published(&devices.relay);
+    due_now(&devices.phone);
+    deletes_due_now(&devices.phone, &words.public);
+    assert_eq!(
+        devices.phone.drive_backup_pass().await,
+        Some("device_group_refused"),
+        "partial discovery (any_complete without complete) must refuse the pass"
+    );
+    assert!(
+        blossom.deleters.lock().unwrap().is_empty(),
+        "partial discovery must never sign BUD-01 DELETE for live blobs"
+    );
+    assert_eq!(
+        held(&blossom),
+        live_blobs,
+        "partial discovery must not delete live blobs or upload a truncated backup"
+    );
+    assert_eq!(
+        pointers_published(&devices.relay),
+        published_before,
+        "partial discovery must not publish a truncated pointer"
+    );
+}
+
+/// When backup discovery fails while a condemned blob is due, both pass
+/// admission and worker wake scheduling must honor the failed pass's retry
+/// backoff instead of looping immediately, while normal succeeded schedules
+/// keep waking for due deletes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_backup_discovery_honors_retry_backoff_with_due_condemned_blobs() {
+    use crate::BackgroundBackupOutcome::{FinishedAttempt, NotStarted};
+    use std::sync::atomic::AtomicUsize;
+
+    struct CountingPartialView {
+        inner: restore::PartialPointerView,
+        fetches: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl transport_nostr::DirectoryRelayFetcher for CountingPartialView {
+        async fn fetch_directory_events(
+            &self,
+            request: transport_nostr::DirectoryFetchRequest,
+        ) -> Result<Vec<transport_nostr::DirectoryRelayEventRecord>, String> {
+            self.inner.fetch_directory_events(request).await
+        }
+
+        async fn fetch_directory_events_with_completion(
+            &self,
+            request: transport_nostr::DirectoryFetchRequest,
+        ) -> Result<transport_nostr::DirectoryFetchOutcome, String> {
+            if request
+                .queries
+                .iter()
+                .any(|query| query.kind == KIND_BACKUP_POINTER)
+            {
+                self.fetches.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner
+                .fetch_directory_events_with_completion(request)
+                .await
+        }
+    }
+
+    let blossom = local_blossom();
+    let (mut devices, _chat, words) = lone_writer(&blossom).await;
+    devices.phone.drive_backup_pass().await;
+    let first = pointer(&devices.relay, &words.public).remove(0);
+    let live_backup_id: [u8; 16] = hex::decode(&first.id).unwrap().try_into().unwrap();
+    storage(&devices.phone_app)
+        .condemn_backup_blobs(
+            &words.public,
+            &live_backup_id,
+            &[(first.head.sha256.clone(), blossom.url.clone())],
+            1,
+            0,
+        )
+        .unwrap();
+
+    // First verify normal succeeded schedule (failed_passes == 0) keeps due-delete
+    // wakeups and admission working while next_pass_at is far in the future.
+    storage(&devices.phone_app)
+        .schedule_backup_pass(BackupSchedule {
+            next_pass_at: unix_now_seconds() + DAY,
+            failed_passes: 0,
+        })
+        .unwrap();
+    assert_eq!(
+        devices.phone.history_dispatch_next_at(),
+        Some(0),
+        "normal succeeded schedule must still wake immediately for due deletes"
+    );
+    assert!(
+        devices.phone.prepare_backup_pass().unwrap().is_some(),
+        "normal succeeded schedule must still admit due-delete passes"
+    );
+
+    let account = devices.phone_app.account_home().account("alice").unwrap();
+    let directory = devices.phone_app.directory();
+    let mut entry = directory
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .unwrap_or_else(|| directory.empty_directory_record_for_test(&account.account_id_hex));
+    entry.relay_lists.nip65.created_at = unix_now_seconds();
+    entry.relay_lists.nip65.relays = vec![
+        "wss://completed-empty.example".into(),
+        "wss://unfinished-pointer.example".into(),
+    ];
+    entry.relay_lists.refresh();
+    directory.save_directory_entry_for_test(&entry).unwrap();
+
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let failing_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        None,
+        devices.relay.clone(),
+        Arc::new(CountingPartialView {
+            inner: restore::PartialPointerView {
+                relay: devices.relay.clone(),
+                visible: false,
+                any_completed: true,
+            },
+            fetches: fetches.clone(),
+        }),
+        false,
+    );
+    devices.phone.app.relay_plane = failing_plane.clone();
+    devices.phone_app.relay_plane = failing_plane;
+
+    // Direct client check: after a failed discovery pass, the due condemned row
+    // must not bypass retry backoff in prepare_backup_pass or history_dispatch_next_at.
+    due_now(&devices.phone);
+    deletes_due_now(&devices.phone, &words.public);
+    assert_eq!(
+        devices.phone.drive_backup_pass().await,
+        Some("device_group_refused")
+    );
+    let schedule = storage(&devices.phone_app).backup_schedule().unwrap();
+    assert_eq!(schedule.failed_passes, 1);
+    assert!(schedule.next_pass_at > unix_now_seconds());
+    assert!(
+        devices.phone.prepare_backup_pass().unwrap().is_none(),
+        "failed discovery backoff must block immediate re-admission despite due deletes"
+    );
+    assert_eq!(
+        devices.phone.history_dispatch_next_at(),
+        Some(schedule.next_pass_at),
+        "worker wake calculation must honor failed pass backoff despite due deletes"
+    );
+
+    // Runtime worker check: completion of the failed discovery pass must NOT
+    // immediately launch a second pass in a tight loop.
+    let phone_app = devices.phone_app.clone();
+    drop(devices.phone);
+    fetches.store(0, Ordering::SeqCst);
+    storage(&phone_app)
+        .schedule_backup_pass(BackupSchedule::default())
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(phone_app.clone());
+    runtime
+        .set_runtime_backup_background_conditions(true, true)
+        .unwrap();
+    runtime.reconcile_accounts().await.unwrap();
+    assert_eq!(
+        runtime.run_due_backup_pass("alice").await.unwrap(),
+        FinishedAttempt
+    );
+    // Barrier commands give the worker loop a chance to re-dispatch if buggy.
+    runtime.backup_settings("alice").await.unwrap();
+    runtime.run_due_maintenance("alice").await.unwrap();
+    assert_eq!(
+        runtime.run_due_backup_pass("alice").await.unwrap(),
+        NotStarted,
+        "worker must honor backoff instead of re-admitting a failed discovery pass"
+    );
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        1,
+        "failed discovery with due condemned blobs must not repeat relay reads on completion"
+    );
+    assert_eq!(
+        storage(&phone_app).backup_schedule().unwrap().failed_passes,
+        1
+    );
+    runtime.shutdown().await;
+}
+
+/// A healthy configured discovery fallback relay written with an uppercase
+/// hostname or explicit default port must match the canonical endpoint reported
+/// by transport completion so backup passes still run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_pass_accepts_completed_noncanonical_fallback_relay_url() {
+    let blossom = local_blossom();
+    let (mut devices, _chat, words) = lone_writer(&blossom).await;
+    // Clear cached NIP-65 relays so backup_pointer_endpoints falls back to the
+    // configured directory_relay_urls containing an uppercase host and explicit
+    // default port.
+    let account = devices.phone_app.account_home().account("alice").unwrap();
+    let directory = devices.phone_app.directory();
+    let mut entry = directory
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .unwrap_or_else(|| directory.empty_directory_record_for_test(&account.account_id_hex));
+    entry.relay_lists.nip65.relays.clear();
+    entry.relay_lists.refresh();
+    directory.save_directory_entry_for_test(&entry).unwrap();
+
+    devices.phone.app.config.directory_relay_urls =
+        vec!["wss://BACKUP-FALLBACK.EXAMPLE:443".into()];
+    assert_eq!(
+        devices.phone.app.directory().directory_source_relays(&[]),
+        vec![TransportEndpoint(
+            "wss://BACKUP-FALLBACK.EXAMPLE:443".into()
+        )]
+    );
+
+    assert_eq!(
+        devices.phone.drive_backup_pass().await,
+        None,
+        "completed canonical fallback relay must be recognized as complete"
+    );
+    assert_eq!(pointer(&devices.relay, &words.public).len(), 1);
 }
 
 /// Under a key nothing can be sealed to, the writer uploads nothing and

@@ -543,6 +543,30 @@ impl SqliteAppStorage {
         )
     }
 
+    /// Distinct groups in `app_events` holding at least one row whose pinned
+    /// source-epoch retention expiry has reached `now_seconds`, sorted by
+    /// group id. Scans the partial index
+    /// `idx_app_events_group_retention_expiry` (only rows with
+    /// `retention_expires_at IS NOT NULL`, keyed by `(group_id_hex,
+    /// retention_expires_at)`) so groups whose current policy is `0` or that
+    /// are absent from `chat_list_rows` are still discovered.
+    pub fn groups_with_expiring_app_events(&self, now_seconds: u64) -> StorageResult<Vec<String>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT DISTINCT group_id_hex
+                 FROM app_events
+                 WHERE retention_expires_at IS NOT NULL
+                   AND retention_expires_at <= ?1
+                 ORDER BY group_id_hex ASC",
+            )
+            .storage()?;
+        stmt.query_map([u64_to_i64(now_seconds)?], |row| row.get(0))
+            .storage()?
+            .collect::<Result<Vec<String>, _>>()
+            .storage()
+    }
+
     /// Direct-conversation candidates for a peer-keyed reuse lookup.
     ///
     /// Returns only rows whose durable projection is currently classified as
