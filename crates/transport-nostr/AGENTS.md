@@ -58,7 +58,12 @@ drop: storage imports loss by count, so a token's count must cover every drop un
   relay's reply keeps its own end (EOSE, CLOSED reason, cut, deadline) and exact per-REQ raw-vs-admitted EVENT counts
   (`raw_items == received_items` replaces the retired `DirectoryWireTransport` prefilter counter for strict absence
   proofs), and a relay that requires NIP-42 is asked once
-  more after the signer authenticates. A pending signer callback at the inspection deadline is
+  more after the signer authenticates. `NostrSdkDirectoryRelayFetcher` holds no idle `Client`; every read builds and
+  tears down a scoped client (`ScopedDirectoryClient` / `ScopedInspectionClient`). `DirectoryRelayPlane` coalesces
+  identical in-flight plain and strict fetches with waiter-counted ownership and a `CancellationToken`: cancelling one
+  waiter leaves shared work running for remaining waiters, losing the final waiter cancels and tears down the shared
+  fetch, and `MarmotRelayPlane::shutdown()` cancels and joins active coalesced fetches within
+  `RELAY_PLANE_SHUTDOWN_WAIT`. A pending signer callback at the inspection deadline is
   `AuthenticationTimedOut`; other deadlines are `TimedOut`. Inspection watches authentication from before the dial with
   `AUTH_CHALLENGE_WAIT` (so a bare `auth-required:` CLOSED with no `AUTH` challenge ends as `AuthenticationRequired`
   instead of waiting out the EOSE window, while an `AUTH` challenge still waits until the deadline), so a refusal on
