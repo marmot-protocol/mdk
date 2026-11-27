@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -293,10 +294,11 @@ class GitHubOps:
         res = self._run_gh_safe("run", "rerun", base_id, "--failed", "--repo", self.repo)
         return res is not None and res.returncode == 0
 
-    def dispatch_canary(self) -> None:
+    def dispatch_canary(self) -> bool:
+        """Start a hosted Canary run on `master`; return True only when accepted (or dry-run)."""
         if self.dry_run:
-            return
-        self._run_gh_safe(
+            return True
+        res = self._run_gh_safe(
             "workflow",
             "run",
             "canary.yml",
@@ -307,6 +309,27 @@ class GitHubOps:
             "-f",
             "force=true",
         )
+        return res is not None and res.returncode == 0
+
+    def workflow_runs(self, workflow: str, *, limit: int = 20) -> list[dict[str, Any]] | None:
+        """Recent `master` runs of `workflow` in any status, or `None` on API failure."""
+        res = self._run_gh_safe(
+            "api", f"repos/{self.repo}/actions/workflows/{workflow}/runs?branch=master&per_page={limit}"
+        )
+        if res is None or res.returncode != 0:
+            return None
+        try:
+            runs = json.loads(res.stdout).get("workflow_runs")
+        except json.JSONDecodeError:
+            return None
+        return runs if isinstance(runs, list) else None
+
+    def cancel_run(self, run_id: int) -> bool:
+        """Cancel a queued or running workflow run; return True only when accepted (or dry-run)."""
+        if self.dry_run:
+            return True
+        res = self._run_gh_safe("run", "cancel", str(run_id), "--repo", self.repo)
+        return res is not None and res.returncode == 0
 
     def open_or_comment_issue(
         self,
@@ -828,6 +851,59 @@ class BisectController:
             self._persist()
             escalated = True
         return escalated
+
+    def _contains_fix_attempt(self, incident: IncidentRecord, sha: str) -> bool:
+        """Whether `sha` includes a commit merged after `incident` froze the tree.
+
+        While frozen only `tree-fix` and `revert` PRs merge, so any such commit is a fix
+        attempt; squash merges carry their merge time as the committer date.
+        """
+        try:
+            res = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.repo),
+                    "rev-list",
+                    "--count",
+                    f"--since={datetime.fromtimestamp(incident.started_at, timezone.utc):%Y-%m-%dT%H:%M:%SZ}",
+                    f"{incident.tip_sha}..{sha}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        return res.returncode == 0 and res.stdout.strip() not in {"", "0"}
+
+    def supersede_doomed_hosted_runs(self, master_ref: str = "origin/master") -> list[dict[str, Any]]:
+        """While hosted Canary is frozen, cancel runs that cannot clear it and make sure `master` gets one.
+
+        `canary.yml` runs one at a time, so a run on a commit without any fix attempt (certain to
+        fail again) otherwise holds the tree red while the run that could clear it waits behind it.
+        A run that contains a fix attempt is kept, since it may clear the tree first.
+        """
+        incident = self.state.active_incidents.get("hosted_canary")
+        master_sha = resolve_commit(self.repo, master_ref)
+        if incident is None or not master_sha or not self._contains_fix_attempt(incident, master_sha):
+            return []
+        runs = self.github.workflow_runs("canary.yml")
+        if runs is None:
+            return [{"source": "canary.yml", "result": "runs_api_error"}]
+        actions: list[dict[str, Any]] = []
+        for run in runs:
+            sha = str(run.get("head_sha") or "")
+            if run.get("status") == "completed" or sha == master_sha or self._contains_fix_attempt(incident, sha):
+                continue
+            cancelled = self.github.cancel_run(int(run.get("id") or 0))
+            actions.append(
+                {"source": "canary.yml", "run_id": str(run.get("id")), "result": "cancelled" if cancelled else "cancel_failed"}
+            )
+        if not any(str(run.get("head_sha") or "") == master_sha for run in runs):
+            dispatched = self.github.dispatch_canary()
+            actions.append({"source": "canary.yml", "sha": master_sha[:9], "result": "dispatched" if dispatched else "dispatch_failed"})
+        return actions
 
     def _record_open_revert_command(self, culprit_sha: str, command: tuple[str, ...]) -> None:
         if not command:
@@ -2036,6 +2112,13 @@ class BisectController:
                         "error": sanitize_single_line(f"{type(exc).__name__}: {exc}"),
                     }
                 )
+
+        # 3. Stop a frozen hosted Canary from waiting on runs that cannot clear it.
+        if "canary.yml" in hosted_workflows:
+            try:
+                actions.extend(self.supersede_doomed_hosted_runs(master_ref))
+            except Exception as exc:
+                actions.append({"source": "canary.yml", "error": sanitize_single_line(f"{type(exc).__name__}: {exc}")})
 
         escalated = escalated_early or self.check_escalation()
         result: dict[str, Any] = {

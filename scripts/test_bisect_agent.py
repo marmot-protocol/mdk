@@ -86,6 +86,15 @@ def _commit_file(repo: Path, rel: str, content: str, msg: str) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
+def _commit_at(repo: Path, rel: str, content: str, msg: str, epoch: int) -> str:
+    """Commit with a fixed author and committer date (squash merges carry their merge time)."""
+    (repo / rel).write_text(content, encoding="utf-8")
+    env = {**os.environ, "GIT_AUTHOR_DATE": f"@{epoch} +0000", "GIT_COMMITTER_DATE": f"@{epoch} +0000"}
+    subprocess.run(["git", "-C", str(repo), "add", rel], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", msg], check=True, capture_output=True, env=env)
+    return _git(repo, "rev-parse", "HEAD")
+
+
 def _seed_tree_state(tmp: Path, origin: Path, state: str = "green") -> None:
     ts_work = tmp / "ts-init"
     ts_work.mkdir()
@@ -130,6 +139,7 @@ class StubGitHub:
         self.reruns: list[str] = []
         self.recorded_attempts: list[tuple[str, int, int | None]] = []
         self.dispatches: int = 0
+        self.cancelled: list[int] = []
         self.issues: list[dict] = []
         self.prs: list[dict] = []
 
@@ -177,8 +187,16 @@ class StubGitHub:
         self.reruns.append(run_id)
         return True
 
-    def dispatch_canary(self) -> None:
+    def dispatch_canary(self) -> bool:
         self.dispatches += 1
+        return True
+
+    def workflow_runs(self, workflow: str, *, limit: int = 20):
+        return list(self.runs_by_workflow.get(workflow, []))[:limit]
+
+    def cancel_run(self, run_id: int) -> bool:
+        self.cancelled.append(run_id)
+        return True
 
     def open_or_comment_issue(self, *, title: str, body: str, issue_number: int | None = None) -> int | None:
         if self.fail_issue_create:
@@ -783,6 +801,52 @@ class ClassifierTests(unittest.TestCase):
 
 
 class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
+    def test_a_frozen_hosted_canary_stops_waiting_on_runs_that_cannot_clear_it(self):
+        # 2026-11-27: the tree froze on cb02e3694; a Canary run was then started on b836f142f
+        # (merged before the freeze, no fix). The tree-fix merged 16 minutes later, and its
+        # run queued behind the doomed one for ~27 minutes. While frozen, every commit merged
+        # since the freeze is a fix attempt; a run containing none of them can only fail.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            repo, _ = _init_repo(Path(tmp_str))
+            failing = _commit_at(repo, "app.txt", "broken\n", "regression", 1000)
+            before_freeze = _commit_at(repo, "other.txt", "x\n", "merged before the freeze", 1060)
+            fix = _commit_at(repo, "app.txt", "fixed\n", "tree-fix", 1300)
+            second_fix = _commit_at(repo, "app.txt", "fixed again\n", "second tree-fix", 1400)
+            incident = IncidentRecord(started_at=1200.0, reason="frozen", run_url="", tip_sha=failing, source="hosted_canary")
+
+            def supersede(master: str, runs: list[dict]) -> StubGitHub:
+                _git(repo, "update-ref", "refs/remotes/origin/master", master)
+                gh = StubGitHub(runs_by_workflow={"canary.yml": runs})
+                ctrl = BisectController(
+                    repo=repo,
+                    state=AgentState(tree_state="red", active_incidents={"hosted_canary": incident}),
+                    github=gh,
+                    alerter=MarmotAlerter(Roster(), dry_run=True),
+                    tree_state=TreeStateController(repo, dry_run=True, sign_commits=False),
+                    dry_run=False,
+                )
+                ctrl.supersede_doomed_hosted_runs()
+                return gh
+
+            red = {"id": 10, "head_sha": failing, "status": "completed", "conclusion": "failure"}
+            doomed = {"id": 11, "head_sha": before_freeze, "status": "in_progress", "conclusion": None}
+
+            # The fix landed: cancel the run that contains no fix and start one on master.
+            gh = supersede(fix, [doomed, red])
+            self.assertEqual((gh.cancelled, gh.dispatches), ([11], 1))
+
+            # A run on master is already queued or running: nothing to do.
+            gh = supersede(fix, [{"id": 12, "head_sha": fix, "status": "queued", "conclusion": None}, doomed, red])
+            self.assertEqual((gh.cancelled, gh.dispatches), ([11], 0))
+
+            # A run that contains a fix may still clear the tree: keep it, and queue master behind it.
+            gh = supersede(second_fix, [{"id": 13, "head_sha": fix, "status": "in_progress", "conclusion": None}, red])
+            self.assertEqual((gh.cancelled, gh.dispatches), ([], 1))
+
+            # No fix merged since the freeze: leave everything alone.
+            gh = supersede(before_freeze, [doomed, red])
+            self.assertEqual((gh.cancelled, gh.dispatches), ([], 0))
+
     def test_bisect_budget_enforcement_and_detached_dry_run_branch_safety(self):
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)
