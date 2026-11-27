@@ -577,52 +577,168 @@ fn uppercase_wipe_retirement_watermark_fences_uppercase_secret_restoration() {
         );
     }
 
-    // A pre-existing uppercase watermark (written before canonicalization)
-    // must also fence lowercase callers.
+    // A pre-existing uppercase or arbitrary mixed-case watermark (written before
+    // canonicalization) must also fence lowercase and uppercase callers.
     store
         .lock()
         .unwrap()
         .execute(
             "INSERT INTO encrypted_media_epoch_secret_retirement_watermarks(
                  group_id_hex, retired_through_epoch, retired_at_unix_seconds
-             ) VALUES('EE01', 10, 1)",
+             ) VALUES('EE01', 10, 1), ('EeFf', 10, 1)",
             [],
         )
         .unwrap();
-    app.remember_encrypted_media_epoch_secret("ee01", 1, 5, b"blocked")
+    for (target, probe) in [
+        ("ee01", "ee01"),
+        ("eeff", "eeff"),
+        ("EEFF", "eeff"),
+        ("EeFf", "eeff"),
+    ] {
+        app.remember_encrypted_media_epoch_secret(target, 1, 5, b"blocked")
+            .unwrap();
+        assert_eq!(
+            app.encrypted_media_epoch_secret(probe, 1, 5).unwrap(),
+            None,
+            "legacy watermark must fence secret restoration for {target} -> {probe}"
+        );
+        assert!(
+            !app.encrypted_media_epoch_secret_may_be_served(probe, 5)
+                .unwrap(),
+            "legacy watermark must keep may_be_served false for {probe}"
+        );
+    }
+}
+
+/// Regression for #3798 / PR #3818 review: arbitrary mixed-case secrets and
+/// app events persisted without a matching `account_groups` / `chat_list_rows`
+/// row must still be discovered, wiped, and fenced by `delete_local_group_data`.
+#[test]
+fn wipe_discovers_and_fences_mixed_case_secrets_and_events_without_projection_rows() {
+    let store = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let app = store.app_storage();
+
+    // 1. Mixed-case secret persisted via the public API with no projection row.
+    app.remember_encrypted_media_epoch_secret("AaBb", 1, 5, b"mixed-api-secret")
         .unwrap();
     assert_eq!(
-        app.encrypted_media_epoch_secret("ee01", 1, 5).unwrap(),
+        app.encrypted_media_epoch_secret("AaBb", 1, 5)
+            .unwrap()
+            .as_deref(),
+        Some(b"mixed-api-secret".as_slice())
+    );
+
+    let wiped_ab = store.delete_local_group_data("aabb").unwrap();
+    assert!(
+        wiped_ab.did_delete(),
+        "wipe must delete mixed-case secret even without a projection row"
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM encrypted_media_epoch_secrets WHERE LOWER(group_id_hex) = 'aabb'"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM encrypted_media_epoch_secret_retirement_watermarks WHERE group_id_hex = 'aabb'"
+        ),
+        1
+    );
+    app.remember_encrypted_media_epoch_secret("AaBb", 1, 5, b"resurrected")
+        .unwrap();
+    assert_eq!(
+        app.encrypted_media_epoch_secret("AaBb", 1, 5).unwrap(),
         None
     );
     assert!(
-        !app.encrypted_media_epoch_secret_may_be_served("ee01", 5)
+        !app.encrypted_media_epoch_secret_may_be_served("AaBb", 5)
             .unwrap()
+    );
+
+    // 2. Pre-existing raw mixed-case secret and app event with no projection row.
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO encrypted_media_epoch_secrets(
+                 group_id_hex, component_id, source_epoch, secret, created_at_unix_seconds
+             ) VALUES('CcDd', 1, 7, x'9988', 1);
+             INSERT INTO app_events(
+                 group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                 tags_json, recorded_at, received_at
+             ) VALUES('CcDd', 'm-mixed', 'received', 'alice', 'secret plaintext', 9, '[]', 1, 1);",
+        )
+        .unwrap();
+
+    let wiped_cd = store.delete_local_group_data("ccdd").unwrap();
+    assert!(
+        wiped_cd.did_delete(),
+        "wipe must discover and delete raw mixed-case rows without projection rows"
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM encrypted_media_epoch_secrets WHERE LOWER(group_id_hex) = 'ccdd'"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM app_events WHERE LOWER(group_id_hex) = 'ccdd'"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM encrypted_media_epoch_secret_retirement_watermarks WHERE group_id_hex = 'ccdd'"
+        ),
+        1
     );
 }
 
 /// Regression for #3798 / PR #3818 review: `delete_local_group_data` must keep
 /// indexed `group_id_hex` lookups on large message tables (`app_events`,
-/// `message_timeline`) rather than forcing full-table scans via `LOWER(...)`.
+/// `message_timeline`) for both spelling discovery and row deletion, rather
+/// than forcing full-table scans via `LOWER(...)`.
 #[test]
 fn delete_local_group_data_uses_group_id_indexes_on_large_tables() {
     thread_local! {
-        static DELETE_SQLS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+        static TRACED_SQLS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    fn record_deletes(event: rusqlite::trace::TraceEvent<'_>) {
+    fn record_queries(event: rusqlite::trace::TraceEvent<'_>) {
         if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
-            && (sql.contains("DELETE FROM app_events ")
-                || sql.contains("DELETE FROM message_timeline "))
+            && (sql.contains("FROM app_events") || sql.contains("FROM message_timeline"))
         {
-            DELETE_SQLS.with_borrow_mut(|sqls| sqls.push(sql.to_owned()));
+            TRACED_SQLS.with_borrow_mut(|sqls| sqls.push(sql.to_owned()));
         }
     }
 
     let store = SqliteAccountStorage::in_memory_for_test().unwrap();
-    DELETE_SQLS.with_borrow_mut(Vec::clear);
+    // Seed both tables so both the loose-index-scan discovery query and the
+    // indexed DELETE execute during the wipe.
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO app_events(
+                 group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                 tags_json, recorded_at, received_at
+             ) VALUES ('aabb', 'm1', 'received', 'alice', 'hi', 9, '[]', 1, 1);
+             INSERT INTO message_timeline(
+                 group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                 tags_json, timeline_at, received_at, reactions_json
+             ) VALUES ('aabb', 'm1', 'received', 'alice', 'hi', 9, '[]', 1, 1, '[]');",
+        )
+        .unwrap();
+    TRACED_SQLS.with_borrow_mut(Vec::clear);
     store.lock().unwrap().trace_v2(
         rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
-        Some(record_deletes),
+        Some(record_queries),
     );
     store.delete_local_group_data("aabb").unwrap();
     store
@@ -630,11 +746,19 @@ fn delete_local_group_data_uses_group_id_indexes_on_large_tables() {
         .unwrap()
         .trace_v2(rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT, None);
 
-    let sqls = DELETE_SQLS.take();
-    assert_eq!(
-        sqls.len(),
-        2,
-        "expected app_events and message_timeline deletes: {sqls:?}"
+    let sqls = TRACED_SQLS.take();
+    assert!(
+        sqls.iter().any(|s| s.contains("DELETE FROM app_events "))
+            && sqls
+                .iter()
+                .any(|s| s.contains("DELETE FROM message_timeline "))
+            && sqls
+                .iter()
+                .any(|s| s.contains("WITH RECURSIVE") && s.contains("FROM app_events"))
+            && sqls
+                .iter()
+                .any(|s| s.contains("WITH RECURSIVE") && s.contains("FROM message_timeline")),
+        "expected both discovery CTEs and DELETEs for app_events and message_timeline: {sqls:?}"
     );
     let conn = store.lock().unwrap();
     for sql in sqls {
@@ -647,14 +771,19 @@ fn delete_local_group_data_uses_group_id_indexes_on_large_tables() {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let target_plan = details.first().map(String::as_str).unwrap_or("");
         assert!(
-            target_plan.starts_with("SEARCH ") && target_plan.contains("USING "),
+            details.iter().any(|line| {
+                line.contains("SEARCH app_events USING ")
+                    || line.contains("SEARCH message_timeline USING ")
+            }),
             "expected indexed SEARCH plan for `{sql}`, got {details:?}"
         );
         assert!(
-            !target_plan.starts_with("SCAN "),
-            "must not full-table SCAN target table for `{sql}`, got {details:?}"
+            !details
+                .iter()
+                .any(|line| line.contains("SCAN app_events")
+                    || line.contains("SCAN message_timeline")),
+            "must not full-table SCAN app_events/message_timeline for `{sql}`, got {details:?}"
         );
     }
 }

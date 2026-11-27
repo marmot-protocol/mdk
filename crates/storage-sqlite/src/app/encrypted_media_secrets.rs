@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::SqliteAccountStorage;
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, matching_group_id_spellings, sql_placeholders};
 use std::collections::BTreeSet;
 
 use crate::{
@@ -33,10 +33,16 @@ impl SqliteAppStorage {
             ));
         }
         let lower = group_id_hex.to_ascii_lowercase();
-        let upper = group_id_hex.to_ascii_uppercase();
         self.lock()?
             .execute_cached(
                 r#"
+WITH RECURSIVE ref_groups(g) AS (
+    SELECT MIN(group_id_hex) FROM encrypted_media_epoch_secret_references
+    UNION ALL
+    SELECT (SELECT MIN(group_id_hex) FROM encrypted_media_epoch_secret_references WHERE group_id_hex > g)
+    FROM ref_groups
+    WHERE g IS NOT NULL
+)
 INSERT INTO encrypted_media_epoch_secrets (
     group_id_hex,
     component_id,
@@ -50,18 +56,18 @@ SELECT
     EXISTS (
         SELECT 1
         FROM encrypted_media_epoch_secret_references
-        WHERE group_id_hex IN (?1, ?6, ?7)
+        WHERE group_id_hex IN (SELECT g FROM ref_groups WHERE g IS NOT NULL AND LOWER(g) = ?1)
           AND source_epoch = ?3
     )
 WHERE NOT EXISTS (
     SELECT 1
     FROM encrypted_media_epoch_secret_retirement_watermarks
-    WHERE group_id_hex IN (?1, ?6, ?7)
+    WHERE LOWER(group_id_hex) = ?1
       AND retired_through_epoch >= ?3
 ) OR EXISTS (
     SELECT 1
     FROM encrypted_media_epoch_secret_references
-    WHERE group_id_hex IN (?1, ?6, ?7)
+    WHERE group_id_hex IN (SELECT g FROM ref_groups WHERE g IS NOT NULL AND LOWER(g) = ?1)
       AND source_epoch = ?3
 )
 ON CONFLICT(group_id_hex, component_id, source_epoch) DO UPDATE SET
@@ -75,18 +81,16 @@ WHERE excluded.retention_managed = 1
    OR NOT EXISTS (
        SELECT 1
        FROM encrypted_media_epoch_secret_retirement_watermarks
-       WHERE group_id_hex IN (?1, ?6, ?7)
+       WHERE LOWER(group_id_hex) = excluded.group_id_hex
          AND retired_through_epoch >= excluded.source_epoch
    )
 "#,
                 params![
-                    group_id_hex,
+                    &lower,
                     i64::from(component_id),
                     u64_to_i64(source_epoch)?,
                     secret,
                     unix_now_seconds_i64(),
-                    &lower,
-                    &upper,
                 ],
             )
             .storage()?;
@@ -100,38 +104,51 @@ WHERE excluded.retention_managed = 1
         source_epoch: u64,
     ) -> StorageResult<Option<Vec<u8>>> {
         let lower = group_id_hex.to_ascii_lowercase();
-        let upper = group_id_hex.to_ascii_uppercase();
         self.lock()?
             .query_row_cached(
                 r#"
+WITH RECURSIVE
+    secret_groups(g) AS (
+        SELECT MIN(group_id_hex) FROM encrypted_media_epoch_secrets
+        UNION ALL
+        SELECT (SELECT MIN(group_id_hex) FROM encrypted_media_epoch_secrets WHERE group_id_hex > g)
+        FROM secret_groups
+        WHERE g IS NOT NULL
+    ),
+    ref_groups(g) AS (
+        SELECT MIN(group_id_hex) FROM encrypted_media_epoch_secret_references
+        UNION ALL
+        SELECT (SELECT MIN(group_id_hex) FROM encrypted_media_epoch_secret_references WHERE group_id_hex > g)
+        FROM ref_groups
+        WHERE g IS NOT NULL
+    )
 SELECT secret
 FROM encrypted_media_epoch_secrets
-WHERE group_id_hex IN (?1, ?4, ?5)
+WHERE group_id_hex IN (SELECT g FROM secret_groups WHERE g IS NOT NULL AND LOWER(g) = ?1)
   AND component_id = ?2
   AND source_epoch = ?3
   AND (
       EXISTS (
           SELECT 1
           FROM encrypted_media_epoch_secret_references AS refs
-          WHERE refs.group_id_hex IN (?1, ?4, ?5)
+          WHERE refs.group_id_hex IN (SELECT g FROM ref_groups WHERE g IS NOT NULL AND LOWER(g) = ?1)
             AND refs.source_epoch = encrypted_media_epoch_secrets.source_epoch
       )
       OR NOT EXISTS (
           SELECT 1
           FROM encrypted_media_epoch_secret_retirement_watermarks AS watermarks
-          WHERE watermarks.group_id_hex IN (?1, ?4, ?5)
+          WHERE LOWER(watermarks.group_id_hex) = ?1
             AND watermarks.retired_through_epoch >= encrypted_media_epoch_secrets.source_epoch
       )
   )
-ORDER BY CASE WHEN group_id_hex = ?1 THEN 0 WHEN group_id_hex = ?4 THEN 1 ELSE 2 END, group_id_hex
+ORDER BY CASE WHEN group_id_hex = ?4 THEN 0 WHEN group_id_hex = ?1 THEN 1 ELSE 2 END, group_id_hex
 LIMIT 1
 "#,
                 params![
-                    group_id_hex,
+                    &lower,
                     i64::from(component_id),
                     u64_to_i64(source_epoch)?,
-                    &lower,
-                    &upper,
+                    group_id_hex,
                 ],
                 |row| row.get(0),
             )
@@ -149,24 +166,32 @@ LIMIT 1
         source_epoch: u64,
     ) -> StorageResult<bool> {
         let lower = group_id_hex.to_ascii_lowercase();
-        let upper = group_id_hex.to_ascii_uppercase();
         Ok(self
             .lock()?
             .query_row_cached(
-                "SELECT
-                     EXISTS (
-                         SELECT 1
-                         FROM encrypted_media_epoch_secret_references
-                         WHERE group_id_hex IN (?1, ?3, ?4)
-                           AND source_epoch = ?2
-                     )
-                     OR NOT EXISTS (
-                         SELECT 1
-                         FROM encrypted_media_epoch_secret_retirement_watermarks
-                         WHERE group_id_hex IN (?1, ?3, ?4)
-                           AND retired_through_epoch >= ?2
-                     )",
-                params![group_id_hex, u64_to_i64(source_epoch)?, &lower, &upper],
+                r#"
+WITH RECURSIVE ref_groups(g) AS (
+    SELECT MIN(group_id_hex) FROM encrypted_media_epoch_secret_references
+    UNION ALL
+    SELECT (SELECT MIN(group_id_hex) FROM encrypted_media_epoch_secret_references WHERE group_id_hex > g)
+    FROM ref_groups
+    WHERE g IS NOT NULL
+)
+SELECT
+    EXISTS (
+        SELECT 1
+        FROM encrypted_media_epoch_secret_references
+        WHERE group_id_hex IN (SELECT g FROM ref_groups WHERE g IS NOT NULL AND LOWER(g) = ?1)
+          AND source_epoch = ?2
+    )
+    OR NOT EXISTS (
+        SELECT 1
+        FROM encrypted_media_epoch_secret_retirement_watermarks
+        WHERE LOWER(group_id_hex) = ?1
+          AND retired_through_epoch >= ?2
+    )
+"#,
+                params![&lower, u64_to_i64(source_epoch)?],
                 |row| row.get::<_, i64>(0),
             )
             .storage()?
@@ -322,24 +347,49 @@ pub(crate) fn retire_unreferenced_encrypted_media_secret_epochs_tx(
     group_id_hex: &str,
     candidate_epochs: &BTreeSet<i64>,
 ) -> StorageResult<usize> {
+    if candidate_epochs.is_empty() {
+        return Ok(0);
+    }
+    let canonical = group_id_hex.to_ascii_lowercase();
+    let ref_spellings =
+        matching_group_id_spellings(tx, "encrypted_media_epoch_secret_references", &canonical)?;
+    let secret_spellings =
+        matching_group_id_spellings(tx, "encrypted_media_epoch_secrets", &canonical)?;
     let mut deleted = 0usize;
     for source_epoch in candidate_epochs {
-        let referenced = tx
-            .query_row_cached(
+        let referenced = if ref_spellings.is_empty() {
+            false
+        } else {
+            let placeholders = sql_placeholders(ref_spellings.len());
+            let sql = format!(
                 "SELECT EXISTS (
                      SELECT 1
                      FROM encrypted_media_epoch_secret_references
-                     WHERE group_id_hex = ?1 AND source_epoch = ?2
-                 )",
-                params![group_id_hex, source_epoch],
-                |row| row.get::<_, i64>(0),
-            )
-            .storage()?
-            != 0;
+                     WHERE group_id_hex IN ({placeholders}) AND source_epoch = ?
+                 )"
+            );
+            let params = ref_spellings
+                .iter()
+                .map(|s| s as &dyn rusqlite::ToSql)
+                .chain(std::iter::once(source_epoch as &dyn rusqlite::ToSql));
+            tx.query_row_cached(&sql, params_from_iter(params), |row| row.get::<_, i64>(0))
+                .storage()?
+                != 0
+        };
         if referenced {
             continue;
         }
 
+        let prior_max: Option<i64> = tx
+            .query_row_cached(
+                "SELECT MAX(retired_through_epoch)
+                 FROM encrypted_media_epoch_secret_retirement_watermarks
+                 WHERE LOWER(group_id_hex) = ?1",
+                params![&canonical],
+                |row| row.get(0),
+            )
+            .storage()?;
+        let retired_through = prior_max.map_or(*source_epoch, |prev| prev.max(*source_epoch));
         tx.execute_cached(
             "INSERT INTO encrypted_media_epoch_secret_retirement_watermarks (
                  group_id_hex, retired_through_epoch, retired_at_unix_seconds
@@ -350,28 +400,49 @@ pub(crate) fn retire_unreferenced_encrypted_media_secret_epochs_tx(
                      excluded.retired_through_epoch
                  ),
                  retired_at_unix_seconds = excluded.retired_at_unix_seconds",
-            params![group_id_hex, source_epoch, unix_now_seconds_i64()],
+            params![&canonical, retired_through, unix_now_seconds_i64()],
         )
         .storage()?;
         tx.execute_cached(
-            "UPDATE encrypted_media_epoch_secrets
-             SET secret = zeroblob(length(secret))
-             WHERE retention_managed = 1
-               AND group_id_hex = ?1
-               AND source_epoch = ?2",
-            params![group_id_hex, source_epoch],
+            "DELETE FROM encrypted_media_epoch_secret_retirement_watermarks
+             WHERE LOWER(group_id_hex) = ?1 AND group_id_hex != ?1",
+            params![&canonical],
         )
         .storage()?;
-        deleted = deleted.saturating_add(
+        if !secret_spellings.is_empty() {
+            let placeholders = sql_placeholders(secret_spellings.len());
+            let params = secret_spellings
+                .iter()
+                .map(|s| s as &dyn rusqlite::ToSql)
+                .chain(std::iter::once(source_epoch as &dyn rusqlite::ToSql));
             tx.execute_cached(
-                "DELETE FROM encrypted_media_epoch_secrets
-                 WHERE retention_managed = 1
-                   AND group_id_hex = ?1
-                   AND source_epoch = ?2",
-                params![group_id_hex, source_epoch],
+                &format!(
+                    "UPDATE encrypted_media_epoch_secrets
+                     SET secret = zeroblob(length(secret))
+                     WHERE retention_managed = 1
+                       AND group_id_hex IN ({placeholders})
+                       AND source_epoch = ?"
+                ),
+                params_from_iter(params),
             )
-            .storage()?,
-        );
+            .storage()?;
+            let params = secret_spellings
+                .iter()
+                .map(|s| s as &dyn rusqlite::ToSql)
+                .chain(std::iter::once(source_epoch as &dyn rusqlite::ToSql));
+            deleted = deleted.saturating_add(
+                tx.execute_cached(
+                    &format!(
+                        "DELETE FROM encrypted_media_epoch_secrets
+                         WHERE retention_managed = 1
+                           AND group_id_hex IN ({placeholders})
+                           AND source_epoch = ?"
+                    ),
+                    params_from_iter(params),
+                )
+                .storage()?,
+            );
+        }
     }
     Ok(deleted)
 }
@@ -384,31 +455,20 @@ pub(crate) fn retire_unreferenced_encrypted_media_secret_epochs_tx(
 pub(crate) fn retire_all_encrypted_media_secrets_for_group_tx(
     tx: &Connection,
     canonical_group_id_hex: &str,
-    group_id_variants: &[String],
 ) -> StorageResult<usize> {
-    let placeholders = std::iter::repeat_n("?", group_id_variants.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut has_group_data = false;
-    for table in [
-        "account_groups",
-        "app_events",
-        "encrypted_media_epoch_secrets",
-        "encrypted_media_epoch_secret_references",
-    ] {
-        let exists = tx
-            .query_row_cached(
-                &format!(
-                    "SELECT EXISTS (SELECT 1 FROM {table} WHERE group_id_hex IN ({placeholders}))"
-                ),
-                params_from_iter(group_id_variants.iter()),
-                |row| row.get::<_, i64>(0),
-            )
-            .storage()?
-            != 0;
-        if exists {
-            has_group_data = true;
-            break;
+    let secret_spellings =
+        matching_group_id_spellings(tx, "encrypted_media_epoch_secrets", canonical_group_id_hex)?;
+    let mut has_group_data = !secret_spellings.is_empty();
+    if !has_group_data {
+        for table in [
+            "account_groups",
+            "app_events",
+            "encrypted_media_epoch_secret_references",
+        ] {
+            if !matching_group_id_spellings(tx, table, canonical_group_id_hex)?.is_empty() {
+                has_group_data = true;
+                break;
+            }
         }
     }
     if !has_group_data {
@@ -426,25 +486,22 @@ pub(crate) fn retire_all_encrypted_media_secrets_for_group_tx(
     )
     .storage()?;
     tx.execute_cached(
-        &format!(
-            "DELETE FROM encrypted_media_epoch_secret_retirement_watermarks
-             WHERE group_id_hex IN ({placeholders}) AND group_id_hex != ?"
-        ),
-        params_from_iter(
-            group_id_variants
-                .iter()
-                .map(String::as_str)
-                .chain(std::iter::once(canonical_group_id_hex)),
-        ),
+        "DELETE FROM encrypted_media_epoch_secret_retirement_watermarks
+         WHERE LOWER(group_id_hex) = ?1 AND group_id_hex != ?1",
+        params![canonical_group_id_hex],
     )
     .storage()?;
+    if secret_spellings.is_empty() {
+        return Ok(0);
+    }
+    let placeholders = sql_placeholders(secret_spellings.len());
     tx.execute_cached(
         &format!(
             "UPDATE encrypted_media_epoch_secrets
              SET secret = zeroblob(length(secret))
              WHERE group_id_hex IN ({placeholders})"
         ),
-        params_from_iter(group_id_variants.iter()),
+        params_from_iter(secret_spellings.iter()),
     )
     .storage()?;
     tx.execute_cached(
@@ -452,7 +509,7 @@ pub(crate) fn retire_all_encrypted_media_secrets_for_group_tx(
             "DELETE FROM encrypted_media_epoch_secrets
              WHERE group_id_hex IN ({placeholders})"
         ),
-        params_from_iter(group_id_variants.iter()),
+        params_from_iter(secret_spellings.iter()),
     )
     .storage()
 }
