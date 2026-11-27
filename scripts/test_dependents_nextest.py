@@ -91,6 +91,12 @@ class DependentsNextestTests(unittest.TestCase):
             with self.subTest(files=files):
                 self.assertIsNone(nextest_command(files, WORKSPACE, FEATURES))
 
+    def test_executable_markdown_fixtures_select_their_crate(self):
+        # `marmot-markdown`'s golden tests parse these `.md` files; skipping them as docs
+        # would let a broken fixture through.
+        command = nextest_command(["crates/marmot-markdown/tests/golden/kitchen_sink.md"], WORKSPACE, FEATURES)
+        self.assertEqual(packages(command), ["marmot-markdown"])
+
     def test_a_simulator_only_change_is_left_to_its_own_smoke(self):
         self.assertIsNone(nextest_command(["crates/cgka-conformance-simulator/src/lib.rs"], WORKSPACE, FEATURES))
 

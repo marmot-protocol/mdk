@@ -19,6 +19,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+from classify_ci_changes import EXECUTABLE_MARKDOWN, EXECUTABLE_MARKDOWN_PREFIXES
+
 ROOT = Path(__file__).resolve().parent.parent
 
 # Inputs every crate builds from: a change here selects the whole workspace.
@@ -50,7 +52,7 @@ def changed_packages(files: list[str], dirs: dict[str, Path]) -> set[str]:
     for file in files:
         if file in SHARED_INPUTS or any(file.startswith(p) for p in SHARED_INPUTS if p.endswith("/")):
             return set(dirs)
-        if file.endswith(".md"):
+        if file.endswith(".md") and file not in EXECUTABLE_MARKDOWN and not file.startswith(EXECUTABLE_MARKDOWN_PREFIXES):
             continue
         path = Path(file)
         owners = [name for name, d in dirs.items() if d != Path(".") and d in (path, *path.parents)]
@@ -98,9 +100,10 @@ def git_changed_files(base: str) -> list[str]:
         return subprocess.run(["git", *args], cwd=ROOT, check=True, capture_output=True, text=True).stdout
 
     merge_base = git("merge-base", base, "HEAD").strip()
-    tracked = git("diff", "--name-only", merge_base).split()
-    untracked = git("ls-files", "--others", "--exclude-standard").split()
-    return sorted(set(tracked) | set(untracked))
+    # No rename detection: a moved file changes both its old crate and its new one.
+    tracked = git("diff", "--no-renames", "--name-only", "-z", merge_base).split("\0")
+    untracked = git("ls-files", "--others", "--exclude-standard", "-z").split("\0")
+    return sorted((set(tracked) | set(untracked)) - {""})
 
 
 def main(argv: list[str] | None = None) -> int:
