@@ -15,9 +15,9 @@ use serde_json::{Value, json};
 
 use crate::{
     CommandOutput, GroupCommand, GroupsCommand, MaintenancePolicySetting, WnError,
-    ensure_local_signing, group_json, group_list_plain, group_show_output, normalize_group_id_hex,
-    npub_for_account_id, parse_public_key, resolve_account, terminal_safe_text,
-    write_private_output_file,
+    ensure_signing_capable, ensure_signing_ready, group_json, group_list_plain, group_show_output,
+    normalize_group_id_hex, npub_for_account_id, parse_public_key, resolve_account,
+    terminal_safe_text, write_private_output_file,
 };
 
 async fn accept_group_invite_retrying_busy(
@@ -178,7 +178,7 @@ async fn group_command_once(
             description,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id = runtime
                 .create_group(&account.label, &name, &members, description.clone())
@@ -187,7 +187,7 @@ async fn group_command_once(
         }
         GroupCommand::Members { group } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
             let members = runtime.group_members(&account.label, &group_id).await?;
@@ -207,7 +207,7 @@ async fn group_command_once(
             admins,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
             // Initial admins ride the same invite commit, so an admin that is
@@ -264,7 +264,7 @@ async fn group_command_once(
         }
         GroupCommand::Remove { group, members } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
             let summary = runtime
@@ -293,7 +293,7 @@ async fn group_command_once(
             description,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
             let summary = runtime
@@ -326,7 +326,7 @@ async fn group_command_once(
             clear,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
             // clap guarantees exactly one of `--url` / `--clear` is present, and
@@ -437,7 +437,7 @@ async fn groups_command_once(
     match command {
         GroupsCommand::List => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_capable(&account)?;
             app.status(&account.label)?;
             let groups = app.visible_groups(&account.label)?;
             Ok(CommandOutput {
@@ -491,7 +491,7 @@ async fn groups_command_once(
                     thumbhash: None,
                 });
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id = runtime
                 .create_group_with_options(
@@ -511,7 +511,7 @@ async fn groups_command_once(
         }
         GroupsCommand::Show { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
             let mls = runtime
@@ -563,7 +563,7 @@ async fn groups_command_once(
         }
         GroupsCommand::Admins { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_capable(&account)?;
             app.status(&account.label)?;
             let group_id = normalize_group_id_hex(&group_id)?;
             let group = app
@@ -600,7 +600,7 @@ async fn groups_command_once(
         }
         GroupsCommand::Relays { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_capable(&account)?;
             app.status(&account.label)?;
             let group_id = normalize_group_id_hex(&group_id)?;
             let group = app
@@ -618,7 +618,7 @@ async fn groups_command_once(
         }
         GroupsCommand::Leave { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
             let summary = runtime.leave_group(&account.label, &group_id).await?;
@@ -676,7 +676,7 @@ async fn groups_command_once(
         }
         GroupsCommand::Invites => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_capable(&account)?;
             app.status(&account.label)?;
             let invites = app
                 .groups(&account.label)?
@@ -694,7 +694,7 @@ async fn groups_command_once(
         }
         GroupsCommand::Accept { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
             let group =
@@ -712,7 +712,7 @@ async fn groups_command_once(
         }
         GroupsCommand::Decline { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
             let declined = runtime
@@ -736,7 +736,7 @@ async fn groups_command_once(
         }
         GroupsCommand::Promote { group_id, pubkey } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             group_admin_policy_output(
                 app,
                 runtime,
@@ -748,7 +748,7 @@ async fn groups_command_once(
         }
         GroupsCommand::Demote { group_id, pubkey } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             group_admin_policy_output(
                 app,
                 runtime,
@@ -760,7 +760,7 @@ async fn groups_command_once(
         }
         GroupsCommand::SelfDemote { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             group_admin_policy_output(
                 app,
                 runtime,
@@ -772,7 +772,7 @@ async fn groups_command_once(
         }
         GroupsCommand::MaintenanceStatus { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
             let status = runtime
@@ -806,7 +806,7 @@ async fn groups_command_once(
         }
         GroupsCommand::ScheduleSelfUpdate { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
             let obligation_id = runtime
@@ -828,7 +828,7 @@ async fn groups_command_once(
         }
         GroupsCommand::MaintenancePolicy { set } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             if let Some(setting) = set {
                 let policy = match setting {
@@ -857,7 +857,7 @@ async fn groups_command_once(
         }
         GroupsCommand::PauseMaintenance => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             runtime.pause_maintenance(&account.label).await?;
             Ok(CommandOutput {
@@ -871,7 +871,7 @@ async fn groups_command_once(
         }
         GroupsCommand::ResumeMaintenance => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             runtime.resume_maintenance(&account.label).await?;
             Ok(CommandOutput {
@@ -885,7 +885,7 @@ async fn groups_command_once(
         }
         GroupsCommand::RunMaintenance => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let summary = runtime.run_due_maintenance(&account.label).await?;
             Ok(CommandOutput {
@@ -921,7 +921,11 @@ async fn groups_command_once(
         }
         GroupsCommand::Retention { group_id, set } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            if set.is_some() {
+                ensure_signing_ready(runtime, &account).await?;
+            } else {
+                ensure_signing_capable(&account)?;
+            }
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -966,7 +970,7 @@ async fn groups_command_once(
         }
         GroupsCommand::EnableDisbanding { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -1000,7 +1004,7 @@ async fn groups_command_once(
                 });
             }
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -1022,7 +1026,7 @@ async fn groups_command_once(
         }
         GroupsCommand::DisbandStatus { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let (group, mls) = group_record_and_mls(app, runtime, &account, &group_id_hex).await?;
@@ -1042,7 +1046,7 @@ async fn groups_command_once(
         }
         GroupsCommand::AcknowledgeDisbandFailure { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -1063,7 +1067,7 @@ async fn groups_command_once(
         }
         GroupsCommand::Management { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -1093,7 +1097,7 @@ async fn groups_command_once(
         }
         GroupsCommand::CommitDelivery { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -1122,7 +1126,7 @@ async fn groups_command_once(
         }
         GroupsCommand::PendingCommit { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -1157,7 +1161,7 @@ async fn groups_command_once(
         }
         GroupsCommand::ChangesNotDelivered { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -1192,7 +1196,7 @@ async fn groups_command_once(
             commit_id,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -1214,7 +1218,7 @@ async fn groups_command_once(
         }
         GroupsCommand::RecoveryStatus { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -1250,7 +1254,7 @@ async fn groups_command_once(
             let welcome_id_hex = normalize_welcome_id_hex(&welcome_id)?;
             let token = parse_rejoin_token(&local_state_token)?;
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let status = runtime
                 .confirm_group_rejoin(
@@ -1271,7 +1275,7 @@ async fn groups_command_once(
         GroupsCommand::DeclineRejoin { welcome_id } => {
             let welcome_id_hex = normalize_welcome_id_hex(&welcome_id)?;
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             runtime
                 .decline_group_rejoin(
@@ -1291,7 +1295,7 @@ async fn groups_command_once(
         }
         GroupsCommand::Quarantined => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let quarantined = runtime.quarantined_groups(&account.label).await?;
             Ok(CommandOutput {
@@ -1319,7 +1323,7 @@ async fn groups_command_once(
         }
         GroupsCommand::RetryHydrate { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -1345,7 +1349,7 @@ async fn groups_command_once(
                 });
             }
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -1395,7 +1399,7 @@ async fn groups_command_once(
         }
         GroupsCommand::DownloadImage { group_id, output } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -1438,7 +1442,7 @@ async fn groups_command_once(
         }
         GroupsCommand::PendingWelcomes => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let pending = runtime.pending_welcome_deliveries(&account.label).await?;
             Ok(CommandOutput {
@@ -1468,7 +1472,7 @@ async fn groups_command_once(
         GroupsCommand::RedeliverWelcome { message_id } => {
             let message_id_hex = normalize_welcome_id_hex(&message_id)?;
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let summary = runtime
                 .redeliver_welcome(&account.label, &message_id_hex)
@@ -1668,7 +1672,7 @@ async fn group_image_update_output(
     action: &str,
 ) -> Result<CommandOutput, WnError> {
     let account = resolve_account(account_home, account_flag)?;
-    ensure_local_signing(&account)?;
+    ensure_signing_ready(runtime, &account).await?;
     app.status(&account.label)?;
     let group_id_hex = normalize_group_id_hex(group_id)?;
     let group_id = GroupId::new(hex::decode(&group_id_hex)?);

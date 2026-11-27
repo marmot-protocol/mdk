@@ -10,7 +10,7 @@ use marmot_app::{
 use serde_json::{Value, json};
 
 use crate::{
-    CommandOutput, KeyPackageCommand, WnError, account_selector_or_default, ensure_local_signing,
+    CommandOutput, KeyPackageCommand, WnError, account_selector_or_default, ensure_signing_ready,
     npub_for_account_id, parse_public_key, relay_endpoints, relay_lists_json, resolve_account,
     terminal_safe_text,
 };
@@ -97,7 +97,7 @@ pub(crate) async fn key_package_command_with_runtime(
         }
         KeyPackageCommand::Publish => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let key_package_bytes = runtime.publish_key_package(&account.label).await?;
             Ok(CommandOutput {
@@ -115,7 +115,7 @@ pub(crate) async fn key_package_command_with_runtime(
         }
         KeyPackageCommand::MaintenanceStatus => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let status = runtime
                 .key_package_maintenance_status(&account.label)
@@ -135,7 +135,7 @@ pub(crate) async fn key_package_command_with_runtime(
         }
         KeyPackageCommand::Rotate => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let key_package_bytes = runtime.rotate_key_package(&account.label).await?;
             Ok(CommandOutput {
@@ -196,7 +196,7 @@ pub(crate) async fn key_package_command_with_runtime(
         }
         KeyPackageCommand::Delete { event_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let deleted = runtime
                 .delete_key_package(&account.label, &event_id, Vec::new())
@@ -221,7 +221,7 @@ pub(crate) async fn key_package_command_with_runtime(
                 });
             }
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let events = runtime
                 .account_key_package_relay_events(&account.label, Vec::new())

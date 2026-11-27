@@ -4,8 +4,8 @@ use marmot_app::{MarmotApp, ReceivedMessage, SyncFailure, SyncSummary};
 use serde_json::{Value, json};
 
 use crate::{
-    CommandOutput, WnError, display_name_for_sender, error::SyncCommandError, npub_for_account_id,
-    terminal_safe_text,
+    CommandOutput, WnError, display_name_for_sender, ensure_signing_ready, error::SyncCommandError,
+    npub_for_account_id, terminal_safe_text,
 };
 
 pub(crate) async fn sync_command(
@@ -13,7 +13,21 @@ pub(crate) async fn sync_command(
     account: marmot_account::AccountSummary,
 ) -> Result<CommandOutput, WnError> {
     app.status(&account.label)?;
-    let summary = match app.sync_account(&account.label).await? {
+    let nip46_runtime = if account.external_signing {
+        let runtime = app.runtime();
+        if let Err(err) = ensure_signing_ready(&runtime, &account).await {
+            runtime.shutdown().await;
+            return Err(err);
+        }
+        Some(runtime)
+    } else {
+        None
+    };
+    let sync_result = app.sync_account(&account.label).await;
+    if let Some(runtime) = nip46_runtime {
+        runtime.shutdown().await;
+    }
+    let summary = match sync_result? {
         Ok(summary) => summary,
         Err(failure) => return Err(sync_failure_error(app, account, failure)),
     };

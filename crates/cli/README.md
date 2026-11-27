@@ -139,6 +139,8 @@ spellings remain as hidden compatibility aliases; new scripts should use the plu
 wn create-identity
 printf '%s\n' "$NSEC" | wn login --nsec-stdin
 printf '%s\n' "$NSEC" | wn login --nsec-stdin --relay <relay-url>
+printf '%s\n' "$BUNKER_URI" | wn login --bunker-stdin --approve-permissions
+wn login --nostrconnect --signer-relays <relay-url>
 wn login <npub-or-hex>
 wn whoami
 wn logout <npub-or-hex>
@@ -146,12 +148,30 @@ wn export-nsec <npub-or-hex>
 wn accounts list
 wn accounts status [npub-or-hex]
 wn accounts relay-lists [npub-or-hex] --bootstrap-relays <relay-url>
+printf '%s\n' "$BUNKER_URI" | wn accounts nip46 login --bunker-stdin --approve-permissions [--default-relays <urls>] [--bootstrap-relays <urls>]
+wn accounts nip46 login --nostrconnect --signer-relays <relay-url> [--approve-permissions]
+printf '%s\n' "$BUNKER_URI" | wn accounts nip46 register [npub-or-hex] --bunker-stdin --approve-permissions
+wn accounts nip46 status [npub-or-hex]
+wn accounts nip46 remove [npub-or-hex]
 wn reset --confirm
 ```
 
 - When a daemon is running, `create-identity` and `login --nsec-stdin` use the daemon's account-relay defaults to
   publish the required relay lists and an initial KeyPackage. `login --nsec-stdin --relay <url>` is the command-local
   fallback for a custom relay-list publish during import.
+- **NIP-46 remote signing (`--bunker-stdin`, `--nostrconnect`, `accounts nip46`)**: log in and operate an
+  `external_signing` identity without storing the user's `nsec` on the machine. Pipe `bunker://` URIs via
+  `--bunker-stdin` (passing `bunker://` or `nostrconnect://` as a CLI argument is rejected so query secrets never leak
+  into argv or shell history). Reviewing and approving the exact NIP-46 permissions is required — confirm interactively
+  on a terminal or pass `--approve-permissions` for headless/scripted setups. NIP-46 login publishes missing relay lists
+  to `--default-relays` (or the daemon/global relay defaults). Communication keys and the external
+  SQLCipher key respect `--home` and `--secret-store file|keychain`. On `wnd` startup and restart, persisted NIP-46
+  sessions are automatically restored independently by `MarmotAppRuntime::start()` so an unreachable remote signer does
+  not block local accounts or crash `wnd`. `accounts nip46 register` attaches a NIP-46 session to an existing
+  external-signing account (run `accounts nip46 remove` first when replacing an active pairing, since only one
+  communication key can own an account), `accounts nip46 status` inspects persisted non-secret session metadata without
+  mutating runtime state, and `accounts nip46 remove` erases local pairing credentials while preserving encrypted
+  history.
 - `wn login <npub-or-hex>` adds a public-only identity. It only checks relay-list availability, and is useful for
   relay-list and KeyPackage lookup, but cannot sign, publish KeyPackages, sync groups, or send messages.
 - `wn logout` is destructive: it removes that account's local data (messages, group membership, and MLS state) from this
