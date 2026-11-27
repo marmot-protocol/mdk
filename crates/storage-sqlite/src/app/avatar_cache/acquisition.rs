@@ -4,6 +4,14 @@ use crate::SqliteAppStorage;
 use crate::base::connection::CachedSql;
 use crate::{ChatPresentationRead, ChatPresentationVersion, SelectedAvatar};
 
+macro_rules! encrypted_avatar_only {
+    () => {
+        " AND CASE WHEN json_valid(CAST(q.descriptor AS TEXT))
+            THEN json_type(CAST(q.descriptor AS TEXT), '$.value.EncryptedGroupImage') = 'object'
+            ELSE 0 END"
+    };
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DescriptorEnvelope {
     format: u8,
@@ -160,14 +168,26 @@ impl SqliteAppStorage {
     /// acquisition (a request, a lease end, a retry or a refresh), and
     /// whether the one-time bootstrap still has rows. Reads only (mdk#2923).
     pub fn avatar_work_schedule(&self) -> StorageResult<(Option<u64>, bool)> {
+        self.avatar_work_schedule_for(true)
+    }
+
+    pub fn avatar_work_schedule_for(
+        &self,
+        include_public: bool,
+    ) -> StorageResult<(Option<u64>, bool)> {
+        let sql = if include_public {
+            "SELECT (SELECT MIN(due) FROM avatar_acquisition WHERE due IS NOT NULL),
+                    EXISTS(SELECT 1 FROM avatar_acquisition_bootstrap)"
+        } else {
+            concat!(
+                "SELECT (SELECT MIN(due) FROM avatar_acquisition q WHERE due IS NOT NULL",
+                encrypted_avatar_only!(),
+                "), EXISTS(SELECT 1 FROM avatar_acquisition_bootstrap)"
+            )
+        };
         let (due, bootstrap): (Option<i64>, bool) = self
             .lock()?
-            .query_row_cached(
-                "SELECT (SELECT MIN(due) FROM avatar_acquisition WHERE due IS NOT NULL),
-                        EXISTS(SELECT 1 FROM avatar_acquisition_bootstrap)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+            .query_row_cached(sql, [], |row| Ok((row.get(0)?, row.get(1)?)))
             .storage()?;
         Ok((due.map(|due| u64::try_from(due).unwrap_or(0)), bootstrap))
     }
@@ -218,28 +238,53 @@ impl SqliteAppStorage {
 
     /// Claim at most one due attempt. Call only after reserving media capacity.
     pub fn claim_avatar_acquisition(&self, now: u64) -> StorageResult<Option<AvatarAcquisition>> {
+        self.claim_avatar_acquisition_for(now, true)
+    }
+
+    pub fn claim_avatar_acquisition_for(
+        &self,
+        now: u64,
+        include_public: bool,
+    ) -> StorageResult<Option<AvatarAcquisition>> {
         let now = u64_to_i64(now)?;
+        let due_sql = if include_public {
+            "SELECT EXISTS(SELECT 1 FROM avatar_acquisition WHERE due <= ?1)"
+        } else {
+            concat!(
+                "SELECT EXISTS(SELECT 1 FROM avatar_acquisition q WHERE due <= ?1",
+                encrypted_avatar_only!(),
+                ")"
+            )
+        };
         let due: bool = self
             .lock()?
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM avatar_acquisition WHERE due <= ?1)",
-                [now],
-                |r| r.get(0),
-            )
+            .query_row_cached(due_sql, [now], |row| row.get(0))
             .storage()?;
         if !due {
             return Ok(None);
         }
+        macro_rules! claim_sql {
+            ($($filter:expr)?) => {
+                concat!(
+                    "SELECT a.token, q.descriptor, a.content_revision, m.store_epoch
+                     FROM avatar_acquisition q JOIN avatar_assets a USING(token)
+                     CROSS JOIN chat_presentation_meta m
+                     WHERE q.due <= ?1 AND m.id = 1",
+                    $($filter,)?
+                    " ORDER BY q.priority DESC, q.due, q.token LIMIT 1"
+                )
+            };
+        }
+        let claim_sql = if include_public {
+            claim_sql!()
+        } else {
+            claim_sql!(encrypted_avatar_only!())
+        };
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let row = conn.query_row(
-                "SELECT a.token, q.descriptor, a.content_revision, m.store_epoch
-                 FROM avatar_acquisition q JOIN avatar_assets a USING(token)
-                 CROSS JOIN chat_presentation_meta m
-                 WHERE q.due <= ?1 AND m.id = 1
-                 ORDER BY q.priority DESC, q.due, q.token LIMIT 1",
-                [now], |r| Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,Vec<u8>>(1)?, r.get::<_,i64>(2)?, r.get::<_,Vec<u8>>(3)?)),
-            ).optional().storage()?;
+            let row = conn.query_row_cached(claim_sql, [now], |r| {
+                Ok((r.get::<_,Vec<u8>>(0)?, r.get::<_,Vec<u8>>(1)?, r.get::<_,i64>(2)?, r.get::<_,Vec<u8>>(3)?))
+            }).optional().storage()?;
             let Some((token, bytes, revision, store_epoch)) = row else { return Ok(None); };
             let descriptor = match serde_json::from_slice::<DescriptorEnvelope>(&bytes) {
                 Ok(value) if value.format == 1 => value.value,

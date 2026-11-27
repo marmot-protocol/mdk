@@ -3700,10 +3700,15 @@ async fn run_scheduled_post_join(
 /// step B).
 fn avatar_pass_next_at(client: &AppClient, failed: bool) -> (Option<TokioInstant>, Option<u64>) {
     let retry = TokioInstant::now() + schedule::RETRY_WHILE_OWED;
-    let Ok((due, bootstrap)) = client
-        .app
-        .account_storage(&client.state.label)
-        .and_then(|storage| Ok(storage.app_storage().avatar_work_schedule()?))
+    let Ok((due, bootstrap)) =
+        client
+            .app
+            .account_storage(&client.state.label)
+            .and_then(|storage| {
+                Ok(storage
+                    .app_storage()
+                    .avatar_work_schedule_for(client.app.config.acquire_public_avatars)?)
+            })
     else {
         return (Some(retry), None);
     };
@@ -3719,7 +3724,11 @@ fn avatar_pass_owed_now(client: &AppClient) -> bool {
     client
         .app
         .account_storage(&client.state.label)
-        .and_then(|storage| Ok(storage.app_storage().avatar_work_schedule()?))
+        .and_then(|storage| {
+            Ok(storage
+                .app_storage()
+                .avatar_work_schedule_for(client.app.config.acquire_public_avatars)?)
+        })
         .map_or(true, |(due, bootstrap)| {
             bootstrap || due.is_some_and(|at| at <= crate::unix_now_seconds())
         })
@@ -5427,6 +5436,7 @@ fn schedule_avatar_acquisition(
     let result = dispatch_avatar_acquisition(
         &storage.app_storage(),
         media_http,
+        client.app.config.acquire_public_avatars,
         resumed,
         &mut dispatched,
         move |descriptor| {
@@ -5451,6 +5461,7 @@ fn schedule_avatar_acquisition(
 fn dispatch_avatar_acquisition<F, Fut>(
     storage: &storage_sqlite::SqliteAppStorage,
     media_http: &MediaHttpContext,
+    include_public: bool,
     resumed: &mut bool,
     dispatched: &mut bool,
     fetch: F,
@@ -5476,7 +5487,9 @@ where
         let Ok(permit) = media_http.permits.clone().try_acquire_owned() else {
             break;
         };
-        let Some(job) = storage.claim_avatar_acquisition(crate::unix_now_seconds())? else {
+        let Some(job) =
+            storage.claim_avatar_acquisition_for(crate::unix_now_seconds(), include_public)?
+        else {
             break;
         };
         *dispatched = true;
@@ -11148,19 +11161,31 @@ mod tests {
         let (media_http, mut completions) = media_http_context(4);
         let foreground = reserve_media_http(&media_http);
         let mut resumed = false;
-        dispatch_avatar_acquisition(&store, &media_http, &mut resumed, &mut false, |_| async {
-            Ok(storage_sqlite::AvatarImage::new(
-                vec![1; 8],
-                storage_sqlite::AvatarImageFormat::Png,
-                1,
-                1,
-            )
-            .unwrap())
-        })
+        dispatch_avatar_acquisition(
+            &store,
+            &media_http,
+            true,
+            &mut resumed,
+            &mut false,
+            |_| async {
+                Ok(storage_sqlite::AvatarImage::new(
+                    vec![1; 8],
+                    storage_sqlite::AvatarImageFormat::Png,
+                    1,
+                    1,
+                )
+                .unwrap())
+            },
+        )
         .unwrap();
-        dispatch_avatar_acquisition(&store, &media_http, &mut resumed, &mut false, |_| async {
-            panic!("another background pass must preserve the foreground slot")
-        })
+        dispatch_avatar_acquisition(
+            &store,
+            &media_http,
+            true,
+            &mut resumed,
+            &mut false,
+            |_| async { panic!("another background pass must preserve the foreground slot") },
+        )
         .unwrap();
         assert_eq!(media_http.permits.available_permits(), 1);
         let mut reserved = Vec::new();
@@ -11190,6 +11215,97 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn avatar_dispatch_skips_public_jobs_when_disabled() {
+        use storage_sqlite::{ChatListAvatar, SelectedAvatar};
+
+        let store = storage_sqlite::SqliteAccountStorage::in_memory_for_test()
+            .unwrap()
+            .app_storage();
+        let public = store
+            .request_avatar_acquisition(
+                "public",
+                &SelectedAvatar::RemoteImage {
+                    url: "https://example.com/avatar".into(),
+                    cache_key: "public-image".into(),
+                },
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.avatar_work_schedule_for(false).unwrap(),
+            (None, false)
+        );
+
+        let group = store
+            .request_avatar_acquisition(
+                "group",
+                &SelectedAvatar::EncryptedGroupImage {
+                    image: ChatListAvatar {
+                        image_hash_hex: "01".repeat(32),
+                        image_key_hex: "02".repeat(32),
+                        image_nonce_hex: "03".repeat(12),
+                        image_upload_key_hex: "04".repeat(32),
+                        media_type: Some("image/png".into()),
+                    },
+                    cache_key: "group-image".into(),
+                },
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.avatar_work_schedule_for(false).unwrap(),
+            (Some(0), false)
+        );
+
+        let (media_http, mut completions) = media_http_context(4);
+        dispatch_avatar_acquisition(
+            &store,
+            &media_http,
+            false,
+            &mut false,
+            &mut false,
+            |source| {
+                assert!(matches!(source, SelectedAvatar::EncryptedGroupImage { .. }));
+                async {
+                    Ok(storage_sqlite::AvatarImage::new(
+                        vec![1; 8],
+                        storage_sqlite::AvatarImageFormat::Png,
+                        1,
+                        1,
+                    )
+                    .unwrap())
+                }
+            },
+        )
+        .unwrap();
+        let done = timeout(Duration::from_secs(2), completions.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let MediaHttpCompletion::Avatar { job, result } = &done.completion else {
+            panic!("avatar completion");
+        };
+        assert_eq!(job.reference, group);
+        store
+            .complete_avatar_acquisition(job, result.as_ref().unwrap(), None)
+            .unwrap();
+        assert_eq!(
+            store.avatar_work_schedule_for(false).unwrap(),
+            (None, false)
+        );
+        assert_eq!(
+            store
+                .claim_avatar_acquisition(0)
+                .unwrap()
+                .unwrap()
+                .reference,
+            public
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn avatar_shutdown_cancels_io_and_leaves_resumable_intent() {
         let store = storage_sqlite::SqliteAccountStorage::in_memory_for_test()
@@ -11216,7 +11332,7 @@ mod tests {
                 let _ = self.0.send(());
             }
         }
-        dispatch_avatar_acquisition(&store, &media_http, &mut false, &mut false, |_| {
+        dispatch_avatar_acquisition(&store, &media_http, true, &mut false, &mut false, |_| {
             let started = started_tx.clone();
             let dropped = dropped_tx.clone();
             async move {

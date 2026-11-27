@@ -258,6 +258,9 @@ pub struct MarmotOptions {
     pub secret_store: Option<Arc<dyn SecretStore>>,
     #[uniffi(default = None)]
     pub attachment_acquisition_mode: Option<AttachmentAcquisitionModeFfi>,
+    /// Disable background acquisition of public avatar URLs. Defaults to false.
+    #[uniffi(default = false)]
+    pub disable_public_avatar_acquisition: bool,
     /// Destination for private moderation reports (`submit_moderation_report`). Set per
     /// build flavor. Invalid values leave reporting unconfigured; `configure_moderation_reporting`
     /// reports why.
@@ -281,6 +284,7 @@ impl MarmotOptions {
             device_platform: None,
             secret_store: None,
             attachment_acquisition_mode: None,
+            disable_public_avatar_acquisition: false,
             moderation_report_config: None,
             deployment,
         }
@@ -289,6 +293,7 @@ impl MarmotOptions {
     fn app_config(&self) -> MarmotAppConfig {
         let relay_policy = self.relay_policy.unwrap_or(RelayPolicyFfi::PublicOnly);
         MarmotAppConfig::default()
+            .with_public_avatar_acquisition(!self.disable_public_avatar_acquisition)
             .with_attachment_acquisition_mode(
                 self.attachment_acquisition_mode.unwrap_or_default().into(),
             )
