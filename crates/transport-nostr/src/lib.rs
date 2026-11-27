@@ -335,8 +335,10 @@ impl RelayPlaneTransport {
 /// `MarmotRelayPlane` drops only the plane's `Arc`, so an in-flight publish or
 /// running account worker keeps its working pool until it releases its `Arc`,
 /// at which point `Drop` schedules `NostrSdkRelayClient::shutdown()`. Explicit
-/// account deactivation and plane shutdown still tear down live clients
-/// immediately via weak handles.
+/// account deactivation tears down all live publish clients for that account
+/// immediately via weak handles; `MarmotRelayPlane::shutdown()` tears down
+/// cached and retired signer-bound publish clients while leaving adapter-owned
+/// anonymous publish pools live until their adapter drops or deactivates.
 struct ManagedSdkPublishClient {
     account_id: MemberId,
     inner: NostrSdkRelayClient,
