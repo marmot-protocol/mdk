@@ -751,6 +751,16 @@ mod tests {
                 (owned("b"), Some((Suspected, Some(F::Unreachable))))
             ]
         );
+        // Local queue backpressure says nothing of the relay AND does not count
+        // as an answer that would blame an unreachable peer on an offline device.
+        assert_eq!(
+            run(&[("a", Ok(())), ("b", Err(LocalBusy))], true),
+            vec![(owned("a"), Some((Healthy, None))), (owned("b"), None)]
+        );
+        assert_eq!(
+            run(&[("a", Err(LocalBusy)), ("b", Err(Unreachable))], true),
+            vec![(owned("a"), None), (owned("b"), None)]
+        );
         // No relay answered: nothing is established.
         assert_eq!(
             run(&[("a", Err(Unreachable)), ("b", Err(TimedOut))], true),

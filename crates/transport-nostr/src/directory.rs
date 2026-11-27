@@ -50,10 +50,11 @@ const DIRECTORY_QUERY_CONCURRENCY: usize = 4;
 /// Serialized event JSON one relay's reply to one directory read may carry.
 const DIRECTORY_REPLY_MAX_BYTES: usize = 16 * 1024 * 1024;
 
-/// A plain directory lookup a relay's reply cut: past the byte budget, or at
-/// a frame that could not be read.
+/// A plain directory lookup a relay's reply cut: past the byte budget, at a
+/// frame that could not be read, or deferred by local queue backpressure.
 const DIRECTORY_READ_OVER_BUDGET: &str = "directory read exceeded its byte budget";
 const DIRECTORY_READ_UNREADABLE: &str = "directory read stopped at an unreadable frame";
+const DIRECTORY_READ_LOCAL_BUSY: &str = "directory read deferred by local queue backpressure";
 
 /// The most filters one strict directory REQ carries. strfry allows 3 per
 /// REQ and refuses more with `CLOSED invalid:`, so a request with more
@@ -81,6 +82,9 @@ pub enum DirectoryInspectionError {
     InvalidRequest,
     /// The relay answered but said it holds more than it sent.
     Incomplete,
+    /// Local finite-request queue capacity stayed full before any REQ went out;
+    /// the relay was never asked.
+    LocalBusy,
     /// Relay health's inbox check only ([`DirectoryFetchRequest::verifying_inbox`]):
     /// the relay ended the read without naming a refusal (a CLOSED reason
     /// other than `restricted:`, `blocked:`, `payment-required:`,
@@ -1072,6 +1076,13 @@ impl NostrSdkDirectoryRelayFetcher {
                             FiniteEnd::InvalidMessage => {
                                 return Err(DIRECTORY_READ_UNREADABLE.to_owned());
                             }
+                            // Plain lookups have no partial-result signal; fail
+                            // explicitly on local deferral rather than silently
+                            // skipping a relay whose records could then read as
+                            // absent.
+                            FiniteEnd::Busy => {
+                                return Err(DIRECTORY_READ_LOCAL_BUSY.to_owned());
+                            }
                             _ => {}
                         }
                     }
@@ -1448,6 +1459,7 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                             Incomplete
                         }
                         FiniteEnd::ItemLimit | FiniteEnd::ByteLimit => Restricted,
+                        FiniteEnd::Busy => LocalBusy,
                         _ => Unreachable,
                     };
                     if preserve_partial {
@@ -1617,6 +1629,7 @@ fn verified_inbox_answer(
         FiniteEnd::TimedOut if challenged => AuthenticationUnconfirmed,
         FiniteEnd::TimedOut => TimedOut,
         FiniteEnd::ItemLimit | FiniteEnd::ByteLimit => Unexplained,
+        FiniteEnd::Busy => LocalBusy,
         _ => Unreachable,
     })
 }
@@ -4110,5 +4123,28 @@ mod tests {
             read(vec![ok(auth, false, "restricted: no"), Err(()),]),
             AuthReply::Unread
         ));
+    }
+
+    /// Local finite-request queue backpressure (`FiniteEnd::Busy`) maps to
+    /// `DirectoryInspectionError::LocalBusy`, never `Unreachable` or `TimedOut`.
+    #[test]
+    fn finite_busy_maps_to_local_busy_not_unreachable() {
+        let reply = FiniteReply {
+            events: Vec::new(),
+            raw_items: 0,
+            retried: false,
+            received_items: 0,
+            duplicates: 0,
+            event_bytes: 0,
+            kept_event_bytes: 0,
+            fetched_bytes: 0,
+            more: false,
+            auth: false,
+            end: FiniteEnd::Busy,
+        };
+        assert_eq!(
+            verified_inbox_answer(&reply, None, false),
+            Err(DirectoryInspectionError::LocalBusy)
+        );
     }
 }
