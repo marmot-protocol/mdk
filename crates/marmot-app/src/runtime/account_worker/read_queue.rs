@@ -979,6 +979,7 @@ impl WorkerCommands {
         }
     }
 
+    #[cfg(all(test, feature = "test-policy-overrides"))]
     pub(crate) fn account_capacity(&self) -> usize {
         match &self.inner {
             WorkerCommandsInner::Split(sender) => sender.0.account_permits.available_permits(),
