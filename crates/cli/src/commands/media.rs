@@ -12,8 +12,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    CommandOutput, MediaCommand, WnError, ensure_local_signing, normalize_group_id_hex,
-    npub_for_account_id, resolve_account, terminal_safe_text, write_private_output_file,
+    CommandOutput, MediaCommand, WnError, ensure_signing_capable, ensure_signing_ready,
+    normalize_group_id_hex, npub_for_account_id, resolve_account, terminal_safe_text,
+    write_private_output_file,
 };
 
 pub(crate) async fn media_command(
@@ -48,7 +49,7 @@ pub(crate) async fn media_command_with_runtime(
             server,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -120,7 +121,7 @@ pub(crate) async fn media_command_with_runtime(
             output,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -157,7 +158,7 @@ pub(crate) async fn media_command_with_runtime(
         }
         MediaCommand::List { group } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_capable(&account)?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group)?;
             let messages = runtime.messages_with_query(
@@ -177,7 +178,7 @@ pub(crate) async fn media_command_with_runtime(
             message,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -259,7 +260,7 @@ pub(crate) async fn media_command_with_runtime(
             locator_kind,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);

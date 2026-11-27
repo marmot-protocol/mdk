@@ -28,11 +28,11 @@ pub use args::SecretStoreKind;
 pub(crate) use args::{
     AccountCommand, ChatsCommand, Cli, Command, DaemonCommand, DebugCommand, FollowsCommand,
     GroupCommand, GroupsCommand, KeyPackageCommand, MaintenancePolicySetting, MediaCommand,
-    MessageCommand, MessageTimelineCommand, NotificationsCommand, ProfileCommand, RelaysCommand,
-    SettingsCommand, UsageDiagnosticsCommand, UsersCommand,
+    MessageCommand, MessageTimelineCommand, Nip46Command, NotificationsCommand, ProfileCommand,
+    RelaysCommand, SettingsCommand, UsageDiagnosticsCommand, UsersCommand,
 };
 pub(crate) use error::{WnError, wn_error_json};
-pub(crate) use secret::ImportNsec;
+pub(crate) use secret::{ImportBunkerUri, ImportNsec};
 
 const PRIVATE_DIR_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -196,11 +196,25 @@ where
         Ok(import_nsec) => import_nsec,
         Err(err) => return command_output_result(cli.json, Err(err)),
     };
+    let import_bunker = match read_import_bunker_for_cli(&cli) {
+        Ok(import_bunker) => import_bunker,
+        Err(err) => return command_output_result(cli.json, Err(err)),
+    };
+    let mut cli = cli;
+    if let Err(err) =
+        obtain_nip46_consent_for_cli(&mut cli, import_nsec.is_some() || import_bunker.is_some())
+    {
+        return command_output_result(cli.json, Err(err));
+    }
 
-    run_cli_with_import_nsec(cli, import_nsec).await
+    run_cli_with_secrets(cli, import_nsec, import_bunker).await
 }
 
-async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNsec>) -> CliOutput {
+async fn run_cli_with_secrets(
+    mut cli: Cli,
+    mut import_nsec: Option<ImportNsec>,
+    mut import_bunker: Option<ImportBunkerUri>,
+) -> CliOutput {
     if let Command::Daemon { command } = cli.command.clone() {
         return daemon::run_daemon_command(cli, command).await;
     }
@@ -245,11 +259,36 @@ async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNs
         };
     }
 
-    if let Some(socket) = daemon_socket_for_client(&cli, &home) {
+    if commands::nip46::is_nip46_nostrconnect_command(&cli.command)
+        && let Some(socket) = daemon_socket_for_client(&cli, &home)
+    {
         let explicit_daemon_socket =
             cli.socket.is_some() || std::env::var_os("WN_SOCKET").is_some();
         let json_output = cli.json;
-        match daemon::send_execute(&socket, cli, import_nsec).await {
+        match daemon::send_nip46_pair(&socket, cli).await {
+            Ok(output) => return output,
+            Err(recover) => {
+                if matches!(
+                    recover.err,
+                    daemon::DaemonClientError::RequestTooLarge { .. }
+                ) {
+                    return daemon_client_error(json_output, recover.err);
+                }
+                if should_fallback_to_local_after_daemon_execute_error(
+                    explicit_daemon_socket,
+                    &recover.err,
+                ) {
+                    cli = recover.cli;
+                } else {
+                    return daemon_execute_error(json_output, recover.err);
+                }
+            }
+        }
+    } else if let Some(socket) = daemon_socket_for_client(&cli, &home) {
+        let explicit_daemon_socket =
+            cli.socket.is_some() || std::env::var_os("WN_SOCKET").is_some();
+        let json_output = cli.json;
+        match daemon::send_execute(&socket, cli, import_nsec, import_bunker).await {
             Ok(output) => return output,
             Err(recover) => {
                 if matches!(
@@ -264,6 +303,7 @@ async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNs
                 ) {
                     cli = recover.cli;
                     import_nsec = recover.import_nsec;
+                    import_bunker = recover.import_bunker;
                 } else {
                     return daemon_execute_error(json_output, recover.err);
                 }
@@ -271,7 +311,7 @@ async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNs
         }
     }
 
-    run_cli_local(cli, import_nsec).await
+    run_cli_local(cli, import_nsec, import_bunker).await
 }
 
 fn validate_secret_input_flags(cli: &Cli) -> Result<(), WnError> {
@@ -279,8 +319,45 @@ fn validate_secret_input_flags(cli: &Cli) -> Result<(), WnError> {
         Command::Login {
             identity,
             nsec_stdin,
+            nip46,
+            default_relays,
+            bootstrap_relays,
+            publish_missing_relay_lists,
             ..
-        } => validate_materialized_secret_identity("login", identity, *nsec_stdin),
+        } => {
+            if identity
+                .as_deref()
+                .is_some_and(commands::nip46::is_nip46_uri)
+            {
+                return Err(WnError::BunkerArgumentRejected { command: "login" });
+            }
+            validate_materialized_secret_identity("login", identity, *nsec_stdin)?;
+            let modes = usize::from(identity.is_some())
+                + usize::from(*nsec_stdin)
+                + usize::from(nip46.bunker_stdin)
+                + usize::from(nip46.nostrconnect);
+            if modes > 1 {
+                if identity.is_some() && *nsec_stdin && !nip46.bunker_stdin && !nip46.nostrconnect {
+                    return Err(WnError::ConflictingSecretInput { command: "login" });
+                }
+                return Err(WnError::ConflictingLoginInput { command: "login" });
+            }
+            let nip46_mode = nip46.bunker_stdin || nip46.nostrconnect;
+            if !nip46_mode
+                && (!nip46.signer_relays.is_empty()
+                    || nip46.client_name.is_some()
+                    || nip46.approve_permissions
+                    || !default_relays.is_empty()
+                    || !bootstrap_relays.is_empty()
+                    || *publish_missing_relay_lists)
+            {
+                return Err(WnError::ConflictingLoginInput { command: "login" });
+            }
+            if nip46.bunker_stdin && !nip46.signer_relays.is_empty() {
+                return Err(WnError::ConflictingLoginInput { command: "login" });
+            }
+            Ok(())
+        }
         Command::Account {
             command:
                 AccountCommand::Create {
@@ -296,7 +373,39 @@ fn validate_secret_input_flags(cli: &Cli) -> Result<(), WnError> {
                     nsec_stdin,
                     ..
                 },
-        } => validate_materialized_secret_identity("account create", identity, *nsec_stdin),
+        } => {
+            if identity
+                .as_deref()
+                .is_some_and(commands::nip46::is_nip46_uri)
+            {
+                return Err(WnError::BunkerArgumentRejected {
+                    command: "account create",
+                });
+            }
+            validate_materialized_secret_identity("account create", identity, *nsec_stdin)
+        }
+        Command::Account {
+            command: AccountCommand::Nip46 { command },
+        }
+        | Command::Accounts {
+            command: AccountCommand::Nip46 { command },
+        } => match command {
+            Nip46Command::Login { pair, .. } => {
+                commands::nip46::validate_nip46_pair_flags("accounts nip46 login", pair)
+            }
+            Nip46Command::Register { account, pair } => {
+                if account
+                    .as_deref()
+                    .is_some_and(commands::nip46::is_nip46_uri)
+                {
+                    return Err(WnError::BunkerArgumentRejected {
+                        command: "accounts nip46 register",
+                    });
+                }
+                commands::nip46::validate_nip46_pair_flags("accounts nip46 register", pair)
+            }
+            Nip46Command::Status { .. } | Nip46Command::Remove { .. } => Ok(()),
+        },
         _ => Ok(()),
     }
 }
@@ -326,6 +435,62 @@ fn read_import_nsec_for_cli(cli: &Cli) -> Result<Option<ImportNsec>, WnError> {
         } => read_identity_secret_input("account create", identity, *nsec_stdin),
         _ => Ok(None),
     }
+}
+
+fn read_import_bunker_for_cli(cli: &Cli) -> Result<Option<ImportBunkerUri>, WnError> {
+    match &cli.command {
+        Command::Login { nip46, .. } if nip46.bunker_stdin => {
+            Ok(Some(read_bunker_uri_from_stdin("login")?))
+        }
+        Command::Account {
+            command:
+                AccountCommand::Nip46 {
+                    command: Nip46Command::Login { pair, .. },
+                },
+        }
+        | Command::Accounts {
+            command:
+                AccountCommand::Nip46 {
+                    command: Nip46Command::Login { pair, .. },
+                },
+        } if pair.bunker_stdin => Ok(Some(read_bunker_uri_from_stdin("accounts nip46 login")?)),
+        Command::Account {
+            command:
+                AccountCommand::Nip46 {
+                    command: Nip46Command::Register { pair, .. },
+                },
+        }
+        | Command::Accounts {
+            command:
+                AccountCommand::Nip46 {
+                    command: Nip46Command::Register { pair, .. },
+                },
+        } if pair.bunker_stdin => Ok(Some(read_bunker_uri_from_stdin("accounts nip46 register")?)),
+        _ => Ok(None),
+    }
+}
+
+fn read_bunker_uri_from_stdin(command: &'static str) -> Result<ImportBunkerUri, WnError> {
+    use zeroize::Zeroizing;
+
+    let mut value = Zeroizing::new(String::new());
+    std::io::stdin().read_to_string(&mut value)?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(WnError::MissingBunkerStdin { command });
+    }
+    if !commands::nip46::is_bunker_uri(trimmed) {
+        return Err(WnError::InvalidBunkerStdin { command });
+    }
+    Ok(ImportBunkerUri::new(Zeroizing::new(trimmed.to_owned())))
+}
+
+fn obtain_nip46_consent_for_cli(cli: &mut Cli, stdin_consumed: bool) -> Result<(), WnError> {
+    if let Some(pair) = commands::nip46::nip46_pair_args_mut(&mut cli.command) {
+        commands::nip46::obtain_nip46_permission_consent(pair.approve_permissions, stdin_consumed)?;
+        pair.approve_permissions = true;
+    }
+    Ok(())
 }
 
 fn read_identity_secret_input(
@@ -461,8 +626,12 @@ fn is_notifications_subscribe(cli: &Cli) -> bool {
     )
 }
 
-pub(crate) async fn run_cli_local(cli: Cli, import_nsec: Option<ImportNsec>) -> CliOutput {
-    match execute(cli, import_nsec).await {
+pub(crate) async fn run_cli_local(
+    cli: Cli,
+    import_nsec: Option<ImportNsec>,
+    import_bunker: Option<ImportBunkerUri>,
+) -> CliOutput {
+    match execute(cli, import_nsec, import_bunker).await {
         Ok((json_output, output)) => command_output_result(json_output, Ok(output)),
         Err((json_output, err)) => command_output_result(json_output, Err(err)),
     }
@@ -514,9 +683,10 @@ pub(crate) fn command_output_result(
 async fn execute(
     cli: Cli,
     import_nsec: Option<ImportNsec>,
+    import_bunker: Option<ImportBunkerUri>,
 ) -> Result<(bool, CommandOutput), (bool, WnError)> {
     let json_output = cli.json;
-    execute_inner(cli, import_nsec)
+    execute_inner(cli, import_nsec, import_bunker)
         .await
         .map(|output| (json_output, output))
         .map_err(|err| (json_output, err))
@@ -525,6 +695,7 @@ async fn execute(
 async fn execute_inner(
     cli: Cli,
     mut import_nsec: Option<ImportNsec>,
+    mut import_bunker: Option<ImportBunkerUri>,
 ) -> Result<CommandOutput, WnError> {
     let home = resolve_home(cli.home.clone());
     let account_flag = cli.account.clone();
@@ -538,6 +709,18 @@ async fn execute_inner(
     let account_home = open_account_home(&home, secret_store, &keychain_service)?;
     let command_relay = match &command {
         Command::Login { relay, .. } => relay.clone().or_else(|| cli.relay.clone()),
+        Command::Account {
+            command:
+                AccountCommand::Nip46 {
+                    command: Nip46Command::Login { relay, .. },
+                },
+        }
+        | Command::Accounts {
+            command:
+                AccountCommand::Nip46 {
+                    command: Nip46Command::Login { relay, .. },
+                },
+        } => relay.clone().or_else(|| cli.relay.clone()),
         _ => cli.relay.clone(),
     };
     let relay = resolve_relay(command_relay)?;
@@ -573,19 +756,41 @@ async fn execute_inner(
         Command::Login {
             identity,
             nsec_stdin,
+            nip46,
             relay: _,
+            default_relays,
+            bootstrap_relays,
+            publish_missing_relay_lists,
         } => {
-            commands::account::identity_login_command(
-                &app,
-                runtime_info,
-                identity,
-                import_nsec.take(),
-                nsec_stdin,
-                relay,
-                cli.daemon_default_account_relays,
-                cli.daemon_discovery_relays,
-            )
-            .await
+            if nip46.bunker_stdin || nip46.nostrconnect {
+                commands::nip46::nip46_login_one_shot(
+                    &account_home,
+                    &app,
+                    commands::nip46::Nip46LoginOptions {
+                        pair: nip46,
+                        relay,
+                        default_relays,
+                        bootstrap_relays,
+                        publish_missing_relay_lists,
+                        daemon_default_account_relays: cli.daemon_default_account_relays,
+                        daemon_discovery_relays: cli.daemon_discovery_relays,
+                    },
+                    import_bunker.take(),
+                )
+                .await
+            } else {
+                commands::account::identity_login_command(
+                    &app,
+                    runtime_info,
+                    identity,
+                    import_nsec.take(),
+                    nsec_stdin,
+                    relay,
+                    cli.daemon_default_account_relays,
+                    cli.daemon_discovery_relays,
+                )
+                .await
+            }
         }
         Command::Whoami => {
             commands::account::whoami_command(&account_home, &app, runtime_info, account_flag)
@@ -600,7 +805,10 @@ async fn execute_inner(
                 runtime_info,
                 account_flag,
                 relay,
+                cli.daemon_default_account_relays,
+                cli.daemon_discovery_relays,
                 import_nsec.take(),
+                import_bunker.take(),
             )
             .await
         }
@@ -612,7 +820,10 @@ async fn execute_inner(
                 runtime_info,
                 account_flag,
                 relay,
+                cli.daemon_default_account_relays,
+                cli.daemon_discovery_relays,
                 import_nsec.take(),
+                import_bunker.take(),
             )
             .await
         }
@@ -691,7 +902,7 @@ async fn execute_inner(
         }),
         Command::Sync => {
             let account = resolve_account(&account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_capable(&account)?;
             commands::sync::sync_command(&app, account).await
         }
         Command::RelayStats => commands::relay_stats::relay_stats_command(&app).await,
@@ -1125,14 +1336,25 @@ pub(crate) fn resolve_account_ref(
     Err(WnError::UnknownLocalAccount(value.to_owned()))
 }
 
-pub(crate) fn ensure_local_signing(
+pub(crate) fn ensure_signing_capable(
     account: &marmot_account::AccountSummary,
 ) -> Result<(), WnError> {
-    if account.local_signing {
+    if account.can_sign() {
         Ok(())
     } else {
         Err(WnError::PublicAccountCannotSign)
     }
+}
+
+pub(crate) async fn ensure_signing_ready(
+    runtime: &marmot_app::MarmotAppRuntime,
+    account: &marmot_account::AccountSummary,
+) -> Result<(), WnError> {
+    ensure_signing_capable(account)?;
+    if account.external_signing {
+        runtime.nip46_resume(&account.account_id_hex).await?;
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_public_key(value: &str) -> Result<String, WnError> {

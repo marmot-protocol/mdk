@@ -24,8 +24,8 @@ use serde_json::{Value, json};
 use crate::args::SearchAttachmentType;
 use crate::{
     CommandOutput, MessageCommand, MessageTimelineCommand, WnError, display_name_for_sender,
-    ensure_local_signing, normalize_group_id_hex, npub_for_account_id, parse_public_key,
-    resolve_account, terminal_safe_text,
+    ensure_signing_capable, ensure_signing_ready, normalize_group_id_hex, npub_for_account_id,
+    parse_public_key, resolve_account, terminal_safe_text,
 };
 
 fn message_target_and_text(
@@ -102,7 +102,7 @@ pub(crate) async fn message_command_with_runtime(
             }
             reject_misplaced_reply_to(reply_to.as_deref(), &text)?;
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -144,7 +144,7 @@ pub(crate) async fn message_command_with_runtime(
             content,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             if marmot_app::is_reserved_app_event_kind(kind) {
                 return Err(WnError::ReservedAppEventKind(kind));
@@ -185,7 +185,7 @@ pub(crate) async fn message_command_with_runtime(
             text,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
@@ -223,7 +223,7 @@ pub(crate) async fn message_command_with_runtime(
             message_id,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
             let summary = runtime
@@ -247,7 +247,7 @@ pub(crate) async fn message_command_with_runtime(
         }
         MessageCommand::Retry { group_id, event_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
             // The runtime retry is group-scoped: it republishes durable
@@ -280,7 +280,7 @@ pub(crate) async fn message_command_with_runtime(
             emoji,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
             let summary = runtime
@@ -313,7 +313,7 @@ pub(crate) async fn message_command_with_runtime(
             message_id,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
             let summary = runtime
@@ -352,7 +352,7 @@ pub(crate) async fn message_command_with_runtime(
                 after_message_id.as_deref(),
             )?;
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_capable(&account)?;
             app.status(&account.label)?;
             let group = group.or(group_id);
             let uses_cursor = before.is_some()
@@ -397,7 +397,7 @@ pub(crate) async fn message_command_with_runtime(
             limit,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_capable(&account)?;
             app.status(&account.label)?;
             let messages = search_messages(app, &account.label, Some(group_id), &query, limit)?;
             Ok(CommandOutput {
@@ -412,7 +412,7 @@ pub(crate) async fn message_command_with_runtime(
         }
         MessageCommand::SearchAll { query, limit } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_capable(&account)?;
             app.status(&account.label)?;
             let messages = search_messages(app, &account.label, None, &query, limit)?;
             Ok(CommandOutput {
@@ -427,7 +427,7 @@ pub(crate) async fn message_command_with_runtime(
         }
         MessageCommand::SweepExpired => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             app.status(&account.label)?;
             // Production clock semantics: the engine applies its own skew
             // tolerance, unread deferral, and scan bounds to this wall-clock
@@ -547,7 +547,7 @@ fn handle_message_timeline_command(
             limit,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_capable(&account)?;
             app.status(&account.label)?;
             let group = group.or(group_id);
             let page = app.timeline_messages_with_query(
@@ -586,7 +586,7 @@ fn handle_message_timeline_command(
             limit,
         } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_capable(&account)?;
             app.status(&account.label)?;
             let group = group.or(group_id);
             let page = app.timeline_messages_with_query(

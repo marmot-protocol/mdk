@@ -1,7 +1,7 @@
 //! App-runtime hosting glue: reconciliation, event bridge, and hosted command dispatch.
 
 use super::*;
-use crate::ImportNsec;
+use crate::{ImportBunkerUri, ImportNsec};
 
 #[derive(Debug)]
 pub(crate) struct DaemonState {
@@ -98,6 +98,197 @@ pub(crate) async fn reconcile_and_clone_runtime(
     let mut guard = workers.lock().await;
     reconcile_app_runtime(defaults, state, events, &mut guard.runtime).await;
     guard.runtime.runtime.clone()
+}
+
+pub(crate) async fn handle_app_runtime_nip46_request(
+    cli: &Cli,
+    import_bunker: &mut Option<ImportBunkerUri>,
+    defaults: &DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    events: DaemonEventHub,
+    workers: &SharedDaemonWorkers,
+) -> Option<CliOutput> {
+    if !app_runtime_enabled(defaults)
+        || !crate::commands::nip46::is_nip46_pairing_command(&cli.command)
+    {
+        return None;
+    }
+    let Some(runtime) = reconcile_and_clone_runtime(defaults, state, events, workers).await else {
+        return Some(crate::command_output_result(
+            cli.json,
+            Err(crate::WnError::MissingRelay),
+        ));
+    };
+    let output = dispatch_hosted_nip46_pairing(
+        cli,
+        defaults,
+        &runtime,
+        import_bunker.take(),
+        Box::new(|uri| {
+            Box::pin(async move { crate::commands::nip46::write_pairing_offer_to_stderr(&uri) })
+        }),
+    )
+    .await;
+    Some(crate::command_output_result(cli.json, output))
+}
+
+pub(crate) async fn handle_nip46_pair_connection(
+    cli: Box<Cli>,
+    stream: &mut UnixStream,
+    defaults: &DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    events: DaemonEventHub,
+    workers: &SharedDaemonWorkers,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(runtime) = reconcile_and_clone_runtime(defaults, state, events, workers).await else {
+        let output = crate::command_output_result(cli.json, Err(crate::WnError::MissingRelay));
+        let _ = write_stream_response(
+            stream,
+            &DaemonStreamResponse::ok(serde_json::json!({
+                "type": "cli_output",
+                "output": output,
+            })),
+        )
+        .await;
+        let _ = write_stream_end(stream).await;
+        return Ok(());
+    };
+    let (offer_tx, mut offer_rx) = mpsc::unbounded_channel::<String>();
+    let cli_ref = cli.as_ref();
+    let pairing_fut = dispatch_hosted_nip46_pairing(
+        cli_ref,
+        defaults,
+        &runtime,
+        None,
+        Box::new(move |uri| {
+            let tx = offer_tx.clone();
+            Box::pin(async move {
+                let _ = tx.send(uri);
+                Ok(())
+            })
+        }),
+    );
+    tokio::pin!(pairing_fut);
+    let (mut read_half, mut write_half) = stream.split();
+    let mut eof_buf = [0_u8; 16];
+    let result = loop {
+        tokio::select! {
+            Some(uri) = offer_rx.recv() => {
+                if !write_stream_response_within(
+                    &mut write_half,
+                    &DaemonStreamResponse::ok(serde_json::json!({
+                        "type": "pairing_offer",
+                        "uri": uri,
+                    })),
+                    DAEMON_RESPONSE_WRITE_TIMEOUT,
+                )
+                .await
+                {
+                    return Ok(());
+                }
+            }
+            read = read_half.read(&mut eof_buf) => {
+                if matches!(read, Ok(0) | Err(_)) {
+                    // Client disconnected (e.g., Ctrl-C) before pairing completed; dropping
+                    // `pairing_fut` cancels the unbound NIP-46 session via `CancelOnDrop`.
+                    return Ok(());
+                }
+            }
+            output = &mut pairing_fut => break output,
+        }
+    };
+    while let Ok(uri) = offer_rx.try_recv() {
+        if !write_stream_response_within(
+            &mut write_half,
+            &DaemonStreamResponse::ok(serde_json::json!({
+                "type": "pairing_offer",
+                "uri": uri,
+            })),
+            DAEMON_RESPONSE_WRITE_TIMEOUT,
+        )
+        .await
+        {
+            return Ok(());
+        }
+    }
+    let cli_output = crate::command_output_result(cli.json, result);
+    let _ = write_stream_response(
+        stream,
+        &DaemonStreamResponse::ok(serde_json::json!({
+            "type": "cli_output",
+            "output": cli_output,
+        })),
+    )
+    .await;
+    let _ = write_stream_end(stream).await;
+    Ok(())
+}
+
+async fn dispatch_hosted_nip46_pairing<'a>(
+    cli: &Cli,
+    defaults: &DaemonDefaults,
+    runtime: &marmot_app::MarmotAppRuntime,
+    import_bunker: Option<ImportBunkerUri>,
+    on_pairing_offer: crate::commands::nip46::PairingOfferCallback<'a>,
+) -> Result<crate::CommandOutput, crate::WnError> {
+    let secret_store = crate::resolve_secret_store(defaults.secret_store)?;
+    let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
+    let account_home = crate::open_account_home(&defaults.home, secret_store, &keychain_service)?;
+    let app = crate::app_for(
+        defaults.home.clone(),
+        defaults.relay.clone(),
+        defaults.discovery_relays.clone(),
+        account_home.clone(),
+    )?;
+    match cli.command.clone() {
+        crate::Command::Login {
+            nip46,
+            relay,
+            default_relays,
+            bootstrap_relays,
+            publish_missing_relay_lists,
+            ..
+        } => {
+            crate::commands::nip46::nip46_login_with_runtime(
+                &account_home,
+                &app,
+                runtime,
+                crate::commands::nip46::Nip46LoginOptions {
+                    pair: nip46,
+                    relay: relay.or_else(|| cli.relay.clone()),
+                    default_relays,
+                    bootstrap_relays,
+                    publish_missing_relay_lists,
+                    daemon_default_account_relays: defaults.default_account_relays.clone(),
+                    daemon_discovery_relays: defaults.discovery_relays.clone(),
+                },
+                import_bunker,
+                on_pairing_offer,
+            )
+            .await
+        }
+        crate::Command::Account {
+            command: crate::AccountCommand::Nip46 { command },
+        }
+        | crate::Command::Accounts {
+            command: crate::AccountCommand::Nip46 { command },
+        } => {
+            crate::commands::nip46::nip46_command_with_runtime(
+                &account_home,
+                &app,
+                runtime,
+                command,
+                cli.account.clone(),
+                cli.relay.clone(),
+                defaults.default_account_relays.clone(),
+                defaults.discovery_relays.clone(),
+                import_bunker,
+                on_pairing_offer,
+            )
+            .await
+        }
+        _ => Err(crate::WnError::MissingNip46Mode { command: "nip46" }),
+    }
 }
 
 pub(crate) async fn handle_app_runtime_account_setup_request(
@@ -317,6 +508,30 @@ async fn dispatch_hosted_runtime_command(
         crate::Command::RelayStats => {
             crate::commands::relay_stats::relay_stats_command_with_runtime(runtime).await
         }
+        crate::Command::Account {
+            command: crate::AccountCommand::Nip46 { command },
+        }
+        | crate::Command::Accounts {
+            command: crate::AccountCommand::Nip46 { command },
+        } => {
+            crate::commands::nip46::nip46_command_with_runtime(
+                &account_home,
+                &app,
+                runtime,
+                command,
+                cli.account.clone(),
+                cli.relay.clone(),
+                defaults.default_account_relays.clone(),
+                defaults.discovery_relays.clone(),
+                None,
+                Box::new(|uri| {
+                    Box::pin(
+                        async move { crate::commands::nip46::write_pairing_offer_to_stderr(&uri) },
+                    )
+                }),
+            )
+            .await
+        }
         _ => return None,
     };
     Some(crate::command_output_result(cli.json, output))
@@ -334,6 +549,18 @@ pub(crate) fn is_hosted_runtime_command(cli: &Cli) -> bool {
         crate::Command::Message { command } | crate::Command::Messages { command } => {
             !matches!(command, crate::MessageCommand::Subscribe { .. })
         }
+        crate::Command::Account {
+            command:
+                crate::AccountCommand::Nip46 {
+                    command: crate::Nip46Command::Status { .. } | crate::Nip46Command::Remove { .. },
+                },
+        }
+        | crate::Command::Accounts {
+            command:
+                crate::AccountCommand::Nip46 {
+                    command: crate::Nip46Command::Status { .. } | crate::Nip46Command::Remove { .. },
+                },
+        } => true,
         crate::Command::Keys { .. }
         | crate::Command::Follows { .. }
         | crate::Command::Profile { .. }
@@ -559,11 +786,20 @@ pub(crate) async fn reconcile_app_runtime(
             events.clone(),
             receiver,
         ));
+        // Resume persisted NIP-46 accounts independently after startup so a
+        // corrupt or temporarily unreachable remote signer cannot block local
+        // accounts or crash wnd startup.
+        if resume_persisted_nip46_accounts(defaults, &state, &runtime).await
+            && let Err(err) = runtime.reconcile_accounts().await
+        {
+            record_runtime_activity_error(&state, err.to_string());
+        }
         host.runtime = Some(runtime);
         return;
     }
 
     if let Some(runtime) = &host.runtime {
+        let _ = resume_persisted_nip46_accounts(defaults, &state, runtime).await;
         if let Err(err) = runtime.reconcile_accounts().await {
             record_runtime_activity_error(&state, err.to_string());
         }
@@ -575,6 +811,47 @@ pub(crate) async fn reconcile_app_runtime(
             host.bridge = Some(spawn_app_runtime_bridge(state, events, runtime.subscribe()));
         }
     }
+}
+
+/// Independently resume every active persisted NIP-46 account via
+/// `MarmotAppRuntime::nip46_resume`. Per-account errors are recorded as
+/// privacy-safe daemon activity errors without blocking other accounts or
+/// crashing daemon startup. Returns true if at least one session resumed.
+pub(crate) async fn resume_persisted_nip46_accounts(
+    defaults: &DaemonDefaults,
+    state: &Arc<Mutex<DaemonState>>,
+    runtime: &marmot_app::MarmotAppRuntime,
+) -> bool {
+    let Ok(secret_store) = crate::resolve_secret_store(defaults.secret_store) else {
+        return false;
+    };
+    let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
+    let Ok(account_home) =
+        crate::open_account_home(&defaults.home, secret_store, &keychain_service)
+    else {
+        return false;
+    };
+    let Ok(accounts) = account_home.accounts() else {
+        return false;
+    };
+    let mut resumed_any = false;
+    for account in accounts {
+        if !account.external_signing || account.signed_out || account.unlinked {
+            continue;
+        }
+        match runtime.nip46_resume(&account.account_id_hex).await {
+            Ok(_session) => {
+                resumed_any = true;
+            }
+            Err(err) if crate::commands::nip46::nip46_error_is_missing_session(&err) => {
+                // External account has no stored NIP-46 pairing (e.g. removed via `nip46 remove`).
+            }
+            Err(err) => {
+                record_runtime_activity_error(state, format!("nip46 resume failed: {err}"));
+            }
+        }
+    }
+    resumed_any
 }
 
 pub(crate) fn open_app_runtime(

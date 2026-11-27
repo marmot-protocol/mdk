@@ -834,7 +834,16 @@ async fn daemon_execute_local_command_runs_without_holding_worker_lock() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        handle_execute_connection(cli, None, &mut server, &defaults, state, events, &workers),
+        handle_execute_connection(
+            cli,
+            None,
+            None,
+            &mut server,
+            &defaults,
+            state,
+            events,
+            &workers,
+        ),
     )
     .await
     .expect("a relay-less Execute must not block on the held workers lock");
@@ -853,7 +862,11 @@ async fn send_execute_connect_failure_recovers_cli_and_import_nsec() {
     let mut cli = daemon_test_cli(crate::Command::Login {
         identity: None,
         nsec_stdin: true,
+        nip46: crate::args::Nip46PairArgs::default(),
         relay: Some("wss://relay.example".to_owned()),
+        default_relays: Vec::new(),
+        bootstrap_relays: Vec::new(),
+        publish_missing_relay_lists: false,
     });
     cli.json = true;
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
@@ -861,7 +874,7 @@ async fn send_execute_connect_failure_recovers_cli_and_import_nsec() {
         nsec.to_owned(),
     )));
 
-    let recover = send_execute(&socket, cli, import_nsec)
+    let recover = send_execute(&socket, cli, import_nsec, None)
         .await
         .expect_err("connect to missing socket must be recoverable");
 
@@ -890,7 +903,11 @@ async fn disabled_app_runtime_skips_relay_validation_and_preserves_nsec_sidecar(
     let mut cli = daemon_test_cli(crate::Command::Login {
         identity: None,
         nsec_stdin: true,
+        nip46: crate::args::Nip46PairArgs::default(),
         relay: Some("wss://relay.example".to_owned()),
+        default_relays: Vec::new(),
+        bootstrap_relays: Vec::new(),
+        publish_missing_relay_lists: false,
     });
     apply_defaults(&mut cli, &defaults);
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
@@ -962,7 +979,11 @@ fn execute_request_roundtrip_carries_import_nsec_sidecar_not_cli_identity() {
     let mut cli = daemon_test_cli(crate::Command::Login {
         identity: None,
         nsec_stdin: true,
+        nip46: crate::args::Nip46PairArgs::default(),
         relay: Some("wss://relay.example".to_owned()),
+        default_relays: Vec::new(),
+        bootstrap_relays: Vec::new(),
+        publish_missing_relay_lists: false,
     });
     cli.daemon_default_account_relays = vec!["wss://relay.example".to_owned()];
     let request = DaemonRequest::Execute {
@@ -970,6 +991,7 @@ fn execute_request_roundtrip_carries_import_nsec_sidecar_not_cli_identity() {
         import_nsec: Some(crate::ImportNsec::new(zeroize::Zeroizing::new(
             nsec.to_owned(),
         ))),
+        import_bunker: None,
     };
     let debug = format!("{request:?}");
     assert!(!debug.contains("nsec1j4"));
@@ -977,7 +999,11 @@ fn execute_request_roundtrip_carries_import_nsec_sidecar_not_cli_identity() {
     let payload = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
     let decoded: DaemonRequest = serde_json::from_slice(payload).expect("decode execute request");
     match decoded {
-        DaemonRequest::Execute { cli, import_nsec } => {
+        DaemonRequest::Execute {
+            cli,
+            import_nsec,
+            import_bunker: _,
+        } => {
             let import_nsec = import_nsec.expect("import_nsec sidecar");
             assert_eq!(import_nsec.into_inner().as_str(), nsec);
             match cli.command {
@@ -1000,6 +1026,7 @@ fn encode_daemon_request_rejects_oversized_payloads() {
     let request = DaemonRequest::Execute {
         cli: Box::new(cli),
         import_nsec: None,
+        import_bunker: None,
     };
 
     let err = encode_daemon_request(&request)
@@ -1473,7 +1500,7 @@ async fn daemon_subscription_guard_errors_are_followed_by_stream_end() {
         accept_undelivered: false,
     };
     let signing_error = format!(
-        "account {} is not a local signing account",
+        "account {} is not a signing-capable account",
         account.account_id_hex
     );
     let workers = SharedDaemonWorkers::default();
@@ -2641,4 +2668,153 @@ async fn daemon_stop_without_a_pid_waits_for_the_socket_to_be_removed() {
         stop_output_json(&output)["error"]["code"],
         "daemon_stop_timeout"
     );
+}
+
+#[test]
+fn execute_request_roundtrip_carries_import_bunker_sidecar_and_redacts_secret() {
+    let secret = "bunker-one-use-secret-4242";
+    let bunker_uri = format!(
+        "bunker://{}?relay=wss%3A%2F%2Frelay.example&secret={secret}",
+        "bb".repeat(32)
+    );
+    let cli = daemon_test_cli(crate::Command::Login {
+        identity: None,
+        nsec_stdin: false,
+        nip46: crate::args::Nip46PairArgs {
+            bunker_stdin: true,
+            approve_permissions: true,
+            ..Default::default()
+        },
+        relay: Some("wss://relay.example".to_owned()),
+        default_relays: Vec::new(),
+        bootstrap_relays: Vec::new(),
+        publish_missing_relay_lists: false,
+    });
+    let request = DaemonRequest::Execute {
+        cli: Box::new(cli),
+        import_nsec: None,
+        import_bunker: Some(crate::ImportBunkerUri::new(zeroize::Zeroizing::new(
+            bunker_uri.clone(),
+        ))),
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains(secret));
+    assert!(!debug.contains("bunker://"));
+    let bytes = encode_daemon_request(&request).expect("encode execute request");
+    let payload = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    let decoded: DaemonRequest = serde_json::from_slice(payload).expect("decode execute request");
+    match decoded {
+        DaemonRequest::Execute { import_bunker, .. } => {
+            let recovered = import_bunker.expect("import_bunker sidecar").into_inner();
+            assert_eq!(recovered.as_str(), bunker_uri);
+        }
+        other => panic!("expected Execute, got {other:?}"),
+    }
+}
+
+#[test]
+fn daemon_account_ref_accepts_external_signing_account() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (defaults, _) = gated_daemon(home.path());
+    let external = marmot_account::AccountHome::open(home.path())
+        .add_external_signer_account(&"cc".repeat(32))
+        .expect("external account");
+    let mut cli = daemon_test_cli(crate::Command::Chats {
+        command: crate::ChatsCommand::Subscribe,
+    });
+    cli.account = Some(external.account_id_hex.clone());
+    let resolved = daemon_account_ref(&defaults, &cli)
+        .expect("external signing accounts must be accepted by streaming subscriptions");
+    assert_eq!(resolved, external.account_id_hex);
+}
+
+#[tokio::test]
+async fn resume_persisted_nip46_accounts_handles_unpaired_and_corrupt_independently() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let account_home = marmot_account::AccountHome::open(home.path());
+    let local = account_home.create_nostr_account().expect("local account");
+    let unpaired = account_home
+        .add_external_signer_account(&"11".repeat(32))
+        .expect("unpaired external account");
+    let corrupt = account_home
+        .add_external_signer_account(&"22".repeat(32))
+        .expect("corrupt external account");
+    let healthy = account_home
+        .add_external_signer_account(&"33".repeat(32))
+        .expect("healthy external account");
+
+    // Write a corrupt session file for `corrupt` and a valid session for `healthy`.
+    std::fs::write(
+        account_home
+            .account_dir(&corrupt.label)
+            .join(".nip46-session.json"),
+        b"{not valid json",
+    )
+    .expect("write corrupt session");
+    let client_keys = nostr::prelude::Keys::generate();
+    let perms = marmot_app::Nip46Session::permissions();
+    account_home
+        .store_nip46_session(
+            &healthy.label,
+            &client_keys,
+            &marmot_account::Nip46SessionRecord {
+                version: 1,
+                user_public_key: healthy.account_id_hex.clone(),
+                remote_signer_public_key: nostr::prelude::Keys::generate().public_key().to_hex(),
+                client_public_key: client_keys.public_key().to_hex(),
+                relays: vec!["wss://relay.example".to_owned()],
+                name: "White Noise CLI".to_owned(),
+                permission_version: perms.version,
+                permissions: perms.grants,
+            },
+        )
+        .expect("store healthy nip46 session");
+
+    let defaults = DaemonDefaults {
+        home: home.path().to_path_buf(),
+        socket: default_socket_path(home.path()),
+        pid_path: default_pid_path(home.path()),
+        log_path: default_log_path(home.path()),
+        relay: Some("wss://relay.example".to_owned()),
+        discovery_relays: vec!["wss://relay.example".to_owned()],
+        default_account_relays: vec!["wss://relay.example".to_owned()],
+        secret_store: Some(crate::SecretStoreKind::File),
+        keychain_service: None,
+    };
+    let state = Arc::new(Mutex::new(DaemonState {
+        pid: 1,
+        started_at: 0,
+        starting: false,
+        last_runtime_activity: None,
+    }));
+    let runtime = open_app_runtime(&defaults).expect("open runtime");
+    let resumed_any = resume_persisted_nip46_accounts(&defaults, &state, &runtime).await;
+    assert!(resumed_any, "healthy NIP-46 account should resume");
+    assert!(
+        runtime.nip46_resume(&healthy.account_id_hex).await.is_ok(),
+        "healthy account session must be live after resume"
+    );
+    assert!(
+        runtime
+            .nip46_resume(&unpaired.account_id_hex)
+            .await
+            .is_err(),
+        "unpaired external account remains unavailable"
+    );
+    let activity = state
+        .lock()
+        .expect("state lock")
+        .last_runtime_activity
+        .clone()
+        .expect("corrupt session error should be recorded");
+    assert!(
+        activity
+            .errors
+            .iter()
+            .all(|msg| !msg.contains(&corrupt.account_id_hex)
+                && !msg.contains(&local.account_id_hex)),
+        "daemon activity errors must remain privacy-safe: {:?}",
+        activity.errors
+    );
+    runtime.shutdown().await;
 }

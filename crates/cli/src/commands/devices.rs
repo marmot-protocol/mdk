@@ -8,7 +8,10 @@ use marmot_app::{
 use serde_json::{Value, json};
 
 use crate::args::{DeviceLinkCommand, DevicesCommand};
-use crate::{CommandOutput, WnError, npub_for_account_id, resolve_account, terminal_safe_text};
+use crate::{
+    CommandOutput, WnError, ensure_signing_ready, npub_for_account_id, resolve_account,
+    terminal_safe_text,
+};
 
 pub(crate) async fn devices_command_with_runtime(
     home: &AccountHome,
@@ -17,6 +20,7 @@ pub(crate) async fn devices_command_with_runtime(
     account_flag: Option<String>,
 ) -> Result<CommandOutput, WnError> {
     let account = resolve_account(home, account_flag)?;
+    ensure_signing_ready(runtime, &account).await?;
     let npub = npub_for_account_id(&account.account_id_hex)?;
     match command {
         DevicesCommand::List => {

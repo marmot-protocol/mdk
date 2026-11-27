@@ -6,9 +6,9 @@ use marmot_app::{AccountRelayListStatus, MarmotApp, MarmotAppRuntime};
 use serde_json::json;
 
 use crate::{
-    CommandOutput, RelaysCommand, WnError, ensure_local_signing, npub_for_account_id,
-    relay_endpoints, relay_lists_json, replaceable_list_inconclusive, resolve_account,
-    terminal_safe_text, validate_relay_url,
+    CommandOutput, RelaysCommand, WnError, ensure_signing_capable, ensure_signing_ready,
+    npub_for_account_id, relay_endpoints, relay_lists_json, replaceable_list_inconclusive,
+    resolve_account, terminal_safe_text, validate_relay_url,
 };
 
 pub(crate) async fn relays_command(
@@ -37,9 +37,9 @@ pub(crate) async fn relays_command_with_runtime(
     relay: Option<String>,
 ) -> Result<CommandOutput, WnError> {
     let account = resolve_account(account_home, account_flag)?;
-    ensure_local_signing(&account)?;
     match command {
         RelaysCommand::List { relay_type } => {
+            ensure_signing_capable(&account)?;
             let status = app.account_relay_list_status(&account.label)?;
             let relays = relays_for_type(&status, relay_type.as_deref())?;
             Ok(CommandOutput {
@@ -54,9 +54,11 @@ pub(crate) async fn relays_command_with_runtime(
             })
         }
         RelaysCommand::Add { url, relay_type } => {
+            ensure_signing_ready(runtime, &account).await?;
             update_relay_list(app, runtime, account, relay, relay_type, url, true).await
         }
         RelaysCommand::Remove { url, relay_type } => {
+            ensure_signing_ready(runtime, &account).await?;
             update_relay_list(app, runtime, account, relay, relay_type, url, false).await
         }
     }
