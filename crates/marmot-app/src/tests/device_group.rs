@@ -333,7 +333,7 @@ async fn a_confirmed_link_creates_a_hidden_device_group_both_devices_trust() {
     // The creating device draws the tag key at random, and the laptop holds the
     // same one.
     let leaf_tag_key = roster(&phone, &group).leaf_tag_key;
-    assert_ne!(leaf_tag_key, [0; 32]);
+    assert_ne!(*leaf_tag_key, [0; 32]);
     assert_eq!(roster(&laptop, &group).leaf_tag_key, leaf_tag_key);
 
     // A roster update reaches the laptop and is never projected either.
@@ -2468,7 +2468,7 @@ async fn each_device_keeps_its_history_key_in_its_own_entry() {
         .unwrap();
     assert_eq!(
         laptop.runtime.open_history(context, &sealed).unwrap(),
-        Some(b"bundle".to_vec())
+        Some(cgka_traits::SecretBytes::new(b"bundle".to_vec()))
     );
     assert_eq!(phone.runtime.open_history(context, &sealed).unwrap(), None);
 

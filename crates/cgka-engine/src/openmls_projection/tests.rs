@@ -157,3 +157,109 @@ fn graph_seed_benchmark() {
         );
     }
 }
+
+#[test]
+fn projection_error_display_omits_raw_message_ids() {
+    let sentinel_id = "cafebabe".repeat(8);
+    let errors = [
+        OpenMlsProjectionError::RejectedProposal {
+            message_id: sentinel_id.clone(),
+            category: cgka_traits::ingest::ProposalRejectionCategory::AuthorizationFailed,
+        },
+        OpenMlsProjectionError::UnauthorizedCommit {
+            message_id: sentinel_id.clone(),
+        },
+        OpenMlsProjectionError::InvalidCommit {
+            message_id: sentinel_id.clone(),
+            reason: "invalid_encoding".into(),
+            rejection_category: Some(
+                cgka_traits::ingest::ProposalRejectionCategory::InvalidEncoding,
+            ),
+        },
+        message_id_from_hex(&format!("zz{sentinel_id}")).unwrap_err(),
+    ];
+
+    for err in errors {
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains(&sentinel_id),
+            "OpenMlsProjectionError::Display leaked raw message id: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn replay_messages_non_openmls_payload_error_omits_message_id() {
+    let (storage, group_id, _admitted) = graph_fixture(0);
+    let sentinel_bytes = [0xca, 0xfe, 0xba, 0xbe].repeat(8);
+    let sentinel_id = hex::encode(&sentinel_bytes);
+    let message_id = MessageId::new(sentinel_bytes);
+    let payload = StoredMessagePayload::raw_transport(TransportMessage {
+        id: message_id.clone(),
+        payload: vec![1, 2, 3],
+        timestamp: Timestamp(0),
+        causal_deps: Vec::new(),
+        source: TransportSource("test".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: vec![0; 32],
+        },
+    })
+    .encode()
+    .unwrap();
+    storage
+        .put_message(&MessageRecord {
+            id: message_id,
+            group_id,
+            epoch: EpochId(10),
+            state: MessageState::Processed,
+            payload,
+            deferred_peel: None,
+        })
+        .unwrap();
+
+    let result = CanonicalizationResult {
+        previous_tip: 10,
+        selected_tip: Some(10),
+        selected_fork_epoch: None,
+        selected_branch_id: None,
+        candidate_count: 1,
+        eligible_count: 1,
+        convergence_status: ConvergenceStatus::Settled,
+        accepted_commits: vec![sentinel_id.clone()],
+        accepted_proposals: Vec::new(),
+        accepted_app_messages: Vec::new(),
+        deferred_messages: Vec::new(),
+        invalidated_app_messages: Vec::new(),
+        dropped_messages: Vec::new(),
+        already_seen: Vec::new(),
+        queued_outbound_intents: Vec::new(),
+        publishable_outbound_messages: Vec::new(),
+        errors: Vec::new(),
+        #[cfg(feature = "test-conformance-snapshot")]
+        replay_probe_count: 0,
+        selection_trace: None,
+    };
+
+    let mut own_commits = PrevalidatedOwnCommits::default();
+    let err = replay_messages_for_canonicalization_result(
+        &storage,
+        &result,
+        &BTreeSet::new(),
+        10,
+        &mut own_commits,
+    )
+    .expect_err("non-OpenMLS stored payload must fail replay resolution");
+    assert!(
+        matches!(err, OpenMlsProjectionError::Decode(_)),
+        "expected Decode error, got: {err:?}"
+    );
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("not a stored OpenMLS wire payload"),
+        "expected privacy-safe decode reason, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&sentinel_id),
+        "OpenMlsProjectionError::Decode leaked raw message id: {rendered}"
+    );
+}

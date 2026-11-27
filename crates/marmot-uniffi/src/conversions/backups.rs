@@ -22,10 +22,10 @@ impl std::fmt::Debug for RecoveryWordsFfi {
     }
 }
 impl From<RecoveryWords> for RecoveryWordsFfi {
-    fn from(value: RecoveryWords) -> Self {
+    fn from(mut value: RecoveryWords) -> Self {
         Self {
-            words: value.words,
-            confirm_positions: value.confirm_positions,
+            words: std::mem::take(&mut value.words),
+            confirm_positions: std::mem::take(&mut value.confirm_positions),
         }
     }
 }

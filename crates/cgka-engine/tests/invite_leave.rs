@@ -1810,7 +1810,7 @@ async fn recovery_device_group_refusal() {
         })
         .unwrap();
     let roster = DeviceRosterV1 {
-        leaf_tag_key: [0x33; 32],
+        leaf_tag_key: [0x33; 32].into(),
         devices: [([1; 32], DeviceEntryV1::default())].into_iter().collect(),
         ..DeviceRosterV1::default()
     };

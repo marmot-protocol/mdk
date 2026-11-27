@@ -252,6 +252,7 @@ fn opened_archive_key(head: &BackupHead, words: &Words) -> Vec<u8> {
     open_with_recovery_key(&RustCrypto::default(), &words.entropy, &context, sealed)
         .unwrap()
         .expect("the words open the archive key")
+        .to_vec()
 }
 
 /// The writer's pass uploads the account's backup to the deployment's

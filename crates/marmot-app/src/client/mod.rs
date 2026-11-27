@@ -700,12 +700,26 @@ impl EncryptedMediaDownloadHttp {
 
 pub(crate) struct GroupImageDownloadHttp {
     image_hash_hex: String,
-    image_key_hex: String,
+    image_key_hex: Zeroizing<String>,
     image_nonce_hex: String,
     media_type: String,
     server: String,
     transport: BlossomHttpTransport,
 }
+
+impl std::fmt::Debug for GroupImageDownloadHttp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupImageDownloadHttp")
+            .field("image_hash_hex", &self.image_hash_hex)
+            .field("image_key_hex", &"<redacted>")
+            .field("image_nonce_hex", &self.image_nonce_hex)
+            .field("media_type", &self.media_type)
+            .field("server", &self.server)
+            .finish_non_exhaustive()
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for GroupImageDownloadHttp {}
 
 pub(crate) struct PreparedGroupImageUploadHttp {
     encrypted_blob: Vec<u8>,
@@ -715,6 +729,8 @@ pub(crate) struct PreparedGroupImageUploadHttp {
     allow_loopback_http: bool,
     transport: BlossomHttpTransport,
 }
+
+impl zeroize::ZeroizeOnDrop for PreparedGroupImageUploadHttp {}
 
 impl PreparedGroupImageUploadHttp {
     pub(crate) async fn run(self) -> Result<(), AppError> {
@@ -744,6 +760,29 @@ pub(crate) enum InitialGroupImageSource {
 }
 
 impl GroupImageDownloadHttp {
+    fn try_from_input(
+        input: &mut AppGroupImageInput,
+        resolve_server: impl FnOnce() -> Result<String, AppError>,
+        transport: BlossomHttpTransport,
+    ) -> Result<Self, AppError> {
+        if !input.is_present() {
+            return Err(AppError::InvalidEncryptedMedia(
+                "group has no image set".into(),
+            ));
+        }
+        // Resolve the server before taking fields out of `input` so a lookup
+        // failure leaves the key material inside the zeroizing input holder.
+        let server = resolve_server()?;
+        Ok(Self {
+            image_hash_hex: std::mem::take(&mut input.image_hash_hex),
+            image_key_hex: Zeroizing::new(std::mem::take(&mut input.image_key_hex)),
+            image_nonce_hex: std::mem::take(&mut input.image_nonce_hex),
+            media_type: input.media_type.take().unwrap_or_default(),
+            server,
+            transport,
+        })
+    }
+
     pub(crate) async fn run(self) -> Result<Vec<u8>, AppError> {
         fetch_group_image_with_transport(
             &self.image_hash_hex,
@@ -2059,7 +2098,8 @@ impl AppClient {
         media_type: &str,
     ) -> Result<AppPreparedGroupImageUpload, AppError> {
         let prepared = prepare_group_image_upload(plaintext, media_type)?;
-        let component_data = hex::decode(AppGroupImageComponent::new(prepared.input).data_hex)?;
+        let component = AppGroupImageComponent::new(prepared.input);
+        let component_data = hex::decode(&component.data_hex)?;
         let mut id_bytes = [0_u8; 16];
         OsRng.fill_bytes(&mut id_bytes);
         let upload_id = hex::encode(id_bytes);
@@ -2158,25 +2198,26 @@ impl AppClient {
                 prepared_group_image_status(&record.status()),
             ));
         }
-        let input =
-            AppGroupImageInput::from_component_bytes(&record.component_data).ok_or_else(|| {
+        let mut input = AppGroupImageInput::from_component_bytes(&record.component_data)
+            .ok_or_else(|| {
                 AppError::InvalidEncryptedMedia("prepared group image component is invalid".into())
             })?;
         let encrypted_blob = record.encrypted_blob.ok_or_else(|| {
             AppError::InvalidEncryptedMedia("prepared group image ciphertext is missing".into())
         })?;
-        let upload_secret = record.upload_secret.ok_or_else(|| {
+        let upload_secret = Zeroizing::new(record.upload_secret.ok_or_else(|| {
             AppError::InvalidEncryptedMedia("prepared group image upload key is missing".into())
-        })?;
+        })?);
+        let server = self
+            .app
+            .deployment()
+            .group_image_endpoint_for(server.as_deref())?;
         Ok(PreparedGroupImageUploadStart::Http(
             PreparedGroupImageUploadHttp {
                 encrypted_blob,
-                image_hash_hex: input.image_hash_hex,
-                upload_secret: Zeroizing::new(upload_secret),
-                server: self
-                    .app
-                    .deployment()
-                    .group_image_endpoint_for(server.as_deref())?,
+                image_hash_hex: std::mem::take(&mut input.image_hash_hex),
+                upload_secret,
+                server,
                 allow_loopback_http,
                 transport: self.blossom_http_transport.clone(),
             },
@@ -2714,7 +2755,8 @@ impl AppClient {
                                 step.finish(&upload);
                                 let upload = upload?;
                                 let input = AppGroupImageInput::from(upload);
-                                hex::decode(AppGroupImageComponent::new(input).data_hex)?
+                                let component = AppGroupImageComponent::new(input);
+                                hex::decode(&component.data_hex)?
                             }
                             InitialGroupImageSource::Prepared { component_data, .. } => {
                                 component_data
@@ -6534,7 +6576,8 @@ impl AppClient {
                 step.finish(&upload);
                 AppGroupImageInput::from(upload?)
             };
-            let data = hex::decode(AppGroupImageComponent::new(input).data_hex)?;
+            let component = AppGroupImageComponent::new(input);
+            let data = hex::decode(&component.data_hex)?;
             let effects = self
                 .runtime
                 .send_host_change_with_audit_context(
@@ -6569,20 +6612,12 @@ impl AppClient {
         self.ensure_group(group_id)?;
         self.sync_runtime_groups_for_send("prepare_group_image_download")
             .await?;
-        let input = self.image_for_group(group_id);
-        if !input.is_present() {
-            return Err(AppError::InvalidEncryptedMedia(
-                "group has no image set".into(),
-            ));
-        }
-        Ok(GroupImageDownloadHttp {
-            image_hash_hex: input.image_hash_hex,
-            image_key_hex: input.image_key_hex,
-            image_nonce_hex: input.image_nonce_hex,
-            media_type: input.media_type.unwrap_or_default(),
-            server: self.app.deployment().group_image_endpoint_for(None)?,
-            transport: self.blossom_http_transport.clone(),
-        })
+        let mut input = self.image_for_group(group_id);
+        GroupImageDownloadHttp::try_from_input(
+            &mut input,
+            || self.app.deployment().group_image_endpoint_for(None),
+            self.blossom_http_transport.clone(),
+        )
     }
 
     /// Send an app-defined event with an arbitrary non-reserved kind. `tags`
@@ -8630,6 +8665,63 @@ mod poll_send_validation_tests {
             AppError::InvalidAppMessagePayload(message)
                 if message == "poll is closed at the response event timestamp"
         ));
+    }
+}
+
+#[cfg(test)]
+mod group_image_download_http_tests {
+    use super::{
+        AppGroupImageInput, BlossomHttpTransport, GroupImageDownloadHttp,
+        PreparedGroupImageUploadHttp,
+    };
+    use crate::AppError;
+
+    #[test]
+    fn group_image_download_http_preserves_zeroizing_on_error_and_redacts_debug() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<GroupImageDownloadHttp>();
+        assert_zeroize_on_drop::<PreparedGroupImageUploadHttp>();
+
+        let hash_hex = "11".repeat(32);
+        let key_hex = "de".repeat(32);
+        let nonce_hex = "22".repeat(12);
+        let upload_key_hex = "ad".repeat(32);
+        let mut input = AppGroupImageInput {
+            image_hash_hex: hash_hex.clone(),
+            image_key_hex: key_hex.clone(),
+            image_nonce_hex: nonce_hex.clone(),
+            image_upload_key_hex: upload_key_hex,
+            media_type: Some("image/png".to_owned()),
+        };
+
+        let err = GroupImageDownloadHttp::try_from_input(
+            &mut input,
+            || Err(AppError::BlobStore("no group-image server".into())),
+            BlossomHttpTransport::new(false),
+        )
+        .expect_err("endpoint resolution failure must fail preparation");
+        assert!(matches!(err, AppError::BlobStore(_)));
+        assert_eq!(
+            input.image_key_hex, key_hex,
+            "endpoint failure must leave key material inside the zeroizing AppGroupImageInput"
+        );
+
+        let download = GroupImageDownloadHttp::try_from_input(
+            &mut input,
+            || Ok("https://blossom.example".to_owned()),
+            BlossomHttpTransport::new(false),
+        )
+        .expect("configured endpoint must produce download request");
+        assert!(input.image_key_hex.is_empty());
+        assert_eq!(download.image_key_hex.as_str(), key_hex);
+
+        let rendered = format!("{download:?}");
+        assert!(rendered.contains(&hash_hex));
+        assert!(rendered.contains("<redacted>"));
+        assert!(
+            !rendered.contains(&key_hex),
+            "GroupImageDownloadHttp Debug must not expose image_key_hex: {rendered}"
+        );
     }
 }
 

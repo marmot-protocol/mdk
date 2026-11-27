@@ -203,7 +203,7 @@ async fn create_solo_device_group(
     let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut phone = build_device_client(b"rollback-device-account", storage.clone(), clock);
     let mut roster = DeviceRosterV1 {
-        leaf_tag_key: [0x33; 32],
+        leaf_tag_key: [0x33; 32].into(),
         ..DeviceRosterV1::default()
     };
     roster.devices.insert(

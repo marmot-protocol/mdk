@@ -877,7 +877,6 @@ impl AppClient {
         let opened = self
             .runtime
             .open_with_recovery_key(&job.entropy, &head.context, &head.sealed_key)?
-            .map(Zeroizing::new)
             .ok_or_else(|| restore_error("backup_archive_key"))?;
         let key =
             ArchiveKey::from_opened(&opened).ok_or_else(|| restore_error("backup_archive_key"))?;

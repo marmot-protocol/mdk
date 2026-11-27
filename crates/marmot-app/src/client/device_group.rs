@@ -324,7 +324,7 @@ impl AppClient {
 
         let now = unix_now_seconds();
         let mut roster = DeviceRosterV1::default();
-        OsRng.fill_bytes(&mut roster.leaf_tag_key);
+        OsRng.fill_bytes(roster.leaf_tag_key.as_mut());
         // The founding roster lists only this device, its rejections and its
         // recovery key; the founding Add sets the new device's entry, as
         // every later Add does, so no entry ever names a device without its

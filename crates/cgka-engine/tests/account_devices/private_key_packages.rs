@@ -1361,7 +1361,7 @@ async fn a_hand_off_round_trips_and_takes_no_untagged_key_package() {
     // so none reads as the sender's.
     let alice = phone.engine.self_id();
     let roster = DeviceRosterV1 {
-        leaf_tag_key: [0x33; 32],
+        leaf_tag_key: [0x33; 32].into(),
         devices: [(OTHER_SLOT, DeviceEntryV1::default())].into(),
         ..DeviceRosterV1::default()
     };
