@@ -10838,27 +10838,16 @@ fn nip46_blocked_pairing_does_not_stall_other_accounts_and_cancels_on_disconnect
     );
     assert_eq!(alice_sent["published"], 1);
 
-    // Kill the pairing client mid-flight (simulating Ctrl-C), let the daemon observe socket EOF,
-    // then have a remote signer accept the abandoned offer URI and confirm the cancelled session
-    // never adopts that account.
+    // Kill the pairing client mid-flight (simulating Ctrl-C) and have a remote signer accept the
+    // abandoned offer URI. Keep that signer alive across Bob's full bunker login below so an
+    // uncancelled pairing session would have ample real relay round-trips to respond and adopt an
+    // account; at the end, verify the abandoned account was never adopted.
     let _ = stalled_child.kill();
     let _ = stalled_child.wait();
     drop(reader);
-    std::thread::sleep(Duration::from_millis(250));
+    let _ = run_json(home.path(), &["--socket", socket_arg, "daemon", "status"]);
     let abandoned_signer = MockNip46Signer::start(relay.url());
     abandoned_signer.accept_nostrconnect(&abandoned_offer);
-    std::thread::sleep(Duration::from_millis(500));
-    let accounts_after_cancel =
-        run_json(home.path(), &["--socket", socket_arg, "accounts", "list"]);
-    assert!(
-        !accounts_after_cancel["accounts"]
-            .as_array()
-            .expect("accounts array")
-            .iter()
-            .any(|row| row["account_id"] == abandoned_signer.user_pubkey_hex()),
-        "abandoned nostrconnect offer must not adopt an account after client disconnect: {accounts_after_cancel}"
-    );
-    drop(abandoned_signer);
 
     // Now block a `bunker://` login mid-adoption (holding Bob's onboarding transaction while
     // waiting on `sign_event`) and confirm Alice's hosted command still completes without stalling.
@@ -10931,6 +10920,18 @@ fn nip46_blocked_pairing_does_not_stall_other_accounts_and_cancels_on_disconnect
         signer.user_pubkey_hex()
     );
     assert_eq!(adoption_json["result"]["signing_mode"], "external");
+
+    let accounts_after_cancel =
+        run_json(home.path(), &["--socket", socket_arg, "accounts", "list"]);
+    assert!(
+        !accounts_after_cancel["accounts"]
+            .as_array()
+            .expect("accounts array")
+            .iter()
+            .any(|row| row["account_id"] == abandoned_signer.user_pubkey_hex()),
+        "abandoned nostrconnect offer must not adopt an account after client disconnect: {accounts_after_cancel}"
+    );
+    drop(abandoned_signer);
 
     stop_daemon_cleanly(&socket);
 }
