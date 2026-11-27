@@ -953,10 +953,22 @@ pub fn open_existing_regular_nofollow(
 /// Create `path` and any missing ancestors as 0700 directories without
 /// traversing untrusted symlinks; tighten the leaf to 0700 if it already
 /// existed.
+///
+/// A path naming only the current directory (such as `.`) succeeds without
+/// altering its permissions so callers writing bare or `./`-rooted files can
+/// prepare their parent directory safely.
 pub fn create_dir_all_private(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        prepare_directory_path(path, PRIVATE_DIR_MODE, ExistingDirectoryMode::Enforce).map(|_| ())
+        let mut components = path.components().peekable();
+        let policy = if components.peek().is_some()
+            && components.all(|component| matches!(component, std::path::Component::CurDir))
+        {
+            ExistingDirectoryMode::Preserve
+        } else {
+            ExistingDirectoryMode::Enforce
+        };
+        prepare_directory_path(path, PRIVATE_DIR_MODE, policy).map(|_| ())
     }
     #[cfg(not(unix))]
     {
@@ -1969,6 +1981,25 @@ mod unix_tests {
         let error = create_dir_all_private(&fifo).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotADirectory, "{error}");
         assert_eq!(mode_of(&fifo), 0o644);
+    }
+
+    #[test]
+    fn create_dir_all_private_allows_current_directory_without_changing_mode() {
+        let before_mode = mode_of(Path::new("."));
+        for path in [Path::new("."), Path::new("./"), Path::new("./.")] {
+            create_dir_all_private(path).expect("current directory should be allowed");
+            assert_eq!(
+                mode_of(Path::new(".")),
+                before_mode,
+                "current directory mode must be preserved for {path:?}"
+            );
+        }
+
+        for invalid in [Path::new("/"), Path::new(""), Path::new("./..")] {
+            let error = create_dir_all_private(invalid)
+                .expect_err("root, empty, and parent traversal paths must stay rejected");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{invalid:?}");
+        }
     }
 
     #[test]

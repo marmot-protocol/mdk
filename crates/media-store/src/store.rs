@@ -210,12 +210,21 @@ impl<C: MediaCatalog> Inner<C> {
         cache.entries.retain(|cached| cached.id != *id);
     }
 
+    /// Marks `id` lost in the catalog while invalidating the reader cache both
+    /// before and after the catalog update commits, so an in-flight read that
+    /// observed the still-ready row before commit cannot cache a lost reader.
+    fn mark_lost(&self, id: &FileId) -> CatalogResult<bool> {
+        self.forget_reader(id);
+        let result = self.catalog.mark_lost(*id);
+        self.forget_reader(id);
+        result
+    }
+
     /// A ready file failed verification: it can never be read, so mark its
     /// row lost (zeroing the key) and drop its cached reader, so reuse stops
     /// attaching it. I/O and cipher errors are not this: they may pass.
     fn lose(&self, id: &FileId) {
-        self.forget_reader(id);
-        let _ = self.catalog.mark_lost(*id);
+        let _ = self.mark_lost(id);
     }
 
     /// Marks `id` lost when `result` is a verification failure.
@@ -438,6 +447,28 @@ impl<C: MediaCatalog> MediaStore<C> {
         }
     }
 
+    /// Runs a catalog commit that checks twin file presence and re-invalidates
+    /// any twin marked absent once the transaction returns, closing the window
+    /// between the pre-commit `present` check and the committed `Lost` state.
+    fn with_present_check<T>(
+        &self,
+        operation: impl FnOnce(&dyn Fn(FileId, u64) -> CatalogResult<FilePresence>) -> MediaResult<T>,
+    ) -> MediaResult<T> {
+        let absent = std::cell::RefCell::new(Vec::new());
+        let check = |id: FileId, byte_len: u64| -> CatalogResult<FilePresence> {
+            let presence = self.present(id, byte_len)?;
+            if presence == FilePresence::Absent {
+                absent.borrow_mut().push(id);
+            }
+            Ok(presence)
+        };
+        let result = operation(&check);
+        for id in absent.into_inner() {
+            self.forget_reader(&id);
+        }
+        result
+    }
+
     pub fn file_state(&self, id: &FileId) -> MediaResult<Option<FileState>> {
         self.inner.ensure_open()?;
         Ok(self.inner.catalog.file_state(*id)?)
@@ -465,11 +496,9 @@ impl<C: MediaCatalog> MediaStore<C> {
             .write_body(&id, &key, body, byte_len, &digest, cancelled)
             .and_then(|()| {
                 self.inner.ensure_open()?;
-                Ok(
-                    target.commit_ready(id, category, &digest, &|twin, byte_len| {
-                        self.present(twin, byte_len)
-                    })?,
-                )
+                self.with_present_check(|check| {
+                    Ok(target.commit_ready(id, category, &digest, check)?)
+                })
             });
         match result {
             Ok(ReadyOutcome::Ready) => Ok(PublishOutcome::Published(id)),
@@ -502,15 +531,13 @@ impl<C: MediaCatalog> MediaStore<C> {
         if target.superseded()? {
             return Ok(Some(PublishOutcome::Superseded));
         }
-        Ok(
-            match target
-                .commit_existing(category, digest, &|id, byte_len| self.present(id, byte_len))?
-            {
-                ExistingOutcome::Attached(id) => Some(PublishOutcome::Existing(id)),
-                ExistingOutcome::Superseded => Some(PublishOutcome::Superseded),
-                ExistingOutcome::None => None,
-            },
-        )
+        let outcome =
+            self.with_present_check(|check| Ok(target.commit_existing(category, digest, check)?))?;
+        Ok(match outcome {
+            ExistingOutcome::Attached(id) => Some(PublishOutcome::Existing(id)),
+            ExistingOutcome::Superseded => Some(PublishOutcome::Superseded),
+            ExistingOutcome::None => None,
+        })
     }
 
     /// Stages an outgoing body: the intent row, then the sealed and synced
@@ -568,7 +595,8 @@ impl<C: MediaCatalog> MediaStore<C> {
             self.inner.lose(&id);
             return Ok(PromoteOutcome::Superseded);
         }
-        match target.commit_promoted(id, &|twin, byte_len| self.present(twin, byte_len))? {
+        let outcome = self.with_present_check(|check| Ok(target.commit_promoted(id, check)?))?;
+        match outcome {
             PromotedOutcome::Ready => Ok(PromoteOutcome::Ready),
             PromotedOutcome::Existing(twin) => {
                 // The target deleted the staged row; only its file remains.
@@ -616,8 +644,7 @@ impl<C: MediaCatalog> MediaStore<C> {
         ) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.forget_reader(id);
-                self.inner.catalog.mark_lost(*id)?;
+                self.inner.mark_lost(id)?;
                 self.inner.ensure_open()?;
                 return Ok(None);
             }
@@ -810,8 +837,7 @@ impl<C: MediaCatalog> MediaStore<C> {
         ) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.forget_reader(id);
-                self.inner.catalog.mark_lost(*id)?;
+                self.inner.mark_lost(id)?;
                 self.inner.ensure_open()?;
                 return Ok(None);
             }
@@ -1061,15 +1087,24 @@ impl<C: MediaCatalog> MediaStore<C> {
     }
 
     /// Opens a checkpoint's wire file at its recorded length. Bytes past
-    /// `received` were never recorded and are dropped. `None` means the file
-    /// is missing or shorter than recorded: the checkpoint cannot resume.
+    /// `received` were never recorded and are dropped. `None` means the entry
+    /// is missing, not a regular file (symlink, directory, FIFO, etc.), or
+    /// shorter than recorded: the checkpoint cannot resume and callers clear
+    /// its row without opening a non-regular entry.
     fn open_wire(&self, id: &FileId, received: u64) -> MediaResult<Option<WireFile<C>>> {
+        let path = self.wire_path(id);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_error(&error)),
+        }
         let file = match fs_private::open_existing_regular_nofollow(
-            &self.wire_path(id),
+            &path,
             OpenOptions::new().read(true).write(true),
         ) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if is_unusable_wire_entry_error(&path, &error) => return Ok(None),
             Err(error) => return Err(io_error(&error)),
         };
         let on_disk = file.metadata().map_err(|e| io_error(&e))?.len();
@@ -1227,8 +1262,7 @@ impl<C: MediaCatalog> MediaStore<C> {
             Ok(metadata) if metadata.is_file() && is_valid_file_len(metadata.len()) => Ok(()),
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(io_error(&error)),
             Ok(_) | Err(_) => {
-                self.forget_reader(id);
-                if self.inner.catalog.mark_lost(*id)? {
+                if self.inner.mark_lost(id)? {
                     report.lost_marked += 1;
                 }
                 Ok(())
@@ -1365,13 +1399,38 @@ impl<C> Drop for WireFile<C> {
     }
 }
 
-/// Cuts a wire file longer than `received` back to it. A missing or shorter
-/// file is left for the next open to discard.
+/// Whether `error` from `open_existing_regular_nofollow` on a wire checkpoint
+/// indicates the entry is missing or permanently not a regular file (symlink,
+/// directory, FIFO, socket, or device) rather than a transient I/O error on a
+/// real wire file.
+fn is_unusable_wire_entry_error(path: &Path, error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::InvalidInput | io::ErrorKind::IsADirectory
+    ) {
+        return true;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => !metadata.file_type().is_file(),
+        Err(meta_error) => meta_error.kind() == io::ErrorKind::NotFound,
+    }
+}
+
+/// Cuts a wire file longer than `received` back to it. A missing, non-regular,
+/// or shorter entry is left untouched for the next open to discard, without
+/// opening it or blocking the sweep.
 fn trim_wire(path: &Path, received: u64) -> io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => return Ok(false),
+        Ok(metadata) if metadata.len() <= received => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
     let file =
         match fs_private::open_existing_regular_nofollow(path, OpenOptions::new().write(true)) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if is_unusable_wire_entry_error(path, &error) => return Ok(false),
             Err(error) => return Err(error),
         };
     if file.metadata()?.len() <= received {

@@ -938,27 +938,30 @@ fn reopen_paths_refuse_symlinks_without_modifying_victim() {
         Err(MediaError::Io(_))
     ));
 
-    // 3. open_wire (restore, reader, append) and trim_wire (sweep) refuse a
-    // symlinked wire file and never truncate the victim.
+    // 3. open_wire (append, restore, reader) and trim_wire (sweep) refuse a
+    // symlinked wire file without opening or truncating the victim, and
+    // restore/reader clear the invalid checkpoint row.
     let target = harness.catalog.checkpoint(0);
     assert!(store.checkpoint_append(&target, 0, b"head").unwrap());
     let (wire_id, _) = target.current().unwrap().unwrap();
     std::fs::remove_file(store.wire_path(&wire_id)).unwrap();
     symlink(&victim, store.wire_path(&wire_id)).unwrap();
 
-    assert!(matches!(
-        store.checkpoint_restore(&target, &mut Vec::new()),
-        Err(MediaError::Io(_))
-    ));
-    assert!(matches!(
-        store.checkpoint_reader(&target),
-        Err(MediaError::Io(_))
-    ));
-    assert!(matches!(
-        store.checkpoint_append(&target, 4, b"tail"),
-        Err(MediaError::Io(_))
-    ));
-    assert!(trim_wire(&store.wire_path(&wire_id), 4).is_err());
+    assert!(!store.checkpoint_append(&target, 4, b"tail").unwrap());
+    assert!(!trim_wire(&store.wire_path(&wire_id), 4).unwrap());
+    assert_eq!(
+        store.checkpoint_restore(&target, &mut Vec::new()).unwrap(),
+        None
+    );
+    assert_eq!(target.current().unwrap(), None);
+
+    assert!(store.checkpoint_append(&target, 0, b"head").unwrap());
+    let (wire_id2, _) = target.current().unwrap().unwrap();
+    std::fs::remove_file(store.wire_path(&wire_id2)).unwrap();
+    symlink(&victim, store.wire_path(&wire_id2)).unwrap();
+    assert!(store.checkpoint_reader(&target).unwrap().is_none());
+    assert_eq!(target.current().unwrap(), None);
+
     assert_eq!(
         std::fs::read(&victim).unwrap(),
         victim_bytes,
@@ -1058,4 +1061,267 @@ fn sweep_rows_marks_non_regular_and_truncated_files_lost() {
         "sweeping a bad ready file must evict its cached reader"
     );
     assert_eq!(std::fs::read(&victim).unwrap(), vec![0x55; 128]);
+}
+
+#[test]
+fn read_at_does_not_cache_lost_reader_from_mark_lost_window() {
+    #[derive(Clone)]
+    struct MarkLostHookCatalog {
+        inner: MemoryCatalog,
+        on_ready_file: Arc<Mutex<Option<Hook>>>,
+        on_mark_lost: Arc<Mutex<Option<Hook>>>,
+    }
+
+    impl MediaCatalog for MarkLostHookCatalog {
+        fn is_closed(&self) -> bool {
+            self.inner.is_closed()
+        }
+        fn insert_pending(&self, file: &NewFile) -> CatalogResult<()> {
+            self.inner.insert_pending(file)
+        }
+        fn abandon_pending(&self, id: FileId) -> CatalogResult<bool> {
+            self.inner.abandon_pending(id)
+        }
+        fn ready_file(&self, id: FileId) -> CatalogResult<Option<crate::catalog::ReadyFile>> {
+            let row = self.inner.ready_file(id)?;
+            if let Some(hook) = self.on_ready_file.lock().unwrap().take() {
+                hook();
+            }
+            Ok(row)
+        }
+        fn file_state(&self, id: FileId) -> CatalogResult<Option<FileState>> {
+            self.inner.file_state(id)
+        }
+        fn mark_lost(&self, id: FileId) -> CatalogResult<bool> {
+            if let Some(hook) = self.on_mark_lost.lock().unwrap().take() {
+                hook();
+            }
+            self.inner.mark_lost(id)
+        }
+        fn page(
+            &self,
+            after: Option<FileId>,
+            limit: usize,
+        ) -> CatalogResult<Vec<(FileId, FileState)>> {
+            self.inner.page(after, limit)
+        }
+        fn wire_partial_received(&self, id: FileId) -> CatalogResult<Option<u64>> {
+            self.inner.wire_partial_received(id)
+        }
+        fn staged_file(&self, id: FileId) -> CatalogResult<Option<crate::catalog::ReadyFile>> {
+            self.inner.staged_file(id)
+        }
+        fn abandon_unowned_staged(&self, id: FileId) -> CatalogResult<bool> {
+            self.inner.abandon_unowned_staged(id)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let inner = MemoryCatalog::default();
+    let on_ready_file = Arc::new(Mutex::new(None));
+    let on_mark_lost = Arc::new(Mutex::new(None));
+    let catalog = MarkLostHookCatalog {
+        inner: inner.clone(),
+        on_ready_file: Arc::clone(&on_ready_file),
+        on_mark_lost: Arc::clone(&on_mark_lost),
+    };
+    let store = MediaStore::new(dir.path().join(MEDIA_DIRECTORY), catalog);
+
+    let publish_one = |slot: u32, body: &[u8]| -> FileId {
+        let PublishOutcome::Published(id) = store
+            .publish(
+                &inner.target(slot),
+                Category::Retained,
+                &mut Cursor::new(body),
+                body.len() as u64,
+                digest(body),
+                NOW,
+                &|| false,
+            )
+            .unwrap()
+        else {
+            panic!("expected published file");
+        };
+        id
+    };
+
+    // Case A: a read starts and finishes after pre-commit forget_reader but
+    // before mark_lost commits; post-commit invalidation must evict it.
+    let id_a = publish_one(0, b"lost-race-body-a");
+    let store_a = store.clone();
+    *on_mark_lost.lock().unwrap() = Some(Box::new(move || {
+        let mut buf = [0u8; 16];
+        assert_eq!(store_a.read_at(&id_a, 0, &mut buf).unwrap(), Some(16));
+    }));
+    store.inner.lose(&id_a);
+    assert_eq!(store.file_state(&id_a).unwrap(), Some(FileState::Lost));
+    assert_eq!(
+        store.read_at(&id_a, 0, &mut [0u8; 16]).unwrap(),
+        None,
+        "reader cached before mark_lost commit must be evicted once loss commits"
+    );
+
+    // Case B: a read starts after pre-commit forget_reader, loads the still-ready
+    // row before mark_lost commits, and attempts to cache the reader after
+    // mark_lost commits; post-commit generation bump must block re-insertion.
+    let id_b = publish_one(1, b"lost-race-body-b");
+    let (loaded_tx, loaded_rx) = std::sync::mpsc::channel::<()>();
+    let (commit_done_tx, commit_done_rx) = std::sync::mpsc::channel::<()>();
+    *on_ready_file.lock().unwrap() = Some(Box::new(move || {
+        loaded_tx.send(()).unwrap();
+        commit_done_rx.recv().unwrap();
+    }));
+    let store_b = store.clone();
+    let reader_thread = Arc::new(Mutex::new(None));
+    let reader_thread_for_hook = Arc::clone(&reader_thread);
+    *on_mark_lost.lock().unwrap() = Some(Box::new(move || {
+        let store_for_reader = store_b.clone();
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 16];
+            store_for_reader.read_at(&id_b, 0, &mut buf)
+        });
+        loaded_rx.recv().unwrap();
+        *reader_thread_for_hook.lock().unwrap() = Some(handle);
+    }));
+    store.inner.lose(&id_b);
+    commit_done_tx.send(()).unwrap();
+    let first_read = reader_thread
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(first_read.unwrap(), Some(16));
+    assert_eq!(store.file_state(&id_b).unwrap(), Some(FileState::Lost));
+    assert_eq!(
+        store.read_at(&id_b, 0, &mut [0u8; 16]).unwrap(),
+        None,
+        "in-flight read spanning mark_lost commit must not cache a lost reader"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rejected_wire_checkpoint_clears_row_and_sweep_continues_past_it() {
+    use std::os::unix::fs::symlink;
+
+    let (harness, store) = fixture();
+    let victim = harness.dir.path().join("victim.bin");
+    let victim_bytes = vec![0xcd; 4096];
+    std::fs::write(&victim, &victim_bytes).unwrap();
+
+    // 1. A symlinked wire checkpoint is cleared on checkpoint_restore so a
+    //    subsequent transfer starts cleanly without opening or modifying victim.
+    let target0 = harness.catalog.checkpoint(0);
+    assert!(store.checkpoint_append(&target0, 0, b"head").unwrap());
+    let (link_wire_id, _) = target0.current().unwrap().unwrap();
+    std::fs::remove_file(store.wire_path(&link_wire_id)).unwrap();
+    symlink(&victim, store.wire_path(&link_wire_id)).unwrap();
+
+    // Before clearing, sweep must skip the bad wire entry without failing or
+    // touching victim, and still trim a healthy wire tail and unlink orphans
+    // in the same shard and later shards.
+    let target_healthy = harness.catalog.checkpoint(1);
+    assert!(
+        store
+            .checkpoint_append(&target_healthy, 0, b"good")
+            .unwrap()
+    );
+    let (healthy_wire_id, _) = target_healthy.current().unwrap().unwrap();
+    std::fs::write(store.wire_path(&healthy_wire_id), b"good-unrecorded-tail").unwrap();
+
+    let same_shard_orphan = FileId([
+        link_wire_id.0[0],
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xfe,
+    ]);
+    let later_shard_orphan = FileId([
+        link_wire_id.0[0].wrapping_add(1),
+        0xee,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+    ]);
+    fs_private::create_dir_all_private(&store.shard_dir(same_shard_orphan.0[0])).unwrap();
+    fs_private::create_dir_all_private(&store.shard_dir(later_shard_orphan.0[0])).unwrap();
+    std::fs::write(store.path(&same_shard_orphan), b"orphan-1").unwrap();
+    std::fs::write(store.path(&later_shard_orphan), b"orphan-2").unwrap();
+
+    let mut total_orphans = 0;
+    let mut total_trimmed = 0;
+    loop {
+        let batch = store.sweep(64).unwrap();
+        total_orphans += batch.orphans_unlinked;
+        total_trimmed += batch.wire_tails_trimmed;
+        if batch.complete {
+            break;
+        }
+    }
+    assert_eq!(total_orphans, 2, "sweep must still unlink later orphans");
+    assert_eq!(
+        total_trimmed, 1,
+        "sweep must still trim healthy wire files after skipping bad ones"
+    );
+    assert_eq!(std::fs::read(&victim).unwrap(), victim_bytes);
+    assert_eq!(
+        std::fs::read(store.wire_path(&healthy_wire_id)).unwrap(),
+        b"good"
+    );
+
+    // Now checkpoint_restore must clear the invalid symlink checkpoint row and
+    // return Ok(None) so recovery can start fresh from offset 0.
+    let mut out = Vec::new();
+    assert_eq!(store.checkpoint_restore(&target0, &mut out).unwrap(), None);
+    assert!(out.is_empty());
+    assert_eq!(target0.current().unwrap(), None);
+    assert!(
+        std::fs::symlink_metadata(store.wire_path(&link_wire_id)).is_err(),
+        "symlink wire entry itself is unlinked on clear"
+    );
+    assert_eq!(std::fs::read(&victim).unwrap(), victim_bytes);
+    assert!(store.checkpoint_append(&target0, 0, b"recovered").unwrap());
+    assert_eq!(restored(&store, &target0).unwrap(), b"recovered".to_vec());
+
+    // 2. A directory planted at a wire path is skipped by trim_wire and cleared
+    //    by checkpoint_reader without opening it or failing recovery.
+    let target2 = harness.catalog.checkpoint(2);
+    assert!(store.checkpoint_append(&target2, 0, b"dir!").unwrap());
+    let (dir_wire_id, _) = target2.current().unwrap().unwrap();
+    let dir_wire_path = store.wire_path(&dir_wire_id);
+    std::fs::remove_file(&dir_wire_path).unwrap();
+    std::fs::create_dir(&dir_wire_path).unwrap();
+
+    assert!(!trim_wire(&dir_wire_path, 4).unwrap());
+    assert!(store.checkpoint_reader(&target2).unwrap().is_none());
+    assert_eq!(target2.current().unwrap(), None);
+    // The directory could not be unlinked by remove_file, so sweep_owed records it
+    // while recovery can already start a fresh checkpoint cleanly.
+    assert!(store.take_sweep_owed());
+    assert!(store.checkpoint_append(&target2, 0, b"fresh").unwrap());
+    assert_eq!(restored(&store, &target2).unwrap(), b"fresh".to_vec());
 }

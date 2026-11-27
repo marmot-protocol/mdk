@@ -129,16 +129,25 @@ fn read_linked_secret(path: &Path, mut after_open: impl FnMut()) -> io::Result<Z
             }
         }
         after_open();
-        let mut bytes = Zeroizing::new(Vec::new());
-        Read::by_ref(&mut file)
-            .take(MAX_SECRET_FILE_BYTES.saturating_add(1))
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_SECRET_FILE_BYTES {
+        let limit =
+            usize::try_from(MAX_SECRET_FILE_BYTES).expect("MAX_SECRET_FILE_BYTES fits in usize");
+        let mut bytes = Zeroizing::new(vec![0u8; limit + 1]);
+        let mut len = 0usize;
+        while len < bytes.len() {
+            match file.read(&mut bytes[len..]) {
+                Ok(0) => break,
+                Ok(read) => len += read,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        if len > limit {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "secret file exceeds size limit",
             ));
         }
+        bytes.truncate(len);
         if still_linked(&file, path)? {
             return Ok(bytes);
         }
@@ -854,6 +863,32 @@ mod tests {
         let bytes = fs::read(&path).unwrap();
         assert_eq!(bytes.len(), len);
         assert!(bytes.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn read_linked_secret_preallocates_bounded_buffer_without_reallocating() {
+        let root = tempfile::tempdir().unwrap();
+        let expected_capacity = usize::try_from(MAX_SECRET_FILE_BYTES).unwrap() + 1;
+
+        let small = root.path().join("small.json");
+        write_secret_json(&small, &serde_json::json!({ "secret": "short" })).unwrap();
+        let small_bytes = read_linked_secret(&small, || {}).unwrap();
+        assert_eq!(
+            small_bytes.capacity(),
+            expected_capacity,
+            "small secret reads must preallocate full bounded capacity without growing"
+        );
+
+        let exact_limit = root.path().join("exact-limit.json");
+        let payload = vec![b'x'; usize::try_from(MAX_SECRET_FILE_BYTES).unwrap()];
+        fs_private::write_private(&exact_limit, &payload).unwrap();
+        let limit_bytes = read_linked_secret(&exact_limit, || {}).unwrap();
+        assert_eq!(limit_bytes.as_slice(), payload.as_slice());
+        assert_eq!(
+            limit_bytes.capacity(),
+            expected_capacity,
+            "exact-limit secret reads must not reallocate past the bounded buffer"
+        );
     }
 }
 

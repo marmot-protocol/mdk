@@ -1450,11 +1450,11 @@ impl AccountHome {
     /// invariant is that once the MLS-DB wipe starts it must complete, because a
     /// half-wiped MLS database is worse than either extreme. The rename is that
     /// commit point. If the rename itself fails, the account directory remains
-    /// intact, but its NIP-46 session may already be removed. If deleting the
-    /// secret or the tombstone fails *after* the rename, the live account is
-    /// already gone; the residual tombstone bytes are orphaned junk outside any
-    /// live account, so the call still reports success rather than a forbidden
-    /// partial-live state.
+    /// intact, but its NIP-46 session may already be removed. After the rename
+    /// commits, tombstoned local secret files are always scrubbed and tombstone
+    /// deletion is attempted best-effort (orphan bytes outside `accounts/` do
+    /// not fail removal), while any independent secret-store deletion error is
+    /// propagated after local cleanup finishes.
     pub fn remove_account(&self, account_ref: &str) -> AccountHomeResult<()> {
         self.remove_account_inner(account_ref, None, false)
     }
@@ -1512,8 +1512,11 @@ impl AccountHome {
 
         // Resolve fallible shared-credential policy before the rename commit
         // point while holding `mutation_lock`, so a lookup failure leaves the
-        // account live and untouched rather than stranding a tombstone.
-        let remove_signing_secret = if !account.local_signing || preserve_account_id_credential {
+        // account live and untouched rather than stranding a tombstone. Check
+        // even for non-signing records so removing a public record after a
+        // reinstall still deletes a surviving same-ID vault credential unless
+        // another signing record depends on it.
+        let remove_signing_secret = if preserve_account_id_credential {
             false
         } else {
             !self.secret_shared_with_other_record(&account)?

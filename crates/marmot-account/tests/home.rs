@@ -2560,3 +2560,62 @@ fn remove_account_post_commit_secret_removal_failure_still_scrubs_and_deletes_to
         assert!(ext_bytes.iter().all(|b| *b == 0));
     }
 }
+
+#[test]
+fn remove_public_account_scrubs_orphaned_same_id_credential_unless_signing_twin_exists() {
+    // Reinstall scenario: a signing credential for `keys` survived in an
+    // account-id-keyed vault, and the fresh home only adds a public record for
+    // the same account ID. Explicit removal must still delete the orphaned
+    // credential when no signing twin exists.
+    let store = Arc::new(MemorySecretStore::default());
+    store.account_id_keyed.store(true, Ordering::SeqCst);
+
+    let first_dir = tempfile::tempdir().unwrap();
+    let first_home = AccountHome::open_with_secret_store(first_dir.path(), store.clone());
+    let created = first_home.create_account("before-reinstall").unwrap();
+    assert!(
+        store
+            .has_secret_for_account_id(&created.account_id_hex)
+            .unwrap()
+    );
+
+    let reinstall_dir = tempfile::tempdir().unwrap();
+    let reinstall_home = AccountHome::open_with_secret_store(reinstall_dir.path(), store.clone());
+    let public_record = reinstall_home
+        .add_public_account(&created.account_id_hex)
+        .unwrap();
+    assert!(!public_record.local_signing);
+
+    reinstall_home.remove_account(&public_record.label).unwrap();
+    assert!(
+        !store
+            .has_secret_for_account_id(&created.account_id_hex)
+            .unwrap(),
+        "removing a public record with no signing twin must delete a surviving same-ID credential"
+    );
+
+    // Twin-preservation check: if a signing twin DOES still exist in the same
+    // home, removing the public record must preserve the shared credential.
+    let twin_dir = tempfile::tempdir().unwrap();
+    let twin_home = AccountHome::open_with_secret_store(twin_dir.path(), store.clone());
+    let signing_twin = twin_home.create_account("signing-twin").unwrap();
+    let public_twin = twin_home
+        .add_public_account(&signing_twin.account_id_hex)
+        .unwrap();
+
+    twin_home.remove_account(&public_twin.label).unwrap();
+    assert!(
+        store
+            .has_secret_for_account_id(&signing_twin.account_id_hex)
+            .unwrap(),
+        "removing a public record must preserve the credential when a signing twin still exists"
+    );
+    assert_eq!(
+        twin_home
+            .load_signing_keys(&signing_twin.label)
+            .unwrap()
+            .public_key()
+            .to_hex(),
+        signing_twin.account_id_hex
+    );
+}
