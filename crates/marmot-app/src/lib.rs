@@ -3723,13 +3723,32 @@ impl MarmotApp {
     /// a same-second older version delivered late by quorum completion could
     /// otherwise replace a newer save. The floor is persisted before signing,
     /// so it survives a restart even when the publication then fails.
+    /// Return the current cached or persisted replaceable-record timestamp
+    /// floor for `(pubkey, kind)` without mutating it.
+    pub(crate) fn replaceable_identity_floor(
+        &self,
+        account_ref: &str,
+        pubkey: &str,
+        kind: u64,
+    ) -> Result<u64, AppError> {
+        let latest = self
+            .replaceable_identity_created_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (pubkey.to_owned(), kind);
+        self.read_replaceable_identity_floor_locked(&latest, account_ref, &key)
+    }
+
     pub(crate) async fn sign_replaceable_identity_event(
         &self,
         account_ref: &str,
         signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
         event: &NostrTransportEvent,
     ) -> Result<NostrTransportEvent, AppError> {
-        let created_at = self.reserve_replaceable_identity_created_at(account_ref, event)?;
+        let created_at =
+            self.reserve_replaceable_identity_created_at_bounded(account_ref, event, None, |_| {
+                unreachable!("unbounded reservation cannot exceed a bound")
+            })?;
         let event = NostrTransportEvent::new_unsigned_at(
             event.pubkey.clone(),
             event.kind,
@@ -3740,10 +3759,57 @@ impl MarmotApp {
         sign_account_publication_event(signer, &event).await
     }
 
-    fn reserve_replaceable_identity_created_at(
+    /// Sign a replaceable identity event only if the effective timestamp
+    /// (`max(event.created_at, floor + 1)`) does not exceed `max_created_at`.
+    /// When exceeded, refuses without advancing the persisted floor or calling
+    /// the signer.
+    pub(crate) async fn sign_replaceable_identity_event_bounded(
+        &self,
+        account_ref: &str,
+        signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+        event: &NostrTransportEvent,
+        max_created_at: u64,
+        on_exceeded: impl FnOnce(u64) -> AppError,
+    ) -> Result<NostrTransportEvent, AppError> {
+        let created_at = self.reserve_replaceable_identity_created_at_bounded(
+            account_ref,
+            event,
+            Some(max_created_at),
+            on_exceeded,
+        )?;
+        let event = NostrTransportEvent::new_unsigned_at(
+            event.pubkey.clone(),
+            event.kind,
+            event.tags.clone(),
+            event.content.clone(),
+            created_at,
+        );
+        sign_account_publication_event(signer, &event).await
+    }
+
+    fn read_replaceable_identity_floor_locked(
+        &self,
+        latest: &std::collections::HashMap<(String, u64), u64>,
+        account_ref: &str,
+        key: &(String, u64),
+    ) -> Result<u64, AppError> {
+        match latest.get(key) {
+            Some(floor) => Ok(*floor),
+            None => Ok(self
+                .account_home()
+                .replaceable_record_floors(account_ref)?
+                .get(&key.1)
+                .copied()
+                .unwrap_or(0)),
+        }
+    }
+
+    fn reserve_replaceable_identity_created_at_bounded(
         &self,
         account_ref: &str,
         event: &NostrTransportEvent,
+        max_created_at: Option<u64>,
+        on_exceeded: impl FnOnce(u64) -> AppError,
     ) -> Result<u64, AppError> {
         let kind = event.kind;
         let mut latest = self
@@ -3751,16 +3817,11 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = (event.pubkey.clone(), kind);
-        let floor = match latest.get(&key) {
-            Some(floor) => *floor,
-            None => self
-                .account_home()
-                .replaceable_record_floors(account_ref)?
-                .get(&kind)
-                .copied()
-                .unwrap_or(0),
-        };
+        let floor = self.read_replaceable_identity_floor_locked(&latest, account_ref, &key)?;
         let created_at = event.created_at.max(floor.saturating_add(1));
+        if max_created_at.is_some_and(|max| created_at > max) {
+            return Err(on_exceeded(created_at));
+        }
         self.account_home()
             .advance_replaceable_record_floor(account_ref, kind, created_at)?;
         latest.insert(key, created_at);

@@ -655,98 +655,170 @@ async fn a_new_pointer_postdates_the_one_it_replaces() {
     );
 }
 
-/// Condemnation and deletion only target configured backup Blossom servers and
-/// never sign BUD-01 DELETE for non-allowlisted servers or unauthenticated
-/// index entries.
+/// A far-future cached or persisted replaceable-record floor must refuse a
+/// backup pass under rotated recovery words (where discovery returns no
+/// pointer) without uploading blobs, invoking the signer, publishing, or
+/// advancing the floor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_condemned_refuses_unconfigured_servers_and_unauthenticated_indexes() {
+async fn far_future_floor_blocks_rotated_recovery_key_without_upload_sign_or_advance() {
+    use crate::backup_archive::backup_address;
+    use nostr_sdk::prelude::{Event, PublicKey, UnsignedEvent};
+    use transport_nostr_peeler::{
+        MarmotNostrSigner, MarmotSignerError, NostrTransportEvent, SignerFuture,
+    };
+
+    #[derive(Debug)]
+    struct PanicSigner;
+    impl MarmotNostrSigner for PanicSigner {
+        fn get_public_key(&self) -> SignerFuture<'_, Result<PublicKey, MarmotSignerError>> {
+            panic!("signer must not be invoked when floor exceeds future skew bound");
+        }
+        fn sign_event(
+            &self,
+            _unsigned: UnsignedEvent,
+        ) -> SignerFuture<'_, Result<Event, MarmotSignerError>> {
+            panic!("signer must not be invoked when floor exceeds future skew bound");
+        }
+        fn nip04_encrypt<'a>(
+            &'a self,
+            _public_key: &'a PublicKey,
+            _content: &'a str,
+        ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
+            panic!("unexpected nip04_encrypt");
+        }
+        fn nip04_decrypt<'a>(
+            &'a self,
+            _public_key: &'a PublicKey,
+            _payload: &'a str,
+        ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
+            panic!("unexpected nip04_decrypt");
+        }
+        fn nip44_encrypt<'a>(
+            &'a self,
+            _public_key: &'a PublicKey,
+            _content: &'a str,
+        ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
+            panic!("unexpected nip44_encrypt");
+        }
+        fn nip44_decrypt<'a>(
+            &'a self,
+            _public_key: &'a PublicKey,
+            _payload: &'a str,
+        ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
+            panic!("unexpected nip44_decrypt");
+        }
+    }
+
+    let blossom = local_blossom();
+    let (devices, _chat, old_words) = lone_writer(&blossom).await;
+    let (mut phone, relay) = (devices.phone, devices.relay);
+    let far_ahead = unix_now_seconds() + DAY;
+    // Simulate a previously authored far-future pointer, populating both the
+    // in-memory cache and persisted `replaceable_record_floors`.
+    publish_pointer_at(&phone, &relay, &old_words.public, Vec::new(), far_ahead).await;
+
+    // Rotate recovery words so relay discovery at the new address is empty.
+    let rotated = confirm_words(&mut phone).await;
+    assert!(pointer_event(&relay, &rotated.public).is_none());
+
+    let published_before = pointers_published(&relay);
+    let blobs_before = held(&blossom);
+    let floor_before = devices
+        .phone_app
+        .account_home()
+        .replaceable_record_floors("alice")
+        .unwrap()
+        .get(&KIND_BACKUP_POINTER)
+        .copied()
+        .unwrap_or(0);
+    assert!(floor_before >= far_ahead);
+
+    due_now(&phone);
+    assert_eq!(
+        phone.drive_backup_pass().await,
+        Some("device_group_refused")
+    );
+    assert_eq!(
+        held(&blossom),
+        blobs_before,
+        "far-future floor must block uploads before write_backup"
+    );
+    assert!(
+        storage(&phone.app).backup_runs().unwrap().is_empty(),
+        "far-future floor must not record a backup run"
+    );
+    assert_eq!(
+        pointers_published(&relay),
+        published_before,
+        "far-future floor must not publish a replacement pointer"
+    );
+    let floor_after_pass = devices
+        .phone_app
+        .account_home()
+        .replaceable_record_floors("alice")
+        .unwrap()
+        .get(&KIND_BACKUP_POINTER)
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        floor_after_pass, floor_before,
+        "far-future floor must not advance during a refused pass"
+    );
+
+    // Also verify the atomic sign-time guard refuses without invoking the
+    // signer or advancing the persisted floor.
+    let summary = devices.phone_app.account_home().account("alice").unwrap();
+    let now = unix_now_seconds();
+    let unsigned = NostrTransportEvent::new_unsigned_at(
+        summary.account_id_hex.clone(),
+        KIND_BACKUP_POINTER,
+        vec![vec!["d".to_owned(), backup_address(&rotated.public)]],
+        "ciphertext".to_owned(),
+        now,
+    );
+    let err = devices
+        .phone_app
+        .sign_replaceable_identity_event_bounded(
+            "alice",
+            Arc::new(PanicSigner),
+            &unsigned,
+            now + 5 * 60,
+            |_| AppError::DeviceGroupRefused("backup_pointer_clock_skew"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AppError::DeviceGroupRefused("backup_pointer_clock_skew")
+        ),
+        "expected backup_pointer_clock_skew, got {err:?}"
+    );
+    let floor_after_sign = devices
+        .phone_app
+        .account_home()
+        .replaceable_record_floors("alice")
+        .unwrap()
+        .get(&KIND_BACKUP_POINTER)
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        floor_after_sign, floor_before,
+        "bounded signer refusal must not advance replaceable_record_floors"
+    );
+}
+
+/// An unauthenticated BackupIndex (encrypted under another recovery key or
+/// tampered) is rejected by `read_index` and never condemns or triggers
+/// BUD-01 DELETE signing for its listed blobs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unauthenticated_backup_index_never_condemns_or_deletes_blobs() {
     use crate::backup_archive::{BlobLocator, MAX_POINTER_BACKUPS};
 
     let blossom = local_blossom();
-    let unconfigured = local_blossom();
     let (devices, _chat, words) = lone_writer(&blossom).await;
     let (mut phone, relay, key) = (devices.phone, devices.relay, words.public);
 
-    // Part 1: a dropped backup whose index names an unconfigured Blossom server,
-    // plus a pre-existing condemned row naming an unconfigured server.
-    phone.drive_backup_pass().await;
-    let first_entry = pointer(&relay, &key).remove(0);
-    let (first_head, mut forged_index) = read_backup(&blossom, &first_entry, &key);
-    let foreign_bytes = b"foreign server blob".to_vec();
-    let foreign_hash = hex::encode(Sha256::digest(&foreign_bytes));
-    unconfigured
-        .blobs
-        .lock()
-        .unwrap()
-        .insert(foreign_hash.clone(), foreign_bytes.clone());
-    forged_index.small_state = Some(BlobLocator {
-        sha256: foreign_hash.clone(),
-        size: foreign_bytes.len() as u64,
-        server: unconfigured.url.clone(),
-    });
-    let rewritten_head =
-        BackupHead::seal(first_head.id, &ArchiveKey::generate(), &key, &forged_index)
-            .unwrap()
-            .encode();
-    let rewritten_head_hash = hex::encode(Sha256::digest(&rewritten_head));
-    let rewritten_head_len = rewritten_head.len() as u64;
-    blossom
-        .blobs
-        .lock()
-        .unwrap()
-        .insert(rewritten_head_hash.clone(), rewritten_head);
-    let mut entries = pointer(&relay, &key);
-    entries[0].head = BlobLocator {
-        sha256: rewritten_head_hash,
-        size: rewritten_head_len,
-        server: blossom.url.clone(),
-    };
-    entries[0].written_at -= 2 * DAY;
-    publish_pointer(&phone, &relay, &key, entries).await;
-
-    // Write two newer backups so the rewritten oldest backup is dropped by retention.
-    for _ in 0..2 {
-        due_now(&phone);
-        phone.drive_backup_pass().await;
-        age_backups(&phone, &relay, &key, 2 * DAY).await;
-    }
-    assert!(
-        !condemned(&phone, &key).contains(&foreign_hash),
-        "listing() must not condemn blobs on unconfigured Blossom servers"
-    );
-
-    // Also seed a pre-existing condemned row targeting the unconfigured server.
-    let stray_run = [0xd4; 16];
-    storage(&devices.phone_app)
-        .condemn_backup_blobs(
-            &key,
-            &stray_run,
-            &[(foreign_hash.clone(), unconfigured.url.clone())],
-            1,
-            0,
-        )
-        .unwrap();
-    deletes_due_now(&phone, &key);
-    phone.drive_backup_pass().await;
-    assert!(
-        unconfigured.deleters.lock().unwrap().is_empty(),
-        "delete_condemned must never sign BUD-01 DELETE for unconfigured servers"
-    );
-    assert!(
-        unconfigured
-            .blobs
-            .lock()
-            .unwrap()
-            .contains_key(&foreign_hash),
-        "blob on unconfigured server must stay untouched"
-    );
-    assert!(
-        !condemned(&phone, &key).contains(&foreign_hash),
-        "disallowed condemned row must be cleared so it does not spin retries"
-    );
-
-    // Part 2: an unauthenticated BackupIndex (encrypted under another recovery key)
-    // must be rejected by read_index and never condemn or delete its listed blobs.
     let victim_bytes = b"victim blob on configured server".to_vec();
     let victim_hash = hex::encode(Sha256::digest(&victim_bytes));
     blossom

@@ -545,9 +545,11 @@ impl SqliteAppStorage {
 
     /// Distinct groups in `app_events` holding at least one row whose pinned
     /// source-epoch retention expiry has reached `now_seconds`, sorted by
-    /// group id. Uses `idx_app_events_group_retention_expiry` directly so
-    /// groups whose current policy is `0` or that are absent from
-    /// `chat_list_rows` are still discovered.
+    /// group id. Scans the partial index
+    /// `idx_app_events_group_retention_expiry` (only rows with
+    /// `retention_expires_at IS NOT NULL`, keyed by `(group_id_hex,
+    /// retention_expires_at)`) so groups whose current policy is `0` or that
+    /// are absent from `chat_list_rows` are still discovered.
     pub fn groups_with_expiring_app_events(&self, now_seconds: u64) -> StorageResult<Vec<String>> {
         let conn = self.lock()?;
         let mut stmt = conn
