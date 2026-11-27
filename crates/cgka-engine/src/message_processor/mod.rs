@@ -2296,7 +2296,10 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(|e| EngineError::Backend(format!("load convergence policy: {e}")))?;
         let rewind = policy.convergence.max_rewind_commits;
         Ok((
-            group.epoch.0.saturating_sub(rewind),
+            crate::openmls_projection::effective_retained_anchor_epoch(
+                group,
+                group.epoch.0.saturating_sub(rewind),
+            ),
             group.epoch.0.saturating_add(rewind),
         ))
     }
@@ -2334,15 +2337,15 @@ impl<S: StorageProvider> Engine<S> {
                 skipped_non_resolvable += 1;
                 continue;
             };
-            // Beyond the future horizon: unreachable from the current tip, so
-            // not gating work (see the ceiling rationale above).
-            if projection.source_epoch.is_some_and(|epoch| epoch > ceiling) {
-                continue;
-            }
+            // Beyond the convergence horizon on either side: unreachable from
+            // the current copy's history or tip, so not gating work.
             let Some(source_epoch) = projection.source_epoch else {
                 skipped_non_resolvable += 1;
                 continue;
             };
+            if source_epoch < anchor || source_epoch > ceiling {
+                continue;
+            }
             let Some(input) = ClassifiedConvergenceInput::from_projection(
                 projection.kind,
                 source_epoch,
@@ -3400,10 +3403,13 @@ impl<S: StorageProvider> Engine<S> {
         let policy = self
             .convergence_policy_for_group_ungated(group_id)
             .map_err(|error| EngineError::Backend(format!("load convergence policy: {error}")))?;
-        let floor = group
-            .epoch
-            .0
-            .saturating_sub(policy.convergence.max_rewind_commits);
+        let floor = crate::openmls_projection::effective_retained_anchor_epoch(
+            &group,
+            group
+                .epoch
+                .0
+                .saturating_sub(policy.convergence.max_rewind_commits),
+        );
         let contested = crate::openmls_projection::commit_edges_are_contested(
             self.stored_convergence_commit_edges(group_id)?
                 .into_iter()

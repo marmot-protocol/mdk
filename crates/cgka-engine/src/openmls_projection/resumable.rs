@@ -305,12 +305,13 @@ impl ReplaySource {
     #[allow(clippy::disallowed_methods)]
     fn load<S: StorageProvider>(
         storage: &S,
+        rewinds: &Rewinds,
         group: &GroupId,
         anchor: u64,
         admitted: Option<&[MessageId]>,
     ) -> Result<Self, OpenMlsProjectionError> {
         Ok(Self {
-            graph: seed_stored_openmls_graph_inputs(storage, group, anchor, admitted)?,
+            graph: seed_stored_openmls_graph_inputs(storage, rewinds, group, anchor, admitted)?,
             group: storage.get_group(group)?,
             snapshots: storage.list_group_snapshots(group)?,
             write_generation: storage.mls_write_generation(),
@@ -423,6 +424,7 @@ pub(crate) fn canonicalize_stored_slice<S: StorageProvider>(
     }
     let mut source = ReplaySource::load(
         storage,
+        rewinds,
         group,
         state.retained_anchor_epoch,
         options.admitted_message_ids,
@@ -480,6 +482,8 @@ pub(crate) fn canonicalize_stored_slice<S: StorageProvider>(
             next_path: 0,
         },
     };
+    let mut state = state;
+    state.retained_anchor_epoch = work.source.graph.effective_floor;
     let result = with_anchor(storage, rewinds, group, &work.source, false, || {
         if let Some(search) = &mut work.search {
             if !search.advance(
@@ -640,7 +644,7 @@ pub(crate) fn candidate_peel_slice<S: StorageProvider>(
         )
         .map(Some);
     }
-    let mut source = ReplaySource::load(storage, group, anchor, None).map_err(fail)?;
+    let mut source = ReplaySource::load(storage, rewinds, group, anchor, None).map_err(fail)?;
     if !commits_share_a_source_epoch(&source.graph.commit_messages) {
         *slot = None;
         return Ok(Some(CandidateBranchPeel::UNCONTESTED));

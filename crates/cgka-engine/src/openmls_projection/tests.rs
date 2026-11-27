@@ -71,11 +71,13 @@ fn graph_seed_read_boundaries() {
         .unwrap();
     old.payload = vec![0xff];
 
+    let rewinds = Rewinds::default();
+
     // Irrelevant payloads must never be decoded, even when malformed.
     for state in [MessageState::Processed, MessageState::EpochInvalidated] {
         old.state = state;
         storage.put_message(&old).unwrap();
-        assert!(seed_stored_openmls_graph_inputs(&storage, &group_id, 10, None).is_ok());
+        assert!(seed_stored_openmls_graph_inputs(&storage, &rewinds, &group_id, 10, None).is_ok());
     }
     for state in OPENMLS_GRAPH_INPUT_STATES {
         old.state = state;
@@ -88,15 +90,19 @@ fn graph_seed_read_boundaries() {
         // Retained processed witnesses and unresolved history stay readable
         // inputs; malformed bytes in either must still propagate an error.
         assert!(matches!(
-            seed_stored_openmls_graph_inputs(&storage, &group_id, 10, None),
+            seed_stored_openmls_graph_inputs(&storage, &rewinds, &group_id, 10, None),
             Err(OpenMlsProjectionError::Serialize(_))
         ));
-        assert!(seed_stored_openmls_graph_inputs(&storage, &group_id, 10, Some(&admitted)).is_ok());
+        assert!(
+            seed_stored_openmls_graph_inputs(&storage, &rewinds, &group_id, 10, Some(&admitted))
+                .is_ok()
+        );
     }
-    assert!(seed_stored_openmls_graph_inputs(&storage, &group_id, 10, Some(&[])).is_ok());
+    assert!(seed_stored_openmls_graph_inputs(&storage, &rewinds, &group_id, 10, Some(&[])).is_ok());
     assert!(matches!(
         seed_stored_openmls_graph_inputs(
             &storage,
+            &rewinds,
             &group_id,
             10,
             Some(std::slice::from_ref(&old.id))
@@ -111,6 +117,7 @@ fn graph_seed_read_boundaries() {
     assert!(
         seed_stored_openmls_graph_inputs(
             &storage,
+            &rewinds,
             &group_id,
             10,
             Some(std::slice::from_ref(&old.id))
@@ -119,7 +126,7 @@ fn graph_seed_read_boundaries() {
     );
     storage.delete_message(&admitted[0]).unwrap();
     assert!(matches!(
-        seed_stored_openmls_graph_inputs(&storage, &group_id, 10, Some(&admitted)),
+        seed_stored_openmls_graph_inputs(&storage, &rewinds, &group_id, 10, Some(&admitted)),
         Err(OpenMlsProjectionError::Storage(_))
     ));
 }
@@ -132,11 +139,15 @@ fn graph_seed_benchmark() {
     use std::time::Instant;
 
     let (storage, group_id, ids) = graph_fixture(20_000);
+    let rewinds = Rewinds::default();
     for (label, members) in [("candidate", None), ("frozen", Some(ids.as_slice()))] {
         let mut samples = Vec::new();
         for _ in 0..9 {
             let start = Instant::now();
-            black_box(seed_stored_openmls_graph_inputs(&storage, &group_id, 10, members).unwrap());
+            black_box(
+                seed_stored_openmls_graph_inputs(&storage, &rewinds, &group_id, 10, members)
+                    .unwrap(),
+            );
             samples.push(start.elapsed());
         }
         samples.sort();

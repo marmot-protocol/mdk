@@ -1208,3 +1208,211 @@ async fn expired_deferred_row_arms_no_epoch_gap_and_keeps_inventory() {
         with_inventory.id.as_slice()
     );
 }
+
+/// A message recovered under a candidate branch's peel context must still be
+/// held to this copy's history floor (`join_epoch` / `local_copy_install_epoch`).
+///
+/// Before #3793, `recovered_from_candidate_branch` buffered straight into
+/// convergence ahead of `epoch_below_this_copys_history`, and graph seeding
+/// checked only `retained_anchor_epoch`. A commit claiming an epoch before the
+/// joiner's own history therefore steered convergence onto an absent anchor and
+/// durably halted a healthy group as `Unrecoverable`.
+#[tokio::test]
+async fn candidate_branch_recovery_enforces_copy_history_floor() {
+    use cgka_traits::engine::GroupEvent;
+    use cgka_traits::transport::TransportSource;
+    use sha2::{Digest, Sha256};
+
+    let (mut alice, _alice_storage) = build_client_with_storage(b"cb-floor-alice");
+    let (mut bob, _bob_storage) = build_client_with_storage(b"cb-floor-bob");
+    let (mut carol, carol_storage) = build_client_with_storage(b"cb-floor-carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "cb-history-floor".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let bob_welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("unexpected create result: {other:?}"),
+    };
+    bob.join_welcome(bob_welcome).await.unwrap();
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(1));
+
+    let snapshot_of = |engine: &Engine<SqliteAccountStorage>| {
+        let ctx = engine.group_context(&group_id).unwrap();
+        let secret: [u8; 32] = ctx
+            .exporter_secret(GROUP_EVENT_EXPORTER_KEY, 32)
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap();
+        test_context(ctx.epoch().0, &secret)
+    };
+
+    // Capture Alice's epoch-1 context before inviting Carol so we can unseal
+    // the epoch-1 commit bytes and re-seal them under Bob's later rival branch.
+    let epoch1_ctx = snapshot_of(&alice);
+
+    // Carol joins late at epoch 2 (`join_epoch == 2`, `local_copy_install_epoch == 2`).
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (invite_commit, carol_welcome) = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            msg,
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            (msg, welcomes.remove(0))
+        }
+        other => panic!("unexpected invite result: {other:?}"),
+    };
+    carol.join_welcome(carol_welcome).await.unwrap();
+    carol.drain_events();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(
+        carol_storage.get_group(&group_id).unwrap().join_epoch,
+        EpochId(2)
+    );
+    assert_eq!(
+        carol_storage
+            .get_group(&group_id)
+            .unwrap()
+            .local_copy_install_epoch,
+        EpochId(2)
+    );
+
+    // Bob catches up to epoch 2, then Alice and Bob fork at epoch 2.
+    bob.ingest(route(invite_commit.clone(), &group_id))
+        .await
+        .unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(2));
+
+    let alice_branch_commit = evolve(
+        &mut alice,
+        SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        },
+    )
+    .await;
+    let bob_rival_commit = evolve(
+        &mut bob,
+        SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        },
+    )
+    .await;
+    let bob_rival_epoch3_ctx = snapshot_of(&bob);
+
+    // Carol adopts Alice's epoch-2 commit (now at epoch 3), then buffers Bob's
+    // epoch-2 rival so Carol's graph is contested with a candidate-branch
+    // context for Bob's epoch-3 tip.
+    carol
+        .ingest(route(alice_branch_commit, &group_id))
+        .await
+        .unwrap();
+    carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+
+    let rival_outcome = carol
+        .ingest(route(bob_rival_commit, &group_id))
+        .await
+        .unwrap();
+    assert!(
+        matches!(rival_outcome, IngestOutcome::Buffered { .. }),
+        "bob's epoch-2 rival must enter convergence; got {rival_outcome:?}"
+    );
+
+    // Re-seal the epoch-1 commit bytes (below Carol's join_epoch = 2) under
+    // Bob's rival epoch-3 context so Carol can only peel it via candidate-branch
+    // recovery.
+    let epoch1_mls_bytes = unseal_group_payload(&invite_commit.payload, &epoch1_ctx).unwrap();
+    let content_id = MessageId::new(Sha256::digest(&epoch1_mls_bytes).to_vec());
+    let sealed_below_floor = seal_group_payload(&epoch1_mls_bytes, &bob_rival_epoch3_ctx).unwrap();
+    let raw_msg_id = MessageId::new(Sha256::digest(&sealed_below_floor).to_vec());
+    let below_floor_msg = TransportMessage {
+        id: raw_msg_id.clone(),
+        payload: sealed_below_floor,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("candidate-branch-below-floor".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+
+    // Direct ingest cannot peel under Alice's branch, so the message defers.
+    let deferred = carol.ingest(below_floor_msg).await.unwrap();
+    assert!(
+        matches!(deferred, IngestOutcome::TransportDeferred { .. }),
+        "rival-branch-sealed message must defer on direct ingest; got {deferred:?}"
+    );
+
+    // Drive deferred-peel recovery (which unseals via Bob's candidate branch)
+    // and convergence to settlement.
+    for _ in 0..4 {
+        let _ = carol
+            .converge_and_drain_queued_outbound_intents(&group_id, u64::MAX)
+            .await
+            .unwrap();
+    }
+    let settled = carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+
+    // Confirm candidate-branch recovery actually peeled the deferred wrapper
+    // and routed the inner below-floor commit to stale terminal rejection.
+    assert_ne!(
+        carol_storage.get_message(&raw_msg_id).unwrap().state,
+        MessageState::PeelDeferred,
+        "deferred wrapper must leave PeelDeferred once candidate-branch recovery runs"
+    );
+    assert_eq!(
+        carol_storage.get_message(&content_id).unwrap().state,
+        MessageState::Failed,
+        "recovered below-floor commit must land in terminal Failed stale rejection"
+    );
+    assert!(
+        settled.errors.is_empty(),
+        "a below-history commit recovered under a candidate branch must not trigger convergence errors; got {:?}",
+        settled.errors
+    );
+    assert!(
+        !carol_storage.get_group(&group_id).unwrap().unrecoverable,
+        "a healthy late joiner must never become Unrecoverable from a below-history commit recovered under a candidate branch"
+    );
+    let events = carol.drain_events();
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupUnrecoverable { group_id: halted } if halted == &group_id
+        )),
+        "must not emit GroupUnrecoverable; got {events:?}"
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+}

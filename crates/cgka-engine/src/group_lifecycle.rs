@@ -1090,6 +1090,11 @@ impl<S: StorageProvider> Engine<S> {
                             self.identity.self_id(),
                             self.ciphersuite,
                         )?;
+                        // Retain the canonical founding epoch anchor inside the
+                        // creation transaction (matching `do_join_welcome`) so a
+                        // healthy founding group never starts without its base
+                        // anchor.
+                        self.retain_current_epoch_snapshot_on_storage(storage, &group_id)?;
                         Ok(canonical_epoch)
                     })?;
 
@@ -1136,14 +1141,6 @@ impl<S: StorageProvider> Engine<S> {
                 .push_back(cgka_traits::engine::GroupEvent::GroupCreated {
                     group_id: group_id.clone(),
                 });
-            if let Err(error) = self.retain_current_epoch_snapshot_for_group(&group_id) {
-                tracing::warn!(
-                    target: "cgka_engine::group_lifecycle",
-                    method = "do_create_group",
-                    transient = error.is_transient(),
-                    "deferred founding snapshot retention"
-                );
-            }
             return Ok((group_id, SendResult::FoundingGroupCreated { welcomes }));
         }
 
