@@ -716,12 +716,18 @@ def classify_failure(
 ) -> ClassificationResult:
     """Classify a FailureSignal into one of the MDK Canary buckets.
 
-    Always runs single-shot `tip` (and `baseline` on tip failure) reproduction before
-    consulting individual `Flaky:` issues so a deterministic regression on a test with
-    an open flake issue is never suppressed. Individual `Flaky:` issues are consulted
-    only when `tip` passes on retry (intermittent) or when both `tip` and `baseline`
-    fail. Signals without a distinct baseline stay in `UNREPRODUCIBLE` so a single
-    missing-baseline run never immediately freezes `master`.
+    For locally reproducible signals, always runs single-shot `tip` (and `baseline` on
+    `tip` failure) reproduction before consulting individual `Flaky:` issues so a
+    deterministic regression is never suppressed. Individual `Flaky:` issues (never
+    `"Flaky test leaderboard"`) are consulted:
+      - on the locally-unreproducible fallback (non-Linux / Relay-E2E) so human-tracked
+        non-Linux flakes do not escalate into false Meltdowns;
+      - when `tip` passes single retry (intermittent), skipping stress runs;
+      - when both `tip` and `baseline` fail; and
+      - to require one confirmation pass on `tip` (and on `baseline` when it passed)
+        before promoting a test with an open individual `Flaky:` issue to
+        `DETERMINISTIC_REGRESSION`, preventing alternating flakes from triggering
+        unisolatable-bisect Meltdowns.
     """
     # Bucket 1: Runner/network/disk infrastructure error.
     # Never let diagnostic tail strings override a concrete parsed nextest test failure.
@@ -731,8 +737,19 @@ def classify_failure(
             reason=f"infrastructure failure detected in {signal.failed_job} ({signal.conclusion})",
         )
 
+    matched_issue = match_known_flake_issue(signal.failed_test, open_flake_issues)
+
     # Platform-specific or unparsed failure with no local reproduction command.
     if not signal.reproducible_locally or not signal.command:
+        if matched_issue is not None:
+            return ClassificationResult(
+                bucket=Bucket.KNOWN_FLAKE,
+                reason=(
+                    f"non-locally-reproducible failure in `{signal.failed_job}` matches "
+                    f"open flake issue #{matched_issue} for {signal.failed_test}"
+                ),
+                matched_issue=matched_issue,
+            )
         step_note = f" (step `{signal.failed_step}`)" if signal.failed_step else ""
         if is_non_linux_job(signal.failed_job):
             reason = f"non-Linux job `{signal.failed_job}`{step_note} is not locally reproducible on this host"
@@ -759,7 +776,6 @@ def classify_failure(
             )
         base_verdict, base_detail = run_on_sha(signal.baseline_sha, signal.command)
         if base_verdict == RunVerdict.FAIL:
-            matched_issue = match_known_flake_issue(signal.failed_test, open_flake_issues)
             if matched_issue is not None:
                 return ClassificationResult(
                     bucket=Bucket.KNOWN_FLAKE,
@@ -783,6 +799,42 @@ def classify_failure(
                 bucket=Bucket.INFRA_ERROR,
                 reason=f"inconclusive baseline check on {signal.baseline_sha[:9]} ({base_detail})",
             )
+        if matched_issue is not None:
+            # Confirm repeatability before promoting a test with an open individual
+            # `Flaky:` issue to `DETERMINISTIC_REGRESSION`, so an alternating flake
+            # cannot enter bisect and trigger a false "unisolatable failure" Meltdown.
+            tip_confirm, tip_confirm_detail = run_on_sha(signal.tip_sha, signal.command)
+            if tip_confirm in {RunVerdict.INCONCLUSIVE, RunVerdict.TEST_ABSENT}:
+                return ClassificationResult(
+                    bucket=Bucket.INFRA_ERROR,
+                    reason=f"inconclusive confirmation on {signal.tip_sha[:9]} ({tip_confirm_detail})",
+                )
+            if tip_confirm == RunVerdict.PASS:
+                return ClassificationResult(
+                    bucket=Bucket.KNOWN_FLAKE,
+                    reason=(
+                        f"mixed tip outcomes on {signal.tip_sha[:9]} (failed then passed); "
+                        f"matches open flake issue #{matched_issue} for {signal.failed_test}"
+                    ),
+                    matched_issue=matched_issue,
+                )
+            if base_verdict == RunVerdict.PASS:
+                base_confirm, base_confirm_detail = run_on_sha(signal.baseline_sha, signal.command)
+                if base_confirm == RunVerdict.INCONCLUSIVE:
+                    return ClassificationResult(
+                        bucket=Bucket.INFRA_ERROR,
+                        reason=f"inconclusive baseline confirmation on {signal.baseline_sha[:9]} ({base_confirm_detail})",
+                    )
+                if base_confirm == RunVerdict.FAIL:
+                    return ClassificationResult(
+                        bucket=Bucket.KNOWN_FLAKE,
+                        reason=(
+                            f"reproduced on tip {signal.tip_sha[:9]} and failed baseline confirmation "
+                            f"on {signal.baseline_sha[:9]}; matches open flake issue #{matched_issue} "
+                            f"for {signal.failed_test}"
+                        ),
+                        matched_issue=matched_issue,
+                    )
         return ClassificationResult(
             bucket=Bucket.DETERMINISTIC_REGRESSION,
             reason=(
@@ -793,7 +845,6 @@ def classify_failure(
 
     # Passed single retry (intermittent). Check open individual `Flaky:` issues before
     # spending time on differential stress runs.
-    matched_issue = match_known_flake_issue(signal.failed_test, open_flake_issues)
     if matched_issue is not None:
         return ClassificationResult(
             bucket=Bucket.KNOWN_FLAKE,

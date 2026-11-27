@@ -889,7 +889,10 @@ class RcReleasePolicyTests(unittest.TestCase):
                 r"Install pinned cargo-nextest.*?version=([0-9]+\.[0-9]+\.[0-9]+)", text, re.S
             ):
                 found.append((path.name, match.group(1)))
-        self.assertGreaterEqual(len(found), 12)
+        self.assertTrue(
+            {"ci.yml", "simulator-nightly.yml", "convergence-hardening.yml"} <= {wf for wf, _ in found},
+            f"expected nextest pins in core/scheduled workflows, got {found}",
+        )
         drifted = [(wf, ver) for wf, ver in found if ver != expected_version]
         self.assertEqual(drifted, [], f"drifted cargo-nextest pins: {drifted}")
         classifier = (ROOT / "scripts/bisect_agent/classifier.py").read_text()

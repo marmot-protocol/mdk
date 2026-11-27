@@ -477,10 +477,6 @@ def partition_leaderboard(summaries: list[dict]) -> tuple[list[dict], list[dict]
     return flaky_rows, failed_rows
 
 
-def leaderboard(summaries: list[dict]) -> list[dict]:
-    return partition_leaderboard(summaries)[0]
-
-
 def created_date(summary: dict) -> str:
     return parse_time(summary["created_at"]).strftime("%Y-%m-%d")
 
@@ -493,7 +489,8 @@ def code(text: str) -> str:
 def render_markdown(report: dict, top: int, samples: int, failed_top: int | None = None) -> str:
     rows = report["tests"]
     failed_rows = report.get("failed_tests", [])
-    effective_failed_top = top if failed_top is None else failed_top
+    if failed_top is None:
+        failed_top = top
     runs = report["runs"]
     flaky = sum(row["flaky_attempts"] for row in rows)
     flaky_hard = sum(row["failed_attempts"] for row in rows)
@@ -535,7 +532,7 @@ def render_markdown(report: dict, top: int, samples: int, failed_top: int | None
                 for sample in row["samples"]:
                     where = code(sample["location"]) + ": " if sample["location"] else ""
                     lines.append(f"   - {where}{code(sample['message'])}" if sample["message"] else f"   - {where}")
-    if failed_rows and effective_failed_top > 0:
+    if failed_rows and failed_top > 0:
         lines += [
             "",
             "## Hard failures (failed every attempt)",
@@ -543,11 +540,11 @@ def render_markdown(report: dict, top: int, samples: int, failed_top: int | None
             "| # | Test | Package (binary) | Failed | Runs seen | First seen | Last seen |",
             "| ---: | --- | --- | ---: | ---: | --- | --- |",
         ]
-        for rank, row in enumerate(failed_rows[:effective_failed_top], 1):
+        for rank, row in enumerate(failed_rows[:failed_top], 1):
             lines.append(f"| {rank} | {code(row['test'])} | {code(row['binary_id'])} | {row['failed_attempts']} | "
                          f"{row['runs_seen']} | {row['first_seen']} | {row['last_seen']} |")
-        if len(failed_rows) > effective_failed_top:
-            more = len(failed_rows) - effective_failed_top
+        if len(failed_rows) > failed_top:
+            more = len(failed_rows) - failed_top
             lines += ["", f"{more} more non-flaky {'test' if more == 1 else 'tests'} failed every attempt."]
     return "\n".join(lines) + "\n"
 

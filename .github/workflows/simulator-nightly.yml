@@ -222,7 +222,7 @@ jobs:
             --body "The simulator nightly failed. Run: ${RUN_URL}"
 
   relay-runtime-offline-replay:
-    # The merge queue's relay-runtime lane ignores this 1,600-message case
+    # The CI relay-runtime lane ignores this 1,600-message case
     # because catch-up outruns its 60-second window on slow runners
     # (mdk#2538). Run it here with that lane's features and flags, unchanged.
     name: Relay runtime 1,600-message offline replay

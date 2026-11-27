@@ -395,9 +395,12 @@ class ClassifierTests(unittest.TestCase):
             }
         ]
 
-        # 1. Deterministic regression (fails tip, passes baseline) MUST NOT be suppressed by
-        # the leaderboard OR by an open individual `Flaky:` issue.
-        for label, issues in (("leaderboard", leaderboard), ("individual", individual)):
+        # 1. Deterministic regression (always fails tip, always passes baseline) MUST NOT be
+        # suppressed by the leaderboard OR by an open individual `Flaky:` issue.
+        for label, issues, expected_shas in (
+            ("leaderboard", leaderboard, [sig.tip_sha, sig.baseline_sha]),
+            ("individual", individual, [sig.tip_sha, sig.baseline_sha, sig.tip_sha, sig.baseline_sha]),
+        ):
             with self.subTest(issues=label):
                 seen_shas: list[str] = []
 
@@ -411,7 +414,50 @@ class ClassifierTests(unittest.TestCase):
 
                 cls = classify_failure(sig, run_on_sha=det_runner, open_flake_issues=issues)
                 self.assertEqual(cls.bucket, Bucket.DETERMINISTIC_REGRESSION)
-                self.assertEqual(seen_shas, [sig.tip_sha, sig.baseline_sha])
+                self.assertEqual(seen_shas, expected_shas)
+
+        # 1b. Alternating known flake (fails tip shot 1, passes baseline, then passes tip
+        # confirmation; or fails baseline confirmation) stays KNOWN_FLAKE and never enters bisect.
+        for label, outcomes in (
+            ("tip_alternates", [RunVerdict.FAIL, RunVerdict.PASS, RunVerdict.PASS]),
+            ("baseline_fails_confirm", [RunVerdict.FAIL, RunVerdict.PASS, RunVerdict.FAIL, RunVerdict.FAIL]),
+        ):
+            with self.subTest(alternating=label):
+                seq = iter(outcomes)
+                alt_cls = classify_failure(
+                    sig,
+                    run_on_sha=lambda _s, _c: (next(seq), "observed"),
+                    open_flake_issues=individual,
+                )
+                self.assertEqual(alt_cls.bucket, Bucket.KNOWN_FLAKE)
+                self.assertEqual(alt_cls.matched_issue, 4001)
+
+        # 1c. Non-locally-reproducible signal (e.g. Windows) honors individual `Flaky:` issues
+        # to avoid false Meltdowns, while still ignoring `"Flaky test leaderboard"`.
+        win_sig = FailureSignal(
+            source="hosted_canary",
+            run_id="r-win-flake",
+            run_url="https://example.com/r-win-flake",
+            tip_sha="2" * 40,
+            baseline_sha="1" * 40,
+            failed_job="Full cross-platform CI (6 shards) / Windows filesystem contracts",
+            failed_test="marmot-session::runtime::an_overdue_component_recheck_is_owed_not_due_now",
+            command=(),
+            reproducible_locally=False,
+        )
+        win_known = classify_failure(
+            win_sig,
+            run_on_sha=lambda _s, _c: (_ for _ in ()).throw(AssertionError("should not run locally")),
+            open_flake_issues=individual,
+        )
+        self.assertEqual(win_known.bucket, Bucket.KNOWN_FLAKE)
+        self.assertEqual(win_known.matched_issue, 4001)
+        win_board = classify_failure(
+            win_sig,
+            run_on_sha=lambda _s, _c: (_ for _ in ()).throw(AssertionError("should not run locally")),
+            open_flake_issues=leaderboard,
+        )
+        self.assertEqual(win_board.bucket, Bucket.UNREPRODUCIBLE)
 
         # 2. Individual `Flaky:` issue applies when tip passes single retry (intermittent),
         # skipping the expensive stress loop.
