@@ -1599,9 +1599,12 @@ sha256sum() { shasum -a 256 "$@"; }
         self.assertIn("fetch-depth: 0", changes)
         self.assertIn("run: python3 scripts/test_check_pr_trailers.py", rust_format)
 
-        script = workflow_step("ci.yml", "PR commit trailers (advisory)")
-        self.assertIn("python3 scripts/check_pr_trailers.py --advisory", script)
-        self.assertIn('|| echo "::warning title=PR trailers::', script)
+        script = workflow_step("ci.yml", "PR commit trailers")
+        self.assertIn('python3 scripts/check_pr_trailers.py --advisory "${enforce[@]}"', script)
+        # Team PRs (fast mode) must fail when a crate change skips `just dependents-nextest`,
+        # so the step may not swallow the script's exit status.
+        self.assertIn('if [[ "$CI_MODE" == fast ]]; then\n    enforce=(--enforce-dependents)', script)
+        self.assertNotIn("|| echo", script)
         self.assertNotIn("${{", script)
 
         # Execute the exact workflow step in a synthetic PR merge-ref checkout
@@ -1620,9 +1623,12 @@ sha256sum() { shasum -a 256 "$@"; }
             git("config", "commit.gpgsign", "false")
             scripts_dir = repo / "scripts"
             scripts_dir.mkdir()
-            for name in ("check_pr_trailers.py", "changelog.py"):
+            for name in ("check_pr_trailers.py", "changelog.py", "dependents_nextest.py", "classify_ci_changes.py"):
                 (scripts_dir / name).write_text((ROOT / "scripts" / name).read_text())
-            git("add", "scripts")
+            (repo / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/app"]\n')
+            (repo / "crates/app").mkdir(parents=True)
+            (repo / "crates/app/Cargo.toml").write_text('[package]\nname = "app"\n')
+            git("add", "scripts", "Cargo.toml", "crates")
             git("commit", "-m", "Base commit")
             git("checkout", "-b", "pr-branch")
             (repo / "feature.txt").write_text("ok\n")
@@ -1651,6 +1657,7 @@ sha256sum() { shasum -a 256 "$@"; }
                     "EVENT_NAME": "pull_request",
                     "BASE_SHA": base_sha,
                     "HEAD_SHA": head_sha,
+                    "CI_MODE": "fast",
                 },
                 capture_output=True,
                 text=True,
@@ -1658,6 +1665,32 @@ sha256sum() { shasum -a 256 "$@"; }
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("pr-trailers: OK (Release-Impact: patch)", result.stdout)
             self.assertNotIn("::warning", result.stdout)
+
+            # A crate change without `just dependents-nextest` fails a team PR and only
+            # warns when the full CI matrix runs the tests itself.
+            git("checkout", "-b", "crate-branch", base_sha)
+            (repo / "crates/app/lib.rs").write_text("changed\n")
+            git("add", "crates/app/lib.rs")
+            git(
+                "commit", "-m",
+                "Change crate\n\n"
+                "Local-Checks: cargo fmt; cargo clippy -p app\n"
+                "Local-Review: claude + codex merge @ 1234567\n"
+                "Release-Impact: none\n",
+            )
+            crate_head = git("rev-parse", "HEAD")
+            for mode, expected in (("fast", 1), ("full", 0)):
+                with self.subTest(mode=mode):
+                    run = subprocess.run(
+                        ["bash", "-c", script],
+                        cwd=repo,
+                        env={**os.environ, "EVENT_NAME": "pull_request", "BASE_SHA": base_sha,
+                             "HEAD_SHA": crate_head, "CI_MODE": mode},
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(run.returncode, expected, run.stdout + run.stderr)
+                    self.assertIn("just dependents-nextest", run.stdout)
 
 
 class CanaryWorkflowPolicyTests(unittest.TestCase):

@@ -15,8 +15,9 @@ description: >-
 
 Your machine is the only place this change is built and tested before it
 reaches `master`. Team PR CI (`Required CI`) is a ~1-minute static gate:
-commit signatures, formatting, static contracts, `cargo-audit`, and advisory
-commit trailers, with zero Rust compile. There is no merge queue, and `master`
+commit signatures, formatting, static contracts, `cargo-audit`, and commit
+trailers (advisory, except that a Rust crate change must record `just
+dependents-nextest`), with zero Rust compile. There is no merge queue, and `master`
 requires only `Required CI`, any CODEOWNERS approvals, and a branch that is up
 to date with `master`. A ready PR that goes green can be merged a minute later
 with nothing else between it and `master`. Post-merge `Canary` (bare-metal
@@ -129,8 +130,10 @@ targeted run of your own crate never sees that. A runtime-crate change almost
 always reaches `marmot-app`, about 8 minutes on a warm build: run it once, on
 the commit you push, and use targeted `cargo nextest run -p <crate> -E
 'test(<area>)'` while you iterate. Run one at a time per machine; concurrent
-full suites saturate the CPU and timing-sensitive tests fail. It leaves the
-simulator and `wn-cli`'s `cli` journeys to the smoke below and the table rows.
+full suites saturate the CPU and timing-sensitive tests fail. When `wn-cli` is
+affected it then runs `wn-cli`'s CLI end-to-end suite on its own, as CI does.
+It leaves the simulator to the smoke below and the table rows. Record it in
+`Local-Checks:`; `Required CI` rejects a team PR that changes a crate without it.
 
 Clippy runs twice because CI does: code used only by feature-gated tests is
 dead in the default build (#3826 broke `master` that way).
@@ -269,7 +272,8 @@ less often, rebase onto `origin/master` before the final round.
 commit message (`git commit --amend -S`, preserving `HEAD^{tree}`) to record
 `Local-Checks:` and `Local-Review:` while keeping the reviewed
 `Release-Impact:` unchanged, then verify with `just pr-trailers-check`. The
-CI trailer check is only advisory; for you it is required.
+CI trailer check is advisory apart from the `just dependents-nextest` record;
+for you all of it is required.
 
 ```text
 Local-Checks: <commands run locally>

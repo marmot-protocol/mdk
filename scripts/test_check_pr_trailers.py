@@ -363,6 +363,50 @@ class PrTrailerTests(unittest.TestCase):
         finally:
             tmp.cleanup()
 
+    def test_crate_changes_must_record_dependents_nextest(self) -> None:
+        # #3819 changed `marmot-app` with targeted tests only and broke `wn-cli`'s CLI suite
+        # on `master`; land-change requires `just dependents-nextest` for any crate change.
+        tmp, repo, base = self.make_repo()
+        try:
+            self.commit_file(repo, "Cargo.toml", '[workspace]\nmembers = ["crates/app"]\n', "Add workspace")
+            base = self.commit_file(repo, "crates/app/Cargo.toml", '[package]\nname = "app"\n', "Add crate")
+            review = "Local-Review: claude + codex merge @ 1234567\nRelease-Impact: none\n"
+            cases = (
+                ("crates/app/src/lib.rs", "cargo fmt; cargo clippy -p app", review, False),
+                ("crates/app/src/lib.rs", "cargo fmt; just dependents-nextest", review, True),
+                ("crates/app/README.md", "cargo fmt", review, True),
+                ("scripts/tool.py", "python3 scripts/test_tool.py", review, True),
+                ("Cargo.toml", "just release-pr-preflight 1.2.3", review, True),
+                (
+                    "crates/app/src/lib.rs",
+                    "cargo nextest run -p app -E test(=x)",
+                    "Local-Review: exempt (automated bisect revert of 0123456789ab)\nRelease-Impact: none\n",
+                    True,
+                ),
+            )
+            for path, checks, rest, recorded in cases:
+                with self.subTest(path=path, checks=checks):
+                    git(repo, "checkout", "-q", "-B", "case", base)
+                    if path == "Cargo.toml":
+                        content = '[workspace]\nmembers = ["crates/app"]\n# 1.2.3\n'
+                    else:
+                        content = "changed\n"
+                    head = self.commit_file(repo, path, content, f"Change\n\nLocal-Checks: {checks}\n{rest}")
+                    args = ["--root", str(repo), "--base", base, "--head", head]
+                    out, err = io.StringIO(), io.StringIO()
+                    with redirect_stdout(out), redirect_stderr(err):
+                        strict = trailers.main(args)
+                        advisory = trailers.main([*args, "--advisory"])
+                        enforced = trailers.main([*args, "--advisory", "--enforce-dependents"])
+                    if recorded:
+                        self.assertEqual((strict, advisory, enforced), (0, 0, 0), err.getvalue() + out.getvalue())
+                    else:
+                        self.assertEqual((strict, advisory, enforced), (1, 0, 1))
+                        self.assertIn("just dependents-nextest", err.getvalue())
+                        self.assertIn("::error title=PR trailers::", out.getvalue())
+        finally:
+            tmp.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

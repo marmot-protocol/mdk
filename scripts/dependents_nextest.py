@@ -3,10 +3,10 @@
 
 Team PRs compile nothing in CI, so this is the local stand-in for the Canary's
 workspace tests, scoped to what the change can break. It uses the Canary's
-feature set and runs `marmot-app`'s `relay_runtime` suite too. It leaves out
-`cgka-conformance-simulator` (the land-change smoke and `just simulator-smoke`
-cover it) and `wn-cli`'s subprocess-heavy `cli` binary (the land-change smoke
-runs its two journeys).
+feature set and runs `marmot-app`'s `relay_runtime` suite too. When `wn-cli` is
+affected it then runs `wn-cli`'s subprocess-heavy `cli` binary on its own, as
+CI's `CLI e2e` job does. It leaves out `cgka-conformance-simulator` (the
+land-change smoke and `just simulator-smoke` cover it).
 
 Usage: python3 scripts/dependents_nextest.py --features <pkg/feat,...> [--base origin/master] [--print]
 """
@@ -72,8 +72,8 @@ def closure(start: set[str], edges: dict[str, set[str]]) -> set[str]:
     return seen
 
 
-def nextest_command(files: list[str], metadata: dict, features: list[str]) -> list[str] | None:
-    """Return the nextest command for a change, or `None` when it touches no testable crate."""
+def nextest_commands(files: list[str], metadata: dict, features: list[str]) -> list[list[str]]:
+    """Return the nextest commands for a change, empty when it touches no testable crate."""
     dirs, deps = workspace_graph(metadata)
     rdeps: dict[str, set[str]] = {name: set() for name in deps}
     for name, its_deps in deps.items():
@@ -81,16 +81,21 @@ def nextest_command(files: list[str], metadata: dict, features: list[str]) -> li
             rdeps[dep].add(name)
     selected = sorted(closure(changed_packages(files, dirs), rdeps) - EXCLUDED_PACKAGES)
     if not selected:
-        return None
-    # Cargo accepts `pkg/feature` only for a selected package or a direct dependency of one.
-    in_scope = set(selected).union(*(deps[name] for name in selected))
-    kept = [f for f in features if f.split("/", 1)[0] in in_scope]
-    command = ["cargo", "nextest", "run", "--locked", "--profile", "ci", "--no-fail-fast"]
-    for name in selected:
-        command += ["-p", name]
-    if kept:
-        command += ["--features", ",".join(kept)]
-    return command + ["-E", TEST_FILTER]
+        return []
+
+    def run(packages: list[str]) -> list[str]:
+        # Cargo accepts `pkg/feature` only for a selected package or a direct dependency of one.
+        in_scope = set(packages).union(*(deps[name] for name in packages))
+        kept = [f for f in features if f.split("/", 1)[0] in in_scope]
+        command = ["cargo", "nextest", "run", "--locked", "--profile", "ci", "--no-fail-fast"]
+        for name in packages:
+            command += ["-p", name]
+        return command + (["--features", ",".join(kept)] if kept else [])
+
+    commands = [run(selected) + ["-E", TEST_FILTER]]
+    if "wn-cli" in selected:
+        commands.append(run(["wn-cli"]) + ["--test", "cli"])
+    return commands
 
 
 def git_changed_files(base: str) -> list[str]:
@@ -123,14 +128,16 @@ def main(argv: list[str] | None = None) -> int:
         ).stdout
     )
     features = [f for f in args.features.split(",") if f]
-    command = nextest_command(git_changed_files(args.base), metadata, features)
-    if command is None:
+    commands = nextest_commands(git_changed_files(args.base), metadata, features)
+    if not commands:
         print(f"dependents-nextest: no testable crate changed since {args.base}")
         return 0
-    print("dependents-nextest: " + " ".join(command), flush=True)
-    if args.print:
-        return 0
-    return subprocess.run(command, cwd=ROOT).returncode
+    failed = False
+    for command in commands:
+        print("dependents-nextest: " + " ".join(command), flush=True)
+        if not args.print:
+            failed |= subprocess.run(command, cwd=ROOT).returncode != 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

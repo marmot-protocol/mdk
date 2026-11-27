@@ -19,6 +19,11 @@ Landed-commit contract (for Stage 3 release tooling reading `master`):
     attestation without reading earlier commits in the squash body.
 
 PR cross-checks (against the branch's merge-base with `base`):
+  - A change to a Rust workspace crate (or a shared build input) requires
+    `Local-Checks:` to record `just dependents-nextest` (land-change step 2),
+    except a release metadata PR (`just release-pr-preflight`) and an automated
+    Bisect Agent revert. `--enforce-dependents` makes this one check block in
+    `--advisory` mode; Required CI passes it on team PRs.
   - Any added or modified `changelog.d/<slug>.md` with a `### Breaking changes`
     section requires `Release-Impact: minor`.
   - Any added or modified `changelog.d/<slug>.md` with other sections forbids
@@ -31,12 +36,14 @@ import argparse
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import changelog  # noqa: E402
+from dependents_nextest import changed_packages  # noqa: E402
 
 VALID_IMPACTS = ("none", "patch", "minor")
 MDK_TRAILER_KEYS = frozenset({"local-checks", "local-review", "release-impact"})
@@ -48,6 +55,8 @@ CROSS_MODEL_REVIEW = re.compile(
 HUMAN_REVIEW = re.compile(r"^human(?:\s+\S.*)?$")
 EXEMPT_REVIEW = re.compile(r"^exempt\s*\((?P<reason>[^()]+)\)$")
 FRAGMENT_PATH = re.compile(r"(?:^|/)changelog\.d/[^/]+\.md$")
+DEPENDENTS_EVIDENCE = ("dependents-nextest", "release-pr-preflight")
+BISECT_REVERT_REVIEW = re.compile(r"^exempt\s*\(automated bisect revert of [0-9a-f]{7,40}\)$")
 GITHUB_SQUASH_SEPARATOR = "---------"
 GITHUB_SQUASH_FOOTER_LINE = re.compile(
     r"^(?:Co-authored-by|Signed-off-by|On-behalf-of):[ \t]+(?:\S[^\r\n]*[ \t]+)?<[^<>\s]+>$",
@@ -250,6 +259,30 @@ def validate_range(root: Path, base: str, head: str) -> tuple[str | None, list[s
     return impact, errors
 
 
+def validate_dependents_tests(root: Path, base: str, head: str) -> list[str]:
+    """Require `just dependents-nextest` in `Local-Checks:` when `base...head` changes a workspace crate."""
+    try:
+        manifest = git(root, "show", f"{head}:Cargo.toml")
+    except subprocess.CalledProcessError:
+        return []
+    members = tomllib.loads(manifest).get("workspace", {}).get("members", [])
+    crates = {member: Path(member) for member in members if isinstance(member, str)}
+    files = [f for f in git(root, "diff", "--no-renames", "--name-only", "-z", f"{base}...{head}").split("\0") if f]
+    if not changed_packages(files, crates):
+        return []
+    tip = git(root, "rev-list", "-1", head).strip()
+    tip_trailers, _ = parse_trailers(git(root, "show", "-s", "--format=%B", tip))
+    checks = tip_trailers.get("local-checks") or ""
+    if any(evidence in checks for evidence in DEPENDENTS_EVIDENCE):
+        return []
+    if BISECT_REVERT_REVIEW.match((tip_trailers.get("local-review") or "").strip()):
+        return []
+    return [
+        "this change touches a Rust workspace crate, so 'Local-Checks:' must record "
+        "`just dependents-nextest` (land-change step 2)"
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", type=Path, default=ROOT, help="repository root")
@@ -260,10 +293,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="emit GitHub Actions warnings instead of failing (Phase 0-2 rollout mode)",
     )
+    parser.add_argument(
+        "--enforce-dependents",
+        action="store_true",
+        help="with --advisory, still fail when a crate change does not record `just dependents-nextest`",
+    )
     args = parser.parse_args(argv)
 
     try:
         impact, errors = validate_range(args.root, args.base, args.head)
+        dependents_errors = validate_dependents_tests(args.root, args.base, args.head)
     except subprocess.CalledProcessError as exc:
         msg = f"pr-trailers: failed to inspect {args.base}..{args.head}: {exc}"
         if args.advisory:
@@ -272,15 +311,24 @@ def main(argv: list[str] | None = None) -> int:
         print(msg, file=sys.stderr)
         return 1
 
-    if errors:
-        if args.advisory:
-            for err in errors:
-                print(f"::warning title=PR trailers::{err}")
+    if args.advisory:
+        enforced = dependents_errors if args.enforce_dependents else []
+        warnings = errors + ([] if args.enforce_dependents else dependents_errors)
+        for err in warnings:
+            print(f"::warning title=PR trailers::{err}")
+        for err in enforced:
+            print(f"::error title=PR trailers::{err}")
+            print(f"pr-trailers: {err}", file=sys.stderr)
+        if enforced:
+            return 1
+        if warnings:
             print(
-                f"pr-trailers: {len(errors)} advisory warning(s) "
+                f"pr-trailers: {len(warnings)} advisory warning(s) "
                 "(enforcement starts in Phase 3; see AGENTS.md)"
             )
             return 0
+    errors += dependents_errors
+    if errors:
         for err in errors:
             print(f"pr-trailers: {err}", file=sys.stderr)
         return 1

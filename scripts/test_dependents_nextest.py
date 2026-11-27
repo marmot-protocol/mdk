@@ -9,7 +9,13 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from dependents_nextest import TEST_FILTER, nextest_command  # noqa: E402
+from dependents_nextest import TEST_FILTER, nextest_commands  # noqa: E402
+
+
+def nextest_command(files: list[str], metadata: dict, features: list[str]) -> list[str] | None:
+    """The workspace-suite command (the first one), or `None` when nothing is selected."""
+    commands = nextest_commands(files, metadata, features)
+    return commands[0] if commands else None
 
 FEATURES = ["wn-cli/test-policy-overrides", "cgka-engine/test-policy-overrides", "cgka-engine/test-crash-hooks"]
 
@@ -64,6 +70,19 @@ class DependentsNextestTests(unittest.TestCase):
         command = nextest_command(["crates/transport-nostr/src/lib.rs"], WORKSPACE, FEATURES)
         self.assertEqual(packages(command), ["marmot-app", "transport-nostr", "wn-cli"])
         self.assertEqual(command[-2:], ["-E", TEST_FILTER])
+
+    def test_a_change_reaching_wn_cli_also_runs_its_cli_journeys(self):
+        # #3819 changed `marmot-app` and broke `wn-cli`'s CLI e2e suite, which the workspace
+        # run leaves out (CI runs it as its own job so it cannot starve the unit tests).
+        commands = nextest_commands(["crates/marmot-session/src/runtime.rs"], WORKSPACE, FEATURES)
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(
+            commands[1],
+            ["cargo", "nextest", "run", "--locked", "--profile", "ci", "--no-fail-fast", "-p", "wn-cli",
+             "--features", "wn-cli/test-policy-overrides", "--test", "cli"],
+        )
+        self.assertEqual(len(nextest_commands(["crates/cgka-engine/src/lib.rs"], metadata(
+            {"cgka-engine": ("crates/cgka-engine", [])}), FEATURES)), 1)
 
     def test_canary_features_are_kept_only_where_cargo_accepts_them(self):
         # Cargo rejects `pkg/feature` unless `pkg` is selected or a direct dependency of one.
