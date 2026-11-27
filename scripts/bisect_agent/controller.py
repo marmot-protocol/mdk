@@ -14,6 +14,8 @@ import time
 from typing import Any, Callable
 
 from .classifier import (
+    NEXTEST_FAIL_RE,
+    NEXTEST_PASS_RE,
     classify_failure,
     evaluate_command_result,
     extract_bare_metal_signal,
@@ -22,6 +24,7 @@ from .classifier import (
     extract_hosted_signals,
     is_non_linux_job,
     match_issue_by_title,
+    normalize_log_text,
 )
 from .models import (
     AgentState,
@@ -196,22 +199,20 @@ class GitHubOps:
         ]
         return "verified" if verified_jobs else "skipped"
 
-    def job_log(self, run_id: int, job_id: int) -> str | None:
+    def job_log(self, _run_id: int, job_id: int) -> str | None:
         """Fetch full job log so failure records earlier than the tail remain detectable.
 
+        Reads the jobs logs API: `gh run view --job <id> --log` prints nothing (exit 0) for
+        jobs of a called workflow, and every hosted Canary test job runs inside `ci.yml`.
+        gh 2.97+ refuses the escape sequences in these logs without `--allow-escape-sequences`,
+        which older gh rejects as an unknown flag. The log is captured, never printed raw.
         Returns `None` on GitHub API/CLI failure or timeout so callers defer and retry
         rather than treating an unavailable log as an empty unparsed job.
         """
-        res = self._run_gh_safe(
-            "run",
-            "view",
-            str(run_id),
-            "--repo",
-            self.repo,
-            "--job",
-            str(job_id),
-            "--log",
-        )
+        endpoint = f"repos/{self.repo}/actions/jobs/{job_id}/logs"
+        res = self._run_gh_safe("api", "--allow-escape-sequences", endpoint)
+        if res is not None and res.returncode != 0 and "unknown flag: --allow-escape-sequences" in res.stderr:
+            res = self._run_gh_safe("api", endpoint)
         if res is None or res.returncode != 0:
             return None
         return res.stdout
@@ -366,6 +367,14 @@ def default_worktree_runner(
     """Return a WorktreePredicate executing `command` with scrubbed env, timeout, and optional OS isolation."""
 
     def _run(wt: Path) -> tuple[RunVerdict, str]:
+        if cargo_target_dir is not None:
+            # nextest keeps its store at `<workspace>/target/nextest` whatever
+            # `CARGO_TARGET_DIR` says, and the isolated runner cannot write the bot-owned
+            # worktree. Point the worktree's `target` at the target dir the runner owns.
+            cargo_target_dir.mkdir(parents=True, exist_ok=True)
+            worktree_target = wt / "target"
+            if not worktree_target.exists() and not worktree_target.is_symlink():
+                worktree_target.symlink_to(cargo_target_dir.resolve(), target_is_directory=True)
         with tempfile.TemporaryDirectory(prefix="mdk-pred-home-") as home_tmp:
             sandbox = Path(home_tmp)
             env = build_sanitized_predicate_env(
@@ -1883,35 +1892,122 @@ class BisectController:
         return result
 
 
+SELFTEST_REPLAY_COMMAND: tuple[str, ...] = ("cargo", "nextest", "run", "--locked", "-p", "cgka-traits", "--profile", "ci")
+
+
+def selftest(
+    github: GitHubOps,
+    *,
+    repo_dir: Path,
+    worktree_root: Path,
+    cargo_target_dir: Path,
+    runner_prefix: tuple[str, ...],
+    timeout_secs: int,
+) -> list[str]:
+    """Exercise the live hosted log fetch and sandboxed replay the unit tests fake; return problems found."""
+    problems: list[str] = []
+    job_ref: tuple[int, int] | None = None
+    # A test shard's log is the one the agent must parse; planner jobs and hourly skip runs
+    # carry no nextest output, so look past them.
+    for run in github.recent_workflow_runs("canary.yml", limit=30):
+        jobs = github.jobs_for_run(int(run.get("id") or 0)) or []
+        shards = [
+            job
+            for job in jobs
+            if "/ Rust tests (" in str(job.get("name") or "") and job.get("conclusion") in {"success", "failure"}
+        ]
+        if shards:
+            job_ref = (int(run["id"]), int(shards[0]["id"]))
+            break
+    if job_ref is None:
+        problems.append("no completed Rust tests shard found in the last 30 hosted Canary runs")
+    else:
+        ref = f"(run {job_ref[0]}, job {job_ref[1]})"
+        log = github.job_log(*job_ref)
+        if log is None:
+            problems.append(f"hosted job log fetch failed {ref}")
+        elif not log.strip():
+            problems.append(f"hosted job log came back empty {ref}")
+        else:
+            cleaned = normalize_log_text(log)
+            if not (NEXTEST_PASS_RE.search(cleaned) or NEXTEST_FAIL_RE.search(cleaned)):
+                problems.append(f"hosted job log has no nextest results {ref}")
+
+    sha = resolve_commit(repo_dir, "origin/master")
+    if sha is None:
+        problems.append("origin/master is not available in --repo-dir")
+    else:
+        verdict, detail = run_in_detached_worktree(
+            repo_dir,
+            sha,
+            default_worktree_runner(
+                SELFTEST_REPLAY_COMMAND,
+                timeout_secs=timeout_secs,
+                cargo_target_dir=cargo_target_dir,
+                runner_prefix=runner_prefix,
+            ),
+            worktree_root=worktree_root,
+        )
+        if verdict != RunVerdict.PASS:
+            problems.append(f"sandboxed replay on {sha[:9]} was {verdict.value}: {detail}")
+    return problems
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MDK always-on revert-only Bisect Agent")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    poll = sub.add_parser("poll", help="Run one poll pass across bare-metal and hosted Canary")
-    poll.add_argument("--repo", default="marmot-protocol/mdk")
-    poll.add_argument("--repo-dir", type=Path, default=Path("/srv/mdk/repo"))
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--repo", default="marmot-protocol/mdk")
+    common.add_argument("--repo-dir", type=Path, default=Path("/srv/mdk/repo"))
+    common.add_argument("--worktree-root", type=Path, default=Path("/srv/mdk/worktrees/bisect"))
+    common.add_argument("--cargo-target-dir", type=Path, default=Path("/srv/mdk/target-bisect"))
+    common.add_argument("--timeout-secs", type=int, default=DEFAULT_COMMAND_TIMEOUT_SECS)
+    common.add_argument(
+        "--predicate-runner-prefix",
+        default="",
+        help="Command prefix isolating build/test predicates from the signing bot UID (e.g. 'sudo -n -u mdk-runner --'); required for --live and selftest",
+    )
+
+    poll = sub.add_parser("poll", parents=[common], help="Run one poll pass across bare-metal and hosted Canary")
     poll.add_argument("--state-file", type=Path, default=Path("/srv/mdk/state/bisect-state.json"))
     poll.add_argument("--canary-status", type=Path, default=Path("/srv/mdk/state/canary-status.json"))
     poll.add_argument("--roster", type=Path, default=Path("/srv/mdk/bisect-roster.json"))
-    poll.add_argument("--worktree-root", type=Path, default=Path("/srv/mdk/worktrees/bisect"))
-    poll.add_argument("--cargo-target-dir", type=Path, default=Path("/srv/mdk/target-bisect"))
-    poll.add_argument("--timeout-secs", type=int, default=DEFAULT_COMMAND_TIMEOUT_SECS)
     poll.add_argument("--bisect-budget-secs", type=int, default=DEFAULT_BISECT_BUDGET_SECS)
     poll.add_argument("--stress-count", type=int, default=10)
-    poll.add_argument(
-        "--predicate-runner-prefix",
-        default="",
-        help="Command prefix isolating build/test predicates from the signing bot UID (e.g. 'sudo -n -u mdk-runner --'); required for --live",
-    )
     poll.add_argument("--no-fetch", action="store_true", help="Skip git fetch before polling")
     poll.add_argument("--live", action="store_true", help="Execute real pushes/PRs/alerts (default: dry-run)")
+
+    sub.add_parser(
+        "selftest",
+        parents=[common],
+        help="Fetch a real hosted Canary job log and replay a small nextest suite in the predicate sandbox",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    dry_run = not args.live
     runner_prefix = tuple(shlex.split(args.predicate_runner_prefix)) if args.predicate_runner_prefix else ()
+    if args.command == "selftest":
+        if not runner_prefix:
+            print("error: selftest requires --predicate-runner-prefix to replay as the live agent does", file=sys.stderr)
+            return 2
+        problems = selftest(
+            GitHubOps(args.repo, dry_run=True),
+            repo_dir=args.repo_dir,
+            worktree_root=args.worktree_root,
+            cargo_target_dir=args.cargo_target_dir,
+            runner_prefix=runner_prefix,
+            timeout_secs=args.timeout_secs,
+        )
+        for problem in problems:
+            print(f"selftest: FAIL: {problem}", file=sys.stderr)
+        if not problems:
+            print("selftest: ok")
+        return 1 if problems else 0
+
+    dry_run = not args.live
     if not dry_run and not runner_prefix:
         print(
             "error: --live requires --predicate-runner-prefix (e.g. 'sudo -n -u mdk-runner --') "
