@@ -423,15 +423,17 @@ def default_worktree_runner(
                     argv,
                     cwd=wt,
                     env=env,
-                    capture_output=True,
+                    # One chronological stream, so the log tail the classifier reads is the
+                    # end of the run (cargo writes its progress and errors to stderr).
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
                     check=False,
                     timeout=timeout_secs,
                 )
             except subprocess.TimeoutExpired:
                 return RunVerdict.INCONCLUSIVE, f"command timed out after {timeout_secs}s"
-            output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
-            return evaluate_command_result(proc.returncode, output, command)
+            return evaluate_command_result(proc.returncode, proc.stdout or "", command)
 
     return _run
 
