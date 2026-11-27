@@ -625,11 +625,10 @@ impl AccountManager {
         Ok(created.group_id)
     }
 
-    pub async fn create_group_with_options(
+    async fn create_group_request(
         &self,
         account_ref: &str,
-        name: &str,
-        members: &[String],
+        request: GroupCreationRequest,
         options: AppCreateGroupOptions,
     ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         let started_at = Instant::now();
@@ -639,11 +638,7 @@ impl AccountManager {
             command
                 .send(AccountWorkerCommand::CreateGroup {
                     queued_at: Instant::now(),
-                    request: GroupCreationRequest::Group {
-                        name: name.to_owned(),
-                        members: members.to_vec(),
-                        prepared_image_upload_id: None,
-                    },
+                    request,
                     options,
                     respond,
                 })
@@ -669,6 +664,25 @@ impl AccountManager {
             operation: created.operation.map(|created| created.group_id),
             member_outcomes: created.member_outcomes,
         })
+    }
+
+    pub async fn create_group_with_options(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        options: AppCreateGroupOptions,
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
+        self.create_group_request(
+            account_ref,
+            GroupCreationRequest::Group {
+                name: name.to_owned(),
+                members: members.to_vec(),
+                prepared_image_upload_id: None,
+            },
+            options,
+        )
+        .await
     }
 
     pub async fn stage_prepared_group_image(
@@ -769,46 +783,19 @@ impl AccountManager {
         description: Option<String>,
         upload_id: String,
     ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
-        let started_at = Instant::now();
-        let result = async {
-            let command = self.worker_commands(account_ref).await?;
-            let (respond, response) = oneshot::channel();
-            command
-                .send(AccountWorkerCommand::CreateGroup {
-                    queued_at: Instant::now(),
-                    request: GroupCreationRequest::Group {
-                        name: name.to_owned(),
-                        members: members.to_vec(),
-                        prepared_image_upload_id: Some(upload_id),
-                    },
-                    options: AppCreateGroupOptions {
-                        description: description.unwrap_or_default(),
-                        ..Default::default()
-                    },
-                    respond,
-                })
-                .await
-                .map_err(|_| AppError::TransportClosed)?;
-            let created = long_account_worker_response(response).await?;
-            if created.operation.is_some() {
-                self.spawn_create_catch_up(command);
-            }
-            Ok::<_, AppError>(created)
-        }
-        .await;
-        self.shared.observer.performance().record(
-            AppPerformanceOperation::GroupCreateTotalCallerLatency,
-            started_at.elapsed(),
-            result.is_ok(),
-        );
-        let created = result?;
-        if created.operation.is_some() {
-            self.schedule_audit_log_tracker_update("create_group");
-        }
-        Ok(crate::GroupMemberResult {
-            operation: created.operation.map(|created| created.group_id),
-            member_outcomes: created.member_outcomes,
-        })
+        self.create_group_request(
+            account_ref,
+            GroupCreationRequest::Group {
+                name: name.to_owned(),
+                members: members.to_vec(),
+                prepared_image_upload_id: Some(upload_id),
+            },
+            AppCreateGroupOptions {
+                description: description.unwrap_or_default(),
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     pub async fn create_group_with_initial_image_detailed(
@@ -3485,6 +3472,7 @@ mod tests {
                 unit: Default::default(),
                 read_state: Default::default(),
                 relay_checks: tokio::sync::watch::channel(Default::default()).1,
+                tasks: Default::default(),
             },
         );
         let error = manager
@@ -3568,6 +3556,7 @@ mod tests {
                 unit: Default::default(),
                 read_state: Default::default(),
                 relay_checks: tokio::sync::watch::channel(Default::default()).1,
+                tasks: Default::default(),
             },
         );
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -3653,6 +3642,7 @@ mod tests {
                 unit: Default::default(),
                 read_state: Default::default(),
                 relay_checks: tokio::sync::watch::channel(Default::default()).1,
+                tasks: Default::default(),
             },
         );
         assert!(
@@ -3744,6 +3734,7 @@ mod tests {
                 unit: Default::default(),
                 read_state,
                 relay_checks: tokio::sync::watch::channel(Default::default()).1,
+                tasks: Default::default(),
             },
         );
         let telemetry = runtime.shared_services().observer.performance().clone();

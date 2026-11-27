@@ -452,7 +452,7 @@ pub(crate) struct HostCommandReceivers {
 /// commands still runs its own retries (mdk#3466, mdk#3801).
 pub(crate) struct WorkerInbox {
     host_group: mpsc::Receiver<QueuedCommand>,
-    host_account: Option<mpsc::Receiver<QueuedCommand>>,
+    host_account: mpsc::Receiver<QueuedCommand>,
     peek_group: Option<QueuedCommand>,
     peek_account: Option<QueuedCommand>,
     host_group_closed: bool,
@@ -468,7 +468,7 @@ impl WorkerInbox {
         (
             Self {
                 host_group: host.group,
-                host_account: Some(host.account),
+                host_account: host.account,
                 peek_group: None,
                 peek_account: None,
                 host_group_closed: false,
@@ -484,10 +484,11 @@ impl WorkerInbox {
     #[cfg(test)]
     pub(crate) fn new(host: mpsc::Receiver<QueuedCommand>) -> (Self, WorkerCommands) {
         let (sender, own) = mpsc::channel(8);
+        let (_closed_account_tx, host_account) = mpsc::channel(1);
         (
             Self {
                 host_group: host,
-                host_account: None,
+                host_account,
                 peek_group: None,
                 peek_account: None,
                 host_group_closed: false,
@@ -507,13 +508,10 @@ impl WorkerInbox {
             }
         }
         if admit_account && self.peek_account.is_none() && !self.host_account_closed {
-            match self.host_account.as_mut() {
-                Some(rx) => match rx.try_recv() {
-                    Ok(command) => self.peek_account = Some(command),
-                    Err(mpsc::error::TryRecvError::Empty) => {}
-                    Err(mpsc::error::TryRecvError::Disconnected) => self.host_account_closed = true,
-                },
-                None => self.host_account_closed = true,
+            match self.host_account.try_recv() {
+                Ok(command) => self.peek_account = Some(command),
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => self.host_account_closed = true,
             }
         }
     }
@@ -561,8 +559,7 @@ impl WorkerInbox {
                 return Some(command);
             }
             let wait_group = admit_group && !self.host_group_closed;
-            let wait_account =
-                admit_account && !self.host_account_closed && self.host_account.is_some();
+            let wait_account = admit_account && !self.host_account_closed;
             if (admit_group || admit_account) && !wait_group && !wait_account {
                 // Every admitted host channel is closed and drained.
                 return None;
@@ -576,7 +573,7 @@ impl WorkerInbox {
                         None => self.host_group_closed = true,
                     }
                 }
-                command = async { self.host_account.as_mut().expect("guarded").recv().await }, if wait_account => {
+                command = self.host_account.recv(), if wait_account => {
                     match command {
                         Some(command) => self.peek_account = Some(command),
                         None => self.host_account_closed = true,
@@ -609,8 +606,7 @@ impl WorkerInbox {
             return Ok(command);
         }
         let open_group = admit_group && !self.host_group_closed;
-        let open_account =
-            admit_account && !self.host_account_closed && self.host_account.is_some();
+        let open_account = admit_account && !self.host_account_closed;
         if !open_group && !open_account {
             Err(mpsc::error::TryRecvError::Disconnected)
         } else {
@@ -624,7 +620,7 @@ impl WorkerInbox {
             + usize::from(self.peek_group.is_some())
             + self.host_group.len()
             + usize::from(self.peek_account.is_some())
-            + self.host_account.as_ref().map_or(0, mpsc::Receiver::len)
+            + self.host_account.len()
     }
 
     /// Whether no command the worker would take now is waiting: its own, and
@@ -632,12 +628,7 @@ impl WorkerInbox {
     pub(crate) fn is_empty_admitting(&self, admit_group: bool, admit_account: bool) -> bool {
         self.own.is_empty()
             && (!admit_group || (self.peek_group.is_none() && self.host_group.is_empty()))
-            && (!admit_account
-                || (self.peek_account.is_none()
-                    && self
-                        .host_account
-                        .as_ref()
-                        .is_none_or(mpsc::Receiver::is_empty)))
+            && (!admit_account || (self.peek_account.is_none() && self.host_account.is_empty()))
     }
 }
 

@@ -3298,7 +3298,7 @@ async fn reordering_queued_work_wakes_the_worker_only_when_the_order_changes() {
 /// finishing teardown, so zero tasks outlive teardown and zero SQLite handles
 /// are reopened after cache eviction (mdk#3801).
 #[test]
-fn remove_account_waits_for_in_flight_blocking_housekeeping_tasks_to_drain() {
+fn teardown_waits_for_in_flight_blocking_housekeeping_tasks_to_drain() {
     one_blocking_thread_runtime().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let home = marmot_account::AccountHome::open(dir.path());
@@ -3307,6 +3307,15 @@ fn remove_account_waits_for_in_flight_blocking_housekeeping_tasks_to_drain() {
         let app =
             MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
         let runtime = crate::MarmotAppRuntime::new(app.clone());
+        let telemetry = runtime.shared_services().observer.performance().clone();
+        let upload_promotion_in_flight = || {
+            telemetry
+                .snapshot()
+                .runtime_operations
+                .into_iter()
+                .find(|sample| sample.operation == RuntimeOp::WorkerUploadPromotion)
+                .map_or(0, |sample| sample.in_flight)
+        };
         runtime.reconcile_accounts().await.unwrap();
         crate::worker_fences::worker_startup_finished(&runtime, "alice")
             .await
@@ -3353,10 +3362,15 @@ fn remove_account_waits_for_in_flight_blocking_housekeeping_tasks_to_drain() {
             .unwrap();
         }
         app.presentation_signals.wake_account("alice");
-        // Wait for the worker to process the wakeup and submit its blocking task.
-        crate::worker_fences::worker_round_trip(&runtime, "alice")
-            .await
-            .unwrap();
+        // Confirm deterministically that `upload_promotion` was actually
+        // spawned and is queued behind `blocker` on the blocking pool.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while upload_promotion_in_flight() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upload_promotion must be queued behind the blocker");
 
         let lane = runtime.accounts().worker_lane("alice").await.unwrap();
         let accounts = runtime.accounts();
@@ -3391,6 +3405,11 @@ fn remove_account_waits_for_in_flight_blocking_housekeeping_tasks_to_drain() {
             .expect("teardown finishes once blocking tasks drain")
             .unwrap()
             .unwrap();
+        assert_eq!(
+            upload_promotion_in_flight(),
+            0,
+            "upload_promotion must have drained before teardown returned"
+        );
         // No SQLite handle may have been reopened after cache eviction.
         assert!(
             !app.account_storages.lock().unwrap().contains_key("alice"),
@@ -3403,4 +3422,64 @@ fn remove_account_waits_for_in_flight_blocking_housekeeping_tasks_to_drain() {
         );
         runtime.shutdown_and_close().await.unwrap();
     });
+}
+
+/// Even when `ManagedAccountWorker::shutdown_with_timeout` hits its deadline
+/// and aborts the worker task, it must still cancel and drain every tracked
+/// blocking task owned by the worker before returning (mdk#3801).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forced_worker_shutdown_drains_tracked_blocking_tasks_after_abort() {
+    let tasks = super::WorkerTaskScope::new();
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished_in_task = finished.clone();
+    let cancel_token = tasks.token();
+    let _blocking = tasks.spawn_blocking(move || {
+        let _ = entered_tx.send(());
+        release_rx.recv().unwrap();
+        assert!(
+            cancel_token.is_cancelled(),
+            "forced shutdown must cancel the shared WorkerTaskScope token"
+        );
+        finished_in_task.store(true, std::sync::atomic::Ordering::Release);
+    });
+    entered_rx.await.unwrap();
+
+    let (commands, _rx) = crate::runtime::test_worker_channel(1);
+    let (shutdown, _shutdown_rx) = oneshot::channel();
+    // Simulate a stuck worker that ignores the graceful shutdown signal so
+    // `shutdown_with_timeout` aborts it immediately at the deadline.
+    let worker = crate::runtime::account_worker::ManagedAccountWorker {
+        ready: true,
+        handle: tokio::spawn(std::future::pending::<()>()),
+        commands,
+        media_admission: Arc::new(Semaphore::new(1)),
+        shutdown,
+        unit: Default::default(),
+        read_state: Default::default(),
+        relay_checks: watch::channel(Default::default()).1,
+        tasks: tasks.clone(),
+    };
+    let draining = tokio::spawn(worker.shutdown_with_timeout(Duration::ZERO));
+    let cancelled = tasks.token();
+    tokio::time::timeout(Duration::from_secs(5), cancelled.cancelled())
+        .await
+        .expect("forced shutdown cancels WorkerTaskScope");
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !draining.is_finished(),
+        "forced worker shutdown returned while a tracked blocking task was still running"
+    );
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), draining)
+        .await
+        .expect("forced shutdown finishes once tracked blocking task completes")
+        .unwrap();
+    assert!(
+        finished.load(std::sync::atomic::Ordering::Acquire),
+        "blocking task must have finished before shutdown_with_timeout returned"
+    );
 }

@@ -81,6 +81,10 @@ pub(crate) struct ManagedAccountWorker {
     pub(crate) read_state: ReadStateReader,
     /// The worker's inbox checks' state, which `account_relay_health` reads.
     pub(crate) relay_checks: watch::Receiver<crate::relay_health::CheckSnapshot>,
+    /// Tracks detached async/blocking tasks spawned for this worker so
+    /// shutdown cancels and drains them even if the worker panics or is
+    /// aborted at the shutdown timeout (mdk#3801).
+    pub(crate) tasks: WorkerTaskScope,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -133,6 +137,9 @@ impl ManagedAccountWorker {
                 let _ = handle.await;
             }
         }
+        // Cancel and drain any worker-owned detached async/blocking tasks even
+        // when the worker panicked or was aborted past the shutdown deadline.
+        self.tasks.end().await;
     }
 }
 
@@ -364,6 +371,9 @@ pub(crate) struct AccountWorkerRuntime {
     /// Where the worker publishes its inbox checks' state for
     /// `account_relay_health`.
     pub(crate) relay_checks: watch::Sender<crate::relay_health::CheckSnapshot>,
+    /// Shared task scope owned alongside the managed handle so forced shutdown
+    /// can still cancel and drain detached worker tasks (mdk#3801).
+    pub(crate) tasks: WorkerTaskScope,
 }
 
 pub(crate) enum GroupCreationRequest {
@@ -1216,6 +1226,7 @@ async fn run_app_runtime_account_worker(
         unit,
         read_state,
         relay_checks: relay_check_state,
+        tasks: worker_tasks,
     } = runtime;
     let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
     let mut relay_config_updates = app.presentation_signals.profile_updates.subscribe();
@@ -1665,7 +1676,6 @@ async fn run_app_runtime_account_worker(
     // later commands can land while a deferred create/invite still owns
     // Welcome fanout.
     let (media_http_tx, mut media_http_rx) = mpsc::unbounded_channel();
-    let worker_tasks = WorkerTaskScope::new();
     let media_http = MediaHttpContext {
         product: shared.observer.product().clone(),
         tx: media_http_tx,
@@ -5177,13 +5187,13 @@ const DEFERRED_COMMAND_LIMIT: usize = 256;
 /// teardown cancels and drains every task before worker exit and cache
 /// eviction (mdk#3801).
 #[derive(Clone, Default)]
-pub(super) struct WorkerTaskScope {
+pub(crate) struct WorkerTaskScope {
     tasks: tokio_util::task::TaskTracker,
     cancel: tokio_util::sync::CancellationToken,
 }
 
 impl WorkerTaskScope {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -5211,7 +5221,7 @@ impl WorkerTaskScope {
         self.tasks.spawn_blocking(func)
     }
 
-    pub(super) async fn end(&self) {
+    pub(crate) async fn end(&self) {
         self.cancel.cancel();
         self.tasks.close();
         self.tasks.wait().await;
@@ -10714,9 +10724,10 @@ mod tests {
     }
 
     /// While a held unit defers host commands, the in-memory `deferred` /
-    /// `follow_up` buffer must stop growing past its bound and apply channel
-    /// backpressure instead of draining unbounded host commands (mdk#3801).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// `follow_up` buffer must stop growing past `DEFERRED_COMMAND_LIMIT` and
+    /// apply channel backpressure instead of draining unbounded host commands
+    /// (mdk#3801).
+    #[tokio::test(flavor = "current_thread")]
     async fn defer_commands_until_bounds_deferred_queue_with_backpressure() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -10732,10 +10743,10 @@ mod tests {
         let (release, work) = oneshot::channel::<()>();
         let serve = defer_commands_until(published, work, &mut receiver, &mut pending, None);
         let probe = async {
-            // Attempt to enqueue well beyond the deferred bound + channel buffer.
+            // Enqueue past DEFERRED_COMMAND_LIMIT + channel buffer (8).
             let mut responses = Vec::new();
             let mut backpressured = false;
-            for _ in 0..300 {
+            for _ in 0..DEFERRED_COMMAND_LIMIT + 32 {
                 let (respond, response) = oneshot::channel();
                 let mut cmd = Some(AccountWorkerCommand::ConnectivityRestored { respond });
                 for _ in 0..16 {
@@ -10767,10 +10778,15 @@ mod tests {
             backpressured,
             "defer_commands_until drained all {sent} commands without backpressure"
         );
-        assert!(
-            pending.len() <= 256,
-            "deferred queue grew to {}, exceeding bound",
-            pending.len()
+        assert_eq!(
+            sent,
+            DEFERRED_COMMAND_LIMIT + commands.max_capacity(),
+            "backpressure must trigger only after DEFERRED_COMMAND_LIMIT + channel capacity"
+        );
+        assert_eq!(
+            pending.len(),
+            DEFERRED_COMMAND_LIMIT,
+            "deferred queue must stop at DEFERRED_COMMAND_LIMIT"
         );
     }
 
@@ -11546,6 +11562,7 @@ mod tests {
         let (ready, readiness) = oneshot::channel();
         let (shutdown, shutdown_rx) = oneshot::channel();
         let (read_state_tx, read_state) = crate::client::read_state::read_state_channel();
+        let tasks = WorkerTaskScope::new();
         let worker = spawn_app_runtime_account_worker(
             AccountWorkerRuntime {
                 app: app.clone(),
@@ -11559,6 +11576,7 @@ mod tests {
                 unit: Arc::default(),
                 read_state: read_state_tx,
                 relay_checks: tokio::sync::watch::channel(Default::default()).0,
+                tasks: tasks.clone(),
             },
             receiver,
             ready,
@@ -11578,6 +11596,7 @@ mod tests {
                 unit: Default::default(),
                 read_state,
                 relay_checks: tokio::sync::watch::channel(Default::default()).1,
+                tasks,
             },
         );
         timeout(Duration::from_secs(5), readiness)

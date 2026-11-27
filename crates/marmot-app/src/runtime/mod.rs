@@ -316,7 +316,8 @@ impl Drop for AccountTeardownGuard<'_> {
 /// 1. Generated-setup fence (`fence_generated_teardown` for removals/resets, or
 ///    the re-entrant `fence_generated_setup` for deactivations whose caller may
 ///    already hold `onboarding_transaction`).
-/// 2. Moderation-report fence (`fence_moderation_reports`).
+/// 2. Moderation-report fence (`fence_moderation_reports`, or
+///    `close_moderation_report_admission` for `reset_incomplete_account_setup`).
 /// 3. Generated-removal preparation fence (`fence_generated_removal`, for
 ///    destructive removals/resets).
 struct AccountLifecycleFences<'a> {
@@ -357,6 +358,35 @@ impl<'a> AccountLifecycleFences<'a> {
         // Check before purging reports and again after taking worker_transactions.
         manager.resolve_original(expected)?;
         let (moderation_reports, _) = manager.fence_moderation_reports(&expected.label).await;
+        let generated_removal = manager
+            .setup
+            .fence_generated_removal(&generated_teardown)
+            .await;
+        Ok(Self {
+            _generated_teardown: Some(generated_teardown),
+            _generated_setup: None,
+            _moderation_reports: moderation_reports,
+            _generated_removal: Some(generated_removal),
+        })
+    }
+
+    async fn acquire_for_reset(
+        manager: &'a AccountManager,
+        expected: &AccountSummary,
+    ) -> Result<Self, AppError> {
+        let generated_teardown = manager
+            .setup
+            .fence_generated_teardown(manager, &expected.account_id_hex)
+            .await;
+        // A label may have been reused while foreground setup finished.
+        // Check before fencing reports and again after taking worker_transactions.
+        manager.resolve_original(expected)?;
+        // Close report admission and drain in-flight work without purging rows
+        // yet, so a reset rejected by precondition re-checks leaves reports
+        // untouched; a committed reset deletes the account directory anyway.
+        let moderation_reports = manager
+            .close_moderation_report_admission(&expected.label)
+            .await;
         let generated_removal = manager
             .setup
             .fence_generated_removal(&generated_teardown)
@@ -7671,36 +7701,11 @@ impl AccountManager {
         .await
     }
 
-    /// Explicit recovery for an account created before durable setup journals.
-    ///
-    /// This is intentionally not automatic: without a lifecycle/legacy slot,
-    /// local files cannot prove that an old KeyPackage was never exposed. The
-    /// caller must present the matching nsec and explicitly acknowledge that
-    /// resetting can orphan such an unknown publication. The credential is
-    /// retained so the next `create_or_import_account` reuses it rather than
-    /// creating a duplicate keychain entry.
-    pub async fn reset_incomplete_account_setup(
+    fn validate_incomplete_account_setup_reset(
         &self,
-        nsec: &str,
-        acknowledge_possible_key_package_orphan: bool,
+        account_id: &str,
+        account: &AccountSummary,
     ) -> Result<(), AppError> {
-        self.shared.lifecycle().ensure_running()?;
-        if !acknowledge_possible_key_package_orphan {
-            return Err(AppError::AccountSetupRecoveryRequired);
-        }
-        let account_id = AccountHome::account_id_for_secret(nsec)?;
-        let expected = self.app.account_home().account(&account_id)?;
-        self.finish_nip46_account(&expected).await;
-        let _fences = AccountLifecycleFences::acquire_for_removal(self, &expected).await?;
-        let lock_wait = self
-            .shared
-            .observer
-            .performance()
-            .observe(RuntimeOp::LifecycleLockWait);
-        let _worker_transaction = self.worker_transactions.lock().await;
-        lock_wait.finish(TelemetryOutcome::Success);
-        self.shared.lifecycle().ensure_running()?;
-        let account = self.resolve_original(&expected)?;
         if !account.local_signing
             || self
                 .app
@@ -7733,15 +7738,48 @@ impl AccountManager {
         {
             return Err(AppError::AccountSetupKeyPackageRecoveryAvailable);
         }
+        Ok(())
+    }
+
+    /// Explicit recovery for an account created before durable setup journals.
+    ///
+    /// This is intentionally not automatic: without a lifecycle/legacy slot,
+    /// local files cannot prove that an old KeyPackage was never exposed. The
+    /// caller must present the matching nsec and explicitly acknowledge that
+    /// resetting can orphan such an unknown publication. The credential is
+    /// retained so the next `create_or_import_account` reuses it rather than
+    /// creating a duplicate keychain entry.
+    pub async fn reset_incomplete_account_setup(
+        &self,
+        nsec: &str,
+        acknowledge_possible_key_package_orphan: bool,
+    ) -> Result<(), AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        if !acknowledge_possible_key_package_orphan {
+            return Err(AppError::AccountSetupRecoveryRequired);
+        }
+        let account_id = AccountHome::account_id_for_secret(nsec)?;
+        let expected = self.app.account_home().account(&account_id)?;
+        // Validate read-only preconditions before fencing generated setup or
+        // report admission so rejected calls never disturb a live account.
+        self.validate_incomplete_account_setup_reset(&account_id, &expected)?;
+        self.finish_nip46_account(&expected).await;
+        let _fences = AccountLifecycleFences::acquire_for_reset(self, &expected).await?;
+        let lock_wait = self
+            .shared
+            .observer
+            .performance()
+            .observe(RuntimeOp::LifecycleLockWait);
+        let _worker_transaction = self.worker_transactions.lock().await;
+        lock_wait.finish(TelemetryOutcome::Success);
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.resolve_original(&expected)?;
+        self.validate_incomplete_account_setup_reset(&account_id, &account)?;
 
         self.ensure_worker_reaped(&account.account_id_hex).await?;
 
         let _teardown = AccountTeardownGuard::new(self, account.account_id_hex.clone());
         async {
-            self.shared
-                .attachment_permissions
-                .forget_account(&account.account_id_hex);
-            self.shared.attachment_cancellations.send_modify(|_| {});
             if let Some(worker) = self.workers.lock().await.remove(&account.account_id_hex) {
                 self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
                 self.ensure_worker_reaped(&account.account_id_hex).await?;
@@ -7767,13 +7805,9 @@ impl AccountManager {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .cancel_account(&account.account_id_hex);
-                    self.app
-                        .forget_unlinked_publish_stop(&account.account_id_hex);
                 }
                 removed?;
             }
-            self.clear_startup_retry(&account.account_id_hex);
-            self.setup.account_removed(&account.account_id_hex);
             Ok(())
         }
         .await
@@ -7810,6 +7844,20 @@ impl AccountManager {
         };
         let (fence, purged) = self.app.fence_moderation_reports(&account.label).await;
         (Some(fence), purged.map(|_| ()))
+    }
+
+    async fn close_moderation_report_admission(
+        &self,
+        account_ref: &str,
+    ) -> Option<crate::moderation_reports::ModerationReportFence> {
+        let Ok(account) = self.app.account_home().account(account_ref) else {
+            return None;
+        };
+        Some(
+            self.app
+                .close_moderation_report_admission(&account.label)
+                .await,
+        )
     }
 
     /// Stop `account_ref`'s generated setup for a teardown, before the
@@ -8264,6 +8312,7 @@ impl AccountManager {
                         self.shared.observer.performance().clone(),
                     ));
                     let (commands, command_rx) = WorkerCommands::host_channel(8, unit.clone());
+                    let tasks = account_worker::WorkerTaskScope::new();
                     let (read_state_tx, read_state) = read_state_channel();
                     let (relay_checks_tx, relay_checks) = watch::channel(Default::default());
                     let (unlinked_tx, unlinked_rx) = oneshot::channel();
@@ -8285,6 +8334,7 @@ impl AccountManager {
                             unit: unit.clone(),
                             read_state: read_state_tx,
                             relay_checks: relay_checks_tx,
+                            tasks: tasks.clone(),
                         },
                         command_rx,
                         ready_tx,
@@ -8302,6 +8352,7 @@ impl AccountManager {
                             unit,
                             read_state,
                             relay_checks,
+                            tasks,
                         },
                     );
                     ready_receivers.push((account_id, Instant::now(), ready_rx, startup_progress));

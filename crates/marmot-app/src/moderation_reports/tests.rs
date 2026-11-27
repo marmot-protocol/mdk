@@ -1691,4 +1691,40 @@ mod runtime {
             .unwrap();
         fixture.runtime.shutdown_and_close().await.unwrap();
     }
+
+    /// A rejected `reset_incomplete_account_setup` must preserve the live
+    /// account's queued moderation reports (mdk#3801).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_reset_incomplete_account_setup_preserves_moderation_reports() {
+        let fixture = runtime_fixture(Mode::Refuse).await;
+        fixture.queue_one().await;
+        assert_eq!(fixture.pending_count(), 1);
+        let secret = fixture
+            .app
+            .account_home()
+            .load_signing_keys(&fixture.label)
+            .unwrap()
+            .secret_key()
+            .to_secret_hex();
+        let error = fixture
+            .runtime
+            .reset_incomplete_account_setup(&secret, true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AppError::AccountSetupResetNotApplicable
+                    | AppError::AccountSetupRetryRequired
+                    | AppError::AccountSetupKeyPackageRecoveryAvailable
+            ),
+            "unexpected error for active account reset: {error:?}"
+        );
+        assert_eq!(
+            fixture.pending_count(),
+            1,
+            "a rejected setup reset must not purge queued moderation reports"
+        );
+        fixture.runtime.shutdown_and_close().await.unwrap();
+    }
 }
