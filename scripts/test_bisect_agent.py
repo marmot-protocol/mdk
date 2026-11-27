@@ -360,6 +360,26 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(evaluate_command_result(0, passing, fast_ci)[0], RunVerdict.PASS)
         self.assertEqual(evaluate_command_result(101, log, fast_ci)[0], RunVerdict.FAIL)
 
+        # Exit 0 is a pass even when the last lines carry infra-like test output.
+        self.assertEqual(
+            evaluate_command_result(0, "CI evidence write failed: No space left on device\nok\n", fast_ci)[0],
+            RunVerdict.PASS,
+        )
+
+        # A replay's tail is its chronological tail: infra text a passing step wrote to
+        # stderr early must not land at the end of the captured output.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            early_stderr_then_failure = (
+                "python3",
+                "-u",
+                "-c",
+                "import sys; print('CI evidence write failed: No space left on device', file=sys.stderr); "
+                "[print(f'    Checking crate-{i}') for i in range(100)]; "
+                "print('error: recipe `clippy-default` failed'); sys.exit(101)",
+            )
+            verdict, _ = default_worktree_runner(early_stderr_then_failure)(Path(tmp_str))
+            self.assertEqual(verdict, RunVerdict.FAIL)
+
         # A real disk-full failure still ends its log and stays infra.
         disk_full = extract_bare_metal_signal(
             {"state": "red", "sha": "a" * 40, "canary_sha": "b" * 40, "failed_step": "fast-ci"},

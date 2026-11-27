@@ -411,10 +411,10 @@ def evaluate_command_result(
             return RunVerdict.INCONCLUSIVE, f"infrastructure or timeout error (exit {returncode})"
         return RunVerdict.INCONCLUSIVE, f"nextest failed before executing target test (exit {returncode})"
 
-    if is_infra_failure(log_tail(cleaned)):
-        return RunVerdict.INCONCLUSIVE, f"infrastructure or timeout error (exit {returncode})"
     if returncode == 0:
         return RunVerdict.PASS, "command passed"
+    if is_infra_failure(log_tail(cleaned)):
+        return RunVerdict.INCONCLUSIVE, f"infrastructure or timeout error (exit {returncode})"
     return RunVerdict.FAIL, f"command exited with status {returncode}"
 
 
