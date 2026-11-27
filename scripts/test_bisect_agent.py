@@ -318,6 +318,55 @@ class ClassifierTests(unittest.TestCase):
         )
         self.assertEqual(bm.run_url, "")
 
+    def test_infra_text_early_in_a_log_does_not_hide_the_build_failure_that_ends_it(self):
+        # fast-ci's own CI-runner tests print "No space left on device" while simulating a
+        # full disk. The agent read that as an infra failure and never froze or bisected the
+        # clippy error that ended the log (#3826), so master stayed broken under a green tree.
+        log = "\n".join(
+            ["CI evidence write failed: No space left on device"]
+            + [f"    Checking crate-{i} v0.1.0" for i in range(100)]
+            + [
+                "error: method `account_capacity` is never used",
+                "error: could not compile `marmot-app` (lib test) due to 1 previous error",
+                "error: recipe `clippy-default` failed on line 40 with exit code 101",
+            ]
+        )
+        signals = (
+            extract_bare_metal_signal(
+                {"state": "red", "sha": "a" * 40, "canary_sha": "b" * 40, "failed_step": "fast-ci"},
+                log,
+            ),
+            extract_hosted_signal(
+                source="hosted_canary",
+                run_id="3:1",
+                run_url="https://example.com/3",
+                tip_sha="a" * 40,
+                baseline_sha="b" * 40,
+                failed_job="Full cross-platform CI (6 shards) / Rust check and clippy",
+                failed_step="Run clippy",
+                log_text=log,
+            ),
+        )
+        replay = lambda sha, _cmd: (RunVerdict.FAIL if sha == "a" * 40 else RunVerdict.PASS, "")
+        for signal in signals:
+            with self.subTest(job=signal.failed_job):
+                self.assertFalse(signal.infra_hint)
+                self.assertEqual(classify_failure(signal, run_on_sha=replay).bucket, Bucket.DETERMINISTIC_REGRESSION)
+
+        # The local replay of `just fast-ci` prints the same self-test line: it must pass on
+        # a green commit and fail on a red one, not come back inconclusive.
+        fast_ci = ("just", "fast-ci")
+        passing = log.rsplit("\nerror: method", 1)[0] + "\nAll gates passed\n"
+        self.assertEqual(evaluate_command_result(0, passing, fast_ci)[0], RunVerdict.PASS)
+        self.assertEqual(evaluate_command_result(101, log, fast_ci)[0], RunVerdict.FAIL)
+
+        # A real disk-full failure still ends its log and stays infra.
+        disk_full = extract_bare_metal_signal(
+            {"state": "red", "sha": "a" * 40, "canary_sha": "b" * 40, "failed_step": "fast-ci"},
+            "    Compiling marmot-app v0.20.0\nerror: failed to write: No space left on device (os error 28)\n",
+        )
+        self.assertTrue(disk_full.infra_hint)
+
     def test_classification_buckets_missing_baseline_and_stress_rules(self):
         sig = FailureSignal(
             source="bare_metal_canary",

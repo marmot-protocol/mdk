@@ -289,6 +289,15 @@ def normalize_log_text(log_text: str) -> str:
     return "\n".join(lines)
 
 
+def log_tail(cleaned: str) -> str:
+    """Return the last lines of a normalized log, where a job's terminal failure is printed.
+
+    Infra patterns are matched only here: earlier output includes passing tests that print
+    infra-like text on purpose (fast-ci's CI-runner tests simulate a full disk).
+    """
+    return "\n".join(cleaned.splitlines()[-80:])
+
+
 def is_infra_failure(log_excerpt: str, conclusion: str = "failure") -> bool:
     """Return True when logs or conclusion point to runner/network/infra failure.
 
@@ -398,11 +407,11 @@ def evaluate_command_result(
         # relay/network test output mentioning TLS/HTTP/connection resets is never misread.
         if NEXTEST_FAIL_RE.search(cleaned):
             return RunVerdict.FAIL, "target test failed"
-        if is_infra_failure(cleaned):
+        if is_infra_failure(log_tail(cleaned)):
             return RunVerdict.INCONCLUSIVE, f"infrastructure or timeout error (exit {returncode})"
         return RunVerdict.INCONCLUSIVE, f"nextest failed before executing target test (exit {returncode})"
 
-    if is_infra_failure(cleaned):
+    if is_infra_failure(log_tail(cleaned)):
         return RunVerdict.INCONCLUSIVE, f"infrastructure or timeout error (exit {returncode})"
     if returncode == 0:
         return RunVerdict.PASS, "command passed"
@@ -427,7 +436,7 @@ def extract_bare_metal_signals(
     tip_sha = str(status_doc.get("sha") or "")
     baseline_sha = str(status_doc.get("canary_sha") or status_doc.get("previous_canary") or "")
     cleaned = normalize_log_text(log_text)
-    excerpt = "\n".join(cleaned.splitlines()[-80:])
+    excerpt = log_tail(cleaned)
     public_url = run_url if run_url.startswith(("http://", "https://")) else ""
     base_run_id = f"bare-metal:{tip_sha[:12]}:{status_doc.get('updated_at', '')}"
 
@@ -473,7 +482,7 @@ def extract_bare_metal_signals(
             log_excerpt=excerpt,
             conclusion="failure",
             reproducible_locally=bool(command),
-            infra_hint=is_infra_failure(cleaned),
+            infra_hint=is_infra_failure(excerpt),
         )
     ]
 
@@ -508,7 +517,7 @@ def extract_hosted_signals(
     nextest jobs with their originating `--profile` / `--test-threads`.
     """
     cleaned = normalize_log_text(log_text)
-    excerpt = "\n".join(cleaned.splitlines()[-80:])
+    excerpt = log_tail(cleaned)
     non_linux = is_non_linux_job(failed_job)
     parsed_failures = parse_nextest_failures(cleaned)
     base_run_id = str(run_id)
@@ -533,7 +542,7 @@ def extract_hosted_signals(
                 log_excerpt=excerpt,
                 conclusion=conclusion,
                 reproducible_locally=True,
-                infra_hint=False if parsed_failures else is_infra_failure(cleaned, conclusion),
+                infra_hint=False if parsed_failures else is_infra_failure(excerpt, conclusion),
             )
         ]
 
@@ -586,7 +595,7 @@ def extract_hosted_signals(
             log_excerpt=excerpt,
             conclusion=conclusion,
             reproducible_locally=False,
-            infra_hint=is_infra_failure(cleaned, conclusion),
+            infra_hint=is_infra_failure(excerpt, conclusion),
         )
     ]
 
