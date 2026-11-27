@@ -348,8 +348,9 @@ pub struct TimelineMessageRecord {
     #[serde(default)]
     pub agent_item: Option<cgka_traits::AgentItem>,
     /// True for an agent item whose first event this device does not hold,
-    /// such as one that began before this member joined: the row is its
-    /// earliest edit, at that edit's place, showing the latest version
+    /// such as one that began before this member joined: the row is the
+    /// first edit of it this device received, at that edit's place, showing
+    /// the latest version
     /// (marmot-agents D-124). An app can say the item started earlier. False
     /// once the first event arrives, and for every other row.
     #[serde(default)]

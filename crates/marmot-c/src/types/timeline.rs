@@ -347,7 +347,8 @@ c_mirror! {
         opt_rec agent_item: MarmotAgentItem,
         /// True for an agent item whose first event this device does not
         /// hold, such as one that began before this member joined: the row
-        /// is its earliest edit, showing the latest version.
+        /// is the first edit of it this device received, showing the latest
+        /// version.
         copy agent_item_first_event_missing: bool,
         rec reactions: MarmotTimelineReactionSummary,
         opt_rec edit: MarmotTimelineEditSummary,

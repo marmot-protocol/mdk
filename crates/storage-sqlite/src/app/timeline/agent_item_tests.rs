@@ -185,10 +185,10 @@ fn an_edit_that_arrives_before_its_item_is_held_and_applied() {
 
 /// A member added after an item began never gets its first event, only its
 /// later edits, each carrying the whole item (marmot-agents D-124). The
-/// item's row is then its earliest edit, at that edit's place, holding the
-/// highest version and saying its first event is missing. Only that edit's
-/// sender's versions count, an edit naming another message too is no
-/// version, and a rebuild agrees. The first event, should it arrive, takes
+/// item's row is then the first edit this device received, at that edit's
+/// place, holding the highest version and saying its first event is missing.
+/// Only that edit's sender's versions count, an edit naming another message
+/// too is no version, and a rebuild agrees. The first event, should it arrive, takes
 /// the row back to its own place.
 #[test]
 fn an_item_whose_first_event_never_arrives_is_shown_from_its_edits() {
