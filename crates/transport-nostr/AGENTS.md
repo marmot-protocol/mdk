@@ -86,9 +86,17 @@ drop: storage imports loss by count, so a token's count must cover every drop un
   `MarmotRelayPlaneAccountAdapter` to hosts, so methods on them that only the app calls are `#[doc(hidden)] pub`.
 - Construct `MarmotRelayPlane` inside a Tokio runtime. `spawn_router` returns early without one, so construction
   succeeds and nothing is routed. Follow-up: take an explicit runtime handle.
-- Shutdown aborts the router and the notification forwarders, but does not join the spill writer (`delivery_spill.rs`
-  spawns `write()`), the loss-marker task (`persist_marker_before_drop`) or the directory fetch tasks; the plane
-  registers nothing in the app's close registry (#2341). Follow-up: join or register them.
+- Shutdown tears down the SDK relay pool, directory client, `publish_clients` (active and retired signer-bound
+  publish clients), and `anonymous_publish_clients`, aborts/joins the router and notification
+  forwarders, drains in-flight `delivery_spill.rs` writers (rejecting new spill spawns once shutdown begins and
+  transferring any unfinished in-flight/queued spill items into durable queue loss before aborting a timed-out writer),
+  and awaits `loss_marker_tasks` and evicted publish-client shutdowns up to `RELAY_PLANE_SHUTDOWN_WAIT`. Account
+  deactivation (`deactivate_account_context`) also tears down that account's cached and retired signer-bound publish
+  clients alongside its anonymous publish pools. Unfinished `loss_marker_tasks` are never aborted on
+  timeout; bounded shutdown still cannot guarantee marker persistence if storage stays `Retryable` until the host
+  closes SQLite (write-ahead cursor fencing for that case is tracked in `#3813`). Directory fetch tasks are not yet
+  joined here (tracked for coalesced fetch cancellation). The plane registers nothing in the app's close registry
+  (`#2341`).
 - Dropping the last plane handle without shutdown aborts the same router and forwarder tasks
   (`Drop for MarmotRelayPlaneInner`). They hold the transport, so without it every short-lived plane (one per `wnd`
   Execute request) stayed alive with its SDK clients. Never give those tasks a `MarmotRelayPlane` clone, or the

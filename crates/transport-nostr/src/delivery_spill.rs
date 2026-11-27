@@ -12,6 +12,7 @@
 //! spill is full, or the store keeps failing.
 
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -75,6 +76,10 @@ pub(super) struct AccountDeliverySpill {
 #[derive(Default)]
 struct Handoff {
     items: VecDeque<TransportDelivery>,
+    /// Recovery coordinates for the batch currently inside `store_with_retry`,
+    /// so `omit_unfinished_for_shutdown()` can transfer ownership into durable
+    /// queue loss if shutdown times out before the blocking store call returns.
+    in_flight_lost: Vec<(u64, Option<super::DeliveryRoute>)>,
     bytes: usize,
     writing: bool,
 }
@@ -103,24 +108,63 @@ impl AccountDeliverySpill {
     /// and the writer releases that count when it settles the delivery.
     pub(super) fn offer(self: &Arc<Self>, delivery: TransportDelivery) -> bool {
         let size = retained_size(&delivery);
+        let Some(transport) = self.transport.upgrade() else {
+            return false;
+        };
         let mut handoff = self.handoff.lock().unwrap_or_else(|p| p.into_inner());
-        if handoff.items.len() >= SPILL_HANDOFF_MAX_DELIVERIES
+        if transport.shutting_down.load(Ordering::SeqCst)
+            || handoff.items.len() >= SPILL_HANDOFF_MAX_DELIVERIES
             || handoff.bytes.saturating_add(size) > SPILL_HANDOFF_MAX_BYTES
         {
             return false;
         }
+        if !handoff.writing {
+            if !transport.try_spawn_spill_task(self.clone()) {
+                return false;
+            }
+            handoff.writing = true;
+        }
         handoff.bytes += size;
         handoff.items.push_back(delivery);
-        if !handoff.writing {
-            handoff.writing = true;
-            tokio::spawn(self.clone().write());
-        }
         true
     }
 
-    async fn write(self: Arc<Self>) {
+    /// Transfer any unfinished in-flight batch and queued handoff items into
+    /// retired queue loss so shutdown never drops deliveries below a saved
+    /// transport cursor without recording durable recovery debt.
+    pub(super) fn omit_unfinished_for_shutdown(&self) {
+        let (unfinished, pending_count) = {
+            let mut handoff = self.handoff.lock().unwrap_or_else(|p| p.into_inner());
+            let mut unfinished = std::mem::take(&mut handoff.in_flight_lost);
+            for delivery in handoff.items.drain(..) {
+                unfinished.push((
+                    delivery.message.timestamp.0,
+                    super::DeliveryRoute::of(&delivery),
+                ));
+            }
+            handoff.bytes = 0;
+            handoff.writing = false;
+            let count = unfinished.len() as u64;
+            (unfinished, count)
+        };
+        if pending_count == 0 {
+            return;
+        }
+        for (created_at, route) in unfinished {
+            self.omit(Some(created_at), route);
+        }
+        self.overflow.finish_spill(pending_count, 0, 0);
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.transport
+            .upgrade()
+            .is_none_or(|transport| transport.shutting_down.load(Ordering::SeqCst))
+    }
+
+    pub(super) async fn write(self: Arc<Self>) {
         loop {
-            let batch: Vec<_> = {
+            let (batch, count) = {
                 let mut handoff = self.handoff.lock().unwrap_or_else(|p| p.into_inner());
                 if handoff.items.is_empty() {
                     handoff.writing = false;
@@ -130,14 +174,23 @@ impl AccountDeliverySpill {
                 let batch: Vec<_> = handoff.items.drain(..take).collect();
                 let bytes: usize = batch.iter().map(retained_size).sum();
                 handoff.bytes = handoff.bytes.saturating_sub(bytes);
-                batch
+                handoff.in_flight_lost = batch
+                    .iter()
+                    .map(|d| (d.message.timestamp.0, super::DeliveryRoute::of(d)))
+                    .collect();
+                let count = batch.len() as u64;
+                (batch, count)
             };
-            let count = batch.len() as u64;
-            let lost: Vec<_> = batch
-                .iter()
-                .map(|d| (d.message.timestamp.0, super::DeliveryRoute::of(d)))
-                .collect();
             let dispositions = self.store_with_retry(batch).await;
+            let lost = {
+                let mut handoff = self.handoff.lock().unwrap_or_else(|p| p.into_inner());
+                std::mem::take(&mut handoff.in_flight_lost)
+            };
+            if lost.is_empty() {
+                // `omit_unfinished_for_shutdown()` already transferred this
+                // batch and any remaining handoff items into queue loss.
+                return;
+            }
             let stored = count_of(&dispositions, DeliverySpillDisposition::Stored);
             let seen = count_of(&dispositions, DeliverySpillDisposition::AlreadySeen);
             // Record loss before releasing the spill fence, so the cursor
@@ -153,6 +206,10 @@ impl AccountDeliverySpill {
             self.overflow.finish_spill(count, stored, seen);
             if stored > 0 {
                 self.overflow.spill_ready.notify_one();
+            }
+            if dispositions.is_empty() && self.is_shutting_down() {
+                self.omit_unfinished_for_shutdown();
+                return;
             }
         }
     }
@@ -171,7 +228,23 @@ impl AccountDeliverySpill {
                 Ok(Err(AccountDeliveryRecoveryMarkerError::Retryable))
                     if attempt < SPILL_WRITE_RETRIES =>
                 {
-                    tokio::time::sleep(SPILL_WRITE_RETRY_DELAY).await;
+                    let Some(transport) = self.transport.upgrade() else {
+                        break;
+                    };
+                    if transport.shutting_down.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let notified = transport.shutdown_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if transport.shutting_down.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    tokio::select! {
+                        biased;
+                        () = notified => break,
+                        () = tokio::time::sleep(SPILL_WRITE_RETRY_DELAY) => {}
+                    }
                 }
                 _ => break,
             }
@@ -195,8 +268,11 @@ impl AccountDeliverySpill {
     }
 
     fn omit(&self, created_at: Option<u64>, delivery_route: Option<super::DeliveryRoute>) {
+        let transport = self.transport.upgrade();
         match self.current_route() {
-            Some(route) => omit_account_delivery(&route, created_at, delivery_route),
+            Some(route) => {
+                omit_account_delivery(&route, created_at, delivery_route, transport.as_deref())
+            }
             // The route was retired while this batch was in flight. The loss
             // still fences any replacement, which shares this overflow state,
             // and becomes durable through the retired route's marker. A
@@ -206,7 +282,7 @@ impl AccountDeliverySpill {
                 self.overflow
                     .record_retired_drop(created_at, delivery_route);
                 if let Some(marker) = self.marker.clone() {
-                    persist_retired_queue_loss(&self.overflow, marker);
+                    persist_retired_queue_loss(&self.overflow, marker, transport.as_deref());
                 }
                 if let Some(route) = self.current_route()
                     && let Some(generation) = self.overflow.claim_retired_loss_signal()

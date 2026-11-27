@@ -914,6 +914,10 @@ pub trait NostrRelayNotificationSource: Send + Sync {
 }
 
 /// Boundary between this adapter and the actual Nostr relay implementation.
+///
+/// Any new method with a default implementation that `NostrSdkRelayClient`
+/// overrides must also be forwarded by `ManagedSdkPublishClient` in
+/// `transport-nostr`.
 #[async_trait]
 pub trait NostrRelayClient: Send + Sync {
     /// Where the messages this client's relays send come from, for a relay
@@ -2454,6 +2458,60 @@ impl NostrTransportAdapter {
             .await
     }
 
+    /// Admit one raw kind-1059 inbox copy from `RelayMessage::Event` after
+    /// verifying its supplied wire bytes.
+    #[cfg(feature = "sdk")]
+    async fn handle_sdk_inbox_copy(
+        &self,
+        event: &nostr::prelude::Event,
+        endpoint: TransportEndpoint,
+        subscription_id: String,
+        account_id: Option<&MemberId>,
+    ) -> Result<usize, TransportAdapterError> {
+        if event.verify().is_err() {
+            // A kind-1059 copy whose supplied bytes fail signature/id
+            // verification cannot be trusted for observation or admission.
+            return Err(TransportAdapterError::InvalidInboundSignature);
+        }
+        let (relay_event, message) =
+            match NostrTransportEvent::from_nostr_event(event).and_then(|transport_event| {
+                let message = transport_event.to_transport_message()?;
+                Ok((transport_event, message))
+            }) {
+                Ok((transport_event, message)) => (
+                    NostrRelayEvent {
+                        endpoint,
+                        subscription_id: Some(subscription_id),
+                        event: transport_event,
+                    },
+                    message,
+                ),
+                Err(error) => {
+                    self.observe_unconvertible_relay_event(
+                        endpoint,
+                        subscription_id,
+                        event.created_at.as_secs(),
+                    )
+                    .await;
+                    return Err(map_inbound_event_error(error));
+                }
+            };
+        tracing::trace!(
+            target: "transport_nostr_adapter::sdk_client",
+            method = "handle_sdk_inbox_copy",
+            "forwarding SDK relay inbox event"
+        );
+        self.observe_relay_event(
+            event.id.as_bytes(),
+            &relay_event.endpoint,
+            relay_event.subscription_id.as_deref(),
+            message.timestamp.0,
+        )
+        .await;
+        self.admit_relay_message(&relay_event, message, account_id, RelayCopy::RawInbox)
+            .await
+    }
+
     /// Route a comparison result to one account without the delivery queue.
     /// The caller admits each delivery itself, a few per worker turn.
     pub async fn reconciled_deliveries(
@@ -3715,6 +3773,7 @@ struct BufferedReplay {
 enum RelayCopy {
     Deduplicated,
     RawGroup,
+    RawInbox,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6248,6 +6307,9 @@ impl AdapterState {
                 continue;
             }
             if copy == RelayCopy::RawGroup && !source.is_some_and(|source| source.0) {
+                continue;
+            }
+            if copy == RelayCopy::RawInbox && source.is_some_and(|source| source.0) {
                 continue;
             }
             let input = match source {

@@ -125,9 +125,10 @@ for reconnect/backoff and relay status mechanics.
 - Stage each group's complete replay range before timestamp/id-ordered release. Keep
   live arrivals behind the draining batch. Every replacement REQ establishes its own current-peer boundary,
   including equivalent or narrower repacks; never inherit another REQ's ready floor. In-deadline peers fence
-  payload release until EOSE or their finite lease settles. Verified raw SDK group copies feed admission;
-  deduplicated `Event` copies must not bypass
-  it, and retired REQs must never admit late copies. SDK seen-state is not account admission.
+  payload release until EOSE or their finite lease settles. Verified raw SDK group (`RawGroup`) and kind-1059
+  inbox (`RawInbox`) copies feed admission on `RelayMessage::Event`; deduplicated `ClientNotification::Event`
+  copies are ignored, and retired or wrong-scope REQs must never admit late copies. SDK seen-state is not
+  account admission.
 - Admission belongs to each REQ/relay/transport-route, never a sticky group-wide failure flag. Share
   ciphertext bodies with separate source claims; retiring or failing one source must not discard a healthy
   source's older history. Waiting starts again at an unfinished source's first connection boundary. Each
