@@ -165,6 +165,8 @@ jobs:
       source_sha: ${{ needs.prepare.outputs.release_commit_sha }}
       build_only: false
       release_version: ${{ needs.prepare.outputs.stable_version }}
+    secrets:
+      release_token: ${{ secrets.RELEASE_TOKEN }}
 
   marmotc:
     name: Build Stable Marmot C
@@ -178,6 +180,8 @@ jobs:
       source_sha: ${{ needs.prepare.outputs.release_commit_sha }}
       build_only: false
       release_version: ${{ needs.prepare.outputs.stable_version }}
+    secrets:
+      release_token: ${{ secrets.RELEASE_TOKEN }}
 
   wn-agent:
     name: Build Stable wn-agent
@@ -191,6 +195,8 @@ jobs:
       source_sha: ${{ needs.prepare.outputs.release_commit_sha }}
       build_only: false
       release_version: ${{ needs.prepare.outputs.stable_version }}
+    secrets:
+      release_token: ${{ secrets.RELEASE_TOKEN }}
 
   publish:
     name: Publish Stable cohort

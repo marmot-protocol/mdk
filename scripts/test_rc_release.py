@@ -682,6 +682,21 @@ typedef void (*MarmotEventCallback)(const char *item, int flags, void *user_data
                 self.assertEqual(report["impact"], "minor")
                 self.assertIn(rel_path, delta["storage_migrations"])
 
+    def test_command_publish_writes_rc_meta_with_the_workflow_token(self):
+        # The release token publishes the tracks; rc-meta commits stay signed by the workflow token.
+        args = argparse.Namespace(
+            version="0.20.0-rc.3", source_sha="a" * 40,
+            impact_report=None, signature_delta=None, integration_notes=None,
+        )
+        env = {"GH_TOKEN": "release-pat", "META_GH_TOKEN": "workflow-token", "GITHUB_REPOSITORY": "o/r"}
+        with (
+            unittest.mock.patch.dict(os.environ, env),
+            unittest.mock.patch.object(rc_release, "publish_rc", return_value=None) as publish,
+        ):
+            self.assertEqual(rc_release.command_publish(args), 0)
+        self.assertEqual(publish.call_args.args[0].token, "release-pat")
+        self.assertEqual(publish.call_args.kwargs["meta_gh"].token, "workflow-token")
+
     def test_command_publish_rejects_missing_companion_files_before_publishing(self):
         args = argparse.Namespace(
             version="0.20.0-rc.1",
