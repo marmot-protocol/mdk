@@ -263,7 +263,8 @@ touched: `git diff --stat "$old_base" origin/master`.
   end-to-end smoke and every table row your change matches.
 
 Keep the rerun short so another merge is less likely to land while it runs;
-`Local-Checks:` names what you reran.
+`Local-Checks:` names what you reran, and keeps the `just dependents-nextest`
+you ran before the rebase (`Required CI` rejects a crate change without it).
 
 When a case holds, the new HEAD becomes the reviewed head. To need a rebase
 less often, rebase onto `origin/master` before the final round.

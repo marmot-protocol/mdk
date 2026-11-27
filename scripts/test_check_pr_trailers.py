@@ -376,7 +376,9 @@ class PrTrailerTests(unittest.TestCase):
                 ("crates/app/src/lib.rs", "cargo fmt; just dependents-nextest", review, True),
                 ("crates/app/README.md", "cargo fmt", review, True),
                 ("scripts/tool.py", "python3 scripts/test_tool.py", review, True),
-                ("Cargo.toml", "just release-pr-preflight 1.2.3", review, True),
+                # Release metadata PRs run with `ci:full`, where CI runs the tests itself and
+                # this check only warns; naming the preflight is no evidence on a team PR.
+                ("Cargo.toml", "just release-pr-preflight 1.2.3", review, False),
                 (
                     "crates/app/src/lib.rs",
                     "cargo nextest run -p app -E test(=x)",

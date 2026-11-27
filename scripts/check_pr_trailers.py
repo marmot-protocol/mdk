@@ -21,9 +21,10 @@ Landed-commit contract (for Stage 3 release tooling reading `master`):
 PR cross-checks (against the branch's merge-base with `base`):
   - A change to a Rust workspace crate (or a shared build input) requires
     `Local-Checks:` to record `just dependents-nextest` (land-change step 2),
-    except a release metadata PR (`just release-pr-preflight`) and an automated
-    Bisect Agent revert. `--enforce-dependents` makes this one check block in
-    `--advisory` mode; Required CI passes it on team PRs.
+    except an automated Bisect Agent revert. `--enforce-dependents` makes this
+    one check block in `--advisory` mode; Required CI passes it only on team
+    PRs in fast mode, since `ci:full` PRs (release metadata PRs among them) run
+    the tests in CI.
   - Any added or modified `changelog.d/<slug>.md` with a `### Breaking changes`
     section requires `Release-Impact: minor`.
   - Any added or modified `changelog.d/<slug>.md` with other sections forbids
@@ -55,7 +56,7 @@ CROSS_MODEL_REVIEW = re.compile(
 HUMAN_REVIEW = re.compile(r"^human(?:\s+\S.*)?$")
 EXEMPT_REVIEW = re.compile(r"^exempt\s*\((?P<reason>[^()]+)\)$")
 FRAGMENT_PATH = re.compile(r"(?:^|/)changelog\.d/[^/]+\.md$")
-DEPENDENTS_EVIDENCE = ("dependents-nextest", "release-pr-preflight")
+DEPENDENTS_EVIDENCE = "dependents-nextest"
 BISECT_REVERT_REVIEW = re.compile(r"^exempt\s*\(automated bisect revert of [0-9a-f]{7,40}\)$")
 GITHUB_SQUASH_SEPARATOR = "---------"
 GITHUB_SQUASH_FOOTER_LINE = re.compile(
@@ -273,7 +274,7 @@ def validate_dependents_tests(root: Path, base: str, head: str) -> list[str]:
     tip = git(root, "rev-list", "-1", head).strip()
     tip_trailers, _ = parse_trailers(git(root, "show", "-s", "--format=%B", tip))
     checks = tip_trailers.get("local-checks") or ""
-    if any(evidence in checks for evidence in DEPENDENTS_EVIDENCE):
+    if DEPENDENTS_EVIDENCE in checks:
         return []
     if BISECT_REVERT_REVIEW.match((tip_trailers.get("local-review") or "").strip()):
         return []

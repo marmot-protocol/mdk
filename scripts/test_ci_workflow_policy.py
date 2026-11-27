@@ -1600,10 +1600,10 @@ sha256sum() { shasum -a 256 "$@"; }
         self.assertIn("run: python3 scripts/test_check_pr_trailers.py", rust_format)
 
         script = workflow_step("ci.yml", "PR commit trailers")
-        self.assertIn('python3 scripts/check_pr_trailers.py --advisory "${enforce[@]}"', script)
+        self.assertIn('python3 scripts/check_pr_trailers.py "${args[@]}"', script)
         # Team PRs (fast mode) must fail when a crate change skips `just dependents-nextest`,
         # so the step may not swallow the script's exit status.
-        self.assertIn('if [[ "$CI_MODE" == fast ]]; then\n    enforce=(--enforce-dependents)', script)
+        self.assertIn('if [[ "$CI_MODE" == fast ]]; then\n    args+=(--enforce-dependents)', script)
         self.assertNotIn("|| echo", script)
         self.assertNotIn("${{", script)
 

@@ -300,13 +300,12 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$EVENT_NAME" == "pull_request" && -n "$BASE_SHA" && -n "$HEAD_SHA" ]]; then
-            enforce=()
+            # Never empty: bash 3.2 (macOS) rejects an empty "${array[@]}" under `set -u`.
+            args=(--advisory --base "$BASE_SHA" --head "$HEAD_SHA")
             if [[ "$CI_MODE" == fast ]]; then
-              enforce=(--enforce-dependents)
+              args+=(--enforce-dependents)
             fi
-            python3 scripts/check_pr_trailers.py --advisory "${enforce[@]}" \
-              --base "$BASE_SHA" \
-              --head "$HEAD_SHA"
+            python3 scripts/check_pr_trailers.py "${args[@]}"
           fi
 
   rust-format:
