@@ -166,7 +166,7 @@ jobs:
       build_only: false
       release_version: ${{ needs.prepare.outputs.stable_version }}
     secrets:
-      release_token: ${{ secrets.RELEASE_TOKEN }}
+      stage_token: ${{ secrets.RELEASE_TOKEN }}
 
   marmotc:
     name: Build Stable Marmot C
@@ -181,7 +181,7 @@ jobs:
       build_only: false
       release_version: ${{ needs.prepare.outputs.stable_version }}
     secrets:
-      release_token: ${{ secrets.RELEASE_TOKEN }}
+      stage_token: ${{ secrets.RELEASE_TOKEN }}
 
   wn-agent:
     name: Build Stable wn-agent
@@ -196,7 +196,7 @@ jobs:
       build_only: false
       release_version: ${{ needs.prepare.outputs.stable_version }}
     secrets:
-      release_token: ${{ secrets.RELEASE_TOKEN }}
+      stage_token: ${{ secrets.RELEASE_TOKEN }}
 
   publish:
     name: Publish Stable cohort

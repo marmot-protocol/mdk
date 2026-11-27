@@ -9,8 +9,8 @@ on:
       - "!marmotc-v*-rc.*"
   workflow_call:
     secrets:
-      release_token:
-        description: Token that stages the release draft (RC and Stable callers pass secrets.RELEASE_TOKEN; the workflow token is refused there)
+      stage_token:
+        description: Token that stages the release draft (RC and Stable callers pass secrets.RELEASE_TOKEN; the workflow token is refused there). Named so no repo secret matches it, so tag-push and dispatch runs keep the workflow token
         required: false
     inputs:
       source_sha:
@@ -317,7 +317,7 @@ jobs:
         if: ${{ !!inputs.release_version }}
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.release_token || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.stage_token || secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.linux-bindings.outputs.release_tag }}
           RELEASE_VERSION: ${{ needs.linux-bindings.outputs.release_version }}
           SOURCE_SHA: ${{ needs.linux-bindings.outputs.source_sha }}

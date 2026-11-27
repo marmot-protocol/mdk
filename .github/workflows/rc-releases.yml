@@ -187,7 +187,7 @@ jobs:
       build_only: ${{ inputs.build_only == true }}
       release_version: ${{ needs.plan.outputs.version }}
     secrets:
-      release_token: ${{ secrets.RELEASE_TOKEN }}
+      stage_token: ${{ secrets.RELEASE_TOKEN }}
 
   marmotc:
     name: Marmot C
@@ -202,7 +202,7 @@ jobs:
       build_only: ${{ inputs.build_only == true }}
       release_version: ${{ needs.plan.outputs.version }}
     secrets:
-      release_token: ${{ secrets.RELEASE_TOKEN }}
+      stage_token: ${{ secrets.RELEASE_TOKEN }}
 
   wn-agent:
     name: wn-agent
@@ -217,7 +217,7 @@ jobs:
       build_only: ${{ inputs.build_only == true }}
       release_version: ${{ needs.plan.outputs.version }}
     secrets:
-      release_token: ${{ secrets.RELEASE_TOKEN }}
+      stage_token: ${{ secrets.RELEASE_TOKEN }}
 
   publish:
     name: Publish SemVer RC and rc-meta

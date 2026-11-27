@@ -931,12 +931,12 @@ class RcReleasePolicyTests(unittest.TestCase):
             for track in ("bindings.yaml", "c-bindings.yml", "wn-agent-binaries.yml"):
                 with self.subTest(caller=caller, track=track):
                     call = text.split(f"uses: ./.github/workflows/{track}\n", 1)[1].split("\n\n", 1)[0]
-                    self.assertIn("release_token: ${{ secrets.RELEASE_TOKEN }}", call)
+                    self.assertIn("stage_token: ${{ secrets.RELEASE_TOKEN }}", call)
         for track in ("bindings.yaml", "c-bindings.yml", "wn-agent-binaries.yml"):
             with self.subTest(track=track):
                 text = (workflows / track).read_text()
-                self.assertIn("    secrets:\n      release_token:\n", text)
-                self.assertEqual(text.count("GH_TOKEN: ${{ secrets.release_token || secrets.GITHUB_TOKEN }}"), 1)
+                self.assertIn("    secrets:\n      stage_token:\n", text)
+                self.assertEqual(text.count("GH_TOKEN: ${{ secrets.stage_token || secrets.GITHUB_TOKEN }}"), 1)
         rc = (workflows / "rc-releases.yml").read_text()
         self.assertIn("Preflight release credentials", rc)
         publish = rc.split("- name: Publish the three RC pre-releases and update rc-meta", 1)[1].split("run:", 1)[0]
