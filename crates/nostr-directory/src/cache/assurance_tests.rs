@@ -26,14 +26,28 @@ fn encrypted_connection(path: &std::path::Path) -> Connection {
     conn
 }
 
-/// Hash every typed value, including rowids, with deterministic row ordering.
+/// Hash every typed v1-schema value, including rowids, with deterministic row
+/// ordering. Migration 4 appends `follows_created_at INTEGER NOT NULL DEFAULT 0`
+/// to `directory_users` and `directory_search_graph_users`; comparing v1 columns
+/// verifies every historical column and rowid stays unchanged.
 fn snapshot(conn: &Connection, tables: &[&str], limit: i64) -> Vec<(u64, Vec<u8>)> {
     tables
         .iter()
         .map(|table| {
+            let columns_sql = match *table {
+                "directory_users" => {
+                    "rowid, account_id_hex, npub, local_account_json, profile_json, \
+                     relay_lists_json, key_package_json, updated_at"
+                }
+                "directory_search_graph_users" => {
+                    "rowid, account_id_hex, npub, profile_json, metadata_updated_at, \
+                     metadata_expires_at, follows_known, follows_updated_at, created_at, updated_at"
+                }
+                _ => "rowid, *",
+            };
             let mut statement = conn
                 .prepare(&format!(
-                    "SELECT rowid, * FROM {table} ORDER BY rowid LIMIT {limit}"
+                    "SELECT {columns_sql} FROM {table} ORDER BY rowid LIMIT {limit}"
                 ))
                 .unwrap();
             let columns = statement.column_count();
@@ -107,6 +121,7 @@ fn seed_legacy(conn: &mut Connection, users: u64) -> Vec<crate::UserDirectoryRec
             }),
             follows: vec!["synthetic-follow".into()],
             follow_source_relays: vec!["wss://synthetic.example".into()],
+            follows_created_at: 0,
             relay_lists: crate::AccountRelayListStatus::empty(),
             key_package: None,
         };

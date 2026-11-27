@@ -15,6 +15,7 @@ use storage_sqlite::PublicDirectoryUserRecord;
 
 use crate::error::DirectoryError;
 use crate::ids::parse_account_id_hex;
+use crate::published_records::is_zero_u64;
 use crate::{
     AccountRelayListStatus, DirectoryFreshness, DirectorySelection, sort_directory_records,
 };
@@ -38,6 +39,10 @@ pub struct UserDirectoryRecord {
     pub follows: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub follow_source_relays: Vec<String>,
+    /// Event `created_at` of the kind-3 contact list backing `follows`.
+    /// Zero denotes unknown or legacy recency.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub follows_created_at: u64,
     pub relay_lists: AccountRelayListStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_package: Option<DirectoryKeyPackage>,
@@ -193,6 +198,9 @@ pub struct DirectoryKeyPackage {
 pub struct FetchedFollowList {
     pub follows: Vec<String>,
     pub source_relays: Vec<String>,
+    /// Event `created_at` of the kind-3 contact list event. Zero denotes
+    /// unknown or caller-constructed recency.
+    pub created_at: u64,
 }
 
 /// An account's current kind-3 event, kept whole so a follow or unfollow can
@@ -258,6 +266,7 @@ pub fn public_directory_user_record(
                     .map(|key_package| key_package.created_at)
             }),
         follows: entry.follows.clone(),
+        follows_created_at: entry.follows_created_at,
     })
 }
 
@@ -274,6 +283,7 @@ pub(crate) fn user_directory_record_from_public(
             .transpose()?,
         follows: record.follows,
         follow_source_relays: Vec::new(),
+        follows_created_at: record.follows_created_at,
         relay_lists: serde_json::from_str(&record.relay_lists_json)?,
         key_package: record
             .key_package_json
@@ -300,6 +310,11 @@ fn merge_directory_entries(
             .is_none_or(|current| candidate.created_at > current.created_at)
     }) {
         preferred.profile = alternate.profile;
+    }
+    if alternate.follows_created_at > preferred.follows_created_at {
+        preferred.follows = alternate.follows;
+        preferred.follow_source_relays = alternate.follow_source_relays;
+        preferred.follows_created_at = alternate.follows_created_at;
     }
     if alternate.key_package.as_ref().is_some_and(|candidate| {
         preferred
@@ -725,6 +740,7 @@ pub(crate) fn latest_current_follow_list_from_records(
             follow_list: FetchedFollowList {
                 follows: follows_from_tags(&record.event.tags),
                 source_relays: source_relays_from_record(&record),
+                created_at: record.event.created_at,
             },
             tags: record.event.tags,
             content: record.event.content,
@@ -768,6 +784,7 @@ pub(crate) fn follow_list_from_record(record: RelayEventRecord) -> FetchedFollow
     FetchedFollowList {
         follows: follows_from_tags(&record.event.tags),
         source_relays: source_relays_from_record(&record),
+        created_at: record.event.created_at,
     }
 }
 

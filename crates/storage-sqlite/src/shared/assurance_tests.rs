@@ -86,6 +86,19 @@ fn assert_live_api(storage: &SqliteSharedStorage) {
     );
 }
 
+fn expected_after_v6(mut before: Vec<Vec<Vec<Value>>>, tables: &[&str]) -> Vec<Vec<Vec<Value>>> {
+    // Migration 6 appends `follows_created_at INTEGER NOT NULL DEFAULT 0` to
+    // `directory_users`; every pre-existing column and rowid stays unchanged.
+    for (table, rows) in tables.iter().zip(&mut before) {
+        if *table == "directory_users" {
+            for row in rows {
+                row.push(Value::Integer(0));
+            }
+        }
+    }
+    before
+}
+
 #[test]
 fn populated_current_shape_adoption_preserves_every_value_and_rowid() {
     let dir = tempfile::tempdir().unwrap();
@@ -94,14 +107,14 @@ fn populated_current_shape_adoption_preserves_every_value_and_rowid() {
     conn.execute_batch(PRE_LEDGER).unwrap();
     conn.pragma_update(None, "foreign_keys", true).unwrap();
     seed(&mut conn, 10_000); // 30,003 rows, all values and rowids compared.
-    let before = snapshot(&conn, TABLES);
+    let expected = expected_after_v6(snapshot(&conn, TABLES), TABLES);
     let storage = SqliteSharedStorage::open(&path).unwrap();
-    assert_eq!(snapshot(&storage.lock().unwrap(), TABLES), before);
+    assert_eq!(snapshot(&storage.lock().unwrap(), TABLES), expected);
     assert_live_api(&storage);
     assert_integrity(&storage.lock().unwrap());
     storage.close().unwrap();
     let storage = SqliteSharedStorage::open(&path).unwrap();
-    assert_eq!(snapshot(&storage.lock().unwrap(), TABLES), before);
+    assert_eq!(snapshot(&storage.lock().unwrap(), TABLES), expected);
 }
 
 #[test]
@@ -128,9 +141,9 @@ fn every_verified_schema_generation_preserves_live_and_retired_rows() {
             conn.execute_batch("UPDATE audit_log_settings SET data_mode = 'full_data'")
                 .unwrap();
         }
-        let before = snapshot(&conn, &tables);
+        let expected = expected_after_v6(snapshot(&conn, &tables), &tables);
         let storage = SqliteSharedStorage::from_connection(conn).unwrap();
-        assert_eq!(snapshot(&storage.lock().unwrap(), &tables), before);
+        assert_eq!(snapshot(&storage.lock().unwrap(), &tables), expected);
         assert_live_api(&storage);
         assert_integrity(&storage.lock().unwrap());
         storage

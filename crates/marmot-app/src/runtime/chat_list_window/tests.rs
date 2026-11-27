@@ -571,6 +571,7 @@ async fn failed_local_preparation_retries_without_another_invalidation() {
         event_kind: None,
         event_created_at: None,
         follows: vec![],
+        follows_created_at: 0,
     };
     f.app
         .shared_storage()
@@ -901,6 +902,7 @@ async fn preview_sender_profile_commits_refresh_at_unchanged_selected_revision()
             }),
             follows: vec![],
             follow_source_relays: vec![],
+            follows_created_at: 0,
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
         })
@@ -1272,6 +1274,7 @@ async fn system_preview_resolves_subject_fallback_and_refreshes_profile_without_
             }),
             follows: vec![],
             follow_source_relays: vec![],
+            follows_created_at: 0,
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
         })
@@ -1764,6 +1767,7 @@ async fn a_text_filtered_window_picks_up_an_off_screen_peer_profile_change() {
                 }),
                 follows: vec![],
                 follow_source_relays: vec![],
+                follows_created_at: 0,
                 relay_lists: AccountRelayListStatus::empty(),
                 key_package: None,
             })
@@ -1817,6 +1821,7 @@ fn search_catch_up_is_owed_until_a_selected_peer_is_fanned_out() {
             }),
             follows: vec![],
             follow_source_relays: vec![],
+            follows_created_at: 0,
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
         })
@@ -1873,6 +1878,7 @@ fn a_window_batch_read_before_a_catch_up_step_is_read_again() {
             }),
             follows: vec![],
             follow_source_relays: vec![],
+            follows_created_at: 0,
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
         })

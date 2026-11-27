@@ -57,6 +57,9 @@ pub struct PublicDirectoryUserRecord {
     pub event_kind: Option<u64>,
     pub event_created_at: Option<u64>,
     pub follows: Vec<String>,
+    /// Event `created_at` of the kind-3 contact list backing `follows`.
+    /// Zero denotes unknown or legacy recency.
+    pub follows_created_at: u64,
 }
 
 /// Public identity/profile projection for search; excludes follows, relay lists,
@@ -531,9 +534,9 @@ impl SqliteSharedStorage {
             tx.execute_cached(
                 "INSERT INTO directory_users (
                 account_id_hex, npub, profile_json, relay_lists_json, key_package_json,
-                event_id_hex, event_kind, event_created_at
+                event_id_hex, event_kind, event_created_at, follows_created_at
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(account_id_hex) DO UPDATE SET
                 npub = excluded.npub,
                 profile_json = excluded.profile_json,
@@ -541,7 +544,8 @@ impl SqliteSharedStorage {
                 key_package_json = excluded.key_package_json,
                 event_id_hex = excluded.event_id_hex,
                 event_kind = excluded.event_kind,
-                event_created_at = excluded.event_created_at",
+                event_created_at = excluded.event_created_at,
+                follows_created_at = excluded.follows_created_at",
                 params![
                     &record.account_id_hex,
                     &record.npub,
@@ -551,6 +555,7 @@ impl SqliteSharedStorage {
                     &record.event_id_hex,
                     optional_u64_to_i64(record.event_kind)?,
                     optional_u64_to_i64(record.event_created_at)?,
+                    u64_to_i64(record.follows_created_at)?,
                 ],
             )
             .storage()?;
@@ -588,7 +593,8 @@ impl SqliteSharedStorage {
         let Some(mut record) = tx
             .query_row_cached(
                 "SELECT account_id_hex, npub, profile_json, relay_lists_json,
-                        key_package_json, event_id_hex, event_kind, event_created_at
+                        key_package_json, event_id_hex, event_kind, event_created_at,
+                        follows_created_at
                  FROM directory_users
                  WHERE account_id_hex = ?1",
                 params![account_id_hex],
@@ -603,6 +609,7 @@ impl SqliteSharedStorage {
                         event_kind: optional_i64_to_u64(row.get::<_, Option<i64>>(6)?),
                         event_created_at: optional_i64_to_u64(row.get::<_, Option<i64>>(7)?),
                         follows: Vec::new(),
+                        follows_created_at: u64::try_from(row.get::<_, i64>(8)?).unwrap_or(0),
                     })
                 },
             )
@@ -792,7 +799,8 @@ impl SqliteSharedStorage {
         let mut stmt = tx
             .prepare_cached(
                 "SELECT account_id_hex, npub, profile_json, relay_lists_json,
-                        key_package_json, event_id_hex, event_kind, event_created_at
+                        key_package_json, event_id_hex, event_kind, event_created_at,
+                        follows_created_at
                  FROM directory_users
                  ORDER BY account_id_hex
                  LIMIT ?1",
@@ -810,6 +818,7 @@ impl SqliteSharedStorage {
                     event_kind: optional_i64_to_u64(row.get::<_, Option<i64>>(6)?),
                     event_created_at: optional_i64_to_u64(row.get::<_, Option<i64>>(7)?),
                     follows: Vec::new(),
+                    follows_created_at: u64::try_from(row.get::<_, i64>(8)?).unwrap_or(0),
                 })
             })
             .storage()?
@@ -1433,6 +1442,7 @@ mod tests {
             event_kind: Some(0),
             event_created_at: Some(1_700_000_000),
             follows: vec!["cc".repeat(32), "dd".repeat(32)],
+            follows_created_at: 1_700_000_042,
         };
 
         storage.put_public_directory_user(&record).unwrap();
@@ -1489,6 +1499,7 @@ mod tests {
             event_kind: None,
             event_created_at: None,
             follows: follows.iter().map(|follow| follow.repeat(32)).collect(),
+            follows_created_at: 0,
         }
     }
 
@@ -1543,6 +1554,7 @@ mod tests {
             event_kind: Some(3),
             event_created_at: Some(1_700_000_000),
             follows: vec![follow.clone(), follow.clone()],
+            follows_created_at: 1_700_000_000,
         };
 
         storage.put_public_directory_user(&record).unwrap();
@@ -1568,6 +1580,7 @@ mod tests {
             event_kind: None,
             event_created_at: None,
             follows: vec!["bb".repeat(32)],
+            follows_created_at: 0,
         };
         storage.put_public_directory_user(&record).unwrap();
         storage
@@ -1602,6 +1615,7 @@ mod tests {
             event_kind: None,
             event_created_at: None,
             follows: Vec::new(),
+            follows_created_at: 0,
         };
         for (field, rank) in [("name", 0), ("nip05", 1), ("display_name", 2), ("about", 3)] {
             record.profile_json = Some(format!(r#"{{"{field}":"ÉCOLE %_","created_at":42}}"#));
@@ -1721,6 +1735,7 @@ mod tests {
                     event_kind: None,
                     event_created_at: None,
                     follows: vec!["ff".repeat(32)],
+                    follows_created_at: 0,
                 })
                 .unwrap();
         }
@@ -2787,7 +2802,7 @@ mod migration_contract_tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(row, (5, "0005_key_package_replacements".into()));
+        assert_eq!(row, (6, "0006_directory_follows_created_at".into()));
     }
 
     #[test]

@@ -44,7 +44,7 @@ The directory of other people's public Nostr data (step 3 of the 2026-10 archite
 | `src/reference.rs` | The shared Nostr reference decoder (`decode_reference`, context gating, bounded errors, length budgets). |
 | `src/sync.rs` | The directory-subscription sync worker and plan. |
 | `src/availability.rs` | Direct-follow availability: the account-local projection, bounded single-flight refresh, operation-matched cancellation, and read-time fencing against the shared KeyPackage journal. |
-| `src/cache.rs`, `src/cache/` | The per-account SQLCipher cache: its numbered migration runner (`cache/migrations.rs`), frozen schemas (`cache/v1.sql`, `cache/v2.sql`, `cache/v3.sql`), and populated/interrupted-upgrade tests (`cache/assurance_tests.rs`, fixture `cache/fixtures/pre_ledger.sql`). |
+| `src/cache.rs`, `src/cache/` | The per-account SQLCipher cache: its numbered migration runner (`cache/migrations.rs`), frozen schemas (`cache/v1.sql`, `cache/v2.sql`, `cache/v3.sql`, `cache/v4.sql`), and populated/interrupted-upgrade tests (`cache/assurance_tests.rs`, fixture `cache/fixtures/pre_ledger.sql`). |
 
 ## Rules
 
@@ -64,7 +64,7 @@ The directory of other people's public Nostr data (step 3 of the 2026-10 archite
   target the `Client::default()` and `ClientBuilder::default()` trait impls, so review rejects those. See
   `docs/marmot-architecture/overview/dial-safety.md`.
 - Do not change cache SQL, migration ids, file names, TTLs, timeouts or bounds as part of a move. `cache/v1.sql`,
-  `cache/v2.sql`, and `cache/v3.sql` are frozen; schema changes add a numbered migration.
+  `cache/v2.sql`, `cache/v3.sql`, and `cache/v4.sql` are frozen; schema changes add a numbered migration.
 - The public surface is what `src/lib.rs` re-exports, plus the `config` and `error` modules; every other module is
   private. `Directory`'s lookup, refresh, search and KeyPackage-resolution methods are the app-facing API that
   replaced `MarmotApp`'s delegates and stay `pub`. Anything else is `pub` only when another crate's production code

@@ -45,6 +45,14 @@ const MIGRATIONS: &[Migration] = &[
                 .map_err(sqlite_error)
         },
     },
+    Migration {
+        version: 6,
+        name: "0006_directory_follows_created_at",
+        apply: |tx| {
+            tx.execute_batch(include_str!("v6.sql"))
+                .map_err(sqlite_error)
+        },
+    },
 ];
 
 fn version_2(tx: &Transaction<'_>) -> StorageResult<()> {

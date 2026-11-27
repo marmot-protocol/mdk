@@ -110,6 +110,7 @@ fn cached_results(
             local_account: None,
             follows: Vec::new(),
             follow_source_relays: Vec::new(),
+            follows_created_at: 0,
             relay_lists: crate::AccountRelayListStatus::empty(),
             key_package: None,
         };
@@ -293,6 +294,7 @@ mod tests {
                 event_kind: None,
                 event_created_at: None,
                 follows: Vec::new(),
+                follows_created_at: 0,
             })
             .unwrap();
         let profiles = cached_profiles(&[first, second], &shared, "xyz", 0).unwrap();
