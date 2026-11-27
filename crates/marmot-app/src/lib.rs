@@ -3975,6 +3975,19 @@ impl MarmotApp {
             )?)
     }
 
+    pub(crate) fn groups_with_expiring_app_events(
+        &self,
+        label: &str,
+        now_seconds: u64,
+    ) -> Result<Vec<String>, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .groups_with_expiring_app_events(now_seconds)?)
+    }
+
     pub fn message_edit_history(
         &self,
         label: &str,

@@ -203,10 +203,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Write backups only through the backup pass (`src/client/backup_writer.rs`, mdk#2628 4.4b, D71, D79): prepared and
   finished on the worker, run off it on the media lane. A backup counts only once a relay accepts a pointer listing it;
   never treat an upload or a sent pointer as done. Record each blob in the ledger (`backup_run_blobs`) before its
-  upload, and condemn a dropped backup's blobs before the pointer that drops it goes out. Delete a condemned blob only
-  while the pointer fetched in that same pass, from a relay that answered in full, lists no backup it belongs to,
-  and only blobs condemned under the pass's own key; forget other keys' rows on a due pass. Re-check the writer and key on the worker before signing
-  the pointer. Take over only through `edit_roster_account_entry` over the entry read, never resent from here (D75).
+  upload, and condemn a dropped backup's blobs on configured backup Blossom servers before the pointer that drops it goes out. Delete a condemned blob only
+  while the pointer fetched in that same pass, with every requested relay answering in full, lists no backup it belongs to,
+  only on configured backup Blossom servers, and only blobs condemned under the pass's own key; forget other keys' rows on a due pass. Re-check the writer and key on the worker before signing
+  the pointer, and bound pointer replacement timestamps against excessive future skew. Take over only through `edit_roster_account_entry` over the entry read, never resent from here (D75).
   The archive key lives only in the pass: never store or log it, the words or a blob's contents.
   Worker background admission is memory-only and defaults closed: Wi-Fi AND charging must be reported before
   `prepare_backup_pass`, including cleanup/retry passes. An admitted whole pass still runs and settles after false;

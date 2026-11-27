@@ -586,8 +586,9 @@ async fn a_head_that_does_not_match_its_locator_keeps_its_backup() {
     assert!(condemned(&phone, &key).is_empty());
 }
 
-/// A new pointer replaces the one its pass fetched, though another device
-/// whose clock runs a day ahead made that one.
+/// A new pointer replaces the one its pass fetched when the fetched pointer's
+/// clock skew is within the allowed future skew window, and refuses excessive
+/// future skew without signing or advancing the replaceable floor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_pointer_postdates_the_one_it_replaces() {
     let blossom = local_blossom();
@@ -596,15 +597,321 @@ async fn a_new_pointer_postdates_the_one_it_replaces() {
     phone.drive_backup_pass().await;
     let mut first = pointer(&relay, &key);
     first[0].written_at -= 2 * DAY;
-    let ahead = unix_now_seconds() + DAY;
+    let ahead = unix_now_seconds() + 60;
     publish_pointer_at(&devices.laptop, &relay, &key, first.clone(), ahead).await;
 
     due_now(&phone);
-    phone.drive_backup_pass().await;
+    assert_eq!(phone.drive_backup_pass().await, None);
     let event = pointer_event(&relay, &key).unwrap();
     assert!(event.created_at > ahead);
     let listed = BackupPointer::open(&event.content, &key).unwrap().backups;
     assert_eq!(ids(&listed[1..]), ids(&first));
+
+    // A pointer dated far into the future must not be propagated.
+    let mut skewed = listed;
+    for entry in &mut skewed {
+        entry.written_at -= 2 * DAY;
+    }
+    let far_ahead = unix_now_seconds() + DAY;
+    publish_pointer_at(&devices.laptop, &relay, &key, skewed, far_ahead).await;
+    let published_before = pointers_published(&relay);
+    let blobs_before = held(&blossom);
+    let floor_before = devices
+        .phone_app
+        .account_home()
+        .replaceable_record_floors("alice")
+        .unwrap()
+        .get(&KIND_BACKUP_POINTER)
+        .copied()
+        .unwrap_or(0);
+
+    due_now(&phone);
+    assert_eq!(
+        phone.drive_backup_pass().await,
+        Some("device_group_refused")
+    );
+    assert_eq!(
+        pointers_published(&relay),
+        published_before,
+        "excessive future skew must not publish a replacement pointer"
+    );
+    assert_eq!(
+        held(&blossom),
+        blobs_before,
+        "excessive future skew must not upload blobs for an unpublishable pass"
+    );
+    assert!(condemned(&phone, &key).is_empty());
+    let floor_after = devices
+        .phone_app
+        .account_home()
+        .replaceable_record_floors("alice")
+        .unwrap()
+        .get(&KIND_BACKUP_POINTER)
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        floor_after, floor_before,
+        "excessive future skew must not poison replaceable_record_floors"
+    );
+}
+
+/// Condemnation and deletion only target configured backup Blossom servers and
+/// never sign BUD-01 DELETE for non-allowlisted servers or unauthenticated
+/// index entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_condemned_refuses_unconfigured_servers_and_unauthenticated_indexes() {
+    use crate::backup_archive::{BlobLocator, MAX_POINTER_BACKUPS};
+
+    let blossom = local_blossom();
+    let unconfigured = local_blossom();
+    let (devices, _chat, words) = lone_writer(&blossom).await;
+    let (mut phone, relay, key) = (devices.phone, devices.relay, words.public);
+
+    // Part 1: a dropped backup whose index names an unconfigured Blossom server,
+    // plus a pre-existing condemned row naming an unconfigured server.
+    phone.drive_backup_pass().await;
+    let first_entry = pointer(&relay, &key).remove(0);
+    let (first_head, mut forged_index) = read_backup(&blossom, &first_entry, &key);
+    let foreign_bytes = b"foreign server blob".to_vec();
+    let foreign_hash = hex::encode(Sha256::digest(&foreign_bytes));
+    unconfigured
+        .blobs
+        .lock()
+        .unwrap()
+        .insert(foreign_hash.clone(), foreign_bytes.clone());
+    forged_index.small_state = Some(BlobLocator {
+        sha256: foreign_hash.clone(),
+        size: foreign_bytes.len() as u64,
+        server: unconfigured.url.clone(),
+    });
+    let rewritten_head =
+        BackupHead::seal(first_head.id, &ArchiveKey::generate(), &key, &forged_index)
+            .unwrap()
+            .encode();
+    let rewritten_head_hash = hex::encode(Sha256::digest(&rewritten_head));
+    let rewritten_head_len = rewritten_head.len() as u64;
+    blossom
+        .blobs
+        .lock()
+        .unwrap()
+        .insert(rewritten_head_hash.clone(), rewritten_head);
+    let mut entries = pointer(&relay, &key);
+    entries[0].head = BlobLocator {
+        sha256: rewritten_head_hash,
+        size: rewritten_head_len,
+        server: blossom.url.clone(),
+    };
+    entries[0].written_at -= 2 * DAY;
+    publish_pointer(&phone, &relay, &key, entries).await;
+
+    // Write two newer backups so the rewritten oldest backup is dropped by retention.
+    for _ in 0..2 {
+        due_now(&phone);
+        phone.drive_backup_pass().await;
+        age_backups(&phone, &relay, &key, 2 * DAY).await;
+    }
+    assert!(
+        !condemned(&phone, &key).contains(&foreign_hash),
+        "listing() must not condemn blobs on unconfigured Blossom servers"
+    );
+
+    // Also seed a pre-existing condemned row targeting the unconfigured server.
+    let stray_run = [0xd4; 16];
+    storage(&devices.phone_app)
+        .condemn_backup_blobs(
+            &key,
+            &stray_run,
+            &[(foreign_hash.clone(), unconfigured.url.clone())],
+            1,
+            0,
+        )
+        .unwrap();
+    deletes_due_now(&phone, &key);
+    phone.drive_backup_pass().await;
+    assert!(
+        unconfigured.deleters.lock().unwrap().is_empty(),
+        "delete_condemned must never sign BUD-01 DELETE for unconfigured servers"
+    );
+    assert!(
+        unconfigured
+            .blobs
+            .lock()
+            .unwrap()
+            .contains_key(&foreign_hash),
+        "blob on unconfigured server must stay untouched"
+    );
+    assert!(
+        !condemned(&phone, &key).contains(&foreign_hash),
+        "disallowed condemned row must be cleared so it does not spin retries"
+    );
+
+    // Part 2: an unauthenticated BackupIndex (encrypted under another recovery key)
+    // must be rejected by read_index and never condemn or delete its listed blobs.
+    let victim_bytes = b"victim blob on configured server".to_vec();
+    let victim_hash = hex::encode(Sha256::digest(&victim_bytes));
+    blossom
+        .blobs
+        .lock()
+        .unwrap()
+        .insert(victim_hash.clone(), victim_bytes.clone());
+    let wrong_public = cgka_engine::recovery_key::derive_recovery_key_pair(
+        &RustCrypto::default(),
+        &[0x99; RECOVERY_ENTROPY_LEN],
+    )
+    .unwrap()
+    .public;
+    let mut unauth_index = BackupIndex::new(100, &slot_of(&phone));
+    unauth_index.small_state = Some(BlobLocator {
+        sha256: victim_hash.clone(),
+        size: victim_bytes.len() as u64,
+        server: blossom.url.clone(),
+    });
+    let unauth_id = [0xee; 16];
+    let unauth_head = BackupHead::seal(
+        unauth_id,
+        &ArchiveKey::generate(),
+        &wrong_public,
+        &unauth_index,
+    )
+    .unwrap()
+    .encode();
+    let unauth_head_hash = hex::encode(Sha256::digest(&unauth_head));
+    let unauth_head_len = unauth_head.len() as u64;
+    blossom
+        .blobs
+        .lock()
+        .unwrap()
+        .insert(unauth_head_hash.clone(), unauth_head);
+    let mut full_listing = Vec::new();
+    for index in 1..=MAX_POINTER_BACKUPS as u8 {
+        let id = [index; 16];
+        let head = BackupHead::seal(
+            id,
+            &ArchiveKey::generate(),
+            &key,
+            &BackupIndex::new(1_000 + u64::from(index), &slot_of(&phone)),
+        )
+        .unwrap()
+        .encode();
+        let head_hash = hex::encode(Sha256::digest(&head));
+        let head_len = head.len() as u64;
+        blossom
+            .blobs
+            .lock()
+            .unwrap()
+            .insert(head_hash.clone(), head);
+        full_listing.push(PointerEntry::new(
+            &id,
+            1_000 + u64::from(index),
+            BlobLocator {
+                sha256: head_hash,
+                size: head_len,
+                server: blossom.url.clone(),
+            },
+        ));
+    }
+    // Replace the oldest slot with the unauthenticated head so adding one new
+    // backup forces it past MAX_POINTER_BACKUPS and into `dropped`.
+    full_listing[0] = PointerEntry::new(
+        &unauth_id,
+        100,
+        BlobLocator {
+            sha256: unauth_head_hash,
+            size: unauth_head_len,
+            server: blossom.url.clone(),
+        },
+    );
+    publish_pointer(&phone, &relay, &key, full_listing).await;
+
+    due_now(&phone);
+    phone.drive_backup_pass().await;
+    assert!(
+        !condemned(&phone, &key).contains(&victim_hash),
+        "blobs from an unauthenticated BackupIndex must never be condemned"
+    );
+    deletes_due_now(&phone, &key);
+    phone.drive_backup_pass().await;
+    assert!(
+        blossom.blobs.lock().unwrap().contains_key(&victim_hash),
+        "victim blob named only in an unauthenticated BackupIndex must never be deleted"
+    );
+}
+
+/// Partial relay discovery (`any_complete` only, where one relay completes empty
+/// while another holding the active pointer does not complete) must fail the pass
+/// without deleting live blobs, condemning blobs, or publishing a truncated pointer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_relay_discovery_never_condemns_deletes_or_truncates_pointer() {
+    let blossom = local_blossom();
+    let (mut devices, _chat, words) = lone_writer(&blossom).await;
+    devices.phone.drive_backup_pass().await;
+    let first = pointer(&devices.relay, &words.public).remove(0);
+    let live_blobs = held(&blossom);
+    // Condemn one of the live backup's blobs as if an older pass queued it:
+    // on an authoritative pointer listing `first`, it would be spared, whereas
+    // an empty partial view would have deleted it!
+    let live_blob_hash = first.head.sha256.clone();
+    let live_backup_id: [u8; 16] = hex::decode(&first.id).unwrap().try_into().unwrap();
+    storage(&devices.phone_app)
+        .condemn_backup_blobs(
+            &words.public,
+            &live_backup_id,
+            &[(live_blob_hash.clone(), blossom.url.clone())],
+            1,
+            0,
+        )
+        .unwrap();
+    // Age the live pointer so a pass would also try to write and publish a new
+    // pointer if it accepted the empty partial view.
+    age_backups(&devices.phone, &devices.relay, &words.public, 2 * DAY).await;
+
+    let account = devices.phone_app.account_home().account("alice").unwrap();
+    let directory = devices.phone_app.directory();
+    let mut entry = directory
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .unwrap_or_else(|| directory.empty_directory_record_for_test(&account.account_id_hex));
+    entry.relay_lists.nip65.created_at = unix_now_seconds();
+    entry.relay_lists.nip65.relays = vec![
+        "wss://completed-empty.example".into(),
+        "wss://unfinished-pointer.example".into(),
+    ];
+    entry.relay_lists.refresh();
+    directory.save_directory_entry_for_test(&entry).unwrap();
+
+    devices.phone.app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        None,
+        devices.relay.clone(),
+        Arc::new(restore::PartialPointerView {
+            relay: devices.relay.clone(),
+            visible: false,
+            any_completed: true,
+        }),
+        false,
+    );
+
+    let published_before = pointers_published(&devices.relay);
+    due_now(&devices.phone);
+    deletes_due_now(&devices.phone, &words.public);
+    assert_eq!(
+        devices.phone.drive_backup_pass().await,
+        Some("device_group_refused"),
+        "partial discovery (any_complete without complete) must refuse the pass"
+    );
+    assert!(
+        blossom.deleters.lock().unwrap().is_empty(),
+        "partial discovery must never sign BUD-01 DELETE for live blobs"
+    );
+    assert_eq!(
+        held(&blossom),
+        live_blobs,
+        "partial discovery must not delete live blobs or upload a truncated backup"
+    );
+    assert_eq!(
+        pointers_published(&devices.relay),
+        published_before,
+        "partial discovery must not publish a truncated pointer"
+    );
 }
 
 /// Under a key nothing can be sealed to, the writer uploads nothing and

@@ -8079,7 +8079,8 @@ impl AppClient {
     /// Re-publish a welcome that a confirmed create/invite failed to deliver,
     /// from the copy the engine stored at wrap time — no re-commit (mdk#352).
     /// Clears the pending record only once the welcome is accepted; a repeated
-    /// failure leaves it queued for a later retry.
+    /// failure leaves it queued for a later retry. Rejects Welcomes belonging
+    /// to groups the host may not see (such as the internal device group).
     pub async fn redeliver_welcome(
         &mut self,
         message_id_hex: &str,
@@ -8091,34 +8092,81 @@ impl AppClient {
         );
         let work = async move {
             let message_id = cgka_traits::MessageId::new(hex::decode(message_id_hex)?);
-            let effects = self.runtime.redeliver_welcome(&message_id).await?;
-            self.note_welcome_delivery_failures(&effects);
-            // Only clear the durable pending record once every "still undelivered"
-            // signal agrees the welcome landed: no PublishFailure, no structured
-            // WelcomeDeliveryFailure, and a report that met its ack threshold.
-            // These are kept in lockstep by `publish_one` today, but asserting all
-            // three means a future refactor cannot drift one signal and clear the
-            // queue while the welcome is still unreachable (the #375 class of bug).
-            let delivered = effects.failures.is_empty()
-                && effects.welcome_failures.is_empty()
-                && effects
-                    .reports
-                    .last()
-                    .is_some_and(|report| report.met_required_acks());
-            if !delivered {
-                return Err(if effects.failures.is_empty() {
-                    AppError::Publish("welcome re-delivery did not reach the recipient".into())
-                } else {
-                    publish_failure_error(&effects.failures)
-                });
-            }
-            let storage = self.app.account_storage(&self.state.label)?;
-            self.clear_confirmed_welcome_intent(&storage.app_storage(), message_id_hex)?;
-            Ok(send_summary_from_effects(&effects))
+            self.require_host_visible_welcome(&message_id)?;
+            self.redeliver_stored_welcome(&message_id, message_id_hex)
+                .await
         };
         observed
             .run_async(Box::pin(work), marmot_observability::confirmed_or_failure)
             .await
+    }
+
+    /// Internal redelivery seam for device-pairing link maintenance, which owns
+    /// the device group's own founding/linking Welcome retries.
+    pub(super) async fn redeliver_welcome_internal(
+        &mut self,
+        message_id_hex: &str,
+    ) -> Result<SendSummary, AppError> {
+        let observed = self.app.product_analytics.observed(
+            crate::ProductFamily::Welcome,
+            "retry",
+            crate::ProductUnit::Attempt,
+        );
+        let work = async move {
+            let message_id = cgka_traits::MessageId::new(hex::decode(message_id_hex)?);
+            self.redeliver_stored_welcome(&message_id, message_id_hex)
+                .await
+        };
+        observed
+            .run_async(Box::pin(work), marmot_observability::confirmed_or_failure)
+            .await
+    }
+
+    fn require_host_visible_welcome(
+        &self,
+        message_id: &cgka_traits::MessageId,
+    ) -> Result<(), AppError> {
+        use cgka_traits::storage::{MessageStorage as _, StorageError};
+
+        let record = self
+            .app
+            .account_storage(&self.state.label)?
+            .get_message(message_id)?;
+        if !self.host_may_see_group(&record.group_id) {
+            return Err(AppError::Storage(StorageError::NotFound));
+        }
+        Ok(())
+    }
+
+    async fn redeliver_stored_welcome(
+        &mut self,
+        message_id: &cgka_traits::MessageId,
+        message_id_hex: &str,
+    ) -> Result<SendSummary, AppError> {
+        let effects = self.runtime.redeliver_welcome(message_id).await?;
+        self.note_welcome_delivery_failures(&effects);
+        // Only clear the durable pending record once every "still undelivered"
+        // signal agrees the welcome landed: no PublishFailure, no structured
+        // WelcomeDeliveryFailure, and a report that met its ack threshold.
+        // These are kept in lockstep by `publish_one` today, but asserting all
+        // three means a future refactor cannot drift one signal and clear the
+        // queue while the welcome is still unreachable (the #375 class of bug).
+        let delivered = effects.failures.is_empty()
+            && effects.welcome_failures.is_empty()
+            && effects
+                .reports
+                .last()
+                .is_some_and(|report| report.met_required_acks());
+        if !delivered {
+            return Err(if effects.failures.is_empty() {
+                AppError::Publish("welcome re-delivery did not reach the recipient".into())
+            } else {
+                publish_failure_error(&effects.failures)
+            });
+        }
+        let storage = self.app.account_storage(&self.state.label)?;
+        self.clear_confirmed_welcome_intent(&storage.app_storage(), message_id_hex)?;
+        Ok(send_summary_from_effects(&effects))
     }
 }
 

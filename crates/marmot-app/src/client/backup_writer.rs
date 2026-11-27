@@ -9,16 +9,16 @@
 //! 1. [`AppClient::prepare_backup_pass`], on the worker, reads the key and
 //!    the writer and, once a pass is due, forgets the ledger under any other
 //!    key and abandons a run that stopped before its head.
-//! 2. [`BackupPass::run`], off the worker, fetches the pointer from a relay
-//!    that answers in full and deletes condemned blobs whose backup it does
-//!    not list. A run the pointer lists counts; one past its day, or any
-//!    once this device no longer writes, is abandoned. While this device
-//!    writes, it publishes again a run no relay accepted yet, or, once the
-//!    newest listed backup is a day old, uploads a new one, each blob
-//!    recorded in the ledger before its upload. It builds the pointer that
-//!    lists the run, by retention, and condemns the blobs of the backups
-//!    that pointer drops. Ledger, sealing and hashing work runs on the
-//!    blocking pool.
+//! 2. [`BackupPass::run`], off the worker, fetches the pointer only when
+//!    every requested relay answers in full and deletes condemned blobs on
+//!    configured backup Blossom servers whose backup it does not list. A run
+//!    the pointer lists counts; one past its day, or any once this device no
+//!    longer writes, is abandoned. While this device writes, it publishes
+//!    again a run no relay accepted yet, or, once the newest listed backup is
+//!    a day old, uploads a new one, each blob recorded in the ledger before
+//!    its upload. It builds the pointer that lists the run, by retention, and
+//!    condemns the blobs on configured servers of the backups that pointer
+//!    drops. Ledger, sealing and hashing work runs on the blocking pool.
 //! 3. [`AppClient::finish_backup_pass`], on the worker, checks that this
 //!    device still writes under the same key, then signs and publishes the
 //!    pointer. A backup counts only once a relay accepts its pointer. Until
@@ -91,6 +91,9 @@ const MAX_PASS_RETRY_SECS: u64 = 60 * 60;
 /// How many versions of the pointer a fetch reads. A relay keeps one; room
 /// for a relay that keeps old versions to still answer in full.
 const POINTER_FETCH_LIMIT: usize = 10;
+/// Largest future clock skew accepted when postdating a replaced pointer.
+/// Matches MDK's 5-minute future-event skew bound for replaceable events.
+const MAX_POINTER_FUTURE_SKEW_SECS: u64 = 5 * 60;
 
 fn pass_retry_at(now: u64, failed_passes: u64) -> u64 {
     now.saturating_add((PASS_RETRY_SECS << failed_passes.min(6)).min(MAX_PASS_RETRY_SECS))
@@ -98,6 +101,14 @@ fn pass_retry_at(now: u64, failed_passes: u64) -> u64 {
 
 fn delete_retry_at(now: u64, attempts: u64) -> u64 {
     now.saturating_add((DELETE_AFTER_SECS << attempts.min(5)).min(MAX_DELETE_WAIT_SECS))
+}
+
+fn backup_pointer_created_at(now: u64, replaces: u64) -> Result<u64, AppError> {
+    let created_at = now.max(replaces.saturating_add(1));
+    if created_at > now.saturating_add(MAX_POINTER_FUTURE_SKEW_SECS) {
+        return Err(backup_error("backup_pointer_clock_skew"));
+    }
+    Ok(created_at)
 }
 
 fn backup_error(reason: &'static str) -> AppError {
@@ -110,11 +121,10 @@ pub(super) struct BackupPointerDiscovery {
     pub entries: Vec<PointerEntry>,
     pub created_at: Option<u64>,
     pub complete: bool,
-    any_complete: bool,
 }
 
-/// The writer retains its existing requirement that at least one relay
-/// answered in full before it can use this pass's pointer for deletion.
+/// Require full-relay completion before condemning blobs, deleting condemned
+/// blobs, or replacing an existing backup pointer.
 pub(super) async fn read_backup_pointer(
     relay_plane: &crate::MarmotRelayPlane,
     endpoints: &[TransportEndpoint],
@@ -123,7 +133,7 @@ pub(super) async fn read_backup_pointer(
 ) -> Result<(Vec<PointerEntry>, u64), AppError> {
     let discovery =
         read_backup_pointer_discovery(relay_plane, endpoints, account_id_hex, key).await?;
-    if !discovery.any_complete {
+    if !discovery.complete {
         return Err(backup_error("backup_pointer_unavailable"));
     }
     Ok((discovery.entries, discovery.created_at.unwrap_or(0)))
@@ -147,7 +157,6 @@ pub(super) async fn read_backup_pointer_discovery(
         .fetch_directory_events_with_completion(endpoints.to_vec(), vec![query])
         .await
         .map_err(|_| backup_error("backup_pointer_unavailable"))?;
-    let any_complete = !outcome.complete_endpoints.is_empty();
     // An empty request is never evidence that no pointer exists. Require
     // completion from at least one endpoint that was actually requested.
     let complete = outcome.complete
@@ -177,7 +186,6 @@ pub(super) async fn read_backup_pointer_discovery(
         entries,
         created_at,
         complete,
-        any_complete,
     })
 }
 
@@ -261,10 +269,14 @@ impl BackupPass {
         let newest = listed.first().map(|entry| entry.written_at);
         let now = unix_now_seconds();
         let (entry, index) = match (self.settle_runs(&listed, now).await?, &self.write) {
-            (Some(entry), _) => (entry, None),
+            (Some(entry), _) => {
+                backup_pointer_created_at(now, replaces)?;
+                (entry, None)
+            }
             (None, Some(write))
                 if newest.is_none_or(|at| now >= at.saturating_add(BACKUP_INTERVAL_SECS)) =>
             {
+                backup_pointer_created_at(now, replaces)?;
                 let (entry, index) = self.write_backup(write, now).await?;
                 (entry, Some(index))
             }
@@ -280,6 +292,11 @@ impl BackupPass {
             newest,
             pointer: Some(pointer),
         })
+    }
+
+    fn server_is_allowed(&self, server: &str) -> bool {
+        blossom_server_for_endpoint(server)
+            .is_some_and(|normalized| self.servers.contains(&normalized))
     }
 
     /// Run `f` on this pass's ledger, on the blocking pool.
@@ -335,9 +352,9 @@ impl BackupPass {
 
     /// The backups the account's pointer under this key lists, newest first,
     /// and when that pointer was made: none, and zero, when no relay holds
-    /// one. Refused unless a relay answered in full, since a pointer built
-    /// from no answer would drop every backup, and when the newest pointer
-    /// does not open.
+    /// one. Refused unless every requested relay answered in full, since a
+    /// pointer built from a partial view could drop live backups, and when
+    /// the newest pointer does not open.
     async fn fetch_pointer(&self) -> Result<(Vec<PointerEntry>, u64), AppError> {
         read_backup_pointer(
             &self.app.relay_plane,
@@ -348,9 +365,11 @@ impl BackupPass {
         .await
     }
 
-    /// Delete each condemned blob whose delete is due, unless `listed`
-    /// names its backup: then it is the pointer's again, and forgotten. A
-    /// failed delete waits longer each time and is given up after a week.
+    /// Delete each condemned blob on a configured backup Blossom server whose
+    /// delete is due, unless `listed` names its backup: then it is the
+    /// pointer's again, and forgotten. Blobs naming an unconfigured server are
+    /// forgotten without signing a BUD-01 delete authorization. A failed delete
+    /// waits longer each time and is given up after a week.
     async fn delete_condemned(&self, listed: &[PointerEntry]) {
         let (key, started_at) = (self.key.clone(), self.started_at);
         let Ok(due) = self
@@ -368,8 +387,12 @@ impl BackupPass {
             .map(|entry| entry.id.as_str())
             .collect::<BTreeSet<_>>();
         let mut failed = 0_usize;
+        let mut disallowed = 0_usize;
         for blob in due {
             let deleted = if listed.contains(hex::encode(blob.backup_id).as_str()) {
+                true
+            } else if !self.server_is_allowed(&blob.server) {
+                disallowed += 1;
                 true
             } else {
                 delete_blossom_blob(
@@ -405,6 +428,14 @@ impl BackupPass {
             if settled.is_err() {
                 break;
             }
+        }
+        if disallowed > 0 {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "delete_condemned",
+                disallowed,
+                "skipped condemned backup blobs on unconfigured servers"
+            );
         }
         if failed > 0 {
             tracing::warn!(
@@ -615,6 +646,7 @@ impl BackupPass {
                 let blobs = backup
                     .locators()
                     .into_iter()
+                    .filter(|locator| self.server_is_allowed(&locator.server))
                     .map(|locator| (locator.sha256, locator.server))
                     .collect::<Vec<_>>();
                 Ok((id, blobs))
@@ -624,7 +656,9 @@ impl BackupPass {
         self.ledger(move |storage| {
             let storage = storage.app_storage();
             for (id, blobs) in &condemned {
-                storage.condemn_backup_blobs(&key, id, blobs, now, now + DELETE_AFTER_SECS)?;
+                if !blobs.is_empty() {
+                    storage.condemn_backup_blobs(&key, id, blobs, now, now + DELETE_AFTER_SECS)?;
+                }
             }
             Ok(())
         })
@@ -949,6 +983,7 @@ impl AppClient {
             .account_signer_for_summary(&summary)?
             .as_nostr_signer();
         let endpoints = self.app.backup_pointer_endpoints(&summary.account_id_hex);
+        let created_at = backup_pointer_created_at(unix_now_seconds(), replaces)?;
         let event = self
             .app
             .sign_replaceable_identity_event(
@@ -959,7 +994,7 @@ impl AppClient {
                     KIND_BACKUP_POINTER,
                     vec![vec!["d".to_owned(), backup_address(key)]],
                     content,
-                    unix_now_seconds().max(replaces.saturating_add(1)),
+                    created_at,
                 ),
             )
             .await?;

@@ -1047,6 +1047,37 @@ async fn a_device_group_welcome_stays_out_of_host_redelivery() {
     relay.fail_publishes_of_kind(1059);
     let group = phone.dev_create_device_group(link).await.unwrap();
     let group_hex = hex::encode(group.as_slice());
+    let pending = phone_app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .list_pending_welcome_deliveries()
+        .unwrap();
+    let device_welcome = pending
+        .iter()
+        .find(|record| record.group_id_hex == group_hex)
+        .expect("the Welcome stays queued");
+    assert!(phone.pending_welcome_deliveries().unwrap().is_empty());
+    assert!(phone.take_pending_welcome_delivery_events().is_empty());
+
+    relay.allow_all_publish_kinds();
+    let published_before = relay.published_event_ids();
+    let error = phone
+        .redeliver_welcome(&device_welcome.message_id_hex)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::Storage(cgka_traits::storage::StorageError::NotFound)
+        ),
+        "host redeliver_welcome must reject the device group's Welcome as NotFound, got {error:?}"
+    );
+    assert_eq!(
+        relay.published_event_ids(),
+        published_before,
+        "rejected device-group Welcome must not be published"
+    );
     assert!(
         phone_app
             .account_storage("alice")
@@ -1055,11 +1086,9 @@ async fn a_device_group_welcome_stays_out_of_host_redelivery() {
             .list_pending_welcome_deliveries()
             .unwrap()
             .iter()
-            .any(|record| record.group_id_hex == group_hex),
-        "the Welcome stays queued"
+            .any(|record| record.message_id_hex == device_welcome.message_id_hex),
+        "rejected host redelivery must leave the internal pending Welcome queued"
     );
-    assert!(phone.pending_welcome_deliveries().unwrap().is_empty());
-    assert!(phone.take_pending_welcome_delivery_events().is_empty());
 }
 
 /// The host never learns of the device group through a surface built from
