@@ -109,8 +109,8 @@ pub use transport_nostr_adapter::{
 pub const ACCOUNT_DELIVERY_BUFFER: usize = 1024;
 const DIRECTORY_EVENT_BUFFER: usize = 1024;
 pub(crate) const DIRECTORY_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
-pub(crate) const RELAY_PLANE_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
-pub(crate) const RELAY_PLANE_TASK_ABORT_WAIT: Duration = Duration::from_millis(250);
+const RELAY_PLANE_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+const RELAY_PLANE_TASK_ABORT_WAIT: Duration = Duration::from_millis(250);
 const RELAY_NOTIFICATION_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const RELAY_NOTIFICATION_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const RELAY_NOTIFICATION_RESTART_HEALTHY_RUNTIME: Duration = Duration::from_secs(5);
@@ -2866,10 +2866,6 @@ impl MarmotRelayPlane {
         if let Some(directory_client) = &self.inner.transport.directory_client {
             let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, directory_client.shutdown()).await;
         }
-        self.inner
-            .directory
-            .shutdown(RELAY_PLANE_SHUTDOWN_WAIT)
-            .await;
         let managed_clients = {
             // Anonymous publish clients belong to their live account adapters
             // (which may still publish group messages or push triggers after

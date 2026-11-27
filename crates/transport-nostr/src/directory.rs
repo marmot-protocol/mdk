@@ -1,31 +1,29 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
-use std::marker::PhantomData;
-use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::TransportEndpoint;
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use nostr_sdk::authenticator::{Authenticator, SignerAuthenticator};
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, ClientBuilder, Event, EventId, Filter, Kind, PublicKey, RelayMessage,
-    RelayUrl, SingleLetterTag, Timestamp,
+    Client as NostrSdkClient, Event, EventId, Filter, Kind, PublicKey, RelayMessage, RelayUrl,
+    SingleLetterTag, Timestamp,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
-use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::sync::{Mutex, oneshot};
+use tokio::task::JoinSet;
+use tokio::time::timeout;
 use transport_nostr_adapter::{
     FiniteEnd, FiniteLimits, FiniteReply, FiniteRequests, KIND_MARMOT_KEY_PACKAGE,
     NostrAcquisitionCancellation as CancellationToken, RELAY_REPLAY_PAGE_LIMIT,
 };
 use transport_nostr_peeler::{NostrTransportEvent, SdkSigner};
 
-use super::{DIRECTORY_RELAY_CONNECT_WAIT, RELAY_PLANE_SHUTDOWN_WAIT, RELAY_PLANE_TASK_ABORT_WAIT};
+use super::DIRECTORY_RELAY_CONNECT_WAIT;
 
 const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
 
@@ -54,8 +52,6 @@ const DIRECTORY_REPLY_MAX_BYTES: usize = 16 * 1024 * 1024;
 const DIRECTORY_READ_OVER_BUDGET: &str = "directory read exceeded its byte budget";
 const DIRECTORY_READ_UNREADABLE: &str = "directory read stopped at an unreadable frame";
 const DIRECTORY_READ_LOCAL_BUSY: &str = "directory read deferred by local queue backpressure";
-const DIRECTORY_FETCH_CANCELLED: &str = "directory fetch cancelled";
-const DIRECTORY_PLANE_SHUTTING_DOWN: &str = "directory relay plane is shutting down";
 
 /// The most filters one strict directory REQ carries. strfry allows 3 per
 /// REQ and refuses more with `CLOSED invalid:`, so a request with more
@@ -241,45 +237,11 @@ pub struct DirectoryRelayPlane {
     state: Arc<Mutex<DirectoryRelayPlaneState>>,
 }
 
-struct InflightFetch<T> {
-    id: u64,
-    cancel: CancellationToken,
-    waiters: Vec<(u64, oneshot::Sender<T>)>,
-}
-
-trait CoalescedMap {
-    type Output: Clone + Send + 'static;
-
-    fn map(state: &mut DirectoryRelayPlaneState) -> &mut InflightMap<Self::Output>;
-}
-
-struct PlainFetchMap;
-
-impl CoalescedMap for PlainFetchMap {
-    type Output = Vec<DirectoryRelayEventRecord>;
-
-    fn map(state: &mut DirectoryRelayPlaneState) -> &mut InflightMap<Self::Output> {
-        &mut state.inflight
-    }
-}
-
-struct CompletionFetchMap;
-
-impl CoalescedMap for CompletionFetchMap {
-    type Output = DirectoryFetchOutcome;
-
-    fn map(state: &mut DirectoryRelayPlaneState) -> &mut InflightMap<Self::Output> {
-        &mut state.inflight_completion
-    }
-}
-
 #[derive(Default)]
 struct DirectoryRelayPlaneState {
-    next_id: u64,
-    shutting_down: bool,
-    inflight: HashMap<DirectoryFetchKey, InflightFetch<DirectoryFetchResult>>,
-    inflight_completion: HashMap<DirectoryFetchKey, InflightFetch<DirectoryCompletionResult>>,
-    active_tasks: HashMap<u64, JoinHandle<()>>,
+    inflight: HashMap<DirectoryFetchKey, Vec<oneshot::Sender<DirectoryFetchResult>>>,
+    inflight_completion:
+        HashMap<DirectoryFetchKey, Vec<oneshot::Sender<DirectoryCompletionResult>>>,
     active_subscriptions: HashMap<String, DirectorySubscriptionFilter>,
     active_endpoints: HashSet<String>,
     auth_required: HashSet<(String, String)>,
@@ -290,60 +252,6 @@ struct DirectoryRelayPlaneState {
     completed_subscription_syncs: usize,
     subscriptions_created: usize,
     subscriptions_removed: usize,
-}
-
-impl DirectoryRelayPlaneState {
-    fn alloc_id(&mut self) -> u64 {
-        self.next_id = self.next_id.wrapping_add(1);
-        self.next_id
-    }
-}
-
-/// Drops a waiter from its coalesced entry synchronously if the caller future
-/// is cancelled mid-await. Losing the final waiter removes the key and cancels
-/// the shared fetch immediately; remaining waiters keep the fetch running.
-struct CoalescedWaiterGuard<M: CoalescedMap> {
-    state: Arc<Mutex<DirectoryRelayPlaneState>>,
-    key: DirectoryFetchKey,
-    entry_id: u64,
-    waiter_id: u64,
-    armed: bool,
-    _map: PhantomData<M>,
-}
-
-impl<M: CoalescedMap> CoalescedWaiterGuard<M> {
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl<M: CoalescedMap> Drop for CoalescedWaiterGuard<M> {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let map = M::map(&mut state);
-        let cancel = {
-            let empty = map.get_mut(&self.key).is_some_and(|entry| {
-                if entry.id != self.entry_id {
-                    return false;
-                }
-                entry.waiters.retain(|(id, _)| *id != self.waiter_id);
-                entry.waiters.is_empty()
-            });
-            empty
-                .then(|| map.remove(&self.key).map(|entry| entry.cancel))
-                .flatten()
-        };
-        drop(state);
-        if let Some(cancel) = cancel {
-            cancel.cancel();
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -379,7 +287,6 @@ pub struct DirectoryFetchOutcome {
 
 type DirectoryFetchResult = Result<Vec<DirectoryRelayEventRecord>, String>;
 type DirectoryCompletionResult = Result<DirectoryFetchOutcome, String>;
-type InflightMap<T> = HashMap<DirectoryFetchKey, InflightFetch<Result<T, String>>>;
 
 #[async_trait]
 pub trait DirectoryRelayFetcher: Send + Sync {
@@ -387,22 +294,6 @@ pub trait DirectoryRelayFetcher: Send + Sync {
         &self,
         request: DirectoryFetchRequest,
     ) -> Result<Vec<DirectoryRelayEventRecord>, String>;
-
-    /// Cancellable variant of [`Self::fetch_directory_events`] used by
-    /// [`DirectoryRelayPlane`] when the final waiter leaves or the plane shuts
-    /// down. Custom fetchers inherit a default that drops the fetch future on
-    /// cancellation.
-    async fn fetch_directory_events_cancellable(
-        &self,
-        request: DirectoryFetchRequest,
-        cancel: CancellationToken,
-    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => Err(DIRECTORY_FETCH_CANCELLED.to_owned()),
-            result = self.fetch_directory_events(request) => result,
-        }
-    }
 
     /// Per-relay failures produce incomplete outcomes. Return an error for
     /// invalid requests or failures of the fetch resource itself.
@@ -418,21 +309,6 @@ pub trait DirectoryRelayFetcher: Send + Sync {
             })
     }
 
-    /// Cancellable variant of [`Self::fetch_directory_events_with_completion`]
-    /// used by [`DirectoryRelayPlane`] when the final waiter leaves or the
-    /// plane shuts down.
-    async fn fetch_directory_events_with_completion_cancellable(
-        &self,
-        request: DirectoryFetchRequest,
-        cancel: CancellationToken,
-    ) -> Result<DirectoryFetchOutcome, String> {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => Err(DIRECTORY_FETCH_CANCELLED.to_owned()),
-            result = self.fetch_directory_events_with_completion(request) => result,
-        }
-    }
-
     /// A single-relay read that must reach EOSE. Pool fetches may silently
     /// aggregate partial results and cannot establish absence for onboarding.
     async fn inspect_directory_events(
@@ -444,63 +320,26 @@ pub trait DirectoryRelayFetcher: Send + Sync {
     }
 }
 
-/// Stateless factory for bounded one-shot SDK directory reads. Each read owns
-/// and shuts down its own isolated client so no idle SDK pool is retained.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NostrSdkDirectoryRelayFetcher;
-
-/// An isolated anonymous SDK client owned by a single directory/public read.
-/// Explicit [`Self::shutdown`] awaits teardown inside the caller's task; if
-/// the future is dropped early, `Drop` shuts down tracked relays synchronously
-/// and spawns client shutdown as a safety net.
-struct ScopedDirectoryClient {
+#[derive(Clone)]
+pub struct NostrSdkDirectoryRelayFetcher {
     client: NostrSdkClient,
     finite: FiniteRequests,
-    relays: Vec<nostr_sdk::prelude::Relay>,
-    shut_down: bool,
 }
 
-impl ScopedDirectoryClient {
-    fn new() -> Self {
-        Self::from_builder(super::nostr_builder())
-    }
-
-    fn from_builder(builder: ClientBuilder) -> Self {
-        let (builder, finite) = FiniteRequests::install(builder);
-        Self {
-            client: builder.build(),
-            finite,
-            relays: Vec::new(),
-            shut_down: false,
-        }
-    }
-
-    async fn shutdown(mut self) {
-        let deadline = Instant::now() + RELAY_PLANE_SHUTDOWN_WAIT;
-        let _ = timeout_at(deadline, self.finite.shutdown()).await;
-        for relay in &self.relays {
-            relay.shutdown();
-        }
-        let _ = timeout_at(deadline, self.client.shutdown()).await;
-        self.shut_down = true;
-    }
-}
-
-impl Drop for ScopedDirectoryClient {
+/// A client owned by one bounded read. Dropped, it stops the relay it holds
+/// at once (`Relay::shutdown` ends its dial, socket and AUTH handling before
+/// it returns), so a cancelled read leaves no connection behind, and then
+/// shuts the client down.
+struct ScopedInspectionClient(NostrSdkClient, Option<nostr_sdk::prelude::Relay>);
+impl Drop for ScopedInspectionClient {
     fn drop(&mut self) {
-        if self.shut_down {
-            return;
-        }
-        for relay in &self.relays {
+        if let Some(relay) = &self.1 {
             relay.shutdown();
         }
-        let finite = self.finite.clone();
-        let client = self.client.clone();
+        let client = self.0.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let deadline = Instant::now() + RELAY_PLANE_SHUTDOWN_WAIT;
-                let _ = timeout_at(deadline, finite.shutdown()).await;
-                let _ = timeout_at(deadline, client.shutdown()).await;
+                let _ = client.shutdown().await;
             });
         }
     }
@@ -687,12 +526,6 @@ impl DirectoryFetchRequest {
 }
 
 impl DirectoryRelayPlane {
-    fn lock_state(&self) -> MutexGuard<'_, DirectoryRelayPlaneState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     pub(crate) async fn inspect_events(
         &self,
         request: DirectoryFetchRequest,
@@ -700,7 +533,6 @@ impl DirectoryRelayPlane {
     ) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
         self.fetcher.inspect_directory_events(request, signer).await
     }
-
     pub fn new(fetcher: Arc<dyn DirectoryRelayFetcher>) -> Self {
         Self {
             fetcher,
@@ -708,194 +540,107 @@ impl DirectoryRelayPlane {
         }
     }
 
-    /// Cancel all in-flight coalesced directory fetches, notify waiting
-    /// callers, and join their supervisor tasks within `wait`.
-    pub(crate) async fn shutdown(&self, wait: Duration) {
-        let (plain_waiters, completion_waiters, cancels, handles) = {
-            let mut state = self.lock_state();
-            state.shutting_down = true;
-            let mut cancels = Vec::new();
-            let mut plain_waiters = Vec::new();
-            for (_, entry) in state.inflight.drain() {
-                cancels.push(entry.cancel);
-                plain_waiters.extend(entry.waiters.into_iter().map(|(_, tx)| tx));
-            }
-            let mut completion_waiters = Vec::new();
-            for (_, entry) in state.inflight_completion.drain() {
-                cancels.push(entry.cancel);
-                completion_waiters.extend(entry.waiters.into_iter().map(|(_, tx)| tx));
-            }
-            let handles = state
-                .active_tasks
-                .drain()
-                .map(|(_, handle)| handle)
-                .collect::<Vec<_>>();
-            (plain_waiters, completion_waiters, cancels, handles)
-        };
-        for cancel in cancels {
-            cancel.cancel();
-        }
-        for tx in plain_waiters {
-            let _ = tx.send(Err(DIRECTORY_PLANE_SHUTTING_DOWN.to_owned()));
-        }
-        for tx in completion_waiters {
-            let _ = tx.send(Err(DIRECTORY_PLANE_SHUTTING_DOWN.to_owned()));
-        }
-        if handles.is_empty() {
-            return;
-        }
-        let deadline = Instant::now() + wait;
-        futures::future::join_all(handles.into_iter().map(|mut handle| async move {
-            if timeout_at(deadline, &mut handle).await.is_err() {
-                handle.abort();
-                let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut handle).await;
-            }
-        }))
-        .await;
-    }
-
-    async fn coalesce_fetch<M, F, Fut, S>(
-        &self,
-        request: DirectoryFetchRequest,
-        run_fetch: F,
-        is_complete: S,
-    ) -> Result<M::Output, String>
-    where
-        M: CoalescedMap,
-        F: FnOnce(Arc<dyn DirectoryRelayFetcher>, DirectoryFetchRequest, CancellationToken) -> Fut
-            + Send
-            + 'static,
-        Fut: Future<Output = Result<M::Output, String>> + Send + 'static,
-        S: FnOnce(&Result<M::Output, String>) -> bool + Send + 'static,
-    {
-        let key = request.key();
-        let (tx, rx) = oneshot::channel();
-        let (entry_id, waiter_id) = {
-            let mut state = self.lock_state();
-            if state.shutting_down {
-                return Err(DIRECTORY_PLANE_SHUTTING_DOWN.to_owned());
-            }
-            let waiter_id = state.alloc_id();
-            if let Some(entry) = M::map(&mut state).get_mut(&key) {
-                let entry_id = entry.id;
-                entry.waiters.push((waiter_id, tx));
-                state.coalesced_waiters += 1;
-                (entry_id, waiter_id)
-            } else {
-                let entry_id = state.alloc_id();
-                let cancel = CancellationToken::new();
-                M::map(&mut state).insert(
-                    key.clone(),
-                    InflightFetch {
-                        id: entry_id,
-                        cancel: cancel.clone(),
-                        waiters: vec![(waiter_id, tx)],
-                    },
-                );
-                let fetcher = self.fetcher.clone();
-                let state_arc = self.state.clone();
-                let task_key = key.clone();
-                let supervisor_cancel = cancel.clone();
-                let handle = tokio::spawn(async move {
-                    // Run the fetch directly inside the single supervisor task
-                    // with `catch_unwind` so panics still clear the coalescing
-                    // key and aborting this handle during plane shutdown
-                    // drops the fetch future directly without detaching a child.
-                    let fetch =
-                        AssertUnwindSafe(run_fetch(fetcher, request, cancel)).catch_unwind();
-                    let result = tokio::select! {
-                        biased;
-                        joined = fetch => match joined {
-                            Ok(result) => Some(result),
-                            Err(_) => Some(Err("directory fetch task failed".to_owned())),
-                        },
-                        () = async {
-                            supervisor_cancel.cancelled().await;
-                            tokio::time::sleep(RELAY_PLANE_SHUTDOWN_WAIT).await;
-                        } => None,
-                    };
-                    let waiters = {
-                        let mut state = state_arc
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        state.active_tasks.remove(&entry_id);
-                        let matches_entry = M::map(&mut state)
-                            .get(&task_key)
-                            .is_some_and(|entry| entry.id == entry_id);
-                        if matches_entry {
-                            let entry = M::map(&mut state).remove(&task_key);
-                            if let Some(ref outcome) = result {
-                                if is_complete(outcome) {
-                                    state.completed_fetches += 1;
-                                } else {
-                                    state.failed_fetches += 1;
-                                }
-                            }
-                            entry.map(|entry| entry.waiters).unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        }
-                    };
-                    if let Some(result) = result {
-                        for (_, waiter) in waiters {
-                            let _ = waiter.send(result.clone());
-                        }
-                    }
-                });
-                state.active_tasks.insert(entry_id, handle);
-                (entry_id, waiter_id)
-            }
-        };
-
-        let mut guard = CoalescedWaiterGuard::<M> {
-            state: self.state.clone(),
-            key,
-            entry_id,
-            waiter_id,
-            armed: true,
-            _map: PhantomData,
-        };
-        let result = rx
-            .await
-            .map_err(|_| "directory fetch owner dropped before completing".to_owned())?;
-        guard.disarm();
-        result
-    }
-
     pub(crate) async fn fetch_events(
         &self,
         request: DirectoryFetchRequest,
     ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
-        self.coalesce_fetch::<PlainFetchMap, _, _, _>(
-            request,
-            |fetcher, request, cancel| async move {
-                fetcher
-                    .fetch_directory_events_cancellable(request, cancel)
-                    .await
-            },
-            Result::is_ok,
-        )
-        .await
+        let key = request.key();
+        let (rx, should_spawn) = {
+            let (tx, rx) = oneshot::channel();
+            let mut state = self.state.lock().await;
+            if let Some(waiters) = state.inflight.get_mut(&key) {
+                waiters.push(tx);
+                state.coalesced_waiters += 1;
+                (rx, false)
+            } else {
+                state.inflight.insert(key.clone(), vec![tx]);
+                (rx, true)
+            }
+        };
+
+        if should_spawn {
+            let fetcher = self.fetcher.clone();
+            let state = self.state.clone();
+            tokio::spawn(async move {
+                // Keep ownership of the inflight entry in this supervisor.
+                // The child JoinHandle converts a fetcher panic into an error,
+                // so cleanup and waiter notification still run.
+                let result = match tokio::spawn(async move {
+                    fetcher.fetch_directory_events(request).await
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err("directory fetch task failed".to_owned()),
+                };
+                let mut state = state.lock().await;
+                if result.is_ok() {
+                    state.completed_fetches += 1;
+                } else {
+                    state.failed_fetches += 1;
+                }
+                if let Some(waiters) = state.inflight.remove(&key) {
+                    for waiter in waiters {
+                        let _ = waiter.send(result.clone());
+                    }
+                }
+            });
+        }
+
+        rx.await
+            .map_err(|_| "directory fetch owner dropped before completing".to_owned())?
     }
 
     pub(crate) async fn fetch_events_with_completion(
         &self,
         request: DirectoryFetchRequest,
     ) -> Result<DirectoryFetchOutcome, String> {
-        self.coalesce_fetch::<CompletionFetchMap, _, _, _>(
-            request,
-            |fetcher, request, cancel| async move {
-                fetcher
-                    .fetch_directory_events_with_completion_cancellable(request, cancel)
-                    .await
-            },
-            |result| matches!(result, Ok(outcome) if outcome.complete),
-        )
-        .await
+        let key = request.key();
+        let (tx, rx) = oneshot::channel();
+        let should_spawn = {
+            let mut state = self.state.lock().await;
+            if let Some(waiters) = state.inflight_completion.get_mut(&key) {
+                waiters.push(tx);
+                state.coalesced_waiters += 1;
+                false
+            } else {
+                state.inflight_completion.insert(key.clone(), vec![tx]);
+                true
+            }
+        };
+        if should_spawn {
+            let fetcher = self.fetcher.clone();
+            let state = self.state.clone();
+            tokio::spawn(async move {
+                let result = match tokio::spawn(async move {
+                    fetcher
+                        .fetch_directory_events_with_completion(request)
+                        .await
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err("directory fetch task failed".to_owned()),
+                };
+                let mut state = state.lock().await;
+                if matches!(&result, Ok(outcome) if outcome.complete) {
+                    state.completed_fetches += 1;
+                } else {
+                    state.failed_fetches += 1;
+                }
+                if let Some(waiters) = state.inflight_completion.remove(&key) {
+                    for waiter in waiters {
+                        let _ = waiter.send(result.clone());
+                    }
+                }
+            });
+        }
+        rx.await
+            .map_err(|_| "directory fetch owner dropped before completing".to_owned())?
     }
 
     pub(crate) async fn stats(&self) -> DirectoryRelayStats {
-        let state = self.lock_state();
+        let state = self.state.lock().await;
         DirectoryRelayStats {
             inflight_fetches: state.inflight.len() + state.inflight_completion.len(),
             active_subscriptions: state
@@ -924,7 +669,7 @@ impl DirectoryRelayPlane {
         &self,
         desired_ids: &HashSet<String>,
     ) -> (HashSet<String>, HashSet<String>) {
-        let state = self.lock_state();
+        let state = self.state.lock().await;
         let active_ids = state
             .active_subscriptions
             .keys()
@@ -943,7 +688,7 @@ impl DirectoryRelayPlane {
     }
 
     pub(crate) async fn set_subscription_endpoints(&self, endpoints: &[RelayUrl]) -> bool {
-        let mut state = self.lock_state();
+        let mut state = self.state.lock().await;
         let next = endpoints.iter().map(ToString::to_string).collect();
         let changed = !state.active_subscriptions.is_empty() && state.active_endpoints != next;
         state.active_endpoints = next;
@@ -955,23 +700,31 @@ impl DirectoryRelayPlane {
     }
 
     pub(crate) async fn clear_auth_required(&self, subscription_id: &str) {
-        self.lock_state()
+        self.state
+            .lock()
+            .await
             .auth_required
             .retain(|(id, _)| id != subscription_id);
     }
 
     pub(crate) async fn mark_rebuild_pending(&self, ids: &HashSet<String>) {
-        self.lock_state()
+        self.state
+            .lock()
+            .await
             .pending_rebuild
             .extend(ids.iter().cloned());
     }
 
     pub(crate) async fn mark_subscription_installed(&self, subscription_id: &str) {
-        self.lock_state().pending_rebuild.remove(subscription_id);
+        self.state
+            .lock()
+            .await
+            .pending_rebuild
+            .remove(subscription_id);
     }
 
     pub(crate) async fn mark_auth_required(&self, subscription_id: &str, endpoint: &str) -> bool {
-        let mut state = self.lock_state();
+        let mut state = self.state.lock().await;
         if !state.active_endpoints.contains(endpoint)
             || !state.active_subscriptions.contains_key(subscription_id)
         {
@@ -990,7 +743,7 @@ impl DirectoryRelayPlane {
         subscription_id: String,
         filter: DirectorySubscriptionFilter,
     ) -> Option<DirectorySubscriptionFilter> {
-        let mut state = self.lock_state();
+        let mut state = self.state.lock().await;
         let previous = state.active_subscriptions.insert(subscription_id, filter);
         if previous.is_none() {
             state.subscriptions_created += 1;
@@ -1003,7 +756,7 @@ impl DirectoryRelayPlane {
         subscription_id: &str,
         previous: Option<DirectorySubscriptionFilter>,
     ) {
-        let mut state = self.lock_state();
+        let mut state = self.state.lock().await;
         if let Some(previous) = previous {
             state
                 .active_subscriptions
@@ -1020,7 +773,7 @@ impl DirectoryRelayPlane {
         desired: HashMap<String, DirectorySubscriptionFilter>,
         subscriptions_created: usize,
     ) -> Result<DirectorySubscriptionSyncSummary, String> {
-        let mut state = self.lock_state();
+        let mut state = self.state.lock().await;
         let removed = state
             .active_subscriptions
             .keys()
@@ -1055,7 +808,7 @@ impl DirectoryRelayPlane {
         &self,
         desired: HashMap<String, DirectorySubscriptionFilter>,
     ) -> Result<DirectorySubscriptionSyncSummary, String> {
-        let mut state = self.lock_state();
+        let mut state = self.state.lock().await;
         let created = desired
             .keys()
             .filter(|id| !state.active_subscriptions.contains_key(*id))
@@ -1102,7 +855,9 @@ impl DirectoryRelayPlane {
         author: &str,
         kind: u64,
     ) -> bool {
-        self.lock_state()
+        self.state
+            .lock()
+            .await
             .active_subscriptions
             .get(subscription_id)
             .is_some_and(|filter| filter.accepts(author, kind))
@@ -1116,7 +871,7 @@ impl DirectoryRelayPlane {
         kind: u64,
         tags: &[Vec<String>],
     ) -> bool {
-        let state = self.lock_state();
+        let state = self.state.lock().await;
         // Pending rebuild means coverage is unknown and a retry is still owed.
         // A signed, filter-matching EVENT can arrive before SDK subscribe
         // returns; retain that positive observation without claiming coverage.
@@ -1139,14 +894,15 @@ pub(super) fn anonymous_directory_client() -> NostrSdkClient {
 }
 
 impl NostrSdkDirectoryRelayFetcher {
-    /// A stateless fetcher that creates and shuts down an isolated anonymous
-    /// finite-request client per read.
+    /// An owned anonymous client whose reads are finite requests.
     pub fn standalone() -> Self {
-        Self
+        let (builder, finite) = FiniteRequests::install(super::nostr_builder());
+        Self {
+            client: builder.build(),
+            finite,
+        }
     }
-}
 
-impl ScopedDirectoryClient {
     /// Each of `relay_urls`' finite reply to `filters`, in order; `None` for
     /// a relay missing from the pool. A relay's every EVENT frame would count
     /// toward an item cap, matching or not, so none is set: one relay that
@@ -1160,17 +916,20 @@ impl ScopedDirectoryClient {
         &self,
         relay_urls: &[RelayUrl],
         filters: &[Filter],
-        cancel: &CancellationToken,
     ) -> Vec<Option<FiniteReply>> {
         let limits = FiniteLimits {
             max_items: usize::MAX,
             max_event_bytes: DIRECTORY_REPLY_MAX_BYTES,
             timeout: DIRECTORY_RELAY_FETCH_WAIT,
         };
+        let cancel = CancellationToken::new();
         let finite = &self.finite.sharing(DIRECTORY_REPLY_MAX_BYTES);
-        futures::future::join_all(relay_urls.iter().map(|url| async move {
-            let relay = self.client.relay(url.clone()).await.ok().flatten()?;
-            Some(finite.fetch(&relay, filters.to_vec(), limits, cancel).await)
+        futures::future::join_all(relay_urls.iter().map(|url| {
+            let cancel = &cancel;
+            async move {
+                let relay = self.client.relay(url.clone()).await.ok().flatten()?;
+                Some(finite.fetch(&relay, filters.to_vec(), limits, cancel).await)
+            }
         }))
         .await
     }
@@ -1217,26 +976,16 @@ fn directory_query_filter(query: &DirectoryEventQuery, recipient: bool) -> Resul
     Ok(filter)
 }
 
-impl ScopedDirectoryClient {
+impl NostrSdkDirectoryRelayFetcher {
     /// Add and connect `relay_urls`, returning those that connected within
     /// the connect wait. Relays that did not connect are removed again.
-    async fn connect_relays(
-        &mut self,
-        relay_urls: Vec<RelayUrl>,
-        cancel: &CancellationToken,
-    ) -> Result<Vec<RelayUrl>, String> {
-        if cancel.is_cancelled() {
-            return Err(DIRECTORY_FETCH_CANCELLED.to_owned());
-        }
+    async fn connect_relays(&self, relay_urls: Vec<RelayUrl>) -> Result<Vec<RelayUrl>, String> {
         let mut connect_candidates = Vec::new();
         let mut added = vec![false; relay_urls.len()];
         let mut add_failure_count = 0usize;
         for (index, relay_url) in relay_urls.iter().cloned().enumerate() {
             if self.client.add_relay(relay_url.clone()).await.is_ok() {
                 added[index] = true;
-                if let Ok(Some(relay)) = self.client.relay(relay_url.clone()).await {
-                    self.relays.push(relay);
-                }
                 connect_candidates.push((index, relay_url));
             } else {
                 add_failure_count += 1;
@@ -1263,19 +1012,7 @@ impl ScopedDirectoryClient {
         let mut connect_timeout_count = 0usize;
         let mut connect_failure_count = 0usize;
         let mut task_failure_count = 0usize;
-        loop {
-            let next = tokio::select! {
-                biased;
-                () = cancel.cancelled() => {
-                    connects.abort_all();
-                    while connects.join_next().await.is_some() {}
-                    return Err(DIRECTORY_FETCH_CANCELLED.to_owned());
-                }
-                next = connects.join_next() => next,
-            };
-            let Some(result) = next else {
-                break;
-            };
+        while let Some(result) = connects.join_next().await {
             match result {
                 Ok((index, DirectoryRelayConnectOutcome::Connected)) => connected[index] = true,
                 Ok((_index, DirectoryRelayConnectOutcome::TimedOut)) => {
@@ -1308,29 +1045,21 @@ impl ScopedDirectoryClient {
     }
 
     async fn fetch_request_events(
-        &mut self,
+        &self,
         request: DirectoryFetchRequest,
-        cancel: &CancellationToken,
     ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
         let relay_urls = self
-            .connect_relays(parsed_directory_relay_urls(&request.endpoints)?, cancel)
+            .connect_relays(parsed_directory_relay_urls(&request.endpoints)?)
             .await?;
 
         let mut queries = futures::stream::iter(request.queries)
             .map(|query| {
                 let relay_urls = &relay_urls;
-                let client = &*self;
                 async move {
-                    if cancel.is_cancelled() {
-                        return Err(DIRECTORY_FETCH_CANCELLED.to_owned());
-                    }
                     let filter = directory_query_filter(&query, false)?;
-                    let replies = client
-                        .fetch_each(relay_urls, std::slice::from_ref(&filter), cancel)
+                    let replies = self
+                        .fetch_each(relay_urls, std::slice::from_ref(&filter))
                         .await;
-                    if cancel.is_cancelled() {
-                        return Err(DIRECTORY_FETCH_CANCELLED.to_owned());
-                    }
                     // A plain lookup cannot say it is partial, and a record a
                     // cut relay never sent would read as absent: the lookup
                     // fails instead, which callers treat as unresolved. The
@@ -1338,9 +1067,6 @@ impl ScopedDirectoryClient {
                     // a finite request stops at it, so it cuts the same way.
                     for reply in replies.iter().flatten() {
                         match reply.end {
-                            FiniteEnd::Cancelled => {
-                                return Err(DIRECTORY_FETCH_CANCELLED.to_owned());
-                            }
                             FiniteEnd::ByteLimit => {
                                 return Err(DIRECTORY_READ_OVER_BUDGET.to_owned());
                             }
@@ -1422,13 +1148,12 @@ pub async fn fetch_public_events(
     filters: Vec<Filter>,
     max_events: usize,
 ) -> Result<PublicEventFetch, String> {
-    let mut owned = ScopedDirectoryClient::new();
-    let cancel = CancellationToken::new();
+    let fetcher = NostrSdkDirectoryRelayFetcher::standalone();
     let result = async {
         let requested = parsed_directory_relay_urls(endpoints)?;
         let requested_count = requested.len();
-        let relay_urls = owned.connect_relays(requested, &cancel).await?;
-        let replies = owned.fetch_each(&relay_urls, &filters, &cancel).await;
+        let relay_urls = fetcher.connect_relays(requested).await?;
+        let replies = fetcher.fetch_each(&relay_urls, &filters).await;
         let mut complete = relay_urls.len() == requested_count;
         let mut events = BTreeSet::new();
         let mut sources: HashMap<EventId, Vec<TransportEndpoint>> = HashMap::new();
@@ -1462,7 +1187,7 @@ pub async fn fetch_public_events(
         })
     }
     .await;
-    owned.shutdown().await;
+    fetcher.client.shutdown().await;
     result
 }
 
@@ -1571,9 +1296,9 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             }),
             None => super::nostr_builder(),
         };
-        let mut scoped = ScopedDirectoryClient::from_builder(builder);
-        let client = scoped.client.clone();
-        let finite = scoped.finite.clone();
+        let (builder, finite) = FiniteRequests::install(builder);
+        let mut scoped = ScopedInspectionClient(builder.build(), None);
+        let client = scoped.0.clone();
         let urls = parsed_directory_relay_urls(&request.endpoints).map_err(|_| InvalidRequest)?;
         if urls.len() != 1 {
             return Err(InvalidRequest);
@@ -1588,7 +1313,7 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             .await
             .map_err(|_| Unreachable)?
             .ok_or(Unreachable)?;
-        scoped.relays.push(relay.clone());
+        scoped.1 = Some(relay.clone());
         // Relay health reads the relay's own answers to the signer's AUTH,
         // watched from before the dial too.
         let mut auth_replies = relay.notifications().with_gaps();
@@ -1749,18 +1474,9 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         &self,
         request: DirectoryFetchRequest,
     ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
-        self.fetch_directory_events_cancellable(request, CancellationToken::new())
-            .await
-    }
-
-    async fn fetch_directory_events_cancellable(
-        &self,
-        request: DirectoryFetchRequest,
-        cancel: CancellationToken,
-    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
-        let mut owned = ScopedDirectoryClient::new();
-        let result = owned.fetch_request_events(request, &cancel).await;
-        owned.shutdown().await;
+        let owned = Self::standalone();
+        let result = owned.fetch_request_events(request).await;
+        owned.client.shutdown().await;
         result
     }
 
@@ -1768,18 +1484,6 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         &self,
         request: DirectoryFetchRequest,
     ) -> Result<DirectoryFetchOutcome, String> {
-        self.fetch_directory_events_with_completion_cancellable(request, CancellationToken::new())
-            .await
-    }
-
-    async fn fetch_directory_events_with_completion_cancellable(
-        &self,
-        request: DirectoryFetchRequest,
-        cancel: CancellationToken,
-    ) -> Result<DirectoryFetchOutcome, String> {
-        if cancel.is_cancelled() {
-            return Err(DIRECTORY_FETCH_CANCELLED.to_owned());
-        }
         let relay_urls = parsed_directory_relay_urls(&request.endpoints)?;
         // Discovered targets belong to this bounded read, not the long-lived
         // client pool. Closing the owned client also stops reconnects for
@@ -1787,9 +1491,7 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         let mut tasks = JoinSet::new();
         for relay_url in relay_urls.iter().cloned() {
             let queries = request.queries.clone();
-            let task_cancel = cancel.clone();
-            tasks
-                .spawn(async move { strict_fetch_endpoint(relay_url, queries, task_cancel).await });
+            tasks.spawn(async move { strict_fetch_endpoint(relay_url, queries).await });
         }
 
         let mut outcome = DirectoryFetchOutcome {
@@ -1807,9 +1509,6 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                 }
                 Err(_) => return Err("directory relay fetch task failed".to_owned()),
             }
-        }
-        if cancel.is_cancelled() {
-            return Err(DIRECTORY_FETCH_CANCELLED.to_owned());
         }
         if relay_urls.is_empty() {
             outcome.complete = false;
@@ -2001,130 +1700,117 @@ fn directory_closed_reason(reason: &str) -> DirectoryInspectionError {
 async fn strict_fetch_endpoint(
     relay_url: RelayUrl,
     queries: Vec<DirectoryEventQuery>,
-    cancel: CancellationToken,
 ) -> DirectoryFetchOutcome {
-    if cancel.is_cancelled() {
+    // One isolated client owns this connection and its per-REQ finite
+    // requests; cancellation or early return closes the relay immediately
+    // through `ScopedInspectionClient`.
+    let (builder, finite) = FiniteRequests::install(super::nostr_builder());
+    let mut owned = ScopedInspectionClient(builder.build(), None);
+    let client = &owned.0;
+    let endpoint = TransportEndpoint(relay_url.to_string());
+    if client.add_relay(relay_url.clone()).await.is_err() {
         return DirectoryFetchOutcome::default();
     }
-    // One isolated client owns this connection and its per-REQ finite
-    // requests; explicit shutdown awaits teardown on normal exit and
-    // cancellation, while `Drop` protects against external abort.
-    let mut owned = ScopedDirectoryClient::new();
-    let endpoint = TransportEndpoint(relay_url.to_string());
-    let outcome = async {
-        if owned.client.add_relay(relay_url.clone()).await.is_err() {
-            return DirectoryFetchOutcome::default();
-        }
-        let Ok(Some(relay)) = owned.client.relay(relay_url.clone()).await else {
+    let Ok(Some(relay)) = client.relay(relay_url.clone()).await else {
+        return DirectoryFetchOutcome::default();
+    };
+    owned.1 = Some(relay.clone());
+    if !matches!(
+        timeout(
+            DIRECTORY_RELAY_CONNECT_WAIT,
+            client
+                .try_connect_relay(relay_url)
+                .timeout(DIRECTORY_RELAY_CONNECT_WAIT),
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        return DirectoryFetchOutcome::default();
+    }
+    let mut filters = Vec::with_capacity(queries.len());
+    for query in &queries {
+        let Ok(filter) = directory_query_filter(query, false) else {
             return DirectoryFetchOutcome::default();
         };
-        owned.relays.push(relay.clone());
-        let connected = tokio::select! {
-            biased;
-            () = cancel.cancelled() => false,
-            res = timeout(
-                DIRECTORY_RELAY_CONNECT_WAIT,
-                owned
-                    .client
-                    .try_connect_relay(relay_url)
-                    .timeout(DIRECTORY_RELAY_CONNECT_WAIT),
-            ) => matches!(res, Ok(Ok(()))),
-        };
-        if !connected {
-            return DirectoryFetchOutcome::default();
-        }
-        let mut filters = Vec::with_capacity(queries.len());
-        for query in &queries {
-            let Ok(filter) = directory_query_filter(query, false) else {
-                return DirectoryFetchOutcome::default();
-            };
-            filters.push(filter);
-        }
+        filters.push(filter);
+    }
 
-        let max_records = queries.iter().map(|query| query.limit).sum::<usize>();
-        let limits = FiniteLimits {
-            max_items: usize::MAX,
-            max_event_bytes: DIRECTORY_REPLY_MAX_BYTES,
-            timeout: DIRECTORY_RELAY_FETCH_WAIT,
-        };
-        let mut records = Vec::new();
-        let mut seen_event_ids = HashSet::new();
-        let mut complete = true;
-        for (queries, filters) in queries
-            .chunks(DIRECTORY_MAX_FILTERS_PER_REQ)
-            .zip(filters.chunks(DIRECTORY_MAX_FILTERS_PER_REQ))
-        {
-            if cancel.is_cancelled() {
-                complete = false;
-                break;
+    let max_records = queries.iter().map(|query| query.limit).sum::<usize>();
+    let cancel = CancellationToken::new();
+    let limits = FiniteLimits {
+        max_items: usize::MAX,
+        max_event_bytes: DIRECTORY_REPLY_MAX_BYTES,
+        timeout: DIRECTORY_RELAY_FETCH_WAIT,
+    };
+    let mut records = Vec::new();
+    let mut seen_event_ids = HashSet::new();
+    let mut complete = true;
+    for (queries, filters) in queries
+        .chunks(DIRECTORY_MAX_FILTERS_PER_REQ)
+        .zip(filters.chunks(DIRECTORY_MAX_FILTERS_PER_REQ))
+    {
+        let reply = finite
+            .fetch(&relay, filters.to_vec(), limits, &cancel)
+            .await;
+        // Counted per REQ: an event an earlier chunk already returned still
+        // fills this chunk's queries toward their limits. Only the returned
+        // records are deduplicated across chunks.
+        let mut query_counts = vec![0usize; queries.len()];
+        let mut converted_all_matched = true;
+        let mut record_cap_hit = false;
+        for event in &reply.events {
+            let Ok(converted) = NostrTransportEvent::from_nostr_event(event) else {
+                converted_all_matched = false;
+                continue;
+            };
+            if !queries.iter().any(|query| query.matches(&converted)) {
+                converted_all_matched = false;
+                continue;
             }
-            let reply = owned
-                .finite
-                .fetch(&relay, filters.to_vec(), limits, &cancel)
-                .await;
-            // Counted per REQ: an event an earlier chunk already returned still
-            // fills this chunk's queries toward their limits. Only the returned
-            // records are deduplicated across chunks.
-            let mut query_counts = vec![0usize; queries.len()];
-            let mut converted_all_matched = true;
-            let mut record_cap_hit = false;
-            for event in &reply.events {
-                let Ok(converted) = NostrTransportEvent::from_nostr_event(event) else {
-                    converted_all_matched = false;
-                    continue;
-                };
-                if !queries.iter().any(|query| query.matches(&converted)) {
-                    converted_all_matched = false;
-                    continue;
-                }
-                for (query, count) in queries.iter().zip(&mut query_counts) {
-                    if query.matches(&converted) {
-                        *count += 1;
-                    }
-                }
-                if !seen_event_ids.insert(converted.id.clone()) {
-                    continue;
-                }
-                if records.len() < max_records {
-                    records.push(DirectoryRelayEventRecord {
-                        endpoints: vec![endpoint.clone()],
-                        event: converted,
-                    });
-                } else {
-                    record_cap_hit = true;
+            for (query, count) in queries.iter().zip(&mut query_counts) {
+                if query.matches(&converted) {
+                    *count += 1;
                 }
             }
-            // A chunk establishes absence only when:
-            // - it ended at EOSE without NIP-67 `more` or `auth` withholding hints,
-            // - every wire EVENT frame for the REQ passed SDK limits, signature
-            //   verification, and filter matching (`raw_items == received_items`),
-            // - every kept event converted and matched one of this chunk's queries
-            //   without overflowing `max_records`, and
-            // - no query reached its requested limit or the silent relay clamp.
-            let chunk_complete = reply.end == FiniteEnd::Eose
-                && !reply.more
-                && !reply.auth
-                && reply.raw_items == reply.received_items
-                && converted_all_matched
-                && !record_cap_hit
-                && queries
-                    .iter()
-                    .zip(&query_counts)
-                    .all(|(query, count)| *count < query.limit.min(RELAY_REPLAY_PAGE_LIMIT));
-            complete &= chunk_complete;
-            if matches!(reply.end, FiniteEnd::Disconnected | FiniteEnd::Cancelled) {
-                break;
+            if !seen_event_ids.insert(converted.id.clone()) {
+                continue;
+            }
+            if records.len() < max_records {
+                records.push(DirectoryRelayEventRecord {
+                    endpoints: vec![endpoint.clone()],
+                    event: converted,
+                });
+            } else {
+                record_cap_hit = true;
             }
         }
-        DirectoryFetchOutcome {
-            records,
-            complete,
-            complete_endpoints: if complete { vec![endpoint] } else { Vec::new() },
+        // A chunk establishes absence only when:
+        // - it ended at EOSE without NIP-67 `more` or `auth` withholding hints,
+        // - every wire EVENT frame for the REQ passed SDK limits, signature
+        //   verification, and filter matching (`raw_items == received_items`),
+        // - every kept event converted and matched one of this chunk's queries
+        //   without overflowing `max_records`, and
+        // - no query reached its requested limit or the silent relay clamp.
+        let chunk_complete = reply.end == FiniteEnd::Eose
+            && !reply.more
+            && !reply.auth
+            && reply.raw_items == reply.received_items
+            && converted_all_matched
+            && !record_cap_hit
+            && queries
+                .iter()
+                .zip(&query_counts)
+                .all(|(query, count)| *count < query.limit.min(RELAY_REPLAY_PAGE_LIMIT));
+        complete &= chunk_complete;
+        if reply.end == FiniteEnd::Disconnected {
+            break;
         }
     }
-    .await;
-    owned.shutdown().await;
-    outcome
+    DirectoryFetchOutcome {
+        records,
+        complete,
+        complete_endpoints: if complete { vec![endpoint] } else { Vec::new() },
+    }
 }
 
 fn parsed_directory_relay_urls(endpoints: &[TransportEndpoint]) -> Result<Vec<RelayUrl>, String> {
@@ -2587,93 +2273,8 @@ mod tests {
         assert_eq!(records[0].event.id, expected_id);
     }
 
-    #[test]
-    fn standalone_directory_fetcher_holds_no_client() {
-        assert_eq!(
-            std::mem::size_of::<NostrSdkDirectoryRelayFetcher>(),
-            0,
-            "standalone directory fetcher must not hold an idle shared SDK client"
-        );
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn directory_plane_shutdown_aborts_uncooperative_cancellable_fetcher() {
-        use tokio::sync::watch;
-
-        struct UncooperativeFetcher {
-            started: watch::Sender<bool>,
-            active: Arc<AtomicUsize>,
-        }
-
-        struct ActiveGuard(Arc<AtomicUsize>);
-        impl Drop for ActiveGuard {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-
-        #[async_trait]
-        impl DirectoryRelayFetcher for UncooperativeFetcher {
-            async fn fetch_directory_events(
-                &self,
-                _request: DirectoryFetchRequest,
-            ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
-                unreachable!("coalesced fetch uses the cancellable override")
-            }
-
-            async fn fetch_directory_events_cancellable(
-                &self,
-                _request: DirectoryFetchRequest,
-                _cancel: CancellationToken,
-            ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
-                self.active.fetch_add(1, Ordering::SeqCst);
-                let _guard = ActiveGuard(self.active.clone());
-                let _ = self.started.send(true);
-                // Intentionally ignore `_cancel` to prove shutdown aborts the
-                // single supervisor task and drops this future before returning.
-                std::future::pending::<()>().await;
-                unreachable!()
-            }
-        }
-
-        let (started_tx, mut started_rx) = watch::channel(false);
-        let active = Arc::new(AtomicUsize::new(0));
-        let plane = DirectoryRelayPlane::new(Arc::new(UncooperativeFetcher {
-            started: started_tx,
-            active: active.clone(),
-        }));
-        let request = DirectoryFetchRequest::new(
-            vec![TransportEndpoint("wss://relay.example".into())],
-            vec![DirectoryEventQuery::new(0, vec!["11".repeat(32)], 1)],
-        )
-        .unwrap();
-        let waiter = tokio::spawn({
-            let plane = plane.clone();
-            async move { plane.fetch_events(request).await }
-        });
-        timeout(Duration::from_secs(2), started_rx.wait_for(|&s| s))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(active.load(Ordering::SeqCst), 1);
-
-        plane.shutdown(Duration::from_millis(50)).await;
-        assert_eq!(
-            active.load(Ordering::SeqCst),
-            0,
-            "shutdown must abort and drop an uncooperative cancellable fetcher before returning"
-        );
-        assert!(
-            waiter
-                .await
-                .unwrap()
-                .expect_err("waiter receives shutdown error")
-                .contains("shutting down")
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn signerless_inspection_handles_valid_and_invalid_queries() {
+    async fn signerless_inspection_never_retains_relays_in_the_shared_client() {
         let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
         let endpoint = TransportEndpoint(relay.url().await.to_string());
         let fetcher = NostrSdkDirectoryRelayFetcher::standalone();
@@ -2690,6 +2291,7 @@ mod tests {
                 )
                 .await;
             assert_eq!(result.is_ok(), succeeds);
+            assert!(fetcher.client.relays().await.is_empty());
         }
     }
 
@@ -4246,6 +3848,7 @@ mod tests {
                     assert_eq!(filter["since"], 100);
                 }
             }
+            fetcher.client.shutdown().await;
             server.abort();
             let _ = server.await;
         }
