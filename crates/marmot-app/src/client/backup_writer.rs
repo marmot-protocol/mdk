@@ -124,7 +124,7 @@ fn backup_pointer_created_at(
     if created_at > now.saturating_add(MAX_POINTER_FUTURE_SKEW_SECS) {
         tracing::warn!(
             target: TRACE_TARGET,
-            method,
+            method = method,
             skew_secs = created_at.saturating_sub(now),
             "refusing backup pointer whose timestamp exceeds future skew bound"
         );
@@ -188,11 +188,14 @@ pub(super) async fn read_backup_pointer_discovery(
         .fetch_directory_events_with_completion(endpoints.to_vec(), vec![query])
         .await
         .map_err(|_| backup_error("backup_pointer_unavailable"))?;
-    let requested_endpoints = endpoints.len();
-    let complete_endpoints = endpoints
+    let requested: BTreeSet<String> = endpoints.iter().map(crate::relay_endpoint_key).collect();
+    let completed: BTreeSet<String> = outcome
+        .complete_endpoints
         .iter()
-        .filter(|endpoint| outcome.complete_endpoints.contains(endpoint))
-        .count();
+        .map(crate::relay_endpoint_key)
+        .collect();
+    let requested_endpoints = requested.len();
+    let complete_endpoints = requested.intersection(&completed).count();
     let incomplete_endpoints = requested_endpoints.saturating_sub(complete_endpoints);
     // An empty request is never evidence that no pointer exists. Require
     // completion from at least one endpoint that was actually requested.
@@ -845,9 +848,13 @@ impl AppClient {
             return Ok(None);
         };
         let now = unix_now_seconds();
-        let deletes_due = storage
-            .next_condemned_backup_try(&role.key)?
-            .is_some_and(|at| at <= now);
+        // A due condemned delete wakes a healthy daily schedule early, but
+        // must not bypass retry backoff after a failed pass (for example when
+        // pointer discovery failed before deletes could run or defer).
+        let deletes_due = schedule.failed_passes == 0
+            && storage
+                .next_condemned_backup_try(&role.key)?
+                .is_some_and(|at| at <= now);
         if schedule.next_pass_at > now && !deletes_due {
             return Ok(None);
         }

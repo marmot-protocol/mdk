@@ -922,10 +922,11 @@ impl QuorumCancelledDelivery {
 }
 
 /// Compare relay endpoints the way the transport reports them in receipts.
-fn relay_endpoint_key(endpoint: &TransportEndpoint) -> String {
-    nostr::prelude::RelayUrl::parse(endpoint.as_str())
+pub(crate) fn relay_endpoint_key(endpoint: &TransportEndpoint) -> String {
+    let trimmed = endpoint.as_str().trim();
+    nostr::prelude::RelayUrl::parse(trimmed)
         .map(|url| url.to_string())
-        .unwrap_or_else(|_| endpoint.0.clone())
+        .unwrap_or_else(|_| trimmed.to_owned())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

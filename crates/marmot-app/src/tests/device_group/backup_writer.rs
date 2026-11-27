@@ -545,6 +545,7 @@ async fn a_dropped_backup_is_deleted_later_unless_the_pointer_lists_it_again() {
     relay
         .unfinished_directory_reads
         .store(false, Ordering::SeqCst);
+    due_now(&phone);
     deletes_due_now(&phone, &key);
     phone.drive_backup_pass().await;
     assert_eq!(
@@ -984,6 +985,205 @@ async fn partial_relay_discovery_never_condemns_deletes_or_truncates_pointer() {
         published_before,
         "partial discovery must not publish a truncated pointer"
     );
+}
+
+/// When backup discovery fails while a condemned blob is due, both pass
+/// admission and worker wake scheduling must honor the failed pass's retry
+/// backoff instead of looping immediately, while normal succeeded schedules
+/// keep waking for due deletes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_backup_discovery_honors_retry_backoff_with_due_condemned_blobs() {
+    use crate::BackgroundBackupOutcome::{FinishedAttempt, NotStarted};
+    use std::sync::atomic::AtomicUsize;
+
+    struct CountingPartialView {
+        inner: restore::PartialPointerView,
+        fetches: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl transport_nostr::DirectoryRelayFetcher for CountingPartialView {
+        async fn fetch_directory_events(
+            &self,
+            request: transport_nostr::DirectoryFetchRequest,
+        ) -> Result<Vec<transport_nostr::DirectoryRelayEventRecord>, String> {
+            self.inner.fetch_directory_events(request).await
+        }
+
+        async fn fetch_directory_events_with_completion(
+            &self,
+            request: transport_nostr::DirectoryFetchRequest,
+        ) -> Result<transport_nostr::DirectoryFetchOutcome, String> {
+            if request
+                .queries
+                .iter()
+                .any(|query| query.kind == KIND_BACKUP_POINTER)
+            {
+                self.fetches.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner
+                .fetch_directory_events_with_completion(request)
+                .await
+        }
+    }
+
+    let blossom = local_blossom();
+    let (mut devices, _chat, words) = lone_writer(&blossom).await;
+    devices.phone.drive_backup_pass().await;
+    let first = pointer(&devices.relay, &words.public).remove(0);
+    let live_backup_id: [u8; 16] = hex::decode(&first.id).unwrap().try_into().unwrap();
+    storage(&devices.phone_app)
+        .condemn_backup_blobs(
+            &words.public,
+            &live_backup_id,
+            &[(first.head.sha256.clone(), blossom.url.clone())],
+            1,
+            0,
+        )
+        .unwrap();
+
+    // First verify normal succeeded schedule (failed_passes == 0) keeps due-delete
+    // wakeups and admission working while next_pass_at is far in the future.
+    storage(&devices.phone_app)
+        .schedule_backup_pass(BackupSchedule {
+            next_pass_at: unix_now_seconds() + DAY,
+            failed_passes: 0,
+        })
+        .unwrap();
+    assert_eq!(
+        devices.phone.history_dispatch_next_at(),
+        Some(0),
+        "normal succeeded schedule must still wake immediately for due deletes"
+    );
+    assert!(
+        devices.phone.prepare_backup_pass().unwrap().is_some(),
+        "normal succeeded schedule must still admit due-delete passes"
+    );
+
+    let account = devices.phone_app.account_home().account("alice").unwrap();
+    let directory = devices.phone_app.directory();
+    let mut entry = directory
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .unwrap_or_else(|| directory.empty_directory_record_for_test(&account.account_id_hex));
+    entry.relay_lists.nip65.created_at = unix_now_seconds();
+    entry.relay_lists.nip65.relays = vec![
+        "wss://completed-empty.example".into(),
+        "wss://unfinished-pointer.example".into(),
+    ];
+    entry.relay_lists.refresh();
+    directory.save_directory_entry_for_test(&entry).unwrap();
+
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let failing_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        None,
+        devices.relay.clone(),
+        Arc::new(CountingPartialView {
+            inner: restore::PartialPointerView {
+                relay: devices.relay.clone(),
+                visible: false,
+                any_completed: true,
+            },
+            fetches: fetches.clone(),
+        }),
+        false,
+    );
+    devices.phone.app.relay_plane = failing_plane.clone();
+    devices.phone_app.relay_plane = failing_plane;
+
+    // Direct client check: after a failed discovery pass, the due condemned row
+    // must not bypass retry backoff in prepare_backup_pass or history_dispatch_next_at.
+    due_now(&devices.phone);
+    deletes_due_now(&devices.phone, &words.public);
+    assert_eq!(
+        devices.phone.drive_backup_pass().await,
+        Some("device_group_refused")
+    );
+    let schedule = storage(&devices.phone_app).backup_schedule().unwrap();
+    assert_eq!(schedule.failed_passes, 1);
+    assert!(schedule.next_pass_at > unix_now_seconds());
+    assert!(
+        devices.phone.prepare_backup_pass().unwrap().is_none(),
+        "failed discovery backoff must block immediate re-admission despite due deletes"
+    );
+    assert_eq!(
+        devices.phone.history_dispatch_next_at(),
+        Some(schedule.next_pass_at),
+        "worker wake calculation must honor failed pass backoff despite due deletes"
+    );
+
+    // Runtime worker check: completion of the failed discovery pass must NOT
+    // immediately launch a second pass in a tight loop.
+    let phone_app = devices.phone_app.clone();
+    drop(devices.phone);
+    fetches.store(0, Ordering::SeqCst);
+    storage(&phone_app)
+        .schedule_backup_pass(BackupSchedule::default())
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(phone_app.clone());
+    runtime
+        .set_runtime_backup_background_conditions(true, true)
+        .unwrap();
+    runtime.reconcile_accounts().await.unwrap();
+    assert_eq!(
+        runtime.run_due_backup_pass("alice").await.unwrap(),
+        FinishedAttempt
+    );
+    // Barrier commands give the worker loop a chance to re-dispatch if buggy.
+    runtime.backup_settings("alice").await.unwrap();
+    runtime.run_due_maintenance("alice").await.unwrap();
+    assert_eq!(
+        runtime.run_due_backup_pass("alice").await.unwrap(),
+        NotStarted,
+        "worker must honor backoff instead of re-admitting a failed discovery pass"
+    );
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        1,
+        "failed discovery with due condemned blobs must not repeat relay reads on completion"
+    );
+    assert_eq!(
+        storage(&phone_app).backup_schedule().unwrap().failed_passes,
+        1
+    );
+    runtime.shutdown().await;
+}
+
+/// A healthy configured discovery fallback relay written with an uppercase
+/// hostname or explicit default port must match the canonical endpoint reported
+/// by transport completion so backup passes still run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_pass_accepts_completed_noncanonical_fallback_relay_url() {
+    let blossom = local_blossom();
+    let (mut devices, _chat, words) = lone_writer(&blossom).await;
+    // Clear cached NIP-65 relays so backup_pointer_endpoints falls back to the
+    // configured directory_relay_urls containing an uppercase host and explicit
+    // default port.
+    let account = devices.phone_app.account_home().account("alice").unwrap();
+    let directory = devices.phone_app.directory();
+    let mut entry = directory
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .unwrap_or_else(|| directory.empty_directory_record_for_test(&account.account_id_hex));
+    entry.relay_lists.nip65.relays.clear();
+    entry.relay_lists.refresh();
+    directory.save_directory_entry_for_test(&entry).unwrap();
+
+    devices.phone.app.config.directory_relay_urls =
+        vec!["wss://BACKUP-FALLBACK.EXAMPLE:443".into()];
+    assert_eq!(
+        devices.phone.app.directory().directory_source_relays(&[]),
+        vec![TransportEndpoint(
+            "wss://BACKUP-FALLBACK.EXAMPLE:443".into()
+        )]
+    );
+
+    assert_eq!(
+        devices.phone.drive_backup_pass().await,
+        None,
+        "completed canonical fallback relay must be recognized as complete"
+    );
+    assert_eq!(pointer(&devices.relay, &words.public).len(), 1);
 }
 
 /// Under a key nothing can be sealed to, the writer uploads nothing and
