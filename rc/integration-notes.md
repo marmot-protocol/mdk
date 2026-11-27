@@ -1,9 +1,9 @@
-# MDK 0.19.0 → 0.20.0-rc.1 Integration Guide
+# MDK 0.19.0 → 0.20.0-rc.2 Integration Guide
 
 ## Scope and provenance
 
 - **Baseline:** `v0.19.0` (`3fce95465cdea1edc8456dbd1c6691d1c8dc1f2e`)
-- **Target:** `0.20.0-rc.1` (`f732c9353779fecbb1dc97ee23fac4e1e1ababf5`)
+- **Target:** `0.20.0-rc.2` (`a3228a2c572f2c91bbc5948160bbe890f20888a2`)
 - **Classified SemVer impact:** `minor`
 
 ## Impact triggers
@@ -12,7 +12,7 @@
 - C ABI breaking changes (10): changed C type `MarmotEvent`, changed C type `MarmotEvent_Tag`, changed C type `MarmotLocalSendStatus`, changed C type `MarmotNotificationTrafficClass`, changed C type `MarmotOnboardingIssue`
 - SQLite storage migrations (11): migrations.rs, 0219_agent_item_order.rs, 0220_chat_activity_creation_fallback.rs, 0221_agent_item_expired_targets.rs, 0222_small_state_broadcast_devices.rs
 - Pending changelog.d fragment contains `### Breaking changes`
-- Commit trailer `Release-Impact: minor` (2): 2376a640d (Start empty account databases from a migration baseline (#3609)), 3cb8e4a86 (Add unified opt-in onboarding flags across Rust, UniFFI, and C (#3775))
+- Commit trailer `Release-Impact: minor` (3): 2376a640d (Start empty account databases from a migration baseline (#3609)), 3cb8e4a86 (Add unified opt-in onboarding flags across Rust, UniFFI, and C (#3775)), a3228a2c5 (Retire dead reconcile_subscription stack and bound dry-run NEG deadline (#3789))
 
 ## Storage migrations (required upgrade coordination)
 
@@ -37,6 +37,7 @@ This release advances the SQLite account schema. Downgrade across these migratio
 - Rust callers can inject an `EntropySource` for engine draws and kind-445 sealing and signing (mdk#3497).
   `NostrMlsPeeler::new` takes an entropy source and a wall clock. Use `Default` for system sources.
   Pass a clock to `NostrTransportEvent::new_unsigned`, or use `new_unsigned_at` with an explicit timestamp.
+- Removed the retired pre-#2660 `NostrSdkRelayClient::reconcile_subscription`, `NostrTransportAdapter::record_reconciliation`, and `NostrReconciliation*` types from `transport-nostr-adapter` (along with the doc-hidden `reconcile_inbox_history` / `reconcile_group_history` wrappers on `transport-nostr`). Account history recovery uses `sweep::run_sweep` and `compare::run_comparison` over `SdkSweepRelay`.
 - `OutboundWelcomeStatus::PastDeadline` is a Welcome past its delivery deadline that is not marked expired yet;
   `Settled(WelcomeSettlement::Expired)` now means a Welcome marked expired, at any clock (mdk#3589).
 - `Engine::own_account_leaves_tagged_by` returns each leaf's signature key with the slot its tag read as.
@@ -498,6 +499,7 @@ This release advances the SQLite account schema. Downgrade across these migratio
 - Reconnecting a relay now immediately clears per-unit unreachable retry waits on that relay (while keeping timed
   probes for parked broken units intact), so live-fenced groups resume history recovery and message delivery without
   stalling for the 30-second unreachable retry wait.
+- Bounded active dry-run NIP-77 comparisons in `transport-nostr-adapter` (`sync_watching_neg_cap_detailed`) by the caller's `deadline`, so a relay sending non-converging `NEG-MSG` frames that continually reset `idle_timeout` cannot hold a per-relay NEG permit indefinitely.
 - An invite's Welcome whose recipient has no usable inbox relay (no kind-10050 list known, an empty one, or none this
   device may dial) is now delivered once the recipient's list can be found, without a re-invite (mdk#2261). After each
   paced retry that finds no route (10 minutes, doubling, at most 6 hours, and once per app start), MDK looks the
@@ -616,7 +618,7 @@ This release advances the SQLite account schema. Downgrade across these migratio
 ## Binding surface delta
 
 - **Baseline:** `v0.19.0` (`3fce95465cdea1edc8456dbd1c6691d1c8dc1f2e`)
-- **Target:** `f732c9353779fecbb1dc97ee23fac4e1e1ababf5` (classified `minor`, target `0.20.0`)
+- **Target:** `a3228a2c572f2c91bbc5948160bbe890f20888a2` (classified `minor`, target `0.20.0`)
 
 ## UniFFI (`marmot-uniffi`)
 

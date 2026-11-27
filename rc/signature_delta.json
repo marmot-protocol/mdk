@@ -242,7 +242,7 @@
     "crates/storage-sqlite/src/base/migrations/baseline.sql"
   ],
   "target_base_version": "0.20.0",
-  "target_sha": "f732c9353779fecbb1dc97ee23fac4e1e1ababf5",
+  "target_sha": "a3228a2c572f2c91bbc5948160bbe890f20888a2",
   "uniffi": {
     "breaking": [
       "changed UniFFI type `LocalSendStatusFfi`",
