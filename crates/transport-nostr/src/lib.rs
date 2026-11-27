@@ -282,8 +282,9 @@ struct RelayPlaneTransport {
     /// `shutdown()` joins them.
     client_shutdown_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     /// Evicted or replaced SDK publish clients awaiting shutdown when teardown
-    /// was triggered outside a Tokio runtime.
-    pending_client_shutdowns: std::sync::Mutex<Vec<NostrSdkRelayClient>>,
+    /// was triggered outside a Tokio runtime, tagged with their account so
+    /// account deactivation drains that account's pending shutdowns right away.
+    pending_client_shutdowns: std::sync::Mutex<Vec<(MemberId, NostrSdkRelayClient)>>,
 
     shutting_down: AtomicBool,
     shutdown_notify: Notify,
@@ -336,13 +337,19 @@ impl RelayPlaneTransport {
 /// account deactivation and plane shutdown still tear down live clients
 /// immediately via weak handles.
 struct ManagedSdkPublishClient {
+    account_id: MemberId,
     inner: NostrSdkRelayClient,
     transport: Weak<RelayPlaneTransport>,
 }
 
 impl ManagedSdkPublishClient {
-    fn new(inner: NostrSdkRelayClient, transport: &Arc<RelayPlaneTransport>) -> Arc<Self> {
+    fn new(
+        account_id: MemberId,
+        inner: NostrSdkRelayClient,
+        transport: &Arc<RelayPlaneTransport>,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            account_id,
             inner,
             transport: Arc::downgrade(transport),
         })
@@ -367,7 +374,7 @@ impl Drop for ManagedSdkPublishClient {
             return;
         }
         if let Some(transport) = self.transport.upgrade() {
-            spawn_sdk_client_shutdown(&transport, self.inner.clone());
+            spawn_sdk_client_shutdown(&transport, self.account_id.clone(), self.inner.clone());
         } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let client = self.inner.clone();
             runtime.spawn(async move {
@@ -545,7 +552,11 @@ impl NostrRelayClient for ManagedSdkPublishClient {
     }
 }
 
-fn spawn_sdk_client_shutdown(transport: &RelayPlaneTransport, client: NostrSdkRelayClient) {
+fn spawn_sdk_client_shutdown(
+    transport: &RelayPlaneTransport,
+    account_id: MemberId,
+    client: NostrSdkRelayClient,
+) {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         let mut clients = {
             let mut pending = transport
@@ -553,6 +564,9 @@ fn spawn_sdk_client_shutdown(transport: &RelayPlaneTransport, client: NostrSdkRe
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             std::mem::take(&mut *pending)
+                .into_iter()
+                .map(|(_, client)| client)
+                .collect::<Vec<_>>()
         };
         clients.push(client);
         for client in clients {
@@ -566,7 +580,7 @@ fn spawn_sdk_client_shutdown(transport: &RelayPlaneTransport, client: NostrSdkRe
             .pending_client_shutdowns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(client);
+            .push((account_id, client));
     }
 }
 
@@ -1922,6 +1936,7 @@ impl MarmotRelayPlane {
                 let account_id =
                     MemberId::new(hex::decode(account_id_hex).expect("validated account identity"));
                 ManagedSdkPublishClient::new(
+                    account_id.clone(),
                     NostrSdkRelayClient::from_builder_with_account_signer(
                         builder, account_id, signer,
                     ),
@@ -2044,6 +2059,7 @@ impl MarmotRelayPlane {
         // shutdown tears down every live pool for this account immediately.
         let anonymous_publish_client = self.inner.transport.sdk_relay_client.as_ref().map(|_| {
             let client = ManagedSdkPublishClient::new(
+                account_id.clone(),
                 NostrSdkRelayClient::from_builder(nostr_builder()),
                 &self.inner.transport,
             );
@@ -2281,10 +2297,12 @@ impl MarmotRelayPlane {
     }
 
     /// Retire a stopped account worker's subscriptions, immutable SDK
-    /// authenticator, cached and retired signer-bound publish clients, and live
-    /// anonymous publish pools (including any retained earlier adapter clones
-    /// for this account) before a replacement worker registers a fresh signer
-    /// and rebuilds its adapter.
+    /// authenticator, cached, retired, and pending-shutdown signer-bound
+    /// publish clients, and live anonymous publish pools (including any
+    /// retained earlier adapter clones for this account) before a replacement
+    /// worker registers a fresh signer and rebuilds its adapter. Unlike
+    /// reference-counted [`Self::evict_account_publish_client`], explicit
+    /// deactivation preempts every holder of this account's publish clients.
     #[doc(hidden)]
     pub async fn deactivate_account_context(
         &self,
@@ -2332,9 +2350,33 @@ impl MarmotRelayPlane {
                 .into_iter()
                 .flat_map(|entries| entries.into_iter().filter_map(|weak| weak.upgrade())),
         );
-        if !account_clients.is_empty() {
-            futures::future::join_all(account_clients.iter().map(|client| async move {
-                let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, client.inner().shutdown()).await;
+        let pending_clients = {
+            let mut pending = self
+                .inner
+                .transport
+                .pending_client_shutdowns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut drained = Vec::new();
+            let mut kept = Vec::with_capacity(pending.len());
+            for (pending_account, client) in pending.drain(..) {
+                if pending_account == *account_id {
+                    drained.push(client);
+                } else {
+                    kept.push((pending_account, client));
+                }
+            }
+            *pending = kept;
+            drained
+        };
+        if !account_clients.is_empty() || !pending_clients.is_empty() {
+            let clients = account_clients
+                .iter()
+                .map(|client| client.inner().clone())
+                .chain(pending_clients)
+                .collect::<Vec<_>>();
+            futures::future::join_all(clients.into_iter().map(|client| async move {
+                let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, client.shutdown()).await;
             }))
             .await;
         }
@@ -2858,6 +2900,7 @@ impl MarmotRelayPlane {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .drain(..)
+                .map(|(_, client)| client)
                 .collect::<Vec<_>>()
         };
         // Keep `managed_clients` alive until their SDK pools finish shutting

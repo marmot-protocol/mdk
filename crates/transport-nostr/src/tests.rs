@@ -8195,6 +8195,7 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
     let dave_hex = dave_keys.public_key().to_hex();
     let alice_id = MemberId::new(alice_keys.public_key().to_bytes().to_vec());
     let bob_id = MemberId::new(bob_keys.public_key().to_bytes().to_vec());
+    let carol_id = MemberId::new(carol_keys.public_key().to_bytes().to_vec());
 
     let alice_pub_dyn = plane.account_publish_client(&alice_hex, Arc::new(alice_keys.clone()));
     let bob_pub_dyn = plane.account_publish_client(&bob_hex, Arc::new(bob_keys));
@@ -8222,7 +8223,9 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
     assert!(!eve_pub.client().is_shutdown());
 
     // Evicting Carol after all caller refs drop outside a Tokio runtime queues
-    // its shutdown so it is still torn down instead of leaking.
+    // her shutdown in `pending_client_shutdowns`; deactivating Carol right away
+    // (before any unrelated runtime drop drains that queue) must shut her SDK
+    // client down immediately without touching other accounts.
     drop(carol_pub_dyn);
     let plane_for_sync_evict = plane.clone();
     let carol_hex_for_sync_evict = carol_hex.clone();
@@ -8231,6 +8234,17 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
     })
     .join()
     .expect("sync eviction thread should join");
+    assert!(
+        !carol_pub.client().is_shutdown(),
+        "off-runtime eviction should queue shutdown rather than skipping it"
+    );
+    plane.deactivate_account_context(&carol_id).await.unwrap();
+    assert!(
+        carol_pub.client().is_shutdown(),
+        "deactivating an account must drain its pending off-runtime publish-client shutdowns"
+    );
+    assert!(!alice_pub.client().is_shutdown());
+    assert!(!bob_pub.client().is_shutdown());
 
     // Evicting Alice while an account worker still holds its `Arc` must keep
     // that working pool alive (e.g. across `pin_external_signer` reattach) and
