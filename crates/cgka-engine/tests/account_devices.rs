@@ -442,7 +442,7 @@ fn a_stored_history_key_from_another_suite_is_refused_without_replacement() {
             b"history offer",
             &sealed,
         ),
-        Some(b"bundle key".to_vec()),
+        Some(cgka_traits::SecretBytes::new(b"bundle key".to_vec())),
         "the stored pair and ciphertext are valid under their own suite"
     );
     let wrong_suite = |error: EngineError| {

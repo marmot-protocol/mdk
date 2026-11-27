@@ -15,8 +15,10 @@
 //! every build may advertise it once a host turns device groups on.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use super::MAX_LEAVES_PER_ACCOUNT;
 use super::codec::{decode_var_bytes, encode_var_bytes};
@@ -41,14 +43,31 @@ pub const DEVICE_ROSTER_RESERVED_KEY_MAX_LEN: usize = 255;
 
 /// The whole roster. Maps keep entries sorted and unique by key, which is
 /// the canonical order on the wire.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// `leaf_tag_key` is MLS-protected secret key material: it is wrapped in
+/// [`Zeroizing`] so it is erased on drop, and the custom [`fmt::Debug`]
+/// implementation deliberately redacts it.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct DeviceRosterV1 {
     /// The key that seals the account's device tags. The creating device
     /// draws it at random; no update changes it.
-    pub leaf_tag_key: [u8; 32],
+    pub leaf_tag_key: Zeroizing<[u8; 32]>,
     pub devices: BTreeMap<DeviceSlotId, DeviceEntryV1>,
     pub rejected_slots: BTreeMap<DeviceSlotId, RejectedSlotV1>,
     pub account: AccountEntryV1,
+}
+
+impl ZeroizeOnDrop for DeviceRosterV1 {}
+
+impl fmt::Debug for DeviceRosterV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceRosterV1")
+            .field("leaf_tag_key", &"<redacted>")
+            .field("devices", &self.devices)
+            .field("rejected_slots", &self.rejected_slots)
+            .field("account", &self.account)
+            .finish()
+    }
 }
 
 /// One linked device, keyed by its slot.
@@ -491,7 +510,7 @@ const DEVICE_ROSTER_DEVICES_VECTOR_MAX_LEN: usize =
 /// and the state must satisfy [`DeviceRosterV1::validate`].
 pub fn decode_device_roster_v1(bytes: &[u8]) -> Result<DeviceRosterV1, String> {
     let mut cursor = bytes;
-    let leaf_tag_key = decode_slot(&mut cursor, "leaf tag key")?;
+    let leaf_tag_key = Zeroizing::new(decode_slot(&mut cursor, "leaf tag key")?);
     let devices_bytes = decode_var_bytes(
         &mut cursor,
         DEVICE_ROSTER_DEVICES_VECTOR_MAX_LEN,
@@ -790,7 +809,7 @@ mod tests {
             ..DeviceEntryV1::default()
         };
         DeviceRosterV1 {
-            leaf_tag_key: [0x33; 32],
+            leaf_tag_key: Zeroizing::new([0x33; 32]),
             devices: [(slot(1), phone), (slot(2), laptop)].into_iter().collect(),
             rejected_slots: [(slot(9), removed())].into_iter().collect(),
             account: AccountEntryV1 {
@@ -828,7 +847,7 @@ mod tests {
     #[test]
     fn spec_vectors() {
         let roster = DeviceRosterV1 {
-            leaf_tag_key: [0x33; 32],
+            leaf_tag_key: Zeroizing::new([0x33; 32]),
             devices: [(
                 slot(0x11),
                 DeviceEntryV1 {
@@ -1229,7 +1248,7 @@ mod tests {
             history_key: Some(vec![0xbb; DEVICE_ROSTER_RESERVED_KEY_MAX_LEN]),
         };
         let maximal = DeviceRosterV1 {
-            leaf_tag_key: [0x33; 32],
+            leaf_tag_key: Zeroizing::new([0x33; 32]),
             devices: (0..MAX_LEAVES_PER_ACCOUNT as u8)
                 .map(|n| (slot(n), maximal_entry(n)))
                 .collect(),
@@ -1250,6 +1269,30 @@ mod tests {
         assert!(
             error.contains("device roster devices exceeds maximum length"),
             "expected vector-bound rejection, got: {error}"
+        );
+    }
+
+    #[test]
+    fn device_roster_debug_redacts_leaf_tag_key() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<DeviceRosterV1>();
+
+        let roster = DeviceRosterV1 {
+            leaf_tag_key: Zeroizing::new([
+                0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33,
+                0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01, 0x02,
+                0x03, 0x04, 0x05, 0x06,
+            ]),
+            ..DeviceRosterV1::default()
+        };
+        let debug = format!("{roster:?}");
+        assert!(
+            debug.contains("<redacted>"),
+            "Debug must show redaction marker: {debug}"
+        );
+        assert!(
+            !debug.contains("171, 205, 239") && !debug.contains("abcdef12"),
+            "Debug must not expose leaf_tag_key bytes: {debug}"
         );
     }
 }

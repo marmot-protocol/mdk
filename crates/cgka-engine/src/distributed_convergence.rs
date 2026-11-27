@@ -3191,7 +3191,7 @@ fn quarantined_result(current_tip: u64) -> CanonicalizationResult {
 fn message_id_from_hex(encoded: &str) -> Result<MessageId, OpenMlsProjectionError> {
     hex::decode(encoded)
         .map(MessageId::new)
-        .map_err(|e| OpenMlsProjectionError::Decode(format!("message id {encoded}: {e:?}")))
+        .map_err(|e| OpenMlsProjectionError::Decode(format!("invalid message id hex: {e:?}")))
 }
 
 fn app_invalidation_reason(reason: InvalidatedAppMessageReason) -> AppMessageInvalidationReason {

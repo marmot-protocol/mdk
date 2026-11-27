@@ -145,7 +145,7 @@ pub(super) fn entry(label: &str) -> DeviceEntryV1 {
 /// zero, so a test that compares rosters sees it carried through updates.
 pub(super) fn roster(devices: &[(u8, &str)]) -> DeviceRosterV1 {
     DeviceRosterV1 {
-        leaf_tag_key: [0x33; 32],
+        leaf_tag_key: [0x33; 32].into(),
         devices: devices
             .iter()
             .map(|(n, label)| (slot(*n), entry(label)))

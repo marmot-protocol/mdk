@@ -35,7 +35,7 @@ use marmot_session::{
 use rand::RngCore;
 use rand::rngs::OsRng;
 use rand::seq::index::sample;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::AppClient;
 use super::device_renames::nothing_went_out;
@@ -68,6 +68,14 @@ impl fmt::Debug for RecoveryWords {
             .finish()
     }
 }
+
+impl Drop for RecoveryWords {
+    fn drop(&mut self) {
+        self.words.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for RecoveryWords {}
 
 /// Where the account's backups stand.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -136,8 +144,9 @@ impl AppClient {
             return Err(AppError::DeviceGroupRefused("roster_unsupported"));
         }
         let pending = PendingRecoveryWords::generate();
+        let mut words = pending.words();
         let shown = RecoveryWords {
-            words: pending.words().to_vec(),
+            words: std::mem::take(&mut *words),
             confirm_positions: pending
                 .confirm
                 .iter()
@@ -411,6 +420,9 @@ mod tests {
     /// never shows the words.
     #[test]
     fn new_words_confirm_two_distinct_positions_and_never_print() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<RecoveryWords>();
+
         for _ in 0..64 {
             let pending = PendingRecoveryWords::generate();
             let [first, second] = pending.confirm;

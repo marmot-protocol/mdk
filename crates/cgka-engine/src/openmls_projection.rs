@@ -424,23 +424,18 @@ impl std::fmt::Display for OpenMlsProjectionError {
             OpenMlsProjectionError::MissingGroup => write!(f, "MLS group not found"),
             OpenMlsProjectionError::Snapshot(e) => write!(f, "snapshot failed: {e}"),
             OpenMlsProjectionError::Replay(e) => write!(f, "OpenMLS replay failed: {e}"),
-            OpenMlsProjectionError::RejectedProposal {
-                message_id,
-                category,
-            } => {
+            OpenMlsProjectionError::RejectedProposal { category, .. } => {
                 write!(
                     f,
-                    "rejected proposal {message_id}: {}",
+                    "rejected proposal: {}",
                     crate::app_components::proposal_rejection_category_tag(*category)
                 )
             }
-            OpenMlsProjectionError::UnauthorizedCommit { message_id } => {
-                write!(f, "unauthorized admin-gated commit: {message_id}")
+            OpenMlsProjectionError::UnauthorizedCommit { .. } => {
+                write!(f, "unauthorized admin-gated commit")
             }
-            OpenMlsProjectionError::InvalidCommit {
-                message_id, reason, ..
-            } => {
-                write!(f, "invalid commit {message_id}: {reason}")
+            OpenMlsProjectionError::InvalidCommit { reason, .. } => {
+                write!(f, "invalid commit: {reason}")
             }
             OpenMlsProjectionError::Serialize(e) => write!(f, "serialize failed: {e}"),
             OpenMlsProjectionError::Storage(e) => write!(f, "storage failed: {e}"),
@@ -3721,10 +3716,9 @@ fn replay_messages_for_canonicalization_result<S: StorageProvider>(
         let payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))?;
         let Some(message) = payload.as_openmls_wire().cloned() else {
-            return Err(OpenMlsProjectionError::Decode(format!(
-                "accepted message {} is not a stored OpenMLS wire payload",
-                hex_message_id
-            )));
+            return Err(OpenMlsProjectionError::Decode(
+                "accepted message is not a stored OpenMLS wire payload".to_owned(),
+            ));
         };
         let projection = project_mls_message(&message.payload)?;
         if projection.kind == OpenMlsContentKind::Commit
@@ -3983,7 +3977,7 @@ fn message_state_for_invalidated_reason(
 fn message_id_from_hex(encoded: &str) -> Result<MessageId, OpenMlsProjectionError> {
     hex::decode(encoded)
         .map(MessageId::new)
-        .map_err(|e| OpenMlsProjectionError::Decode(format!("message id {encoded}: {e:?}")))
+        .map_err(|e| OpenMlsProjectionError::Decode(format!("invalid message id hex: {e:?}")))
 }
 
 fn candidate_paths_with_pending_replay_messages(

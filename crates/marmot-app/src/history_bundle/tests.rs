@@ -335,3 +335,31 @@ fn a_builder_that_takes_no_row_has_no_bundle() {
             .is_none()
     );
 }
+
+#[test]
+fn file_key_debug_redacts_secret_key() {
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+    assert_zeroize_on_drop::<FileKey>();
+
+    let secret_key = "deadbeef".repeat(8);
+    let file_key = FileKey {
+        ciphertext_sha256: "cc".repeat(32),
+        key: secret_key.clone(),
+    };
+    let rendered = format!("{file_key:?}");
+    assert!(
+        rendered.contains("<redacted>"),
+        "FileKey Debug must include redaction marker: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&secret_key),
+        "FileKey Debug must not expose secret key: {rendered}"
+    );
+    let mut item = bundled(1, 1, "hi");
+    item.keys = Some(vec![file_key]);
+    let item_debug = format!("{item:?}");
+    assert!(
+        !item_debug.contains(&secret_key),
+        "BundledEvent Debug must not expose FileKey secret: {item_debug}"
+    );
+}

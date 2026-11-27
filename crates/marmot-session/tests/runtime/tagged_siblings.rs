@@ -159,7 +159,7 @@ mod tagged_siblings {
             ..entry("Phone")
         };
         let founding = DeviceRosterV1 {
-            leaf_tag_key: [0x33; 32],
+            leaf_tag_key: [0x33; 32].into(),
             devices: [(own_slot(&phone), phone_entry)].into_iter().collect(),
             ..DeviceRosterV1::default()
         };

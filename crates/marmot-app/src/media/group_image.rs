@@ -7,7 +7,7 @@ use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use cgka_traits::app_components::canonicalize_marmot_media_type;
 
@@ -119,11 +119,22 @@ pub(crate) struct GroupImageUpload {
     pub(crate) media_type: String,
 }
 
+impl Drop for GroupImageUpload {
+    fn drop(&mut self) {
+        self.image_key_hex.zeroize();
+        self.image_upload_key_hex.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for GroupImageUpload {}
+
 pub(crate) struct PreparedGroupImageUpload {
     pub(crate) input: AppGroupImageInput,
     pub(crate) encrypted_blob: Vec<u8>,
     pub(crate) upload_secret: Zeroizing<Vec<u8>>,
 }
+
+impl ZeroizeOnDrop for PreparedGroupImageUpload {}
 
 impl fmt::Debug for PreparedGroupImageUpload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -135,13 +146,13 @@ impl fmt::Debug for PreparedGroupImageUpload {
 }
 
 impl From<GroupImageUpload> for AppGroupImageInput {
-    fn from(upload: GroupImageUpload) -> Self {
+    fn from(mut upload: GroupImageUpload) -> Self {
         Self {
-            image_hash_hex: upload.image_hash_hex,
-            image_key_hex: upload.image_key_hex,
-            image_nonce_hex: upload.image_nonce_hex,
-            image_upload_key_hex: upload.image_upload_key_hex,
-            media_type: Some(upload.media_type),
+            image_hash_hex: std::mem::take(&mut upload.image_hash_hex),
+            image_key_hex: std::mem::take(&mut upload.image_key_hex),
+            image_nonce_hex: std::mem::take(&mut upload.image_nonce_hex),
+            image_upload_key_hex: std::mem::take(&mut upload.image_upload_key_hex),
+            media_type: Some(std::mem::take(&mut upload.media_type)),
         }
     }
 }
@@ -164,7 +175,7 @@ pub(crate) async fn upload_group_image(
     server: &str,
     transport: &BlossomHttpTransport,
 ) -> Result<GroupImageUpload, AppError> {
-    let prepared = prepare_group_image_upload(plaintext, media_type)?;
+    let mut prepared = prepare_group_image_upload(plaintext, media_type)?;
     upload_prepared_group_image(
         prepared.encrypted_blob,
         &prepared.input.image_hash_hex,
@@ -175,11 +186,11 @@ pub(crate) async fn upload_group_image(
     )
     .await?;
     Ok(GroupImageUpload {
-        image_hash_hex: prepared.input.image_hash_hex,
-        image_key_hex: prepared.input.image_key_hex,
-        image_nonce_hex: prepared.input.image_nonce_hex,
-        image_upload_key_hex: prepared.input.image_upload_key_hex,
-        media_type: prepared.input.media_type.unwrap_or_default(),
+        image_hash_hex: std::mem::take(&mut prepared.input.image_hash_hex),
+        image_key_hex: std::mem::take(&mut prepared.input.image_key_hex),
+        image_nonce_hex: std::mem::take(&mut prepared.input.image_nonce_hex),
+        image_upload_key_hex: std::mem::take(&mut prepared.input.image_upload_key_hex),
+        media_type: prepared.input.media_type.take().unwrap_or_default(),
     })
 }
 
@@ -424,6 +435,10 @@ mod tests {
 
     #[test]
     fn prepared_group_image_debug_redacts_keys_hash_and_ciphertext() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<super::GroupImageUpload>();
+        assert_zeroize_on_drop::<super::PreparedGroupImageUpload>();
+
         let prepared = prepare_group_image_upload(&png(1, 1), "image/png").unwrap();
         let debug = format!("{prepared:?}");
         assert!(!debug.contains(&prepared.input.image_hash_hex));

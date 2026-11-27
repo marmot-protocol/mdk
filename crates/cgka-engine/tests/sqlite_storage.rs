@@ -400,7 +400,7 @@ async fn the_history_key_survives_reopen_and_opens_what_a_sibling_sealed() {
     assert_eq!(reopened.history_public_key().unwrap(), history_key);
     assert_eq!(
         reopened.open_history(b"context", &sealed).unwrap(),
-        Some(b"history".to_vec())
+        Some(cgka_traits::SecretBytes::new(b"history".to_vec()))
     );
     assert_eq!(reopened.open_history(b"other", &sealed).unwrap(), None);
     // The sealing device's own key does not open it.

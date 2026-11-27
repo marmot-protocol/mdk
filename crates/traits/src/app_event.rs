@@ -149,10 +149,77 @@ pub struct MarmotAppEvent {
     pub content: String,
 }
 
+/// Coarse JSON serialization or deserialization failure category for
+/// [`MarmotAppEvent`] and [`GroupSystemEvent`].
+///
+/// Carries no plaintext tokens, unknown field names, or raw `serde_json`
+/// error strings so [`MarmotAppEventError`] display output stays privacy-safe
+/// when it reaches engine errors or audit logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarmotAppEventJsonError {
+    Io,
+    Syntax,
+    Eof,
+    UnknownField,
+    MissingField,
+    DuplicateField,
+    TypeMismatch,
+    Data,
+}
+
+impl MarmotAppEventJsonError {
+    /// Classify a `serde_json::Error` into a closed privacy-safe category,
+    /// discarding any quoted plaintext or field names from the underlying
+    /// message.
+    #[must_use]
+    pub fn from_serde_json(err: &serde_json::Error) -> Self {
+        match err.classify() {
+            serde_json::error::Category::Io => Self::Io,
+            serde_json::error::Category::Syntax => Self::Syntax,
+            serde_json::error::Category::Eof => Self::Eof,
+            serde_json::error::Category::Data => {
+                let message = err.to_string();
+                if message.starts_with("unknown field ") {
+                    Self::UnknownField
+                } else if message.starts_with("missing field ") {
+                    Self::MissingField
+                } else if message.starts_with("duplicate field ") {
+                    Self::DuplicateField
+                } else if message.starts_with("invalid type:") {
+                    Self::TypeMismatch
+                } else {
+                    Self::Data
+                }
+            }
+        }
+    }
+
+    /// Stable low-cardinality name suitable for diagnostics and audit logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Io => "io",
+            Self::Syntax => "syntax",
+            Self::Eof => "eof",
+            Self::UnknownField => "unknown_field",
+            Self::MissingField => "missing_field",
+            Self::DuplicateField => "duplicate_field",
+            Self::TypeMismatch => "type_mismatch",
+            Self::Data => "data",
+        }
+    }
+}
+
+impl std::fmt::Display for MarmotAppEventJsonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MarmotAppEventError {
     #[error("marmot app event JSON: {0}")]
-    Json(String),
+    Json(MarmotAppEventJsonError),
     #[error("marmot app event id mismatch")]
     IdMismatch { expected: String, found: String },
     #[error("marmot app event pubkey mismatch")]
@@ -190,13 +257,16 @@ impl MarmotAppEvent {
     /// The `id` is the canonical NIP-01 id and is validated separately on
     /// decode via [`Self::validate_id`].
     pub fn encode(&self) -> Result<Vec<u8>, MarmotAppEventError> {
-        serde_json::to_vec(self).map_err(|err| MarmotAppEventError::Json(err.to_string()))
+        serde_json::to_vec(self).map_err(|err| {
+            MarmotAppEventError::Json(MarmotAppEventJsonError::from_serde_json(&err))
+        })
     }
 
     /// Decode MLS plaintext bytes and strictly validate the canonical id.
     pub fn decode(bytes: &[u8]) -> Result<Self, MarmotAppEventError> {
-        let event: Self = serde_json::from_slice(bytes)
-            .map_err(|err| MarmotAppEventError::Json(err.to_string()))?;
+        let event: Self = serde_json::from_slice(bytes).map_err(|err| {
+            MarmotAppEventError::Json(MarmotAppEventJsonError::from_serde_json(&err))
+        })?;
         event.validate_id()?;
         Ok(event)
     }
@@ -300,12 +370,16 @@ impl GroupSystemEvent {
     /// Serialize to the kind-1210 `content` JSON string. Returns an error rather
     /// than swallowing a serialization failure into empty content.
     pub fn to_content(&self) -> Result<String, MarmotAppEventError> {
-        serde_json::to_string(self).map_err(|err| MarmotAppEventError::Json(err.to_string()))
+        serde_json::to_string(self).map_err(|err| {
+            MarmotAppEventError::Json(MarmotAppEventJsonError::from_serde_json(&err))
+        })
     }
 
     /// Parse a kind-1210 `content` JSON string.
     pub fn parse(content: &str) -> Result<Self, MarmotAppEventError> {
-        serde_json::from_str(content).map_err(|err| MarmotAppEventError::Json(err.to_string()))
+        serde_json::from_str(content).map_err(|err| {
+            MarmotAppEventError::Json(MarmotAppEventJsonError::from_serde_json(&err))
+        })
     }
 
     /// Read a hex/string field out of `data`.
@@ -803,5 +877,73 @@ mod tests {
         assert_eq!(event.system_type, GROUP_SYSTEM_TYPE_GROUP_RENAMED);
         assert_eq!(event.data_str(GROUP_SYSTEM_DATA_NAME), Some("Team Two"));
         assert_eq!(event.data_str(GROUP_SYSTEM_DATA_OLD_NAME), Some("Team One"));
+    }
+
+    #[test]
+    fn decode_error_display_omits_plaintext_tokens() {
+        let sentinel_unknown = "sentinel_unknown_field_secret_9371";
+        let sentinel_type = "sentinel_type_mismatch_secret_4821";
+        let sentinel_syntax = "sentinel_syntax_secret_6192";
+        let sentinel_eof = "sentinel_eof_secret_7743";
+        let valid = String::from_utf8(
+            MarmotAppEvent::new("aa".repeat(32), 1, MARMOT_APP_EVENT_KIND_CHAT, vec![], "hi")
+                .encode()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let unknown_field = valid.replacen('{', &format!("{{\"{sentinel_unknown}\":1,"), 1);
+        let type_mismatch =
+            valid.replacen("\"kind\":9", &format!("\"kind\":\"{sentinel_type}\""), 1);
+        let duplicate_field = valid.replacen('{', "{\"content\":\"sentinel_dup_secret\",", 1);
+        let missing_field = "{\"id\":\"00\"}";
+        let syntax = format!("{{{sentinel_syntax}");
+        let eof = format!("{{\"content\":\"{sentinel_eof}");
+
+        for (payload, sentinel, expected) in [
+            (
+                unknown_field.as_bytes(),
+                sentinel_unknown,
+                MarmotAppEventJsonError::UnknownField,
+            ),
+            (
+                type_mismatch.as_bytes(),
+                sentinel_type,
+                MarmotAppEventJsonError::TypeMismatch,
+            ),
+            (
+                duplicate_field.as_bytes(),
+                "sentinel_dup_secret",
+                MarmotAppEventJsonError::DuplicateField,
+            ),
+            (
+                missing_field.as_bytes(),
+                "pubkey",
+                MarmotAppEventJsonError::MissingField,
+            ),
+            (
+                syntax.as_bytes(),
+                sentinel_syntax,
+                MarmotAppEventJsonError::Syntax,
+            ),
+            (eof.as_bytes(), sentinel_eof, MarmotAppEventJsonError::Eof),
+        ] {
+            let err = MarmotAppEvent::decode(payload).unwrap_err();
+            assert_eq!(err, MarmotAppEventError::Json(expected));
+            let rendered = err.to_string();
+            assert_eq!(rendered, format!("marmot app event JSON: {expected}"));
+            assert!(
+                !rendered.contains(sentinel),
+                "MarmotAppEventError::Display leaked plaintext token: {rendered}"
+            );
+        }
+
+        let sys_err =
+            GroupSystemEvent::parse(&format!("{{\"v\":\"{sentinel_type}\"}}")).unwrap_err();
+        assert_eq!(
+            sys_err,
+            MarmotAppEventError::Json(MarmotAppEventJsonError::TypeMismatch)
+        );
+        assert!(!sys_err.to_string().contains(sentinel_type));
     }
 }

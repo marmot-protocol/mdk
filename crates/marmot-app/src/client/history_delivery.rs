@@ -1088,11 +1088,10 @@ impl AppClient {
     ) -> Result<(Zeroizing<[u8; 32]>, [u8; 32]), AppError> {
         let opened = self
             .runtime
-            .open_history(&delivery_context(from, to, chat), sealed)?
-            .map(Zeroizing::new);
+            .open_history(&delivery_context(from, to, chat), sealed)?;
         opened
             .as_deref()
-            .and_then(|opened| opened_key_and_hash(opened))
+            .and_then(opened_key_and_hash)
             .ok_or(AppError::DeviceGroupRefused("history_delivery_seal"))
     }
 

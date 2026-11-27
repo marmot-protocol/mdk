@@ -670,7 +670,7 @@ mod tests {
 
     fn roster_with_device(tag_signature_key: Option<Vec<u8>>) -> DeviceRosterV1 {
         let mut roster = DeviceRosterV1 {
-            leaf_tag_key: LEAF_TAG_KEY,
+            leaf_tag_key: LEAF_TAG_KEY.into(),
             ..DeviceRosterV1::default()
         };
         roster.devices.insert(
@@ -825,7 +825,7 @@ mod tests {
         unclaimed(&spec_tag(), &[0x67; 32], &roster);
         // Another account's leaf_tag_key.
         let other_key = DeviceRosterV1 {
-            leaf_tag_key: [0x34; 32],
+            leaf_tag_key: [0x34; 32].into(),
             ..roster.clone()
         };
         unclaimed(&spec_tag(), &LEAF_SIGNATURE_KEY, &other_key);

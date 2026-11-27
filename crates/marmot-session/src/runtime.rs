@@ -1353,7 +1353,11 @@ where
 
     /// `sealed` opened with this device's history key for `context`;
     /// `None` when it does not open or this device has no history key yet.
-    pub fn open_history(&self, context: &[u8], sealed: &[u8]) -> SessionResult<Option<Vec<u8>>> {
+    pub fn open_history(
+        &self,
+        context: &[u8],
+        sealed: &[u8],
+    ) -> SessionResult<Option<cgka_traits::SecretBytes>> {
         self.session.open_history(context, sealed)
     }
 
@@ -1386,7 +1390,7 @@ where
         entropy: &[u8; crate::RECOVERY_ENTROPY_LEN],
         context: &[u8],
         sealed: &[u8],
-    ) -> SessionResult<Option<Vec<u8>>> {
+    ) -> SessionResult<Option<cgka_traits::SecretBytes>> {
         self.session
             .open_with_recovery_key(entropy, context, sealed)
     }
