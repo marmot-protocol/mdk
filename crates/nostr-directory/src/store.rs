@@ -518,15 +518,10 @@ impl<R: DirectoryResources> Directory<R> {
                 let Some(entry) = entry else {
                     return Ok(false);
                 };
-                let known_created_at =
-                    entry
-                        .follows_created_at
-                        .max(max_search_graph_follows_created_at(
-                            caches,
-                            &entry.account_id_hex,
-                        )?);
-                if !follow_recency_accepts(known_created_at, follow_list.created_at, false) {
-                    return Ok(false);
+                let reconciled = reconcile_entry_follows_from_search_graph(entry, caches)?;
+                if !follow_recency_accepts(entry.follows_created_at, follow_list.created_at, false)
+                {
+                    return Ok(reconciled);
                 }
                 entry.follows = follow_list.follows.clone();
                 entry.follow_source_relays = follow_list.source_relays.clone();
@@ -542,8 +537,12 @@ impl<R: DirectoryResources> Directory<R> {
         }
         // Finish graph maintenance and user promotion after releasing the
         // record lane: those paths may perform their own directory updates.
-        // A fetched empty kind-3 remains authoritative.
-        self.remember_directory_follow_edges_for_search(account_id_hex, follow_list)?;
+        // Timestamped or non-empty lists were already written to the search
+        // graph inside `cache.put_with_reason`; only an explicit untimestamped
+        // empty kind-3 needs an extra graph write so `follows_known` is set.
+        if follow_list.created_at == 0 && follow_list.follows.is_empty() {
+            self.remember_directory_follow_edges_for_search(account_id_hex, follow_list)?;
+        }
         for follow in &follow_list.follows {
             self.remember_directory_user(follow)?;
         }
@@ -579,37 +578,24 @@ impl<R: DirectoryResources> Directory<R> {
     ) -> Result<(), DirectoryError> {
         let account_id_hex = parse_account_id_hex(account_id_hex)?;
         let npub = npub_for_account_id(&account_id_hex)?;
-        let mut accepted = false;
+        let mut needs_empty_graph_write = false;
         self.update_directory_entry_with_options(
             &account_id_hex,
             "directory",
             false,
             false,
             |entry, _shared, caches| {
-                let entry_created_at = entry.as_ref().map_or(0, |record| record.follows_created_at);
-                let graph_created_at =
-                    max_search_graph_follows_created_at(caches, &account_id_hex)?;
-                let known_created_at = entry_created_at.max(graph_created_at);
-                // Reconcile a lagging promoted row (e.g. promoted after graph-only
-                // caching or retrying after a partial write) when an equal-timestamp
-                // event matches the graph's accepted version, while still rejecting
-                // equal-timestamp live overwrites once both tiers hold that version.
-                let repairs_lagging_entry = entry.is_some()
-                    && follow_list.created_at > 0
-                    && follow_list.created_at == known_created_at
-                    && entry_created_at < known_created_at;
-                if !repairs_lagging_entry
-                    && !follow_recency_accepts(
-                        known_created_at,
-                        follow_list.created_at,
-                        require_strictly_newer,
-                    )
-                {
-                    return Ok(false);
-                }
-                accepted = true;
                 let Some(entry) = entry else {
                     // Graph-only ingestion must not promote an unknown author.
+                    let graph_created_at = latest_search_graph_follows(caches, &account_id_hex)?
+                        .map_or(0, |(_, created_at)| created_at);
+                    if !follow_recency_accepts(
+                        graph_created_at,
+                        follow_list.created_at,
+                        require_strictly_newer,
+                    ) {
+                        return Ok(false);
+                    }
                     for cache in caches {
                         cache.remember_search_graph_follows(
                             &account_id_hex,
@@ -621,26 +607,52 @@ impl<R: DirectoryResources> Directory<R> {
                     }
                     return Ok(false);
                 };
-                // For known authors, `update_directory_entry_with_options` commits
-                // `shared_storage` first and then `cache.put_with_reason` updates both
-                // `directory_users` and `directory_search_graph_users` in one SQLite
-                // transaction, so a shared-storage write failure never advances the graph.
-                entry.follows = follow_list.follows.clone();
-                entry.follow_source_relays = follow_list.source_relays.clone();
-                if follow_list.created_at > 0 {
-                    entry.follows_created_at = follow_list.created_at;
+                // Reconcile any pre-existing lagging promoted row from the search
+                // graph's already-accepted follows rather than trusting an incoming
+                // equal-timestamp event payload.
+                let reconciled = reconcile_entry_follows_from_search_graph(entry, caches)?;
+                if follow_recency_accepts(
+                    entry.follows_created_at,
+                    follow_list.created_at,
+                    require_strictly_newer,
+                ) {
+                    // For known authors, `update_directory_entry_with_options` commits
+                    // `shared_storage` first and then `cache.put_with_reason` updates both
+                    // `directory_users` and `directory_search_graph_users` in one SQLite
+                    // transaction, so a shared-storage write failure never advances the graph.
+                    entry.follows = follow_list.follows.clone();
+                    entry.follow_source_relays = follow_list.source_relays.clone();
+                    if follow_list.created_at > 0 {
+                        entry.follows_created_at = follow_list.created_at;
+                    }
+                    needs_empty_graph_write = !require_strictly_newer
+                        && follow_list.created_at == 0
+                        && follow_list.follows.is_empty();
+                    return Ok(true);
                 }
-                Ok(true)
+                // Even when the incoming event is rejected (e.g. exact retry after
+                // shared storage committed but an account cache write failed), let
+                // `update_directory_entry_with_options` propagate the already-accepted
+                // `entry` into any lagging cache without adopting the incoming payload.
+                let mut cache_lags = false;
+                if entry.follows_created_at > 0 {
+                    for cache in caches {
+                        let graph_at = cache
+                            .search_graph_follows_with_created_at(&account_id_hex)?
+                            .map_or(0, |(_, created_at)| created_at);
+                        if graph_at < entry.follows_created_at {
+                            cache_lags = true;
+                            break;
+                        }
+                    }
+                }
+                Ok(reconciled || cache_lags)
             },
         )?;
         // `put_search_graph_snapshot` skips untimestamped empty follow lists so bare
         // promotion does not erase graph edges; record explicit empty lists here after
         // the promoted write succeeds.
-        if accepted
-            && !require_strictly_newer
-            && follow_list.created_at == 0
-            && follow_list.follows.is_empty()
-        {
+        if needs_empty_graph_write {
             for cache in self.resources.current_caches()? {
                 cache.remember_search_graph_follows(
                     &account_id_hex,
@@ -902,7 +914,23 @@ impl<R: DirectoryResources> Directory<R> {
                 })
                 .transpose()?;
             let mut current = select_newer_directory_entry(cached_entry, shared_entry);
-            let mut proposed = current.clone().or_else(|| create_missing.then_some(empty));
+            let mut proposed = match current.clone() {
+                Some(existing) => Some(existing),
+                None if create_missing => {
+                    // Seed a newly promoted row from any already-accepted search-graph
+                    // contact list so `directory_users` never starts lagging behind
+                    // `directory_search_graph_users`.
+                    let mut seeded = empty;
+                    if let Some((follows, created_at)) =
+                        latest_search_graph_follows(&caches, &account_id_hex)?
+                    {
+                        seeded.follows = follows;
+                        seeded.follows_created_at = created_at;
+                    }
+                    Some(seeded)
+                }
+                None => None,
+            };
             if !update(proposed.as_mut(), &shared_storage, &caches)? {
                 return Ok(());
             }
@@ -1022,15 +1050,39 @@ fn directory_entry_from_caches(
     Ok(None)
 }
 
-fn max_search_graph_follows_created_at(
+fn latest_search_graph_follows(
     caches: &[DirectoryCache],
     account_id_hex: &str,
-) -> Result<u64, DirectoryError> {
-    let mut latest = 0;
+) -> Result<Option<(Vec<String>, u64)>, DirectoryError> {
+    let mut best: Option<(Vec<String>, u64)> = None;
     for cache in caches {
-        latest = latest.max(cache.search_graph_follows_created_at_for(account_id_hex)?);
+        if let Some((follows, created_at)) =
+            cache.search_graph_follows_with_created_at(account_id_hex)?
+            && best
+                .as_ref()
+                .is_none_or(|(_, current)| created_at > *current)
+        {
+            best = Some((follows, created_at));
+        }
     }
-    Ok(latest)
+    Ok(best)
+}
+
+fn reconcile_entry_follows_from_search_graph(
+    entry: &mut UserDirectoryRecord,
+    caches: &[DirectoryCache],
+) -> Result<bool, DirectoryError> {
+    let Some((graph_follows, graph_created_at)) =
+        latest_search_graph_follows(caches, &entry.account_id_hex)?
+    else {
+        return Ok(false);
+    };
+    if graph_created_at > entry.follows_created_at {
+        entry.follows = graph_follows;
+        entry.follows_created_at = graph_created_at;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 pub fn hydrate_directory_record(

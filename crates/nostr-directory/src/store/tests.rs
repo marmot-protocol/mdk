@@ -613,51 +613,12 @@ async fn live_kind_3_recency_guards_search_graph_and_survives_reopen() {
         Some(vec![dave.clone()])
     );
 
-    // Promote the graph-only author (creates directory/shared rows with follows_created_at = 0):
-    // stale replays via both live kind-3 and explicit follow-list ingestion must still be
-    // rejected against the search graph's newer timestamp (200), keeping both tiers in sync.
+    // Promote the graph-only author: promotion seeds both `directory_users` and
+    // `shared_storage` from the already-accepted search-graph contact list (200),
+    // so neither stale replays (100) nor a conflicting first equal-timestamp live
+    // event (200, carol) can overwrite the accepted follows ([bob]).
     directory
         .remember_directory_message_sender(&unknown_author)
-        .unwrap();
-    directory
-        .ingest_directory_relay_event(kind3(&unknown_keys, 100, &carol))
-        .unwrap();
-    directory
-        .remember_directory_follow_list(
-            &unknown_author,
-            &FetchedFollowList {
-                follows: vec![carol.clone()],
-                source_relays: vec!["wss://relay.example".into()],
-                created_at: 100,
-            },
-        )
-        .unwrap();
-    assert!(
-        cache
-            .entry(&unknown_author)
-            .unwrap()
-            .unwrap()
-            .follows
-            .is_empty()
-    );
-    assert!(
-        shared
-            .public_directory_user(&unknown_author)
-            .unwrap()
-            .unwrap()
-            .follows
-            .is_empty()
-    );
-    assert_eq!(
-        cache.search_graph_follows(&unknown_author).unwrap(),
-        Some(vec![bob.clone()])
-    );
-
-    // Search-first / promoted lag repair: an equal-timestamp live event (200) must
-    // reconcile the lagging promoted row up to the graph's accepted timestamp (200),
-    // and once both tiers hold 200, another live event at 200 must be rejected.
-    directory
-        .ingest_directory_relay_event(kind3(&unknown_keys, 200, &bob))
         .unwrap();
     assert_eq!(
         cache.entry(&unknown_author).unwrap().unwrap().follows,
@@ -679,21 +640,108 @@ async fn live_kind_3_recency_guards_search_graph_and_survives_reopen() {
             .follows,
         vec![bob.clone()]
     );
+    // First equal-timestamp live event after promotion carries conflicting follows
+    // ([carol] at 200) and must be rejected without touching either tier.
     directory
         .ingest_directory_relay_event(kind3(&unknown_keys, 200, &carol))
+        .unwrap();
+    directory
+        .ingest_directory_relay_event(kind3(&unknown_keys, 100, &carol))
+        .unwrap();
+    directory
+        .remember_directory_follow_list(
+            &unknown_author,
+            &FetchedFollowList {
+                follows: vec![carol.clone()],
+                source_relays: vec!["wss://relay.example".into()],
+                created_at: 100,
+            },
+        )
         .unwrap();
     assert_eq!(
         cache.entry(&unknown_author).unwrap().unwrap().follows,
         vec![bob.clone()]
     );
+    assert_eq!(
+        shared
+            .public_directory_user(&unknown_author)
+            .unwrap()
+            .unwrap()
+            .follows,
+        vec![bob.clone()]
+    );
+    assert_eq!(
+        cache.search_graph_follows(&unknown_author).unwrap(),
+        Some(vec![bob.clone()])
+    );
 
-    // A failed promoted write must not advance the search graph ahead of the promoted
-    // row, so retrying the same event at timestamp 300 still succeeds and updates both tiers.
-    let closed_shared = SqliteSharedStorage::in_memory().unwrap();
-    closed_shared.close().unwrap();
-    let failing_directory = Directory::new(
+    // Pre-existing lagging promoted row (e.g. upgraded DB where `directory_users`
+    // has follows_created_at = 0 while search graph already holds [bob] at 200):
+    // a conflicting equal-timestamp live event ([carol] at 200) must repair the
+    // promoted row from the graph's stored [bob], never from [carol].
+    let legacy_keys = Keys::generate();
+    let legacy_author = legacy_keys.public_key().to_hex();
+    directory.remember_directory_user(&legacy_author).unwrap();
+    cache
+        .remember_search_graph_follows(
+            &legacy_author,
+            &crate::ids::npub_for_account_id(&legacy_author).unwrap(),
+            std::slice::from_ref(&bob),
+            200,
+            false,
+        )
+        .unwrap();
+    directory
+        .ingest_directory_relay_event(kind3(&legacy_keys, 200, &carol))
+        .unwrap();
+    assert_eq!(
+        cache.entry(&legacy_author).unwrap().unwrap().follows,
+        vec![bob.clone()]
+    );
+    assert_eq!(
+        cache
+            .entry(&legacy_author)
+            .unwrap()
+            .unwrap()
+            .follows_created_at,
+        200
+    );
+    assert_eq!(
+        shared
+            .public_directory_user(&legacy_author)
+            .unwrap()
+            .unwrap()
+            .follows,
+        vec![bob.clone()]
+    );
+    assert_eq!(
+        cache.search_graph_follows(&legacy_author).unwrap(),
+        Some(vec![bob.clone()])
+    );
+
+    // Partial write failure after `shared_storage` commits (cache write fails):
+    // `shared_storage` advances to [dave] at 300 while the account cache still holds
+    // [bob] at 200. Retrying the live event at 300 (even with conflicting payload
+    // [carol]) must reconcile the lagging cache from `shared_storage`'s accepted [dave].
+    let failing_cache = DirectoryCache::open(
+        temp.path().join("failing-cache.sqlite3"),
+        &storage_sqlite::SqlCipherKey::raw([0x39; 32]),
+    )
+    .unwrap();
+    failing_cache
+        .put(&cache.entry(&unknown_author).unwrap().unwrap())
+        .unwrap();
+    {
+        let conn = failing_cache.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_cache_write BEFORE UPDATE ON directory_users
+             BEGIN SELECT RAISE(ABORT, 'simulated cache write failure'); END;",
+        )
+        .unwrap();
+    }
+    let partial_failure_directory = Directory::new(
         Resources {
-            shared: closed_shared,
+            cache: failing_cache.clone(),
             ..resources.clone()
         },
         DirectoryConfig {
@@ -709,20 +757,37 @@ async fn live_kind_3_recency_guards_search_graph_and_survives_reopen() {
         DirectoryState::default(),
     );
     assert!(
-        failing_directory
+        partial_failure_directory
             .ingest_directory_relay_event(kind3(&unknown_keys, 300, &dave))
             .is_err()
+    );
+    assert_eq!(
+        shared
+            .public_directory_user(&unknown_author)
+            .unwrap()
+            .unwrap()
+            .follows,
+        vec![dave.clone()]
     );
     assert_eq!(
         cache.search_graph_follows(&unknown_author).unwrap(),
         Some(vec![bob.clone()])
     );
+    failing_cache.close().unwrap();
     directory
-        .ingest_directory_relay_event(kind3(&unknown_keys, 300, &dave))
+        .ingest_directory_relay_event(kind3(&unknown_keys, 300, &carol))
         .unwrap();
     assert_eq!(
         cache.entry(&unknown_author).unwrap().unwrap().follows,
         vec![dave.clone()]
+    );
+    assert_eq!(
+        cache
+            .entry(&unknown_author)
+            .unwrap()
+            .unwrap()
+            .follows_created_at,
+        300
     );
     assert_eq!(
         cache.search_graph_follows(&unknown_author).unwrap(),
@@ -887,21 +952,112 @@ async fn key_package_recency_barriers_and_live_kind_5_deletion_invalidation() {
         kp_newer.key_package_event_id
     );
 
-    // Live relay ingest of an older different slot must NOT regress a newer cached slot.
-    directory
-        .remember_directory_key_package_inner(&kp_other_slot, false)
+    // Live relay ingest of a real signed older-slot kind-30443 event through
+    // `ingest_directory_relay_event` must NOT regress a newer cached slot.
+    {
+        use cgka_engine::account_identity_proof::{
+            AccountIdentityProofRequest, AccountIdentityProofSigner,
+        };
+        use cgka_traits::engine::CgkaEngine as _;
+
+        struct TestProofSigner(Keys);
+        impl AccountIdentityProofSigner for TestProofSigner {
+            fn sign_account_identity_proof(
+                &self,
+                request: &AccountIdentityProofRequest,
+            ) -> Result<[u8; 64], String> {
+                let event = request
+                    .proof_event()
+                    .and_then(|event| event.finalize(&self.0).map_err(|err| err.to_string()))?;
+                request.signature_from_signed_event(event)
+            }
+        }
+
+        let live_keys = Keys::generate();
+        let live_author = live_keys.public_key().to_hex();
+        let mut engine = cgka_engine::EngineBuilder::new(
+            storage_sqlite::SqliteAccountStorage::in_memory().unwrap(),
+        )
+        .identity(hex::decode(&live_author).unwrap())
+        .account_identity_proof_signer(Arc::new(TestProofSigner(live_keys.clone())))
+        .peeler(Box::new(transport_nostr_peeler::NostrMlsPeeler::default()))
+        .build()
         .unwrap();
-    assert_eq!(
-        cache_a
-            .entry(&author)
-            .unwrap()
-            .unwrap()
-            .key_package
-            .as_ref()
-            .unwrap()
-            .key_package_event_id,
-        kp_newer.key_package_event_id
-    );
+        let newer_kp = engine.fresh_key_package().await.unwrap();
+        let older_kp = engine.fresh_key_package().await.unwrap();
+        let make_signed_kp = |key_package: KeyPackage, slot: &str, created_at: u64| {
+            let metadata = cgka_engine::key_package_metadata(&key_package).unwrap();
+            let unsigned = transport_nostr_adapter::NostrKeyPackagePublication {
+                client_name: None,
+                account_id: cgka_traits::MemberId::new(hex::decode(&live_author).unwrap()),
+                key_package,
+                key_package_slot_id: slot.to_owned(),
+                key_package_ref: metadata.key_package_ref_hex,
+                mls_ciphersuite: format!("0x{:04x}", metadata.ciphersuite),
+                mls_extensions: metadata
+                    .mls_extensions
+                    .iter()
+                    .map(|id| format!("0x{id:04x}"))
+                    .collect(),
+                mls_proposals: metadata
+                    .mls_proposals
+                    .iter()
+                    .map(|id| format!("0x{id:04x}"))
+                    .collect(),
+                app_components: metadata
+                    .app_components
+                    .iter()
+                    .filter(|id| {
+                        **id >= cgka_traits::app_components::PRIVATE_USE_APP_COMPONENT_ID_START
+                    })
+                    .map(|id| format!("0x{id:04x}"))
+                    .collect(),
+                publish_endpoints: vec![cgka_traits::TransportEndpoint(
+                    "wss://relay.example".into(),
+                )],
+            }
+            .to_event_at(created_at)
+            .unwrap();
+            let tags = unsigned
+                .tags
+                .iter()
+                .map(|tag| Tag::parse(tag.iter().map(String::as_str)).unwrap())
+                .collect::<Vec<_>>();
+            let signed =
+                EventBuilder::new(Kind::from(KIND_MARMOT_KEY_PACKAGE as u16), unsigned.content)
+                    .tags(tags)
+                    .custom_created_at(Timestamp::from_secs(created_at))
+                    .finalize(&live_keys)
+                    .unwrap();
+            let event_id = signed.id.to_hex();
+            (
+                event_id,
+                RelayEventRecord {
+                    endpoints: vec![cgka_traits::TransportEndpoint("wss://relay.example".into())],
+                    event: NostrTransportEvent::from_nostr_event(&signed).unwrap(),
+                },
+            )
+        };
+        let (newer_id, newer_record) = make_signed_kp(newer_kp, "live-slot-2", now - 250);
+        let (_older_id, older_record) = make_signed_kp(older_kp, "live-slot-1", now - 350);
+        directory
+            .ingest_directory_relay_event(newer_record)
+            .unwrap();
+        directory
+            .ingest_directory_relay_event(older_record)
+            .unwrap();
+        assert_eq!(
+            cache_a
+                .entry(&live_author)
+                .unwrap()
+                .unwrap()
+                .key_package
+                .as_ref()
+                .unwrap()
+                .key_package_event_id,
+            newer_id
+        );
+    }
 
     // Explicitly remembering a different valid slot (e.g. selector choosing a non-last-resort
     // slot created earlier than a last-resort slot) must not be blocked by cross-slot created_at.

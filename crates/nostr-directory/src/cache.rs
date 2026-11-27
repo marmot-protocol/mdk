@@ -734,12 +734,28 @@ impl DirectoryCache {
         Ok(())
     }
 
-    pub(crate) fn search_graph_follows_created_at_for(
+    pub(crate) fn search_graph_follows_with_created_at(
         &self,
         account_id_hex: &str,
-    ) -> Result<u64, DirectoryError> {
+    ) -> Result<Option<(Vec<String>, u64)>, DirectoryError> {
         let conn = self.lock()?;
-        Self::search_graph_follows_created_at(&conn, account_id_hex)
+        let row = conn
+            .query_row(
+                "SELECT follows_known, follows_created_at
+                 FROM directory_search_graph_users
+                 WHERE account_id_hex = ?1",
+                [account_id_hex],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((known, created_at)) = row else {
+            return Ok(None);
+        };
+        if known == 0 {
+            return Ok(None);
+        }
+        let follows = Self::follow_rows(&conn, "directory_search_graph_follows", account_id_hex)?;
+        Ok(Some((follows, u64::try_from(created_at).unwrap_or(0))))
     }
 
     fn search_graph_follows_created_at(
