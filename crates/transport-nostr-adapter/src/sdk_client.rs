@@ -2562,7 +2562,13 @@ impl NostrSdkRelayClient {
 
     /// Shut down this SDK context and reap its owned notification monitors.
     pub async fn shutdown(&self) {
+        if let Some(finite) = &self.finite_requests {
+            finite.begin_shutdown();
+        }
         self.client.shutdown().await;
+        if let Some(finite) = &self.finite_requests {
+            finite.join_shutdown().await;
+        }
         let monitors = {
             let mut state = self
                 .frontier
