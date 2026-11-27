@@ -259,8 +259,8 @@ for reconnect/backoff and relay status mechanics.
   blocks or delays another frame. It reads each frame's verb and id as the SDK's JSON parser reads them
   (`classify`, pinned against `RelayMessage::from_json`); a frame whose verb or EVENT id is not JSON (a raw control
   character included), or any binary frame, passes on and ends that connection's requests `InvalidMessage`, so no
-  EVENT the SDK would drop can shorten a page unseen. Each request's queue holds its byte budget plus one frame, which covers an ordinary
-  page's envelopes however slow the caller; only rejected events or more than a frame of padding can fill it, and
+  EVENT the SDK would drop can shorten a page unseen. Each unshared request's queue holds its byte budget plus one frame, which covers an ordinary
+  page's envelopes however slow the caller; under `FiniteRequests::sharing`, each relay slot keeps one private 5 MiB frame and shares the group's byte budget across overflow backlogs. Only rejected events, shared-group backlog overflow, or more than a frame of padding can fill it, and
   that ends the request as a cut. Active finite requests admit against a shared global queued-byte budget (192 MiB
   default, FIFO reservation per unshared request, or one shared group budget plus one private 5 MiB frame per active
   relay under `FiniteRequests::sharing` so peer relays in a directory fan-out never multiply the shared budget; an

@@ -710,14 +710,21 @@ impl Slot {
         }
     }
 
-    /// Retire this slot during shutdown: suppress any unsent REQ, drop queued
-    /// frames, release shared queue bytes, and return whether its REQ had
-    /// already gone out on a connection.
+    /// Retire this slot during shutdown: suppress any unsent REQ, count cleared
+    /// unread EVENT frames into `dropped_event_bytes` (preserving interrupted
+    /// `fetched_bytes` accounting), release shared queue bytes, and return
+    /// whether its REQ had already gone out on a connection.
     fn retire_for_shutdown(&self) -> bool {
         let mut state = self.lock();
         let was_sent = matches!(state.binding, Binding::Sent(_));
         state.binding = Binding::Retired;
-        state.frames.clear();
+        let mut dropped = 0u64;
+        for frame in state.frames.drain(..) {
+            if head_verb(&frame).as_deref() == Some("EVENT") {
+                dropped += frame.len() as u64;
+            }
+        }
+        state.dropped_event_bytes += dropped;
         state.queued_bytes = 0;
         self.release_shared_bytes(&mut state);
         drop(state);
@@ -792,17 +799,17 @@ impl FiniteRequests {
     /// (suppressing any unsent REQs), and return `(id, relay)` pairs whose REQs
     /// had already gone out on a live connection.
     pub(crate) fn begin_shutdown(&self) -> Vec<(String, Relay)> {
+        let mut to_close = Vec::new();
+        // Strict lock order: `cleanup` -> `requests` -> `slot` (matching
+        // `Registered::drop`). Holding `cleanup` across slot retirement ensures
+        // a concurrent `Registered::drop()` cannot mark a `Sent` slot `Retired`
+        // and skip spawning `CLOSE` before we capture every `CLOSE` obligation.
+        let _cleanup = self.0.cleanup.lock().unwrap_or_else(|e| e.into_inner());
+        self.0.shutdown.cancel();
         let active = {
-            // Strict lock order: `cleanup` -> `requests` (matching
-            // `Registered::drop`), so no task can be spawned after shutdown
-            // begins and no in-flight `Drop` can hide a `Sent` slot between
-            // `requests` and `cleanup`.
-            let _cleanup = self.0.cleanup.lock().unwrap_or_else(|e| e.into_inner());
-            self.0.shutdown.cancel();
             let mut requests = self.0.requests.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *requests)
         };
-        let mut to_close = Vec::new();
         for (id, entry) in active {
             if entry.slot.retire_for_shutdown()
                 && let Some(relay) = entry.relay
@@ -911,16 +918,18 @@ impl FiniteRequests {
         cancel: &CancellationToken,
         auth: &mut Option<AuthWatch>,
     ) -> FiniteReply {
-        let (first, deadline) = self.request(relay, &filters, limits, None, cancel).await;
+        // One total deadline covers both local queue admission and wire
+        // execution (including any NIP-42 retry) so caller budgets never double.
+        let deadline = Instant::now() + limits.timeout;
+        let first = self
+            .request(relay, &filters, limits, deadline, cancel)
+            .await;
         let auth_required = match &first.end {
             FiniteEnd::Closed(reason) => is_auth_required(reason),
             FiniteEnd::Eose => first.auth,
             _ => false,
         };
         let Some(mut watch) = auth.take_if(|_| auth_required && self.0.can_authenticate) else {
-            return first;
-        };
-        let Some(deadline) = deadline else {
             return first;
         };
         match authenticated(
@@ -945,9 +954,7 @@ impl FiniteRequests {
             max_event_bytes: limits.max_event_bytes.saturating_sub(first.event_bytes),
             ..limits
         };
-        let (retry, _) = self
-            .request(relay, &filters, left, Some(deadline), cancel)
-            .await;
+        let retry = self.request(relay, &filters, left, deadline, cancel).await;
         first.then(retry)
     }
 
@@ -956,23 +963,17 @@ impl FiniteRequests {
         relay: &Relay,
         filters: &[Filter],
         limits: FiniteLimits,
-        existing_deadline: Option<Instant>,
+        request_deadline: Instant,
         cancel: &CancellationToken,
-    ) -> (FiniteReply, Option<Instant>) {
+    ) -> FiniteReply {
         if cancel.is_cancelled() {
-            return (FiniteReply::ended(FiniteEnd::Cancelled), existing_deadline);
+            return FiniteReply::ended(FiniteEnd::Cancelled);
         }
         if self.0.is_shutting_down() {
-            return (
-                FiniteReply::ended(FiniteEnd::Disconnected),
-                existing_deadline,
-            );
+            return FiniteReply::ended(FiniteEnd::Disconnected);
         }
-        // One total deadline covers both local queue admission and wire
-        // execution so callers' inspection/sweep budgets never double. Expiry
-        // before admission reports `FiniteEnd::Busy` (never a relay timeout);
-        // expiry after admission reports `FiniteEnd::TimedOut`.
-        let request_deadline = existing_deadline.unwrap_or_else(|| Instant::now() + limits.timeout);
+        // Expiry before local queue admission reports `FiniteEnd::Busy` (never
+        // a relay timeout); expiry after admission reports `FiniteEnd::TimedOut`.
         let permit = match &self.1 {
             Some(shared) => {
                 match shared
@@ -980,7 +981,7 @@ impl FiniteRequests {
                     .await
                 {
                     Ok(permit) => permit,
-                    Err(end) => return (FiniteReply::ended(end), Some(request_deadline)),
+                    Err(end) => return FiniteReply::ended(end),
                 }
             }
             None => {
@@ -995,7 +996,7 @@ impl FiniteRequests {
                         _relay_permit: relay_permit,
                         _group_guard: None,
                     },
-                    Err(end) => return (FiniteReply::ended(end), Some(request_deadline)),
+                    Err(end) => return FiniteReply::ended(end),
                 }
             }
         };
@@ -1012,10 +1013,7 @@ impl FiniteRequests {
         let Some(registered) =
             Registered::new(&self.0, id.clone(), slot.clone(), relay.clone(), permit)
         else {
-            return (
-                FiniteReply::ended(FiniteEnd::Disconnected),
-                Some(request_deadline),
-            );
+            return FiniteReply::ended(FiniteEnd::Disconnected);
         };
         let subscription_id = SubscriptionId::new(&id);
         let req = ClientMessage::req(subscription_id.clone(), filters.to_vec());
@@ -1095,7 +1093,7 @@ impl FiniteRequests {
             collector.charge_unread(unread.frames);
             collector.fetched_bytes += unread.dropped_event_bytes;
         }
-        (collector.reply(end), Some(request_deadline))
+        collector.reply(end)
     }
 }
 
@@ -2973,9 +2971,9 @@ mod tests {
 
         // Second request queues behind the first on the global budget and gets
         // cancelled while waiting; third queues with a short admission timeout
-        // and must end `SetupFailed` (a local setup failure, never blaming the
-        // healthy relay as `TimedOut`); fourth queues behind them and must
-        // still proceed with its full relay timeout once the first finishes.
+        // and must end `Busy` (local backpressure, never blaming the healthy
+        // relay as `TimedOut`); fourth queues behind them and must still
+        // proceed once the first finishes.
         let cancel_second = CancellationToken::new();
         let second_task = tokio::spawn({
             let finite = finite.clone();
@@ -3321,10 +3319,12 @@ mod tests {
         relay.run().await.unwrap();
         let url = relay.url().await;
         let keys = Keys::generate();
-        relay
-            .add_event(note(&keys, "shutdown-target"))
-            .await
-            .unwrap();
+        let target_event = note(&keys, "shutdown-target");
+        let second_event = note(&keys, "shutdown-queued-unread");
+        let expected_queued_bytes =
+            event_frame(&target_event).len() as u64 + event_frame(&second_event).len() as u64;
+        relay.add_event(target_event).await.unwrap();
+        relay.add_event(second_event).await.unwrap();
 
         let started = Arc::new(Notify::new());
         let budget = Arc::new(QueueBudget::new(MAX_FRAME_BYTES + 2_048));
@@ -3378,6 +3378,18 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), started.notified())
             .await
             .expect("active request must reach stalled admission");
+        let active_slot = finite
+            .0
+            .slots()
+            .pop()
+            .expect("active request must be registered");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while active_slot.lock().event_frames < 2 {
+                active_slot.ready.notified().await;
+            }
+        })
+        .await
+        .expect("both events must buffer before shutdown");
 
         let waiting_task = tokio::spawn({
             let finite = finite.clone();
@@ -3411,6 +3423,10 @@ mod tests {
         .await
         .expect("shutdown must end active and waiting requests");
         assert_eq!(active_reply.end, FiniteEnd::Disconnected);
+        assert_eq!(
+            active_reply.fetched_bytes, expected_queued_bytes,
+            "shutdown must preserve unread queued EVENT bytes in fetched_bytes"
+        );
         assert_eq!(waiting_reply.end, FiniteEnd::Disconnected);
         assert!(
             finite.0.cleanup.lock().unwrap().is_empty(),
@@ -3567,7 +3583,8 @@ mod tests {
     /// relay (`16 + 4×5 = 36 MiB`), rather than multiplying `16 + 5 = 21 MiB`
     /// per relay (`84 MiB`). With a 64 MiB global budget and one stalled relay,
     /// all three healthy relays still complete and return their records while
-    /// the stalled relay times out (`TimedOut`), and all reserved bytes release.
+    /// the stalled relay remains active until cancelled, and all reserved bytes
+    /// release.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sharing_group_reserves_shared_budget_once_so_stalled_relay_does_not_starve_peers() {
         use tokio_tungstenite::tungstenite::Message as Ws;
@@ -3818,5 +3835,147 @@ mod tests {
 
         client.shutdown().await;
         server.abort();
+    }
+
+    /// Dropping an active fetch concurrently with standalone
+    /// `FiniteRequests::shutdown()` on a multi-threaded runtime must never lose
+    /// the `CLOSE` frame for an already-sent REQ while the SDK `Client` stays
+    /// connected (#2895/#2897).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn standalone_shutdown_concurrent_with_fetch_drop_never_loses_close() {
+        use tokio_tungstenite::tungstenite::Message as Ws;
+
+        for _ in 0..8 {
+            let req_seen = Arc::new(Notify::new());
+            let close_seen = Arc::new(Notify::new());
+            let seen_reqs = Arc::new(Mutex::new(Vec::<String>::new()));
+            let seen_closes = Arc::new(Mutex::new(Vec::<String>::new()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = RelayUrl::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+            let server = tokio::spawn({
+                let req_seen = req_seen.clone();
+                let close_seen = close_seen.clone();
+                let seen_reqs = seen_reqs.clone();
+                let seen_closes = seen_closes.clone();
+                async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    while let Some(Ok(message)) = socket.next().await {
+                        let Ws::Text(text) = message else {
+                            continue;
+                        };
+                        let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        match (frame[0].as_str(), frame[1].as_str()) {
+                            (Some("REQ"), Some(id)) => {
+                                seen_reqs.lock().unwrap().push(id.to_owned());
+                                req_seen.notify_one();
+                            }
+                            (Some("CLOSE"), Some(id)) => {
+                                seen_closes.lock().unwrap().push(id.to_owned());
+                                close_seen.notify_one();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+
+            let (finite, client) = client_on(None, &url).await;
+            let sdk_relay = client.relay(&url).await.unwrap().unwrap();
+            let cancel = CancellationToken::new();
+            let filter = Filter::new().kind(Kind::TextNote);
+            let fetch_task = tokio::spawn({
+                let finite = finite.clone();
+                let sdk_relay = sdk_relay.clone();
+                async move {
+                    let _ = finite
+                        .fetch(&sdk_relay, vec![filter], limits(10, 1 << 20), &cancel)
+                        .await;
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), req_seen.notified())
+                .await
+                .expect("REQ must reach the relay");
+            let sent_id = seen_reqs.lock().unwrap()[0].clone();
+
+            // Race aborting (dropping) the active fetch against standalone
+            // `finite.shutdown()` on a multi-threaded runtime.
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let drop_task = tokio::spawn({
+                let barrier = barrier.clone();
+                async move {
+                    barrier.wait().await;
+                    fetch_task.abort();
+                    let _ = fetch_task.await;
+                }
+            });
+            let shutdown_task = tokio::spawn({
+                let barrier = barrier.clone();
+                let finite = finite.clone();
+                async move {
+                    barrier.wait().await;
+                    finite.shutdown().await;
+                }
+            });
+            let (drop_res, shutdown_res) = tokio::join!(drop_task, shutdown_task);
+            drop_res.unwrap();
+            shutdown_res.unwrap();
+
+            tokio::time::timeout(Duration::from_secs(5), close_seen.notified())
+                .await
+                .expect("concurrent drop + standalone shutdown must still deliver CLOSE");
+            assert!(
+                seen_closes.lock().unwrap().contains(&sent_id),
+                "sent subscription {sent_id} must receive CLOSE"
+            );
+
+            client.shutdown().await;
+            server.abort();
+        }
+    }
+
+    /// Under `FiniteRequests::sharing`, bytes buffered in a slot past its
+    /// private `MAX_FRAME_BYTES` frame draw from `SharedBudget::queue_used`,
+    /// cutting with `ByteLimit` when the shared pool fills and releasing the
+    /// borrowed bytes back to `0` when `Slot::take()` drains the frames.
+    #[test]
+    fn shared_queue_pool_cuts_on_overflow_and_releases_on_take() {
+        let shared = Arc::new(SharedBudget::new(100));
+        let registry = requests().0;
+        let slot_a = registry.new_slot(
+            RELAY.to_owned(),
+            limits(100, MAX_FRAME_BYTES),
+            Some(shared.clone()),
+        );
+        let slot_b = registry.new_slot(
+            RELAY.to_owned(),
+            limits(100, MAX_FRAME_BYTES),
+            Some(shared.clone()),
+        );
+        slot_a.lock().binding = Binding::Sent(1);
+        slot_b.lock().binding = Binding::Sent(2);
+
+        // Fill `slot_a` to its exact private ceiling (`MAX_FRAME_BYTES`), then
+        // push 80 bytes past it into the 100-byte shared overflow pool.
+        let half_private = "a".repeat(MAX_FRAME_BYTES / 2);
+        slot_a.receive(1, false, half_private.clone());
+        slot_a.receive(1, false, half_private.clone());
+        assert_eq!(shared.queue_used.load(Ordering::Relaxed), 0);
+        slot_a.receive(1, false, "b".repeat(80));
+        assert_eq!(shared.queue_used.load(Ordering::Relaxed), 80);
+        assert_eq!(slot_a.lock().end, None);
+
+        // Fill `slot_b` to its own private ceiling (unaffected by `slot_a`'s
+        // shared usage), then overflow the remaining 20 bytes of shared pool.
+        slot_b.receive(2, false, half_private.clone());
+        slot_b.receive(2, false, half_private);
+        assert_eq!(slot_b.lock().end, None);
+        slot_b.receive(2, false, "c".repeat(40));
+        assert_eq!(slot_b.lock().end, Some(FiniteEnd::ByteLimit));
+        assert_eq!(shared.queue_used.load(Ordering::Relaxed), 80);
+
+        // Draining `slot_a` via `take()` releases all 80 shared bytes cleanly.
+        assert!(slot_a.take().is_ok());
+        assert_eq!(shared.queue_used.load(Ordering::Relaxed), 0);
     }
 }

@@ -1076,6 +1076,10 @@ impl NostrSdkDirectoryRelayFetcher {
                             FiniteEnd::InvalidMessage => {
                                 return Err(DIRECTORY_READ_UNREADABLE.to_owned());
                             }
+                            // Plain lookups have no partial-result signal; fail
+                            // explicitly on local deferral rather than silently
+                            // skipping a relay whose records could then read as
+                            // absent.
                             FiniteEnd::Busy => {
                                 return Err(DIRECTORY_READ_LOCAL_BUSY.to_owned());
                             }
