@@ -53,7 +53,8 @@ struct Network {
         FixtureMutex<HashMap<(u64, String), transport_nostr::DirectoryInspectionError>>,
     inspected_endpoints: FixtureMutex<Vec<String>>,
     inspection_signers: FixtureMutex<Vec<(u64, bool)>>,
-    inbox_authentication_times_out: AtomicBool,
+    inbox_authentication:
+        FixtureMutex<HashMap<String, Result<(), transport_nostr::DirectoryInspectionError>>>,
     block_inbox_route_check: AtomicBool,
     inbox_route_checking: Notify,
     publish_failures: FixtureMutex<HashMap<String, cgka_traits::TransportEndpointFailure>>,
@@ -149,13 +150,6 @@ impl DirectoryRelayFetcher for Network {
             self.inbox_route_checking.notify_waiters();
             std::future::pending::<()>().await;
         }
-        if kind == 1059 && self.inbox_authentication_times_out.load(Ordering::SeqCst) {
-            return Err(if signer.is_some() {
-                transport_nostr::DirectoryInspectionError::AuthenticationTimedOut
-            } else {
-                transport_nostr::DirectoryInspectionError::AuthenticationRequired
-            });
-        }
         self.inspected_endpoints
             .lock()
             .extend(request.endpoints.iter().map(|endpoint| endpoint.0.clone()));
@@ -191,6 +185,19 @@ impl DirectoryRelayFetcher for Network {
             })
         }) {
             return Err(error);
+        }
+        if kind == 1059
+            && let Some(authenticated) = self
+                .inbox_authentication
+                .lock()
+                .get(&relay_key(&request.endpoints[0].0))
+                .cloned()
+        {
+            return if signer.is_some() {
+                authenticated.map(|()| Vec::new())
+            } else {
+                Err(transport_nostr::DirectoryInspectionError::AuthenticationRequired)
+            };
         }
         self.fetch_directory_events(request)
             .await
@@ -6267,9 +6274,12 @@ async fn external_inbox_lookup_precedes_signer_availability_and_auth_probe() {
         "",
         now,
     ));
-    network
-        .inbox_authentication_times_out
-        .store(true, Ordering::SeqCst);
+    for relay in ["wss://inbox-one.example", "wss://inbox-two.example"] {
+        network.inbox_authentication.lock().insert(
+            relay_key(relay),
+            Err(transport_nostr::DirectoryInspectionError::AuthenticationTimedOut),
+        );
+    }
     let check_waiting = |snapshot: OnboardingSnapshot| {
         let state = &snapshot.steps[inbox.index()];
         assert_eq!(state.status, OnboardingStatus::WaitingForSigner);
@@ -6307,6 +6317,188 @@ async fn external_inbox_lookup_precedes_signer_availability_and_auth_probe() {
         vec![(1059, true)]
     );
     assert!(network.attempts.lock().is_empty());
+    reopened.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbox_retry_rotates_after_a_definite_authenticated_refusal() {
+    assert_inbox_retry_fails_over_after_reopen(
+        Some((
+            transport_nostr::DirectoryInspectionError::AuthenticationRejected,
+            OnboardingIssue::AccessRestricted,
+        )),
+        false,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbox_retry_fails_over_when_the_preferred_relay_stops_answering() {
+    assert_inbox_retry_fails_over_after_reopen(None, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbox_retry_rotates_when_the_relay_still_requires_authentication() {
+    assert_inbox_retry_fails_over_after_reopen(
+        Some((
+            transport_nostr::DirectoryInspectionError::AuthenticationRequired,
+            OnboardingIssue::AuthenticationRequired,
+        )),
+        false,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbox_retry_keeps_its_place_when_discovery_catches_up_to_the_cache() {
+    assert_inbox_retry_fails_over_after_reopen(
+        Some((
+            transport_nostr::DirectoryInspectionError::AuthenticationRejected,
+            OnboardingIssue::AccessRestricted,
+        )),
+        true,
+    )
+    .await;
+}
+
+async fn assert_inbox_retry_fails_over_after_reopen(
+    signed_failure: Option<(transport_nostr::DirectoryInspectionError, OnboardingIssue)>,
+    start_with_cached_declaration: bool,
+) {
+    use transport_nostr::DirectoryInspectionError::{AuthenticationSignerFailed, TimedOut};
+
+    let expected_signed_attempts = if signed_failure.is_some() { 4 } else { 3 };
+
+    let directory = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let first = runtime(directory.path(), network.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let id = keys.public_key().to_hex();
+    let signer = BlockingSigner {
+        keys: keys.clone(),
+        block: Arc::new(AtomicBool::new(false)),
+        started: Arc::new(Notify::new()),
+    };
+    let inbox = OnboardingStep::InboxRelays;
+    let relay_a = relay_key("wss://inbox-a.example");
+    let relay_b = relay_key("wss://inbox-b.example");
+    let now = unix_now_seconds();
+    let inbox_tags = vec![
+        vec!["relay".into(), relay_a.clone()],
+        vec!["relay".into(), relay_b.clone()],
+    ];
+    if start_with_cached_declaration {
+        let cached_event = signed(&keys, 10050, inbox_tags.clone(), "", now);
+        let mut cached = crate::AccountRelayListStatus::empty();
+        cached.inbox = crate::relay_list_state_from_event(&cached_event).unwrap();
+        cached.refresh();
+        first
+            .accounts()
+            .app
+            .directory()
+            .remember_directory_relay_lists(&id, &cached)
+            .unwrap();
+    }
+    network.events.lock().extend([
+        signed(&keys, 0, vec![], "{}", now),
+        signed(&keys, 3, vec![], "", now),
+        signed(
+            &keys,
+            10002,
+            vec![vec!["r".into(), "wss://healthy.example".into()]],
+            "",
+            now,
+        ),
+        signed(
+            &keys,
+            10050,
+            inbox_tags.clone(),
+            "",
+            if start_with_cached_declaration {
+                now - 1
+            } else {
+                now
+            },
+        ),
+    ]);
+    network.inbox_authentication.lock().extend([
+        (relay_a.clone(), Err(AuthenticationSignerFailed)),
+        (relay_b.clone(), Ok(())),
+    ]);
+
+    let setup = first.account_setup();
+    setup
+        .begin_external_signer_onboarding(id.clone(), signer.clone(), options())
+        .await
+        .unwrap();
+    for snapshot in [
+        setup.run_onboarding(&id).await.unwrap(),
+        setup.retry_onboarding_step(&id, inbox).await.unwrap(),
+    ] {
+        assert_eq!(
+            snapshot.steps[inbox.index()].status,
+            OnboardingStatus::WaitingForSigner
+        );
+        assert!(
+            snapshot.steps[inbox.index()]
+                .findings
+                .iter()
+                .any(|finding| {
+                    finding.issue == OnboardingIssue::SignerUnavailable
+                        && finding.endpoint.as_deref() == Some(relay_a.as_str())
+                })
+        );
+    }
+    if let Some((error, issue)) = signed_failure {
+        network
+            .inbox_authentication
+            .lock()
+            .insert(relay_a.clone(), Err(error));
+        let refused = setup.retry_onboarding_step(&id, inbox).await.unwrap();
+        let state = &refused.steps[inbox.index()];
+        assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+        assert!(state.findings.iter().any(|finding| {
+            finding.issue == issue && finding.endpoint.as_deref() == Some(relay_a.as_str())
+        }));
+    } else {
+        network
+            .inspection_errors
+            .lock()
+            .insert(relay_a.clone(), TimedOut);
+    }
+    first.shutdown_and_close().await.unwrap();
+    if start_with_cached_declaration {
+        network
+            .events
+            .lock()
+            .push(signed(&keys, 10050, inbox_tags, "", now));
+    }
+
+    let reopened = runtime(directory.path(), network.clone());
+    let setup = reopened.account_setup();
+    let waiting = setup.retry_onboarding_step(&id, inbox).await.unwrap();
+    assert!(waiting.steps[inbox.index()].findings.iter().any(|finding| {
+        finding.issue == OnboardingIssue::SignerUnavailable
+            && finding.endpoint.as_deref() == Some(relay_b.as_str())
+    }));
+    reopened
+        .register_external_signer(&id, signer.clone())
+        .await
+        .unwrap();
+    let recovered = setup.retry_onboarding_step(&id, inbox).await.unwrap();
+    assert_eq!(
+        recovered.steps[inbox.index()].status,
+        OnboardingStatus::Passed
+    );
+    assert_eq!(
+        network
+            .inspection_signers
+            .lock()
+            .iter()
+            .filter(|(_, signed)| *signed)
+            .count(),
+        expected_signed_attempts,
+    );
     reopened.shutdown_and_close().await.unwrap();
 }
 
