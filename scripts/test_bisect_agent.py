@@ -37,6 +37,7 @@ from scripts.bisect_agent.controller import (
     default_worktree_runner,
     is_wrapper_job,
     main as cli_main,
+    selftest,
 )
 from scripts.bisect_agent.models import (
     AgentState,
@@ -141,6 +142,9 @@ class StubGitHub:
     def hosted_run_verification_status(self, run_id: int, *, attempt: int | None = None) -> str:
         self.recorded_attempts.append(("verify", run_id, attempt))
         return self.verification_status_by_run.get(run_id, "skipped")
+
+    def jobs_for_run(self, run_id: int, *, attempt: int | None = None):
+        return self.failed_jobs_by_run.get(run_id, [])
 
     def failed_jobs_for_run(self, run_id: int, *, attempt: int | None = None):
         self.recorded_attempts.append(("failed_jobs", run_id, attempt))
@@ -392,6 +396,61 @@ class ClassifierTests(unittest.TestCase):
             # `--live` without `--predicate-runner-prefix` must refuse to run (exit 2).
             rc = cli_main(["poll", "--live", "--repo-dir", str(tmp), "--no-fetch"])
             self.assertEqual(rc, 2)
+
+    def test_predicate_nextest_store_lands_in_the_sandbox_target_dir(self):
+        # nextest keeps its store at `<workspace>/target/nextest` whatever `CARGO_TARGET_DIR`
+        # says. The `mdk-runner` sandbox cannot write the bot-owned worktree, so every live
+        # replay exited 96 before running its test. The store must land in the target dir
+        # the sandbox owns.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            wt = tmp / "wt"
+            wt.mkdir()
+            target = tmp / "target-bisect"
+            write_store = (
+                "python3",
+                "-c",
+                "import pathlib; p = pathlib.Path('target/nextest/ci'); "
+                "p.mkdir(parents=True, exist_ok=True); (p / 'probe').write_text('ok')",
+            )
+            verdict, _ = default_worktree_runner(write_store, cargo_target_dir=target)(wt)
+            self.assertEqual(verdict, RunVerdict.PASS)
+            self.assertEqual((target / "nextest" / "ci" / "probe").read_text(), "ok")
+
+    def test_selftest_flags_an_empty_hosted_job_log(self):
+        # Every live hosted job log came back empty and nothing noticed. `selftest` is the
+        # deploy check that must, while a non-empty log raises no log problem.
+        job = {"id": 70, "name": "Full cross-platform CI (6 shards) / Rust tests (5/6)", "conclusion": "failure"}
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            for log, flagged in (("", True), ("  FAIL [ 0.1s] marmot-app a::b\n", False)):
+                with self.subTest(log=log):
+                    gh = StubGitHub(
+                        runs_by_workflow={"canary.yml": [{"id": 7}]},
+                        failed_jobs_by_run={7: [job]},
+                        logs_by_job={70: log},
+                    )
+                    problems = selftest(
+                        gh,
+                        repo_dir=tmp,
+                        worktree_root=tmp / "wt",
+                        cargo_target_dir=tmp / "target",
+                        runner_prefix=("env",),
+                        timeout_secs=30,
+                    )
+                    self.assertEqual("hosted job log came back empty (run 7, job 70)" in problems, flagged)
+
+    def test_job_log_reads_called_workflow_jobs_through_the_jobs_logs_api(self):
+        # `gh run view --job <id> --log` prints nothing and exits 0 for jobs of the reusable
+        # `ci.yml` call ("Full cross-platform CI (6 shards) / ..."), which turned every hosted
+        # Canary failure into an unparsed, unreproducible freeze.
+        gh_ops = GitHubOps("marmot-protocol/mdk", dry_run=True)
+        log = "  TRY 2 FAIL [   4.443s] ( 382/1567) marmot-app client::push::tests::push_batch_delivery\n"
+        with mock.patch.object(
+            gh_ops, "_run_gh_safe", return_value=subprocess.CompletedProcess([], 0, stdout=log, stderr="")
+        ) as mocked_gh:
+            self.assertEqual(gh_ops.job_log(45980601156, 140455972327), log)
+            mocked_gh.assert_called_once_with("api", "repos/marmot-protocol/mdk/actions/jobs/140455972327/logs")
 
 
 class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
@@ -1736,7 +1795,7 @@ class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
             self.assertNotIn("fail:hosted_canary:510:1", state_log_err.seen_runs)
             self.assertNotIn("fail:hosted_canary:511:1", state_log_err.seen_runs)
 
-            # GitHubOps.job_log returns None (not "") when `gh run view --log` fails.
+            # GitHubOps.job_log returns None (not "") when the jobs logs API call fails.
             gh_ops = GitHubOps("marmot-protocol/mdk", dry_run=True)
             with mock.patch.object(gh_ops, "_run_gh_safe", return_value=subprocess.CompletedProcess([], 1, stdout="", stderr="err")):
                 self.assertIsNone(gh_ops.job_log(510, 5101))
