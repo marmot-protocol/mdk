@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
   "state": "red",
-  "updated_at": "2026-11-27T10:57:39Z",
-  "reason": "2 consecutive red hosted_canary runs on unreproducible job `Full cross-platform CI (6 shards) / Relay runtime tests (1/2)` (step `Run relay runtime tests serially`)",
+  "updated_at": "2026-11-27T10:57:47Z",
+  "reason": "2 consecutive red hosted_canary runs on unreproducible job `Full cross-platform CI (6 shards) / Rust tests (5/6)` (step `Run workspace tests`)",
   "run_url": "https://github.com/marmot-protocol/mdk/actions/runs/45980601156",
   "incidents": {
     "hosted_canary": {
       "source": "hosted_canary",
       "tip_sha": "cb02e36940133d16120bae7c77e7a58dd8902f1c",
       "started_at": 1795777059.2258506,
-      "reason": "2 consecutive red hosted_canary runs on unreproducible job `Full cross-platform CI (6 shards) / Relay runtime tests (1/2)` (step `Run relay runtime tests serially`)",
+      "reason": "2 consecutive red hosted_canary runs on unreproducible job `Full cross-platform CI (6 shards) / Rust tests (5/6)` (step `Run workspace tests`)",
       "run_url": "https://github.com/marmot-protocol/mdk/actions/runs/45980601156",
       "culprit_sha": null
     }
