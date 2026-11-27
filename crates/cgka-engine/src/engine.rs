@@ -281,7 +281,7 @@ pub(crate) struct ScheduledSelfRemoveAutoCommit {
 /// Coordinates authenticated group evolution, durable replay and native events
 /// over the caller-provided storage backend and transport peeler.
 pub struct Engine<S: StorageProvider> {
-    pub(crate) storage: S,
+    pub(crate) storage: Arc<S>,
     pub(crate) crypto: RustCrypto,
     pub(crate) identity: Identity,
     pub(crate) registry: FeatureRegistry,
@@ -448,6 +448,12 @@ pub struct Engine<S: StorageProvider> {
     /// the failure here; [`Self::quarantined_reason`] reads it as a
     /// `RewindRestoreFailed` quarantine until the move.
     pub(crate) rewinds: crate::snapshot_guard::Rewinds,
+
+    /// Groups whose [`crate::pending_commit_guard::PendingCommitCleanupGuard`]
+    /// could not finish its atomic OpenMLS cleanup transaction on `Drop`
+    /// (mdk#3794). Normal engine retry, send, and convergence entry points
+    /// resume that cleanup before reading or mutating the group.
+    pub(crate) unfinished_staging_cleanups: crate::pending_commit_guard::UnfinishedStagingCleanups,
 
     /// Groups seeded by the session-open cheap pass whose full per-group
     /// hydration (MLS load, validation, pending-commit recovery) has not run
@@ -823,7 +829,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
 
         let convergence_clock_instance_id = self.entropy.next_u64();
         Ok(Engine {
-            storage: self.storage,
+            storage: Arc::new(self.storage),
             crypto,
             identity,
             registry: self.registry,
@@ -879,6 +885,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
             current_audit_context: None,
             quarantined_groups: HashMap::new(),
             rewinds,
+            unfinished_staging_cleanups:
+                crate::pending_commit_guard::UnfinishedStagingCleanups::default(),
             unhydrated_groups: HashSet::new(),
             route_backfill_pending: HashSet::new(),
             transport_group_id_index: HashMap::new(),
@@ -1026,7 +1034,7 @@ impl<S: StorageProvider> Engine<S> {
                     // disband ended, which its candidates for this epoch hold.
                     // Rival disbands of one epoch each count as evidence.
                     let mut evidence = crate::disband::unsettled_disband_evidence(
-                        &self.storage,
+                        self.storage.as_ref(),
                         group_id,
                         EpochId(mls_group.epoch().as_u64()),
                     )?;
@@ -2482,10 +2490,16 @@ impl<S: StorageProvider> Engine<S> {
         // any read (mdk#3272), so this finds none in a group the open
         // seeded; it stays as the check full hydration has always made
         // before loading any MLS or Marmot state.
-        crate::openmls_projection::recover_interrupted_rewind_guard(&self.storage, group_id)
-            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
-        crate::openmls_projection::recover_interrupted_apply_snapshot(&self.storage, group_id)
-            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        crate::openmls_projection::recover_interrupted_rewind_guard(
+            self.storage.as_ref(),
+            group_id,
+        )
+        .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        crate::openmls_projection::recover_interrupted_apply_snapshot(
+            self.storage.as_ref(),
+            group_id,
+        )
+        .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
 
         // The one group-record read for this hydration (mdk#1161): every later
         // consumer (tombstone check, profile mirror check, pending-commit
@@ -2673,7 +2687,7 @@ impl<S: StorageProvider> Engine<S> {
                     return Err(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed);
                 }
                 crate::maintenance::rollback_recovery_stage(
-                    &self.storage,
+                    self.storage.as_ref(),
                     group_id,
                     &preparing[0].id,
                 )
@@ -2761,16 +2775,55 @@ impl<S: StorageProvider> Engine<S> {
         // state of a deferred SelfRemove auto-commit, whose Marmot record
         // is already projected forward past the leave. Rolling back a
         // commit that removes a member would re-add the departed member and
-        // fork convergence, so we only recover commits that add no
-        // member-removal (no `Remove`, no `SelfRemove`). Removal-bearing
-        // staged commits without a recovery Preparing descriptor are left
-        // exactly as they were before this compatibility path existed.
+        // fork convergence, so we preserve removal-bearing commits once their
+        // forward projection has been committed.
+        //
+        // By contrast, if a SelfRemove auto-commit aborted before committing
+        // `record_sent_openmls_message_with_group` and its cleanup guard
+        // failed on a transient storage fault (or the process crashed mid-
+        // staging), the group record stays at `source_epoch` with every
+        // departing member still present. Recover that unpublished SelfRemove
+        // commit together with its stored SelfRemove proposals inside one
+        // storage transaction so reopen heals cleanly instead of wedging
+        // outbound chat and retries.
         let staged_removes_member = mls_group.pending_commit().is_some_and(|staged| {
             staged.queued_proposals().any(|queued| {
                 matches!(
                     queued.proposal(),
                     openmls::prelude::Proposal::Remove(_) | openmls::prelude::Proposal::SelfRemove
                 )
+            })
+        });
+        let unpublished_staged_self_remove = mls_group.pending_commit().is_some_and(|staged| {
+            let mut saw_self_remove = false;
+            let all_self_remove = staged.queued_proposals().all(|queued| {
+                if matches!(queued.proposal(), openmls::prelude::Proposal::SelfRemove) {
+                    saw_self_remove = true;
+                    true
+                } else {
+                    false
+                }
+            });
+            if !saw_self_remove || !all_self_remove {
+                return false;
+            }
+            let source_epoch = EpochId(mls_group.epoch().as_u64());
+            if group.epoch != source_epoch {
+                return false;
+            }
+            staged.queued_proposals().all(|queued| {
+                let openmls::prelude::Sender::Member(index) = queued.sender() else {
+                    return false;
+                };
+                mls_group
+                    .members()
+                    .find(|member| member.index == *index)
+                    .is_some_and(|member| {
+                        group
+                            .members
+                            .iter()
+                            .any(|record_member| record_member.credential == member.signature_key)
+                    })
             })
         });
         let restored_durable_evolution =
@@ -2780,14 +2833,27 @@ impl<S: StorageProvider> Engine<S> {
                 false
             };
         if mls_group.pending_commit().is_some()
-            && !staged_removes_member
+            && (!staged_removes_member || unpublished_staged_self_remove)
             && !restored_pending
             && !restored_durable_evolution
         {
-            // Retire the staged Welcomes, clear the pending MLS commit and
-            // persist its corrected mirror in one durable unit (#421, #2422).
-            // Losing the pending marker before the mirror is durable would
-            // let a later hydration promote the canceled invitees as members.
+            let self_remove_proposal_refs: Vec<openmls::ciphersuite::hash_ref::ProposalRef> =
+                if unpublished_staged_self_remove {
+                    mls_group
+                        .pending_proposals()
+                        .filter(|proposal| {
+                            matches!(proposal.proposal(), openmls::prelude::Proposal::SelfRemove)
+                        })
+                        .map(|proposal| proposal.proposal_reference_ref().clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            // Retire the staged Welcomes, clear the pending MLS commit (and any
+            // unpublished SelfRemove proposals), and persist its corrected
+            // mirror in one durable unit (#421, #2422, #3794). Losing the
+            // pending marker before the mirror is durable would let a later
+            // hydration promote the canceled invitees as members.
             let recovered_epoch = self.storage
                 .with_transaction(|storage| {
                     let source_epoch = EpochId(mls_group.epoch().as_u64());
@@ -2802,11 +2868,21 @@ impl<S: StorageProvider> Engine<S> {
                         &self.crypto,
                         storage.mls_storage(),
                     );
+                    let tx_mls_storage = <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&tx_provider);
                     mls_group
-                        .clear_pending_commit(
-                            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&tx_provider),
-                        )
+                        .clear_pending_commit(tx_mls_storage)
                         .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))?;
+                    for proposal_ref in &self_remove_proposal_refs {
+                        match mls_group.remove_pending_proposal(tx_mls_storage, proposal_ref) {
+                            Ok(())
+                            | Err(openmls::group::RemoveProposalError::ProposalNotFound) => {}
+                            Err(e) => {
+                                return Err(EngineError::Backend(format!(
+                                    "remove_pending_proposal: {e:?}"
+                                )));
+                            }
+                        }
+                    }
                     crate::test_crash_hooks::pause_if_requested("orphan-pending-after-clear");
                     let recovered_epoch = EpochId(mls_group.epoch().as_u64());
                     group.epoch = recovered_epoch;
@@ -2885,7 +2961,7 @@ impl<S: StorageProvider> Engine<S> {
             Some(committed) => self.backfill_committed_roster(group_id, &committed)?,
             None => {
                 let evidence = crate::disband::unsettled_disband_evidence(
-                    &self.storage,
+                    self.storage.as_ref(),
                     group_id,
                     EpochId(mls_group.epoch().as_u64()),
                 )
@@ -3021,6 +3097,7 @@ impl<S: StorageProvider> Engine<S> {
         {
             self.schedule_pending_convergence_group(group_id);
         }
+        self.unfinished_staging_cleanups.clear(group_id);
         Ok(group.epoch)
     }
 
@@ -3223,34 +3300,25 @@ impl<S: StorageProvider> Engine<S> {
             );
             return Ok(true);
         }
-        let pending = self
-            .epoch_manager
-            .next_pending_ref()
-            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+        let prepared_pending = match self.epoch_manager.prepare_pending(
+            group_id.clone(),
+            source_epoch,
+            evolution.target_epoch,
+            cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
+            crate::epoch_manager::PendingKind::GroupEvolution,
+            None,
+        ) {
+            Ok(prepared) => prepared,
+            Err(EngineError::InvalidTransition(_)) => return recovery_failed(),
+            Err(_) => return Err(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed),
+        };
+        let pending = prepared_pending.pending_ref();
         let mut evolution = evolution;
         evolution.pending_ref = Some(pending);
         if maintenance.put_group_evolution(&evolution).is_err() {
             return recovery_failed();
         }
-        if self
-            .epoch_manager
-            .begin_pending(
-                group_id.clone(),
-                source_epoch,
-                evolution.target_epoch,
-                cgka_traits::engine_state::StagedCommitHandle::from_bytes(
-                    group_id.as_slice().to_vec(),
-                ),
-                pending,
-                crate::epoch_manager::PendingKind::GroupEvolution,
-                None,
-            )
-            .is_err()
-        {
-            evolution.pending_ref = None;
-            let _ = maintenance.put_group_evolution(&evolution);
-            return recovery_failed();
-        }
+        self.epoch_manager.commit_pending(prepared_pending);
         self.track_pending_origin_commit(pending, message_id);
         self.auto_publish_buf.push_back(cgka_traits::AutoPublish {
             msg: exact_message,
@@ -3501,7 +3569,7 @@ impl<S: StorageProvider> Engine<S> {
             hasher.update(record.id.as_slice());
             let digest = hasher.finalize();
             let processed = crate::snapshot_guard::SnapshotRollbackGuard::contained(
-                &self.storage,
+                self.storage.as_ref(),
                 &self.rewinds,
                 group_id,
                 crate::snapshot_guard::RewindSite::HydrateSelfRemove,
@@ -4166,6 +4234,49 @@ impl<S: StorageProvider> Engine<S> {
         self.pending_origin_commits.remove(&pending)
     }
 
+    /// Arm a [`crate::pending_commit_guard::PendingCommitCleanupGuard`] bound to
+    /// this engine's storage and unfinished-cleanup tracker.
+    pub(crate) fn arm_pending_commit_guard(
+        &self,
+        group_id: GroupId,
+    ) -> crate::pending_commit_guard::PendingCommitCleanupGuard<S> {
+        crate::pending_commit_guard::PendingCommitCleanupGuard::arm(
+            Arc::clone(&self.storage),
+            self.unfinished_staging_cleanups.clone(),
+            group_id,
+        )
+    }
+
+    /// Resume any OpenMLS pending-commit / stored-proposal cleanup that an
+    /// earlier [`crate::pending_commit_guard::PendingCommitCleanupGuard::drop`]
+    /// could not finish due to a transient storage fault.
+    ///
+    /// Fast-paths when no cleanup is pending for `group_id`. If the retry
+    /// transaction fails again, ownership stays recorded for a later attempt.
+    pub(crate) fn resume_unfinished_staging_cleanup(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), EngineError> {
+        let Some(proposal_refs) = self.unfinished_staging_cleanups.pending_refs(group_id) else {
+            return Ok(());
+        };
+        if !self
+            .epoch_manager
+            .state(group_id)
+            .is_none_or(cgka_traits::engine_state::EpochState::is_stable)
+        {
+            return Ok(());
+        }
+        crate::pending_commit_guard::cleanup_staged_commit_and_proposals(
+            self.storage.as_ref(),
+            group_id,
+            &proposal_refs,
+        )?;
+        self.unfinished_staging_cleanups.clear(group_id);
+        self.mls_group_cache.forget_group(group_id);
+        Ok(())
+    }
+
     /// Reset this group on this account-device, without network
     /// traffic. Storage commits the deletion before any in-memory state changes.
     pub fn forget_group_local(&mut self, group_id: &GroupId) -> Result<bool, EngineError> {
@@ -4189,6 +4300,7 @@ impl<S: StorageProvider> Engine<S> {
         self.unhydrated_groups.remove(group_id);
         self.quarantined_groups.remove(group_id);
         self.rewinds.forget(group_id);
+        self.unfinished_staging_cleanups.clear(group_id);
         self.leaving_groups.remove(group_id);
         self.leave_requests.remove(group_id);
         self.valid_proposal_groups.remove(group_id);
@@ -5120,7 +5232,7 @@ impl<S: StorageProvider> Engine<S> {
         // A contained window: its own savepoint undoes the rewind, the guard
         // included, if the restore fails.
         crate::openmls_projection::with_retained_anchor_group(
-            &self.storage,
+            self.storage.as_ref(),
             &self.rewinds,
             &self.crypto,
             group_id,
@@ -5787,5 +5899,11 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
 }
 
 #[cfg(test)]
+#[path = "engine/prepare_pending_rollback_tests.rs"]
+mod prepare_pending_rollback_tests;
+#[cfg(test)]
 #[path = "engine/rewind_gate_tests.rs"]
 mod rewind_gate_tests;
+#[cfg(test)]
+#[path = "engine/test_support.rs"]
+pub(crate) mod test_support;

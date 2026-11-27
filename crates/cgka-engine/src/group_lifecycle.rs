@@ -7,6 +7,7 @@
 //! creation retains the older staged/pending lifecycle until strict cutover.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use crate::capabilities::{
     capabilities_of_key_package, extension_from_group_capabilities, leaf_capabilities,
@@ -257,19 +258,15 @@ pub(crate) const ENCRYPTED_MEDIA_EXPORTER_SNAPSHOT_KEY: &str =
 /// publish lifecycle. Until then no caller has received the group id and no
 /// transport work has escaped.
 struct NewGroupCleanupGuard<S: StorageProvider> {
-    storage: *const S,
+    storage: Arc<S>,
     group_id: GroupId,
     armed: bool,
 }
 
-// SAFETY: `S` is `Send + Sync`; the pointer is dereferenced only from Drop
-// while the guarded `&mut Engine` future (and therefore its storage) is alive.
-unsafe impl<S: StorageProvider> Send for NewGroupCleanupGuard<S> {}
-
 impl<S: StorageProvider> NewGroupCleanupGuard<S> {
-    fn arm(storage: &S, group_id: GroupId) -> Self {
+    fn arm(storage: Arc<S>, group_id: GroupId) -> Self {
         Self {
-            storage: storage as *const S,
+            storage,
             group_id,
             armed: true,
         }
@@ -285,10 +282,8 @@ impl<S: StorageProvider> Drop for NewGroupCleanupGuard<S> {
         if !self.armed {
             return;
         }
-        // SAFETY: see the `Send` justification above.
-        let storage = unsafe { &*self.storage };
         let mls_gid = openmls::group::GroupId::from_slice(self.group_id.as_slice());
-        let cleanup = storage.with_transaction(|storage| {
+        let cleanup = self.storage.with_transaction(|storage| {
             let crypto = openmls_rust_crypto::RustCrypto::default();
             let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
             // Deletes the group its own create just made (see clippy.toml).
@@ -595,7 +590,7 @@ impl<S: StorageProvider> Engine<S> {
             .app_components
             .contains(DEVICE_ROSTER_COMPONENT_ID)
         {
-            let own_slot = own_device_slot(&self.storage).ok().flatten();
+            let own_slot = own_device_slot(self.storage.as_ref()).ok().flatten();
             req.app_components
                 .iter()
                 .find(|component| component.component_id == DEVICE_ROSTER_COMPONENT_ID)
@@ -688,7 +683,8 @@ impl<S: StorageProvider> Engine<S> {
         })?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let group_id = GroupId::new(mls_group.group_id().as_slice().to_vec());
-        let new_group_guard = NewGroupCleanupGuard::arm(&self.storage, group_id.clone());
+        let new_group_guard =
+            NewGroupCleanupGuard::arm(Arc::clone(&self.storage), group_id.clone());
 
         let mut siblings = Vec::new();
         let mut sibling_plan = None;
@@ -898,46 +894,6 @@ impl<S: StorageProvider> Engine<S> {
             _ => Vec::new(),
         };
 
-        if self.new_protocol_profile == ProtocolProfile::Legacy {
-            // Every check that can refuse the creation runs before its first
-            // write. A current-profile create runs them inside its creation
-            // transaction instead.
-            crate::capability_manager::check_key_packages_carry_profile(
-                group_record.protocol_profile,
-                &parsed_kps,
-            )?;
-            crate::capability_manager::check_own_leaf(
-                &mls_group,
-                self.identity.self_id(),
-                self.ciphersuite,
-            )?;
-            // The route may replace an existing group's mapping. Keep it
-            // with every founding artifact so any later Welcome error restores
-            // the previous owner. Hot indexes wait until the pending handoff.
-            self.storage.with_transaction(|storage| {
-                // Message/group foreign keys require this row first.
-                storage.put_group_with_roster(&group_record, &committed_members(&mls_group))?;
-                if let Ok(transport_group_id) =
-                    crate::app_components::transport_group_id_of_group(&mls_group)
-                {
-                    let _ = storage.put_transport_group_route(
-                        &transport_group_id,
-                        &group_id,
-                        EpochId(mls_group.epoch().as_u64()),
-                    );
-                }
-                for welcome in &welcomes {
-                    self.persist_transport_message(
-                        welcome,
-                        &group_id,
-                        EpochId(0),
-                        MessageState::Sent,
-                    )?;
-                }
-                Ok::<_, EngineError>(())
-            })?;
-        }
-
         if self.new_protocol_profile == ProtocolProfile::Current {
             let enrolled_at = self.wall_clock.now();
             let unique_welcome_ids = welcomes
@@ -1144,31 +1100,59 @@ impl<S: StorageProvider> Engine<S> {
             return Ok((group_id, SendResult::FoundingGroupCreated { welcomes }));
         }
 
-        // 7. Enter PendingPublish — the caller must confirm_published once
-        //    the transport hands off every welcome. The visible epoch
-        //    becomes the projected post-merge epoch. For multi-member
-        //    create that's epoch 1 (the staged commit's target); for solo
-        //    create it stays 0 (no commit was staged). Tagged
+        // 7. Legacy profile: validate checks and pending-publish transition
+        //    before committing founding rows, then enter PendingPublish — the
+        //    caller must confirm_published once the transport hands off every
+        //    welcome. The visible epoch becomes the projected post-merge epoch.
+        //    For multi-member create that's epoch 1 (the staged commit's
+        //    target); for solo create it stays 0 (no commit was staged). Tagged
         //    `PendingKind::CreateGroup` so confirm emits `GroupCreated`.
+        crate::capability_manager::check_key_packages_carry_profile(
+            group_record.protocol_profile,
+            &parsed_kps,
+        )?;
+        crate::capability_manager::check_own_leaf(
+            &mls_group,
+            self.identity.self_id(),
+            self.ciphersuite,
+        )?;
         let projected_epoch = if welcome_bytes.is_some() {
             // Multi-member: the pending commit advances to epoch 1.
             EpochId(1)
         } else {
             EpochId(0)
         };
-        let pending_ref = self.epoch_manager.next_pending_ref()?;
-        let staged =
-            cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
-        self.invalidate_deferred_peel_candidate_cache(&group_id);
-        self.epoch_manager.begin_pending(
+        let prepared_pending = self.epoch_manager.prepare_pending(
             group_id.clone(),
             EpochId(0),
             projected_epoch,
-            staged,
-            pending_ref,
+            cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
             crate::epoch_manager::PendingKind::CreateGroup,
             self.current_audit_context.clone(),
         )?;
+        // The route may replace an existing group's mapping. Keep it
+        // with every founding artifact so any later Welcome error restores
+        // the previous owner. Hot indexes wait until the pending handoff.
+        self.storage.with_transaction(|storage| {
+            // Message/group foreign keys require this row first.
+            storage.put_group_with_roster(&group_record, &committed_members(&mls_group))?;
+            if let Ok(transport_group_id) =
+                crate::app_components::transport_group_id_of_group(&mls_group)
+            {
+                let _ = storage.put_transport_group_route(
+                    &transport_group_id,
+                    &group_id,
+                    EpochId(mls_group.epoch().as_u64()),
+                );
+            }
+            for welcome in &welcomes {
+                self.persist_transport_message(welcome, &group_id, EpochId(0), MessageState::Sent)?;
+            }
+            Ok::<_, EngineError>(())
+        })?;
+        let pending_ref = prepared_pending.pending_ref();
+        self.invalidate_deferred_peel_candidate_cache(&group_id);
+        self.epoch_manager.commit_pending(prepared_pending);
         self.audit_group(
             &group_id,
             crate::audit_helpers::epoch_state_changed_event(
@@ -1459,7 +1443,7 @@ impl<S: StorageProvider> Engine<S> {
                 (peeled, content_id)
             }
         };
-        if content_id.is_settled(&self.storage)? {
+        if content_id.is_settled(self.storage.as_ref())? {
             self.storage.put_ingress_dedup_marker(&welcome_id)?;
             return Err(EngineError::WelcomeAlreadyProcessed);
         }
@@ -2364,7 +2348,7 @@ impl<S: StorageProvider> Engine<S> {
             // join here would undo a completed, authenticated repair over an
             // opportunistic sweep.
             match crate::openmls_projection::reopen_rows_refused_by_the_removed_copy(
-                &self.storage,
+                self.storage.as_ref(),
                 &group_id,
                 floor,
             ) {

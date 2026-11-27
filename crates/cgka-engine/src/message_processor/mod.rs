@@ -1010,6 +1010,7 @@ impl<S: StorageProvider> Engine<S> {
 
     pub(crate) async fn do_send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
         let group_id = self.validate_send_acceptance(&intent)?;
+        self.resume_unfinished_staging_cleanup(&group_id)?;
         // Disband is an intent-persistence operation, not a Commit-preparation
         // operation. It remains acceptable while another staged Commit owns
         // the group and while Unrecoverable is paused.
@@ -1377,6 +1378,7 @@ impl<S: StorageProvider> Engine<S> {
         if !self.prepare_convergence_input_advance(group_id)? {
             return Ok(Vec::new());
         }
+        self.resume_unfinished_staging_cleanup(group_id)?;
 
         // This entry point belongs to background recovery even when output is
         // queued. Borrowing a send's four-row preflight allowance here makes
@@ -3039,7 +3041,9 @@ impl<S: StorageProvider> Engine<S> {
                 .map(Arc::clone);
             let before_enumeration = past_contexts
                 .as_ref()
-                .map(|_| ingest::PastPeelContextCache::replay_state(&self.storage, group_id))
+                .map(|_| {
+                    ingest::PastPeelContextCache::replay_state(self.storage.as_ref(), group_id)
+                })
                 .transpose()?
                 .flatten();
             let enumerated =
@@ -3049,7 +3053,7 @@ impl<S: StorageProvider> Engine<S> {
             self.quarantine_failed_rewinds();
             if let Some(contexts) = past_contexts {
                 let after_enumeration = if matches!(&enumerated, Ok(Some(_))) {
-                    ingest::PastPeelContextCache::replay_state(&self.storage, group_id)?
+                    ingest::PastPeelContextCache::replay_state(self.storage.as_ref(), group_id)?
                 } else {
                     None
                 };
@@ -3445,7 +3449,7 @@ impl<S: StorageProvider> Engine<S> {
             })?;
         let max_rewind_commits = policy.convergence.max_rewind_commits;
         crate::openmls_projection::candidate_branch_peel(
-            &self.storage,
+            self.storage.as_ref(),
             &self.rewinds,
             group_id,
             group.epoch.0.saturating_sub(max_rewind_commits),
@@ -3489,7 +3493,7 @@ impl<S: StorageProvider> Engine<S> {
         let max_rewind = policy.convergence.max_rewind_commits;
         let mut continuation = self.peel_replays.remove(group_id);
         let result = crate::openmls_projection::candidate_peel_slice(
-            &self.storage,
+            self.storage.as_ref(),
             &self.rewinds,
             group_id,
             group.epoch.0.saturating_sub(max_rewind),

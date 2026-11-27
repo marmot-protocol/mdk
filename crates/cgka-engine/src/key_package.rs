@@ -627,7 +627,7 @@ impl<S: StorageProvider> Engine<S> {
     /// fails the read instead: skipping it would report an owned KeyPackage
     /// as not owned.
     pub fn durably_owned_key_packages(&self) -> Result<Vec<KeyPackage>, EngineError> {
-        durably_owned_key_packages(&self.storage, self.new_protocol_profile)
+        durably_owned_key_packages(self.storage.as_ref(), self.new_protocol_profile)
     }
 
     /// [`Self::durably_owned_key_packages`] with how long the list holds while
@@ -635,7 +635,7 @@ impl<S: StorageProvider> Engine<S> {
     pub fn durably_owned_key_packages_with_validity(
         &self,
     ) -> Result<OwnedKeyPackages, EngineError> {
-        durably_owned_key_packages_with_validity(&self.storage, self.new_protocol_profile)
+        durably_owned_key_packages_with_validity(self.storage.as_ref(), self.new_protocol_profile)
     }
 
     /// Whether `key_package` advertises what a KeyPackage built now would:

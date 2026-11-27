@@ -13,7 +13,6 @@
 //! the same way (device-tag-v1.md, "Producing tags").
 
 use crate::engine::Engine;
-use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::engine::SendResult;
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
@@ -26,20 +25,17 @@ use cgka_traits::transport::EncryptedPayload;
 use cgka_traits::types::{EpochId, GroupId, MessageId};
 use openmls_traits::OpenMlsProvider as _;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use tls_codec::Serialize as _;
 
 struct PreparingEvolutionGuard<S: StorageProvider> {
-    storage: *const S,
+    storage: Arc<S>,
     id: MessageId,
     armed: bool,
 }
 
-// SAFETY: the pointer is only dereferenced from Drop while the guarded
-// `&mut Engine` future, and therefore its storage, is still alive.
-unsafe impl<S: StorageProvider> Send for PreparingEvolutionGuard<S> {}
-
 impl<S: StorageProvider> PreparingEvolutionGuard<S> {
-    fn arm(storage: &S, id: MessageId) -> Self {
+    fn arm(storage: Arc<S>, id: MessageId) -> Self {
         Self {
             storage,
             id,
@@ -54,12 +50,10 @@ impl<S: StorageProvider> PreparingEvolutionGuard<S> {
 
 impl<S: StorageProvider> Drop for PreparingEvolutionGuard<S> {
     fn drop(&mut self) {
-        if self.armed {
-            // SAFETY: see the Send justification above.
-            let storage = unsafe { &*self.storage };
-            if let Some(maintenance) = storage.maintenance_storage() {
-                let _ = maintenance.delete_group_evolution(&self.id);
-            }
+        if self.armed
+            && let Some(maintenance) = self.storage.maintenance_storage()
+        {
+            let _ = maintenance.delete_group_evolution(&self.id);
         }
     }
 }
@@ -141,10 +135,10 @@ impl<S: StorageProvider> Engine<S> {
         };
         // Semantic intent precedes every MLS mutation.
         maintenance_storage.put_group_evolution(&evolution)?;
-        let preparation_guard = PreparingEvolutionGuard::arm(&self.storage, evolution_id.clone());
+        let preparation_guard =
+            PreparingEvolutionGuard::arm(Arc::clone(&self.storage), evolution_id.clone());
 
-        let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+        let pending_commit_guard = self.arm_pending_commit_guard(group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
@@ -213,7 +207,15 @@ impl<S: StorageProvider> Engine<S> {
         evolution.phase = GroupEvolutionPhase::Prepared;
         evolution.signed_message_id = Some(wrapped.id.clone());
 
-        let pending_ref = self.epoch_manager.next_pending_ref()?;
+        let prepared_pending = self.epoch_manager.prepare_pending(
+            group_id.clone(),
+            source_epoch,
+            evolution.target_epoch,
+            StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
+            crate::epoch_manager::PendingKind::GroupEvolution,
+            self.current_audit_context.clone(),
+        )?;
+        let pending_ref = prepared_pending.pending_ref();
         evolution.pending_ref = Some(pending_ref);
         // A Prepared descriptor and its exact signed Commit/content marker
         // are one staging unit. Preparing predates the transport await; the
@@ -233,15 +235,7 @@ impl<S: StorageProvider> Engine<S> {
             Ok::<_, EngineError>(content_id)
         })?;
         self.invalidate_deferred_peel_candidate_cache(&group_id);
-        self.epoch_manager.begin_pending(
-            group_id.clone(),
-            source_epoch,
-            evolution.target_epoch,
-            StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
-            pending_ref,
-            crate::epoch_manager::PendingKind::GroupEvolution,
-            self.current_audit_context.clone(),
-        )?;
+        self.epoch_manager.commit_pending(prepared_pending);
         self.track_pending_origin_commit(pending_ref, wrapped.id.clone());
         self.sent_message_ids.insert(wrapped.id.clone());
         self.sent_message_ids.insert(content_id);

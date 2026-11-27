@@ -8,28 +8,20 @@ use super::{
 };
 // Stands still at zero: a zero deadline has passed, and a later one never comes.
 use super::resumable::StoppedClock;
-use crate::account_identity_proof::{AccountIdentityProofRequest, AccountIdentityProofSigner};
 use crate::convergence::V1_MAX_REWIND_COMMITS;
+use crate::engine::test_support::{PassthroughPeeler, SeedProofSigner, carried, signing_key};
 use crate::message_processor::MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS;
 use crate::provider::EngineOpenMlsProvider;
 use crate::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
-use async_trait::async_trait;
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
-use cgka_traits::error::PeelerError;
-use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::maintenance::MonotonicClock as _;
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
-use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerStorage, GroupStorage, MessageStorage, OutboundIntentStorage,
     StorageProvider,
 };
-use cgka_traits::transport::{
-    EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
-};
+use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
-use k256::schnorr::{SigningKey, signature::hazmat::PrehashSigner};
 use openmls::group::MlsGroup;
 use openmls::prelude::{MlsMessageIn, ProcessedMessageContent};
 use openmls_basic_credential::SignatureKeyPair;
@@ -43,132 +35,12 @@ use tls_codec::{Deserialize as _, Serialize as _};
 
 // --- Test devices --------------------------------------------------------
 
-/// Deterministic BIP-340 key for a seed label. Marmot credential identities
-/// MUST be a valid 32-byte x-only secp256k1 public key, so identities are
-/// derived rather than invented.
-fn signing_key(seed: &[u8]) -> SigningKey {
-    for counter in 0u64.. {
-        let mut material = [0u8; 32];
-        let mut hasher = Sha256::new();
-        hasher.update(b"cgka-engine-test-identity-v1");
-        hasher.update(seed);
-        hasher.update(counter.to_be_bytes());
-        material.copy_from_slice(&hasher.finalize());
-        if let Ok(key) = SigningKey::from_slice(&material) {
-            return key;
-        }
-    }
-    unreachable!("a signing key is found within u64 counters")
-}
-
 fn member_id(seed: &[u8]) -> MemberId {
     MemberId::new(signing_key(seed).verifying_key().to_bytes().to_vec())
 }
 
-struct SeedProofSigner(SigningKey);
-
-impl AccountIdentityProofSigner for SeedProofSigner {
-    fn sign_account_identity_proof(
-        &self,
-        request: &AccountIdentityProofRequest,
-    ) -> Result<[u8; 64], String> {
-        Ok(self
-            .0
-            .sign_prehash(&request.proof_event_id()?)
-            .map_err(|e| e.to_string())?
-            .to_bytes())
-    }
-}
-
-/// Transport is not under test here: every message is carried verbatim.
-struct PassthroughPeeler;
-
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-impl TransportPeeler for PassthroughPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
-        &self,
-        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
-        _ctx: &GroupContextSnapshot,
-    ) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.message.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::MlsMessage {
-                bytes: msg.message.payload.clone(),
-            },
-            origin: msg.message.clone(),
-        })
-    }
-
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-
-    async fn wrap_group_message(
-        &self,
-        payload: &EncryptedPayload,
-        _ctx: &GroupContextSnapshot,
-    ) -> Result<TransportMessage, PeelerError> {
-        Ok(transport_message(
-            &payload.ciphertext,
-            TransportEnvelope::GroupMessage {
-                transport_group_id: vec![],
-            },
-        ))
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        let mut message = transport_message(
-            &payload.ciphertext,
-            TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
-            },
-        );
-        // Current-profile founding sends a distinct envelope per invitee,
-        // even when the underlying MLS Welcome bytes are shared.
-        let mut digest = Sha256::new();
-        digest.update(&payload.ciphertext);
-        digest.update(recipient.as_slice());
-        message.id = MessageId::new(digest.finalize().to_vec());
-        Ok(message)
-    }
-}
-
 fn transport_message(payload: &[u8], envelope: TransportEnvelope) -> TransportMessage {
-    TransportMessage {
-        id: MessageId::new(Sha256::digest(payload).to_vec()),
-        payload: payload.to_vec(),
-        timestamp: Timestamp(0),
-        causal_deps: vec![],
-        source: TransportSource("candidate-branch-peel-test".into()),
-        envelope,
-    }
+    carried("candidate-branch-peel-test", payload, envelope)
 }
 
 fn build_client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {

@@ -30,7 +30,6 @@
 
 use crate::commit_class::CommitClass;
 use crate::engine::Engine;
-use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::private_key_packages::SiblingWelcome;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
@@ -206,7 +205,7 @@ impl<S: StorageProvider> Engine<S> {
                 )
                 .and_then(|parsed| {
                     crate::capability_manager::check_key_package_profiles(
-                        &self.storage,
+                        self.storage.as_ref(),
                         group_id,
                         &parsed,
                     )
@@ -314,8 +313,7 @@ impl<S: StorageProvider> Engine<S> {
         };
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
-        let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+        let pending_commit_guard = self.arm_pending_commit_guard(group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let (commit_out, welcome_out) =
@@ -358,7 +356,7 @@ impl<S: StorageProvider> Engine<S> {
             mls_group.own_leaf_index(),
         )?;
         crate::capability_manager::check_key_package_profiles(
-            &self.storage,
+            self.storage.as_ref(),
             &group_id,
             &parsed_kps,
         )?;
@@ -414,6 +412,17 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
+        let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
+        let prepared_pending = self.epoch_manager.prepare_pending(
+            group_id.clone(),
+            pre_commit_epoch,
+            new_epoch,
+            StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
+            crate::epoch_manager::PendingKind::GroupEvolution,
+            self.current_audit_context.clone(),
+        )?;
+        let pending_ref = prepared_pending.pending_ref();
+
         let content_id = self.storage.with_transaction(|storage| {
             let content_id = self.persist_sent_openmls_message_with_application_stamp(
                 &commit_msg,
@@ -436,18 +445,8 @@ impl<S: StorageProvider> Engine<S> {
         self.sent_message_ids.insert(commit_msg.id.clone());
         self.sent_message_ids.insert(content_id);
 
-        let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
-        let pending_ref = self.epoch_manager.next_pending_ref()?;
         self.invalidate_deferred_peel_candidate_cache(&group_id);
-        self.epoch_manager.begin_pending(
-            group_id.clone(),
-            pre_commit_epoch,
-            new_epoch,
-            StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
-            pending_ref,
-            crate::epoch_manager::PendingKind::GroupEvolution,
-            self.current_audit_context.clone(),
-        )?;
+        self.epoch_manager.commit_pending(prepared_pending);
         self.audit_group(
             &group_id,
             crate::audit_helpers::epoch_state_changed_event(

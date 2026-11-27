@@ -294,7 +294,7 @@ impl<S: StorageProvider> Engine<S> {
         if !matches!(crate::engine::add_leaf_lifetime(leaf), Ok(Some(_))) {
             return None;
         }
-        let own_slot = own_device_slot(&self.storage).ok().flatten();
+        let own_slot = own_device_slot(self.storage.as_ref()).ok().flatten();
         self.own_device_tag_after(group, proposals, own_slot)
     }
 
@@ -314,7 +314,7 @@ impl<S: StorageProvider> Engine<S> {
             .as_ref()
             .is_some_and(|group_id| group_id.as_slice() == mls_group.group_id().as_slice());
         let own = if in_device_group {
-            let own_slot = own_device_slot(&self.storage).ok().flatten();
+            let own_slot = own_device_slot(self.storage.as_ref()).ok().flatten();
             self.own_device_tag_after(mls_group, proposals, own_slot)
         } else {
             self.first_own_roster_tag(mls_group, proposals)
