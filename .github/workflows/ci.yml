@@ -390,6 +390,7 @@ jobs:
           python3 scripts/test_check_cargo_audit_ci.py
           python3 scripts/test_classify_ci_changes.py
           python3 scripts/test_ci_workflow_policy.py
+          python3 scripts/test_dependents_nextest.py
           python3 scripts/test_flake_report.py
 
       - name: Test timing ratchet

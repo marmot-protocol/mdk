@@ -115,9 +115,30 @@ crate `AGENTS.md` ask for:
 
 ```sh
 cargo fmt --all
-cargo clippy -p <crate> --all-targets --all-features --locked -- -D warnings   # each crate you changed
-cargo nextest run -p <crate> -E 'test(<area>)'                                 # tests covering the change
+cargo clippy -p <crate> --all-targets --locked -- -D warnings                  # each crate you changed, default features
+cargo clippy -p <crate> --all-targets --all-features --locked -- -D warnings   # each crate you changed, all features
+just dependents-nextest                                                        # changed crates and every crate depending on one
 ```
+
+`just dependents-nextest` is the Canary's workspace test run cut down to what
+your change can break: the full suites of every crate changed since the
+merge-base with `origin/master` (committed or not) and of every crate that
+depends on one, `marmot-app`'s `relay_runtime` included, with the Canary's
+test features. A change to a lower crate breaks the crates above it, and a
+targeted run of your own crate never sees that. A runtime-crate change almost
+always reaches `marmot-app`, about 8 minutes on a warm build: run it once, on
+the commit you push, and use targeted `cargo nextest run -p <crate> -E
+'test(<area>)'` while you iterate. Run one at a time per machine; concurrent
+full suites saturate the CPU and timing-sensitive tests fail. It leaves the
+simulator and `wn-cli`'s `cli` journeys to the smoke below and the table rows.
+
+Clippy runs twice because CI does: code used only by feature-gated tests is
+dead in the default build (#3826 broke `master` that way).
+
+Stress every test you add or change, alone and without retries: `just
+flake-stress <crate> 'test(=<name>)' 5`, adding `--features
+test-policy-overrides` when its module needs it. A test that fails once in
+five is a flake you are about to merge.
 
 Then run the end-to-end smoke, unless the change touches only docs or CI
 metadata:
@@ -144,7 +165,7 @@ team PR skips; a row you skip is a failure you push to `master`.
 
 | Your change touches | Run |
 | --- | --- |
-| A `pub` item other crates use (type, field, variant, trait, signature, feature) | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, and the tests of each dependent whose behavior changed |
+| A `pub` item other crates use (type, field, variant, trait, signature, feature) | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` (`just dependents-nextest` already ran its dependents' tests) |
 | `cgka-traits`, `cgka-engine`, `transport-nostr-peeler`, or anything they depend on | `just wasm-check` |
 | A crate in `marmot-uniffi`'s tree (through `marmot-app` that is nearly every runtime crate; check with `cargo tree -p marmot-uniffi -i <crate>`) | `just android-check`, and `just binding-docs-gate` when the binding surface changed |
 | Convergence, delivery, branch selection, or multi-client behavior | `just simulator-smoke` |
