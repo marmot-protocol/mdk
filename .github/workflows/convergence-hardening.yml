@@ -80,7 +80,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
         with:
-          tool: cargo-nextest@0.9.104
+          tool: cargo-nextest@0.9.132
 
       - name: Install just
         uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5

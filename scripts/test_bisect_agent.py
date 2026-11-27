@@ -364,6 +364,103 @@ class ClassifierTests(unittest.TestCase):
         self.assertIn("never auto-reverted", inter_stress.reason)
         self.assertNotIn("1/5", inter_stress.reason)
 
+    def test_deterministic_regression_not_suppressed_by_leaderboard_or_flake_issue(self):
+        sig = FailureSignal(
+            source="hosted_canary",
+            run_id="r-flake-order",
+            run_url="https://example.com/r-flake-order",
+            tip_sha="2" * 40,
+            baseline_sha="1" * 40,
+            failed_job="Full cross-platform CI (6 shards) / Rust tests (1/6)",
+            failed_test="marmot-session::runtime::an_overdue_component_recheck_is_owed_not_due_now",
+            command=nextest_command_for_test(
+                "marmot-session",
+                "runtime",
+                "an_overdue_component_recheck_is_owed_not_due_now",
+                profile="ci",
+            ),
+        )
+        leaderboard = [
+            {
+                "number": 3351,
+                "title": "Flaky test leaderboard",
+                "body": "| 1 | `an_overdue_component_recheck_is_owed_not_due_now` | `marmot-session::runtime` | 0 | 2 |",
+            }
+        ]
+        individual = [
+            {
+                "number": 4001,
+                "title": "Flaky: marmot-session::runtime::an_overdue_component_recheck_is_owed_not_due_now",
+                "body": "",
+            }
+        ]
+
+        # 1. Deterministic regression (fails tip, passes baseline) MUST NOT be suppressed by
+        # the leaderboard OR by an open individual `Flaky:` issue.
+        for label, issues in (("leaderboard", leaderboard), ("individual", individual)):
+            with self.subTest(issues=label):
+                seen_shas: list[str] = []
+
+                def det_runner(sha: str, _cmd: tuple[str, ...]) -> tuple[RunVerdict, str]:
+                    seen_shas.append(sha)
+                    return (
+                        (RunVerdict.FAIL, "target test failed")
+                        if sha == sig.tip_sha
+                        else (RunVerdict.PASS, "target test passed")
+                    )
+
+                cls = classify_failure(sig, run_on_sha=det_runner, open_flake_issues=issues)
+                self.assertEqual(cls.bucket, Bucket.DETERMINISTIC_REGRESSION)
+                self.assertEqual(seen_shas, [sig.tip_sha, sig.baseline_sha])
+
+        # 2. Individual `Flaky:` issue applies when tip passes single retry (intermittent),
+        # skipping the expensive stress loop.
+        retry_calls: list[tuple[str, tuple[str, ...]]] = []
+
+        def pass_retry(sha: str, cmd: tuple[str, ...]) -> tuple[RunVerdict, str]:
+            retry_calls.append((sha, cmd))
+            return RunVerdict.PASS, "target test passed"
+
+        inter_known = classify_failure(
+            sig,
+            run_on_sha=pass_retry,
+            open_flake_issues=individual,
+            stress_count=5,
+        )
+        self.assertEqual(inter_known.bucket, Bucket.KNOWN_FLAKE)
+        self.assertEqual(inter_known.matched_issue, 4001)
+        self.assertEqual(len(retry_calls), 1)
+        self.assertNotIn("--stress-count", retry_calls[0][1])
+
+        # 3. Leaderboard alone never counts as a known-flake issue even on an intermittent pass.
+        inter_board_only = classify_failure(
+            sig,
+            run_on_sha=lambda _s, _c: (RunVerdict.PASS, "target test passed"),
+            open_flake_issues=leaderboard,
+            stress_count=5,
+        )
+        self.assertEqual(inter_board_only.bucket, Bucket.NEW_INTERMITTENT)
+        self.assertIsNone(inter_board_only.matched_issue)
+
+        # 4. Individual `Flaky:` issue also applies when BOTH tip and baseline fail.
+        both_fail_known = classify_failure(
+            sig,
+            run_on_sha=lambda _s, _c: (RunVerdict.FAIL, "target test failed"),
+            open_flake_issues=individual,
+        )
+        self.assertEqual(both_fail_known.bucket, Bucket.KNOWN_FLAKE)
+        self.assertEqual(both_fail_known.matched_issue, 4001)
+
+        # Without a matching individual `Flaky:` issue (including leaderboard-only), both failing
+        # remains an INFRA_ERROR baseline break.
+        both_fail_unknown = classify_failure(
+            sig,
+            run_on_sha=lambda _s, _c: (RunVerdict.FAIL, "target test failed"),
+            open_flake_issues=leaderboard,
+        )
+        self.assertEqual(both_fail_unknown.bucket, Bucket.INFRA_ERROR)
+        self.assertIn("baseline break:", both_fail_unknown.reason)
+
     def test_sanitized_predicate_env_and_live_mode_requires_isolation_prefix(self):
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)
@@ -887,12 +984,11 @@ class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
         self.assertIsNone(
             match_known_flake_issue("core::jobs::connect", [{"number": 11, "title": "Flaky: other::connect", "body": ""}])
         )
-        self.assertEqual(
+        self.assertIsNone(
             match_known_flake_issue(
                 "core::jobs::connect",
                 [{"number": 12, "title": "Flaky test leaderboard", "body": "| `core::jobs::connect` | 3 |"}],
             ),
-            12,
         )
         self.assertEqual(
             match_known_flake_issue("core::jobs::connect", [{"number": 13, "title": "Flaky: connect", "body": ""}]),
@@ -998,8 +1094,11 @@ class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
                 dry_run=False,
                 sign_commits=False,
                 worktree_root=tmp / "wts",
-                run_in_wt=lambda wt, _cmd: (
-                    RunVerdict.PASS if (wt / "app.txt").read_text(encoding="utf-8").strip() == "good" else RunVerdict.FAIL,
+                run_in_wt=lambda wt, cmd: (
+                    RunVerdict.PASS
+                    if "known_flake" in " ".join(cmd)
+                    or (wt / "app.txt").read_text(encoding="utf-8").strip() == "good"
+                    else RunVerdict.FAIL,
                     "",
                 ),
             )
@@ -1669,8 +1768,11 @@ class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
                 dry_run=False,
                 sign_commits=False,
                 worktree_root=tmp / "wts",
-                run_in_wt=lambda wt, _cmd: (
-                    RunVerdict.PASS if (wt / "app.txt").read_text(encoding="utf-8").strip() == "good" else RunVerdict.FAIL,
+                run_in_wt=lambda wt, cmd: (
+                    RunVerdict.PASS
+                    if "known_flake" in " ".join(cmd)
+                    or (wt / "app.txt").read_text(encoding="utf-8").strip() == "good"
+                    else RunVerdict.FAIL,
                     "",
                 ),
             )
@@ -1927,6 +2029,8 @@ class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
                 tree_state=TreeStateController(repo, dry_run=True, sign_commits=False),
                 dry_run=False,
                 sign_commits=False,
+                worktree_root=tmp / "wts-drain",
+                run_in_wt=lambda _wt, _cmd: (RunVerdict.PASS, "passed retry"),
             )
             r_err = ctrl_drain.poll_once(hosted_workflows=("canary.yml",), fetch_remote=False)
             self.assertEqual(r_err["actions"][0]["result"], "jobs_api_error")

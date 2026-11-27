@@ -3,7 +3,7 @@ name: CI
 # Team pull requests run a fast static gate (~1 minute, zero Rust compile):
 # verified commit signatures, formatting, static/contract gates, cargo-audit,
 # and advisory commit-trailer checks. External/fork pull requests, `ci:full`
-# pull requests, `workflow_dispatch`, and `merge_group` runs execute the full
+# pull requests, `workflow_dispatch`, and `workflow_call` runs execute the full
 # CI matrix (`.github/CODEOWNERS` protects `.github/` so fork PRs cannot edit
 # this workflow without owner review). Post-merge verification runs
 # continuously on `master` (advancing `canary`). Master pushes refresh Rust
@@ -30,7 +30,6 @@ on:
       - .github/workflows/ci.yml
       - .github/actions/setup-odin/**
       - scripts/install-odin.sh
-  merge_group:
   workflow_call:
     inputs:
       source_sha:
@@ -38,7 +37,7 @@ on:
         type: string
         default: ""
       rust_test_shards:
-        description: Number of workspace nextest shards (6 for async Canary, 14 for full PR/merge runs)
+        description: Number of workspace nextest shards (6 for async Canary, 14 for full PR/manual runs)
         type: number
         default: 14
   workflow_dispatch:
@@ -57,7 +56,7 @@ permissions:
 
 concurrency:
   # Pull requests and cache-refresh pushes supersede their own older runs. A
-  # unique group protects merge-group and manual runs: GitHub otherwise
+  # unique group protects manual and Canary runs: GitHub otherwise
   # replaces older pending runs even when cancel-in-progress is false.
   group: ci-${{ github.workflow }}-${{ (github.event_name == 'pull_request' || github.event_name == 'push') && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
@@ -216,7 +215,7 @@ jobs:
 
       # fast: team pull requests without `ci:full` run signatures, formatting,
       # static gates, cargo-audit, and advisory trailer checks (zero compile).
-      # full: external/fork PRs, `ci:full` PRs, merge groups, and manual runs
+      # full: external/fork PRs, `ci:full` PRs, `workflow_call`, and manual runs
       # execute every CI job.
       # warm: master pushes run only the jobs that save a Rust cache.
       - name: Select CI mode
@@ -254,7 +253,7 @@ jobs:
             fi
           fi
           shards="${REQUESTED_SHARDS:-14}"
-          if [[ "$EVENT_NAME" == pull_request || "$EVENT_NAME" == merge_group ]]; then
+          if [[ "$EVENT_NAME" == pull_request ]]; then
             shards=14
           fi
           case "$shards" in
@@ -707,7 +706,7 @@ jobs:
           if-no-files-found: warn
 
   # Pull requests run this and marmotkit-native-host only with the `ci:apple`
-  # or `ci:full` label; merge groups always run them, so they gate merging.
+  # or `ci:full` label; hourly Canary and full runs always execute them.
   ios-account-clippy:
     name: iOS keychain and Swift cancellation
     needs: changes
@@ -1969,98 +1968,10 @@ jobs:
           cargo nextest run --locked -p marmot-app --lib
           -E 'test(root_runtime_lease)'
 
-  # A merge-group run stops at its first failed job. `Required CI` waits for
-  # every job, so without this one failure would hold the PR, and every group
-  # built on top of it, in the queue until the slowest job finished. Cancelling
-  # the run cancels the jobs still running; `Required CI` still runs, sees
-  # them cancelled and fails, and the queue ejects the PR. The run also stops
-  # once the queue drops its group, for example to rebuild it after a group
-  # ahead failed; GitHub leaves that run going, holding runners the rebuilt
-  # groups need, and its `Required CI` reports on a commit the queue no longer
-  # tracks. This is the only job with `actions: write` and runs no repository
-  # code. It is not one of `Required CI`'s needs, since it waits for that job
-  # to appear, and it must never fail a run whose required jobs passed.
-  merge-group-fail-fast:
-    name: Merge-group fail-fast
-    if: github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
-    timeout-minutes: 160
-    continue-on-error: true
-    permissions:
-      actions: write
-      checks: read
-      contents: read
-
-    steps:
-      - name: Cancel the run when a job fails
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-          HEAD_REF: ${{ github.ref }}
-          HEAD_SHA: ${{ github.sha }}
-        run: |
-          set -uo pipefail
-          # Stop watching before the job timeout. Two requests a minute keep
-          # a run to about 80 of the token's hourly budget.
-          deadline=$((SECONDS + 150 * 60))
-          # Look up the group's branch only when the event names one;
-          # otherwise watch for failed jobs alone.
-          if [[ "$HEAD_REF" != refs/heads/?* || ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            HEAD_REF=""
-          fi
-          dropped=0
-          while (( SECONDS < deadline )); do
-            # One line per job: name, status, conclusion, check URL. Retry a
-            # failed request on the next poll.
-            if jobs="$(gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/jobs?per_page=100" \
-                --jq '.jobs[] | [.name, .status, .conclusion // "", .check_run_url // ""] | @tsv')"; then
-              # Required CI starts only once every other job has finished.
-              if awk -F '\t' '$1 == "Required CI" { found = 1 } END { exit !found }' <<<"$jobs"; then
-                exit 0
-              fi
-              # Merge groups accept only success, so any other conclusion
-              # already fails Required CI.
-              failed="$(awk -F '\t' '$2 == "completed" && $3 != "success" && $3 != "skipped"' <<<"$jobs")"
-              if [[ -n "$failed" ]]; then
-                printf 'Cancelling the run after:\n%s\n' "$failed"
-                # A dead runner may never upload logs or artifacts. Preserve
-                # its server-side failure annotations on this healthy runner
-                # before cancellation; unavailable annotations never block it.
-                while IFS=$'\t' read -r name _status _conclusion check; do
-                  if [[ -n "$check" ]]; then
-                    printf 'Failure annotations for %s:\n' "$name"
-                    gh api "$check/annotations" \
-                      --jq '.[] | select(.annotation_level == "failure") | .message' || true
-                  fi
-                done <<<"$failed"
-                gh run cancel "$RUN_ID" && exit 0
-              elif [[ -n "$HEAD_REF" ]]; then
-                # The queue deletes a dropped group's branch and may give its
-                # name to a later group on the same base. A passed group's
-                # branch is deleted only after Required CI has run, so the
-                # check above exits first. Cancel only once two lookups in a
-                # row, a minute apart, succeed without finding this commit; a
-                # failed lookup proves nothing.
-                if sha="$(gh api "repos/$GH_REPO/git/matching-refs/${HEAD_REF#refs/}" \
-                    --jq '.[] | select(.ref == env.HEAD_REF) | .object.sha')" && [[ "$sha" != "$HEAD_SHA" ]]; then
-                  dropped=$((dropped + 1))
-                else
-                  dropped=0
-                fi
-                if (( dropped >= 2 )); then
-                  printf 'Cancelling the run: the merge queue dropped %s at %s\n' "$HEAD_REF" "$HEAD_SHA"
-                  gh run cancel "$RUN_ID" && exit 0
-                fi
-              fi
-            fi
-            sleep 60
-          done
-
   required-ci:
     name: Required CI
-    # `always()`, not `!cancelled()`: this must also run, and fail, after
-    # merge-group-fail-fast cancels the run.
+    # `always()`, not `!cancelled()`: this must also run, and fail, when a run
+    # or upstream job is cancelled.
     if: always()
     needs:
       - signatures
@@ -2094,7 +2005,7 @@ jobs:
 
     steps:
       # A full run selects every job, so a skip there means a broken condition
-      # rather than an unaffected lane. Merge groups and external/fork PRs must
+      # rather than an unaffected lane. External/fork PRs and `ci:full` PRs must
       # be full runs; team PRs in fast mode must still pass signatures, changes,
       # rust-format, and rust-audit.
       - name: Require every selected core CI job to succeed
@@ -2112,10 +2023,6 @@ jobs:
           jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
           if [[ "$EVENT_NAME" == pull_request && "${TREE_STATE:-green}" == red && "${TREE_FIX_OPT_IN:-false}" != true ]]; then
             echo "error: master is frozen in Meltdown Mode (tree-state=red: ${TREE_STATE_REASON:-Canary failure}). Only PRs labelled 'tree-fix' or 'revert' may merge until Canary turns green." >&2
-            exit 1
-          fi
-          if [[ "$EVENT_NAME" == merge_group && "$CI_MODE" != full ]]; then
-            echo "error: merge group selected CI mode '$CI_MODE', not full" >&2
             exit 1
           fi
           if [[ "$EVENT_NAME" == pull_request && "$IS_TEAM_PR" != true && "$CI_MODE" != full ]]; then

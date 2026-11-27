@@ -431,7 +431,12 @@ def collect(args: argparse.Namespace, since: dt.datetime, github: GitHub | None)
     return collection
 
 
-def leaderboard(summaries: list[dict]) -> list[dict]:
+def partition_leaderboard(summaries: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split observed failures into flaky tests (passed on retry) and pure hard failures.
+
+    Only tests with `flaky_attempts > 0` belong on the flaky test leaderboard so
+    deterministic regressions and `--retries 0` hard failures never pollute it.
+    """
     rows: dict[str, dict] = {}
     for summary in summaries:
         for test, outcome in summary["outcomes"].items():
@@ -461,9 +466,19 @@ def leaderboard(summaries: list[dict]) -> list[dict]:
         row["stress"] = (f"just flake-stress {row['package']} "
                          f"'binary_id({row['binary_id']}) & test(={row['test']})'"
                          + (f" 40 --features {features}" if features else ""))
-    return sorted(rows.values(), key=lambda row: (
-        -(row["flaky_attempts"] + row["failed_attempts"]), -row["failed_attempts"],
-        row["binary_id"], row["test"]))
+    flaky_rows = sorted(
+        (row for row in rows.values() if row["flaky_attempts"] > 0),
+        key=lambda row: (-row["flaky_attempts"], -row["failed_attempts"], row["binary_id"], row["test"]),
+    )
+    failed_rows = sorted(
+        (row for row in rows.values() if row["flaky_attempts"] == 0 and row["failed_attempts"] > 0),
+        key=lambda row: (-row["failed_attempts"], row["binary_id"], row["test"]),
+    )
+    return flaky_rows, failed_rows
+
+
+def leaderboard(summaries: list[dict]) -> list[dict]:
+    return partition_leaderboard(summaries)[0]
 
 
 def created_date(summary: dict) -> str:
@@ -475,54 +490,79 @@ def code(text: str) -> str:
     return f"`` {text} ``" if "`" in text else f"`{text}`"
 
 
-def render_markdown(report: dict, top: int, samples: int) -> str:
+def render_markdown(report: dict, top: int, samples: int, failed_top: int | None = None) -> str:
     rows = report["tests"]
+    failed_rows = report.get("failed_tests", [])
+    effective_failed_top = top if failed_top is None else failed_top
     runs = report["runs"]
     flaky = sum(row["flaky_attempts"] for row in rows)
-    failed = sum(row["failed_attempts"] for row in rows)
+    flaky_hard = sum(row["failed_attempts"] for row in rows)
+    pure_failed = sum(row["failed_attempts"] for row in failed_rows)
+    flaky_summary = f"{flaky} failed attempts that passed on retry"
+    if flaky_hard:
+        flaky_summary += f" and {flaky_hard} hard-failed attempts"
     lines = [
         "# Flaky test leaderboard",
         "",
         f"Generated {report['generated_at']} from {runs['with_reports']} `{report.get('event', 'schedule')}` "
         f"`{report['workflow']}` runs with test reports, created since {report['since']}. "
-        f"{len(rows)} tests failed at least one attempt: {flaky} failed attempts of tests that then "
-        f"passed on retry (flaky), and {failed} of tests that failed every attempt (failed).",
+        f"{len(rows)} flaky tests ({flaky_summary}); "
+        f"{len(failed_rows)} non-flaky tests failed every attempt ({pure_failed} attempts, separated below).",
         "",
-        "Counts are failed attempts. The relay-runtime job runs with `--retries 0`, so its flakes count as failed. "
-        "Runs seen counts the runs whose reports include the test.",
+        "Counts are failed attempts. Only tests with at least one failed-then-passed retry appear in the "
+        "flaky leaderboard; deterministic failures and `--retries 0` jobs (such as `relay-runtime`) are "
+        "listed separately under Hard failures. Runs seen counts the runs whose reports include the test.",
     ]
     if runs["malformed_reports"]:
         lines += ["", f"{runs['malformed_reports']} report files could not be parsed and are left out."]
     for note in report["notes"]:
         lines += ["", f"> **Note:** {note}"]
     if not rows:
-        lines += ["", "No test failed an attempt in this window."]
-        return "\n".join(lines) + "\n"
-    lines += ["", "| # | Test | Package (binary) | Flaky | Failed | Runs seen | First seen | Last seen |",
-              "| ---: | --- | --- | ---: | ---: | ---: | --- | --- |"]
-    for rank, row in enumerate(rows[:top], 1):
-        lines.append(f"| {rank} | {code(row['test'])} | {code(row['binary_id'])} | {row['flaky_attempts']} | "
-                     f"{row['failed_attempts']} | {row['runs_seen']} | {row['first_seen']} | {row['last_seen']} |")
-    if len(rows) > top:
-        more = len(rows) - top
-        lines += ["", f"{more} more {'test' if more == 1 else 'tests'} failed at least one attempt."]
-    if samples:
-        lines += ["", "## Failure samples"]
-        for rank, row in enumerate(rows[:samples], 1):
-            lines += ["", f"{rank}. {code(row['test'])}", "", f"   {code(row['stress'])}", ""]
-            for sample in row["samples"]:
-                where = code(sample["location"]) + ": " if sample["location"] else ""
-                lines.append(f"   - {where}{code(sample['message'])}" if sample["message"] else f"   - {where}")
+        lines += ["", "No test passed on retry after failing in this window."]
+    else:
+        lines += ["", "| # | Test | Package (binary) | Flaky | Failed | Runs seen | First seen | Last seen |",
+                  "| ---: | --- | --- | ---: | ---: | ---: | --- | --- |"]
+        for rank, row in enumerate(rows[:top], 1):
+            lines.append(f"| {rank} | {code(row['test'])} | {code(row['binary_id'])} | {row['flaky_attempts']} | "
+                         f"{row['failed_attempts']} | {row['runs_seen']} | {row['first_seen']} | {row['last_seen']} |")
+        if len(rows) > top:
+            more = len(rows) - top
+            lines += ["", f"{more} more flaky {'test' if more == 1 else 'tests'} failed and passed on retry."]
+        if samples:
+            lines += ["", "## Failure samples"]
+            for rank, row in enumerate(rows[:samples], 1):
+                lines += ["", f"{rank}. {code(row['test'])}", "", f"   {code(row['stress'])}", ""]
+                for sample in row["samples"]:
+                    where = code(sample["location"]) + ": " if sample["location"] else ""
+                    lines.append(f"   - {where}{code(sample['message'])}" if sample["message"] else f"   - {where}")
+    if failed_rows and effective_failed_top > 0:
+        lines += [
+            "",
+            "## Hard failures (failed every attempt)",
+            "",
+            "| # | Test | Package (binary) | Failed | Runs seen | First seen | Last seen |",
+            "| ---: | --- | --- | ---: | ---: | --- | --- |",
+        ]
+        for rank, row in enumerate(failed_rows[:effective_failed_top], 1):
+            lines.append(f"| {rank} | {code(row['test'])} | {code(row['binary_id'])} | {row['failed_attempts']} | "
+                         f"{row['runs_seen']} | {row['first_seen']} | {row['last_seen']} |")
+        if len(failed_rows) > effective_failed_top:
+            more = len(failed_rows) - effective_failed_top
+            lines += ["", f"{more} more non-flaky {'test' if more == 1 else 'tests'} failed every attempt."]
     return "\n".join(lines) + "\n"
 
 
 def fit_markdown(report: dict, top: int, samples: int, max_chars: int) -> str:
-    """Drop sample sections, then table rows, until the Markdown fits."""
+    """Drop hard-failure rows, sample sections, then flaky table rows, until the Markdown fits."""
+    failed_top = min(top, len(report.get("failed_tests", [])))
+    samples = min(samples, len(report["tests"]))
     while True:
-        text = render_markdown(report, top, samples)
-        if len(text) <= max_chars or (top <= 1 and samples == 0):
+        text = render_markdown(report, top, samples, failed_top=failed_top)
+        if len(text) <= max_chars or (top <= 1 and samples == 0 and failed_top == 0):
             return text
-        if samples:
+        if failed_top:
+            failed_top -= 1
+        elif samples:
             samples -= 1
         else:
             top -= 1
@@ -535,6 +575,7 @@ def build_report(args: argparse.Namespace, since: dt.datetime, collection: Colle
         collection.notes.append(
             f"Partial data: {sum(s['expired'] for s in expired)} test reports in {len(expired)} runs had "
             "expired before they were fetched, so those runs count without them.")
+    flaky_rows, failed_rows = partition_leaderboard(summaries)
     return {
         "generated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "repo": args.repo, "workflow": args.workflow, "event": args.event,
@@ -547,7 +588,8 @@ def build_report(args: argparse.Namespace, since: dt.datetime, collection: Colle
         # Every note says what this report is missing.
         "partial": bool(collection.notes),
         "notes": collection.notes,
-        "tests": leaderboard(summaries),
+        "tests": flaky_rows,
+        "failed_tests": failed_rows,
     }
 
 
