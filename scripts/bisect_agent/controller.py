@@ -14,6 +14,8 @@ import time
 from typing import Any, Callable
 
 from .classifier import (
+    NEXTEST_FAIL_RE,
+    NEXTEST_PASS_RE,
     classify_failure,
     evaluate_command_result,
     extract_bare_metal_signal,
@@ -22,6 +24,7 @@ from .classifier import (
     extract_hosted_signals,
     is_non_linux_job,
     match_issue_by_title,
+    normalize_log_text,
 )
 from .models import (
     AgentState,
@@ -201,10 +204,15 @@ class GitHubOps:
 
         Reads the jobs logs API: `gh run view --job <id> --log` prints nothing (exit 0) for
         jobs of a called workflow, and every hosted Canary test job runs inside `ci.yml`.
+        gh 2.97+ refuses the escape sequences in these logs without `--allow-escape-sequences`,
+        which older gh rejects as an unknown flag. The log is captured, never printed raw.
         Returns `None` on GitHub API/CLI failure or timeout so callers defer and retry
         rather than treating an unavailable log as an empty unparsed job.
         """
-        res = self._run_gh_safe("api", f"repos/{self.repo}/actions/jobs/{job_id}/logs")
+        endpoint = f"repos/{self.repo}/actions/jobs/{job_id}/logs"
+        res = self._run_gh_safe("api", "--allow-escape-sequences", endpoint)
+        if res is not None and res.returncode != 0 and "unknown flag: --allow-escape-sequences" in res.stderr:
+            res = self._run_gh_safe("api", endpoint)
         if res is None or res.returncode != 0:
             return None
         return res.stdout
@@ -1899,24 +1907,31 @@ def selftest(
     """Exercise the live hosted log fetch and sandboxed replay the unit tests fake; return problems found."""
     problems: list[str] = []
     job_ref: tuple[int, int] | None = None
-    for run in github.recent_workflow_runs("canary.yml", limit=10):
+    # A test shard's log is the one the agent must parse; planner jobs and hourly skip runs
+    # carry no nextest output, so look past them.
+    for run in github.recent_workflow_runs("canary.yml", limit=30):
         jobs = github.jobs_for_run(int(run.get("id") or 0)) or []
-        called = [
+        shards = [
             job
             for job in jobs
-            if " / " in str(job.get("name") or "") and job.get("conclusion") in {"success", "failure"}
+            if "/ Rust tests (" in str(job.get("name") or "") and job.get("conclusion") in {"success", "failure"}
         ]
-        if called:
-            job_ref = (int(run["id"]), int(called[0]["id"]))
+        if shards:
+            job_ref = (int(run["id"]), int(shards[0]["id"]))
             break
     if job_ref is None:
-        problems.append("no completed ci.yml job found in the last 10 hosted Canary runs")
+        problems.append("no completed Rust tests shard found in the last 30 hosted Canary runs")
     else:
+        ref = f"(run {job_ref[0]}, job {job_ref[1]})"
         log = github.job_log(*job_ref)
         if log is None:
-            problems.append(f"hosted job log fetch failed (run {job_ref[0]}, job {job_ref[1]})")
+            problems.append(f"hosted job log fetch failed {ref}")
         elif not log.strip():
-            problems.append(f"hosted job log came back empty (run {job_ref[0]}, job {job_ref[1]})")
+            problems.append(f"hosted job log came back empty {ref}")
+        else:
+            cleaned = normalize_log_text(log)
+            if not (NEXTEST_PASS_RE.search(cleaned) or NEXTEST_FAIL_RE.search(cleaned)):
+                problems.append(f"hosted job log has no nextest results {ref}")
 
     sha = resolve_commit(repo_dir, "origin/master")
     if sha is None:

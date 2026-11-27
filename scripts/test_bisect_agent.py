@@ -417,18 +417,25 @@ class ClassifierTests(unittest.TestCase):
             self.assertEqual(verdict, RunVerdict.PASS)
             self.assertEqual((target / "nextest" / "ci" / "probe").read_text(), "ok")
 
-    def test_selftest_flags_an_empty_hosted_job_log(self):
+    def test_selftest_checks_a_test_shard_log_for_nextest_results(self):
         # Every live hosted job log came back empty and nothing noticed. `selftest` is the
-        # deploy check that must, while a non-empty log raises no log problem.
-        job = {"id": 70, "name": "Full cross-platform CI (6 shards) / Rust tests (5/6)", "conclusion": "failure"}
+        # deploy check that must, on a test shard's log: a planner log or a skip run parses
+        # nothing, so it must not stand in for the logs the agent classifies.
+        planner = {"id": 80, "name": "Full cross-platform CI (6 shards) / Plan", "conclusion": "success"}
+        shard = {"id": 70, "name": "Full cross-platform CI (6 shards) / Rust tests (5/6)", "conclusion": "failure"}
+        cases = (
+            ("", "hosted job log came back empty (run 7, job 70)"),
+            ("plain step output\n", "hosted job log has no nextest results (run 7, job 70)"),
+            ("\x1b[31;1m        FAIL\x1b[0m [   0.1s] marmot-app a::b\n", None),
+        )
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)
-            for log, flagged in (("", True), ("  FAIL [ 0.1s] marmot-app a::b\n", False)):
-                with self.subTest(log=log):
+            for shard_log, expected in cases:
+                with self.subTest(shard_log=shard_log):
                     gh = StubGitHub(
-                        runs_by_workflow={"canary.yml": [{"id": 7}]},
-                        failed_jobs_by_run={7: [job]},
-                        logs_by_job={70: log},
+                        runs_by_workflow={"canary.yml": [{"id": 8}, {"id": 7}]},
+                        failed_jobs_by_run={8: [planner], 7: [planner, shard]},
+                        logs_by_job={80: "plan: skip\n", 70: shard_log},
                     )
                     problems = selftest(
                         gh,
@@ -438,19 +445,28 @@ class ClassifierTests(unittest.TestCase):
                         runner_prefix=("env",),
                         timeout_secs=30,
                     )
-                    self.assertEqual("hosted job log came back empty (run 7, job 70)" in problems, flagged)
+                    log_problems = [p for p in problems if p.startswith("hosted job log")]
+                    self.assertEqual(log_problems, [expected] if expected else [])
 
     def test_job_log_reads_called_workflow_jobs_through_the_jobs_logs_api(self):
         # `gh run view --job <id> --log` prints nothing and exits 0 for jobs of the reusable
         # `ci.yml` call ("Full cross-platform CI (6 shards) / ..."), which turned every hosted
-        # Canary failure into an unparsed, unreproducible freeze.
-        gh_ops = GitHubOps("marmot-protocol/mdk", dry_run=True)
-        log = "  TRY 2 FAIL [   4.443s] ( 382/1567) marmot-app client::push::tests::push_batch_delivery\n"
-        with mock.patch.object(
-            gh_ops, "_run_gh_safe", return_value=subprocess.CompletedProcess([], 0, stdout=log, stderr="")
-        ) as mocked_gh:
-            self.assertEqual(gh_ops.job_log(45980601156, 140455972327), log)
-            mocked_gh.assert_called_once_with("api", "repos/marmot-protocol/mdk/actions/jobs/140455972327/logs")
+        # Canary failure into an unparsed, unreproducible freeze. gh 2.97+ refuses these
+        # logs' escape sequences without `--allow-escape-sequences`, which gh 2.46 (mdk-ci-1)
+        # rejects as an unknown flag; both must return the raw log.
+        endpoint = "repos/marmot-protocol/mdk/actions/jobs/140455972327/logs"
+        log = "\x1b[31;1m  TRY 2 FAIL\x1b[0m [   4.443s] ( 382/1567) marmot-app client::push::tests::push_batch_delivery\n"
+        fetched = subprocess.CompletedProcess([], 0, stdout=log, stderr="")
+        unknown_flag = subprocess.CompletedProcess([], 1, stdout="", stderr="unknown flag: --allow-escape-sequences\n")
+        for name, responses, calls in (
+            ("gh 2.97+", [fetched], [("api", "--allow-escape-sequences", endpoint)]),
+            ("gh before 2.97", [unknown_flag, fetched], [("api", "--allow-escape-sequences", endpoint), ("api", endpoint)]),
+        ):
+            with self.subTest(name):
+                gh_ops = GitHubOps("marmot-protocol/mdk", dry_run=True)
+                with mock.patch.object(gh_ops, "_run_gh_safe", side_effect=responses) as mocked_gh:
+                    self.assertEqual(gh_ops.job_log(45980601156, 140455972327), log)
+                    self.assertEqual([c.args for c in mocked_gh.call_args_list], calls)
 
 
 class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):

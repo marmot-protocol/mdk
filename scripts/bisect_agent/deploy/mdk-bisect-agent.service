@@ -19,9 +19,10 @@ Environment=CARGO_PROFILE_TEST_DEBUG=0
 # (even in dry-run mode) so repository code can never read `/home/mdk-bot`
 # credentials, SSH signing keys, or the signing checkout.
 # Add `--live` once dry-run output and the `mdk-runner` boundary are verified.
-# After every deploy, check the live log fetch and the `mdk-runner` replay as mdk-bot,
-# under the poll lock (each poll removes every worktree under --worktree-root):
-#   flock /srv/mdk/state/bisect-agent.lock python3 -m scripts.bisect_agent selftest --predicate-runner-prefix "sudo -n -u mdk-runner --"
+# After every deploy, check the live log fetch and the `mdk-runner` replay with this
+# unit's user, working directory, environment and poll lock (each poll removes every
+# worktree under --worktree-root):
+#   sudo -u mdk-bot sh -c 'cd /srv/mdk/repo && set -a && . /srv/mdk/env && set +a && exec flock /srv/mdk/state/bisect-agent.lock python3 -m scripts.bisect_agent selftest --predicate-runner-prefix "sudo -n -u mdk-runner --"'
 ExecStart=/usr/bin/flock -n /srv/mdk/state/bisect-agent.lock /usr/bin/python3 -m scripts.bisect_agent poll --repo marmot-protocol/mdk --repo-dir /srv/mdk/repo --state-file /srv/mdk/state/bisect-state.json --canary-status /srv/mdk/state/canary-status.json --roster /srv/mdk/bisect-roster.json --worktree-root /srv/mdk/worktrees/bisect --cargo-target-dir /srv/mdk/target-bisect --bisect-budget-secs 3600 --predicate-runner-prefix "sudo -n -u mdk-runner --"
 StandardOutput=journal
 StandardError=journal
