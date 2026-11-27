@@ -108,21 +108,24 @@ impl AccountDeliverySpill {
     /// and the writer releases that count when it settles the delivery.
     pub(super) fn offer(self: &Arc<Self>, delivery: TransportDelivery) -> bool {
         let size = retained_size(&delivery);
+        let Some(transport) = self.transport.upgrade() else {
+            return false;
+        };
         let mut handoff = self.handoff.lock().unwrap_or_else(|p| p.into_inner());
-        if handoff.items.len() >= SPILL_HANDOFF_MAX_DELIVERIES
+        if transport.shutting_down.load(Ordering::SeqCst)
+            || handoff.items.len() >= SPILL_HANDOFF_MAX_DELIVERIES
             || handoff.bytes.saturating_add(size) > SPILL_HANDOFF_MAX_BYTES
         {
             return false;
         }
+        if !handoff.writing {
+            if !transport.try_spawn_spill_task(self.clone()) {
+                return false;
+            }
+            handoff.writing = true;
+        }
         handoff.bytes += size;
         handoff.items.push_back(delivery);
-        if !handoff.writing {
-            handoff.writing = true;
-            let handle = tokio::spawn(self.clone().write());
-            if let Some(transport) = self.transport.upgrade() {
-                transport.track_spill_task(self.clone(), handle);
-            }
-        }
         true
     }
 
@@ -159,7 +162,7 @@ impl AccountDeliverySpill {
             .is_none_or(|transport| transport.shutting_down.load(Ordering::SeqCst))
     }
 
-    async fn write(self: Arc<Self>) {
+    pub(super) async fn write(self: Arc<Self>) {
         loop {
             let (batch, count) = {
                 let mut handoff = self.handoff.lock().unwrap_or_else(|p| p.into_inner());

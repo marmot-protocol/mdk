@@ -188,16 +188,25 @@ pub struct MarmotRelayPlane {
     inner: Arc<MarmotRelayPlaneInner>,
 }
 
+/// Signer-bound publish clients (active cache + evicted clients still held by
+/// callers), kept behind one mutex so eviction cannot hide a client between
+/// maps while `deactivate_account_context()` or `shutdown()` drains them.
+#[derive(Default)]
+struct PublishClientRegistry {
+    account: HashMap<String, Arc<ManagedSdkPublishClient>>,
+    retired: HashMap<String, Vec<Weak<ManagedSdkPublishClient>>>,
+}
+
 struct MarmotRelayPlaneInner {
     subscription_rebuild_lookback: Option<Duration>,
     relay_safety: RelaySafetyPolicy,
     transport: Arc<RelayPlaneTransport>,
     directory: DirectoryRelayPlane,
     directory_subscription_sync: Mutex<()>,
-    /// One signer-bound publisher per account. Setup publishes and the managed
-    /// account worker share this client so the worker can reuse the same relay
-    /// pool instead of constructing another TCP/TLS/WebSocket stack.
-    account_publish_clients: std::sync::Mutex<HashMap<String, Arc<ManagedSdkPublishClient>>>,
+    /// One signer-bound publisher per account, plus evicted clients still held
+    /// by callers keyed by canonical lowercase account hex so account
+    /// deactivation and plane shutdown tear down every live client atomically.
+    publish_clients: std::sync::Mutex<PublishClientRegistry>,
     /// Each account's anonymous group-publish / read-back clients (current and
     /// any retained earlier adapter clones), tracked weakly per account so
     /// adapter clones keep working while held and drop tears them down, while
@@ -205,10 +214,6 @@ struct MarmotRelayPlaneInner {
     /// that account right away.
     anonymous_publish_clients:
         std::sync::Mutex<HashMap<MemberId, Vec<Weak<ManagedSdkPublishClient>>>>,
-    /// Evicted account publish clients still held by an active caller. Their
-    /// `Drop` schedules shutdown once the caller releases its `Arc`, and
-    /// `MarmotRelayPlane::shutdown()` tears down any still live when the plane stops.
-    retired_publish_clients: std::sync::Mutex<Vec<Weak<ManagedSdkPublishClient>>>,
     /// Each account's read-back REQs to each relay in the last hour, shared
     /// by every adapter for the account (mdk#2332).
     read_back_budget: read_back::ReadBackBudget,
@@ -285,17 +290,24 @@ struct RelayPlaneTransport {
 }
 
 impl RelayPlaneTransport {
-    pub(crate) fn track_spill_task(
+    /// Atomically check shutdown state and spawn+register a delivery spill
+    /// writer under `spill_tasks`, so `shutdown()` cannot drain `spill_tasks`
+    /// while an accepted spill writer is still unregistered.
+    pub(crate) fn try_spawn_spill_task(
         &self,
         spill: Arc<delivery_spill::AccountDeliverySpill>,
-        handle: JoinHandle<()>,
-    ) {
+    ) -> bool {
         let mut tasks = self
             .spill_tasks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return false;
+        }
+        let handle = tokio::spawn(spill.clone().write());
         tasks.retain(|(_, existing)| !existing.is_finished());
         tasks.push((spill, handle));
+        true
     }
 
     pub(crate) fn track_loss_marker_task(&self, handle: JoinHandle<()>) {
@@ -1870,9 +1882,8 @@ impl MarmotRelayPlane {
                 transport,
                 directory: DirectoryRelayPlane::new(directory_fetcher),
                 directory_subscription_sync: Mutex::new(()),
-                account_publish_clients: std::sync::Mutex::new(HashMap::new()),
+                publish_clients: std::sync::Mutex::new(PublishClientRegistry::default()),
                 anonymous_publish_clients: std::sync::Mutex::new(HashMap::new()),
-                retired_publish_clients: std::sync::Mutex::new(Vec::new()),
                 read_back_budget: read_back::ReadBackBudget::default(),
             }),
         };
@@ -1893,13 +1904,15 @@ impl MarmotRelayPlane {
         account_id_hex: &str,
         signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     ) -> Arc<dyn NostrRelayClient> {
-        let mut clients = self
+        let key = account_id_hex.to_ascii_lowercase();
+        let mut registry = self
             .inner
-            .account_publish_clients
+            .publish_clients
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        clients
-            .entry(account_id_hex.to_owned())
+        registry
+            .account
+            .entry(key)
             .or_insert_with(|| {
                 let builder = nostr_builder().authenticator(
                     nostr_sdk::authenticator::SignerAuthenticator::new(
@@ -1923,29 +1936,30 @@ impl MarmotRelayPlane {
     /// Existing callers (such as a running account worker during external-signer
     /// reattachment) keep their working `Arc` until they drop it, at which point
     /// `ManagedSdkPublishClient::drop` shuts down the underlying SDK pool;
-    /// `MarmotRelayPlane::shutdown()` also tears down any still-live evicted
-    /// clients.
+    /// `deactivate_account_context()` and `MarmotRelayPlane::shutdown()` also
+    /// tear down any still-live evicted clients immediately.
     #[doc(hidden)]
     pub fn evict_account_publish_client(&self, account_id_hex: &str) {
-        let removed = self
-            .inner
-            .account_publish_clients
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(account_id_hex);
-        if let Some(client) = removed {
-            let weak = Arc::downgrade(&client);
-            drop(client);
-            if weak.strong_count() > 0 {
-                let mut retired = self
-                    .inner
-                    .retired_publish_clients
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                retired.retain(|existing| existing.strong_count() > 0);
-                retired.push(weak);
+        let key = account_id_hex.to_ascii_lowercase();
+        // Move the removed client into `retired` under the same mutex before
+        // releasing our `Arc`, so neither `deactivate_account_context()` nor
+        // `shutdown()` can observe it missing from both maps, and drop our
+        // strong reference outside the lock to avoid nesting mutexes in `Drop`.
+        let removed = {
+            let mut registry = self
+                .inner
+                .publish_clients
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let removed = registry.account.remove(&key);
+            if let Some(client) = &removed {
+                let entries = registry.retired.entry(key).or_default();
+                entries.retain(|existing| existing.strong_count() > 0);
+                entries.push(Arc::downgrade(client));
             }
-        }
+            removed
+        };
+        drop(removed);
     }
 
     /// Build an account adapter without durable queue-overflow recovery.
@@ -2267,9 +2281,10 @@ impl MarmotRelayPlane {
     }
 
     /// Retire a stopped account worker's subscriptions, immutable SDK
-    /// authenticator, and live anonymous publish pools (including any retained
-    /// earlier adapter clones for this account) before a replacement worker
-    /// registers a fresh signer and rebuilds its adapter.
+    /// authenticator, cached and retired signer-bound publish clients, and live
+    /// anonymous publish pools (including any retained earlier adapter clones
+    /// for this account) before a replacement worker registers a fresh signer
+    /// and rebuilds its adapter.
     #[doc(hidden)]
     pub async fn deactivate_account_context(
         &self,
@@ -2292,26 +2307,38 @@ impl MarmotRelayPlane {
         if let Some(sdk) = &self.inner.transport.sdk_relay_client {
             sdk.remove_account(account_id).await;
         }
-        let anonymous_clients = self
-            .inner
-            .anonymous_publish_clients
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(account_id)
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .filter_map(|weak| weak.upgrade())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if !anonymous_clients.is_empty() {
-            futures::future::join_all(anonymous_clients.iter().map(|client| async move {
+        let account_id_hex = hex::encode(account_id.as_slice());
+        let mut account_clients = {
+            let mut registry = self
+                .inner
+                .publish_clients
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut clients = Vec::new();
+            if let Some(client) = registry.account.remove(&account_id_hex) {
+                clients.push(client);
+            }
+            if let Some(entries) = registry.retired.remove(&account_id_hex) {
+                clients.extend(entries.into_iter().filter_map(|weak| weak.upgrade()));
+            }
+            clients
+        };
+        account_clients.extend(
+            self.inner
+                .anonymous_publish_clients
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(account_id)
+                .into_iter()
+                .flat_map(|entries| entries.into_iter().filter_map(|weak| weak.upgrade())),
+        );
+        if !account_clients.is_empty() {
+            futures::future::join_all(account_clients.iter().map(|client| async move {
                 let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, client.inner().shutdown()).await;
             }))
             .await;
         }
-        drop(anonymous_clients);
+        drop(account_clients);
         if let Some(handle) = self
             .inner
             .transport
@@ -2795,14 +2822,25 @@ impl MarmotRelayPlane {
             let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, directory_client.shutdown()).await;
         }
         let managed_clients = {
-            let mut managed = self
-                .inner
-                .account_publish_clients
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .drain()
-                .map(|(_, client)| client)
-                .collect::<Vec<_>>();
+            let mut managed = {
+                let mut registry = self
+                    .inner
+                    .publish_clients
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut clients = registry
+                    .account
+                    .drain()
+                    .map(|(_, client)| client)
+                    .collect::<Vec<_>>();
+                clients.extend(
+                    registry
+                        .retired
+                        .drain()
+                        .flat_map(|(_, entries)| entries.into_iter().filter_map(|w| w.upgrade())),
+                );
+                clients
+            };
             managed.extend(
                 self.inner
                     .anonymous_publish_clients
@@ -2810,14 +2848,6 @@ impl MarmotRelayPlane {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .drain()
                     .flat_map(|(_, entries)| entries.into_iter().filter_map(|weak| weak.upgrade())),
-            );
-            managed.extend(
-                self.inner
-                    .retired_publish_clients
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .drain(..)
-                    .filter_map(|weak| weak.upgrade()),
             );
             managed
         };

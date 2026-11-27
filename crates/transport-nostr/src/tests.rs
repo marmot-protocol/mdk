@@ -8206,13 +8206,13 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
     let eve_hex = eve_keys.public_key().to_hex();
     let _ = plane.account_publish_client(&eve_hex, Arc::new(eve_keys));
     let (alice_pub, bob_pub, carol_pub, dave_pub, eve_pub) = {
-        let guard = plane.inner.account_publish_clients.lock().unwrap();
+        let guard = plane.inner.publish_clients.lock().unwrap();
         (
-            guard[&alice_hex].inner().clone(),
-            guard[&bob_hex].inner().clone(),
-            guard[&carol_hex].inner().clone(),
-            guard[&dave_hex].inner().clone(),
-            guard[&eve_hex].inner().clone(),
+            guard.account[&alice_hex].inner().clone(),
+            guard.account[&bob_hex].inner().clone(),
+            guard.account[&carol_hex].inner().clone(),
+            guard.account[&dave_hex].inner().clone(),
+            guard.account[&eve_hex].inner().clone(),
         )
     };
     assert!(!alice_pub.client().is_shutdown());
@@ -8241,7 +8241,11 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
         !alice_pub.client().is_shutdown(),
         "evicting a cached publish client must not shut down a pool still held by a caller"
     );
-    let alice_replacement_dyn = plane.account_publish_client(&alice_hex, Arc::new(alice_keys));
+    let alice_replacement_dyn =
+        plane.account_publish_client(&alice_hex, Arc::new(alice_keys.clone()));
+    let alice_replacement = plane.inner.publish_clients.lock().unwrap().account[&alice_hex]
+        .inner()
+        .clone();
     drop(alice_pub_dyn);
     timeout(Duration::from_secs(5), async {
         while !alice_pub.client().is_shutdown() || !carol_pub.client().is_shutdown() {
@@ -8252,6 +8256,17 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
     .expect("dropped evicted publish client and pending off-runtime eviction must shut down");
     assert!(!bob_pub.client().is_shutdown());
 
+    // Evict Alice's replacement while still held, then create a third cached
+    // client for Alice so deactivation exercises BOTH a held retired client and
+    // a cached active client for Alice without affecting Bob or Dave.
+    plane.evict_account_publish_client(&alice_hex);
+    let alice_cached_dyn = plane.account_publish_client(&alice_hex, Arc::new(alice_keys));
+    let alice_cached = plane.inner.publish_clients.lock().unwrap().account[&alice_hex]
+        .inner()
+        .clone();
+    assert!(!alice_replacement.client().is_shutdown());
+    assert!(!alice_cached.client().is_shutdown());
+
     // Evicting Dave while held keeps Dave alive until `plane.shutdown()`.
     plane.evict_account_publish_client(&dave_hex);
     tokio::task::yield_now().await;
@@ -8260,14 +8275,14 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
     // Anonymous publish clients stay alive while an earlier adapter clone is
     // still held, shut down once that adapter drops, and shut down immediately
     // on account deactivation or plane shutdown.
-    let adapter_a1 = plane.account_adapter(alice_id.clone(), alice_replacement_dyn.clone());
+    let adapter_a1 = plane.account_adapter(alice_id.clone(), alice_cached_dyn.clone());
     let anon_a1 = adapter_a1
         .anonymous_publish_client
         .as_ref()
         .expect("SDK plane creates anonymous publish client")
         .inner()
         .clone();
-    let adapter_a2 = plane.account_adapter(alice_id.clone(), alice_replacement_dyn.clone());
+    let adapter_a2 = plane.account_adapter(alice_id.clone(), alice_cached_dyn.clone());
     let anon_a2 = adapter_a2
         .anonymous_publish_client
         .as_ref()
@@ -8289,7 +8304,7 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
     .expect("dropped replaced anonymous publish client must shut down");
     assert!(!anon_a2.client().is_shutdown());
 
-    let adapter_a3 = plane.account_adapter(alice_id.clone(), alice_replacement_dyn);
+    let adapter_a3 = plane.account_adapter(alice_id.clone(), alice_cached_dyn.clone());
     let anon_a3 = adapter_a3
         .anonymous_publish_client
         .as_ref()
@@ -8305,9 +8320,18 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
         .inner()
         .clone();
 
-    // Retaining both `adapter_a2` and `adapter_a3` across account deactivation
-    // must tear down every live anonymous client for Alice without touching Bob.
+    // Retaining Alice's cached + retired signer-bound publish clients and both
+    // `adapter_a2` and `adapter_a3` across account deactivation must tear down
+    // every live publish pool for Alice without touching Bob or Dave.
     plane.deactivate_account_context(&alice_id).await.unwrap();
+    assert!(
+        alice_cached.client().is_shutdown(),
+        "deactivating an account must shut down its cached signer-bound publish client even while held"
+    );
+    assert!(
+        alice_replacement.client().is_shutdown(),
+        "deactivating an account must shut down its retired signer-bound publish clients even while held"
+    );
     assert!(
         anon_a2.client().is_shutdown(),
         "deactivating an account must shut down retained earlier anonymous publish clients"
@@ -8316,7 +8340,17 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
         anon_a3.client().is_shutdown(),
         "deactivating an account must shut down its current anonymous publish client"
     );
+    assert!(
+        !bob_pub.client().is_shutdown(),
+        "deactivating Alice must not shut down Bob's cached publish client"
+    );
+    assert!(
+        !dave_pub.client().is_shutdown(),
+        "deactivating Alice must not shut down Dave's retired publish client"
+    );
     assert!(!anon_b.client().is_shutdown());
+    drop(alice_replacement_dyn);
+    drop(alice_cached_dyn);
     drop(adapter_a2);
     drop(adapter_a3);
 
