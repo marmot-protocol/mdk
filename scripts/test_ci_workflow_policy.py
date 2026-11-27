@@ -922,6 +922,27 @@ class RcReleasePolicyTests(unittest.TestCase):
         self.assertIn(expected_version, classifier)
         self.assertNotIn("0.9.148", classifier)
 
+    def test_release_drafts_are_staged_and_published_with_the_release_token(self):
+        # GitHub answers the workflow token's draft-release POST with 403 "Resource not
+        # accessible by integration" (0.20.0-rc.3), so callers pass RELEASE_TOKEN to each track.
+        workflows = ROOT / ".github/workflows"
+        for caller in ("rc-releases.yml", "promote-release.yml"):
+            text = (workflows / caller).read_text()
+            for track in ("bindings.yaml", "c-bindings.yml", "wn-agent-binaries.yml"):
+                with self.subTest(caller=caller, track=track):
+                    call = text.split(f"uses: ./.github/workflows/{track}\n", 1)[1].split("\n\n", 1)[0]
+                    self.assertIn("stage_token: ${{ secrets.RELEASE_TOKEN }}", call)
+        for track in ("bindings.yaml", "c-bindings.yml", "wn-agent-binaries.yml"):
+            with self.subTest(track=track):
+                text = (workflows / track).read_text()
+                self.assertIn("    secrets:\n      stage_token:\n", text)
+                self.assertEqual(text.count("GH_TOKEN: ${{ secrets.stage_token || secrets.GITHUB_TOKEN }}"), 1)
+        rc = (workflows / "rc-releases.yml").read_text()
+        self.assertIn("Preflight release credentials", rc)
+        publish = rc.split("- name: Publish the three RC pre-releases and update rc-meta", 1)[1].split("run:", 1)[0]
+        self.assertIn("GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}", publish)
+        self.assertIn("META_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}", publish)
+
     def test_promote_workflow_skips_test_lanes_and_requires_metadata_diff_guard(self):
         workflow = (ROOT / ".github/workflows/promote-release.yml").read_text()
         self.assertIn("  workflow_dispatch:\n", workflow)

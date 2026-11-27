@@ -682,6 +682,38 @@ typedef void (*MarmotEventCallback)(const char *item, int flags, void *user_data
                 self.assertEqual(report["impact"], "minor")
                 self.assertIn(rel_path, delta["storage_migrations"])
 
+    def test_command_publish_writes_rc_meta_with_the_workflow_token(self):
+        # The release token publishes the tracks; rc-meta commits stay signed by the workflow token.
+        args = argparse.Namespace(
+            version="0.20.0-rc.3", source_sha="a" * 40,
+            impact_report=None, signature_delta=None, integration_notes=None,
+        )
+        env = {"GH_TOKEN": "release-pat", "META_GH_TOKEN": "workflow-token", "GITHUB_REPOSITORY": "o/r"}
+        with (
+            unittest.mock.patch.dict(os.environ, env),
+            unittest.mock.patch.object(rc_release, "publish_rc", return_value=None) as publish,
+        ):
+            self.assertEqual(rc_release.command_publish(args), 0)
+        self.assertEqual(publish.call_args.args[0].token, "release-pat")
+        self.assertEqual(publish.call_args.kwargs["meta_gh"].token, "workflow-token")
+
+    def test_publish_rc_publishes_with_the_release_client_and_writes_rc_meta_with_the_meta_client(self):
+        gh, meta_gh = unittest.mock.Mock(name="release"), unittest.mock.Mock(name="meta")
+        gh.release_for_tag.return_value = {"id": 1}
+        meta_gh.read_latest_rc.return_value = None
+        meta_gh.read_rc_counters.return_value = {}
+        with (
+            unittest.mock.patch.object(rc_release, "check_staged_release"),
+            unittest.mock.patch.object(rc_release, "publish_release", return_value={}) as publish,
+            unittest.mock.patch.object(rc_release, "latest_rc_document", return_value={"version": "0.20.0-rc.3"}),
+            unittest.mock.patch.object(rc_release, "write_meta_files", return_value="c" * 40) as write_meta,
+        ):
+            rc_release.publish_rc(gh, "0.20.0-rc.3", "a" * 40, "run", meta_gh=meta_gh)
+        self.assertEqual({call.args[0] for call in publish.call_args_list}, {gh})
+        self.assertIs(write_meta.call_args.args[0], meta_gh)
+        gh.read_latest_rc.assert_not_called()
+        gh.read_rc_counters.assert_not_called()
+
     def test_command_publish_rejects_missing_companion_files_before_publishing(self):
         args = argparse.Namespace(
             version="0.20.0-rc.1",

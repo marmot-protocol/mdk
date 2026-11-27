@@ -76,6 +76,19 @@ jobs:
             exit 1
           fi
 
+      # GitHub refuses the workflow token when it creates the track release drafts (HTTP 403
+      # "Resource not accessible by integration"), so staging and publishing use RELEASE_TOKEN.
+      # Fail here, not after hours of gates and builds.
+      - name: Preflight release credentials
+        if: ${{ !inputs.dry_run && !inputs.build_only }}
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          if [[ -z "${RELEASE_TOKEN:-}" ]]; then
+            echo "error: publishing RCs requires secrets.RELEASE_TOKEN (Contents and Workflows: read and write)" >&2
+            exit 1
+          fi
+
       - name: Select canary commit, classify impact, and pick RC version
         id: plan
         env:
@@ -173,6 +186,8 @@ jobs:
       source_sha: ${{ needs.plan.outputs.source_sha }}
       build_only: ${{ inputs.build_only == true }}
       release_version: ${{ needs.plan.outputs.version }}
+    secrets:
+      stage_token: ${{ secrets.RELEASE_TOKEN }}
 
   marmotc:
     name: Marmot C
@@ -186,6 +201,8 @@ jobs:
       source_sha: ${{ needs.plan.outputs.source_sha }}
       build_only: ${{ inputs.build_only == true }}
       release_version: ${{ needs.plan.outputs.version }}
+    secrets:
+      stage_token: ${{ secrets.RELEASE_TOKEN }}
 
   wn-agent:
     name: wn-agent
@@ -199,6 +216,8 @@ jobs:
       source_sha: ${{ needs.plan.outputs.source_sha }}
       build_only: ${{ inputs.build_only == true }}
       release_version: ${{ needs.plan.outputs.version }}
+    secrets:
+      stage_token: ${{ secrets.RELEASE_TOKEN }}
 
   publish:
     name: Publish SemVer RC and rc-meta
@@ -233,7 +252,8 @@ jobs:
 
       - name: Publish the three RC pre-releases and update rc-meta
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          META_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.plan.outputs.version }}
           SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
         run: |
@@ -269,7 +289,7 @@ jobs:
 
       - name: Remove unpublished RC drafts
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.plan.outputs.version }}
         run: python3 scripts/rc_release.py cleanup-drafts --version "$VERSION"
 
