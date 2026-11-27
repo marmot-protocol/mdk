@@ -246,7 +246,13 @@ struct PendingFanoutContinuation {
     post_confirmation_welcomes: Vec<TransportMessage>,
     /// Sealed Welcomes whose unsealed rows the first fanout write replaces,
     /// in the same transaction.
-    bind: Vec<SealedWelcome>,
+    bind: CommitWelcomeSeals,
+}
+
+#[derive(Default)]
+struct CommitWelcomeSeals {
+    sealed: Vec<SealedWelcome>,
+    audited: HashSet<cgka_traits::MessageId>,
 }
 
 struct QueuedSealRefusal {
@@ -772,7 +778,7 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     seal_rollback_batch: Option<Arc<std::sync::Mutex<SealRollbackBatch>>>,
     /// The exact Welcome bytes shown to a caller at prepare time. Keep the
     /// native rows unsealed until the first commit fanout is also durable.
-    prepared_welcome_seals: HashMap<PendingStateRef, Vec<SealedWelcome>>,
+    prepared_welcome_seals: HashMap<PendingStateRef, CommitWelcomeSeals>,
     /// This runtime was asked to withdraw the device's slot for sign-out, so
     /// it publishes nothing more, whether or not a relay accepted. The next
     /// runtime for the account republishes.
@@ -4222,9 +4228,11 @@ where
         if invite && let Some((message_id, refusal)) = self.oversized_invite(&commit).await {
             // This invite will never get a fanout. Retain its sealed ids for
             // the refusal audit, then retire the rows with the commit.
-            if let Some(sealed) = self.prepared_welcome_seals.get(&commit.pending) {
-                match self.session.bind_sealed_welcomes(sealed, None) {
-                    Ok(()) => self.note_retained_welcomes(commit.welcomes()),
+            if let Some(seals) = self.prepared_welcome_seals.remove(&commit.pending) {
+                match self.session.bind_sealed_welcomes(&seals.sealed, None) {
+                    Ok(()) => {
+                        self.note_retained_welcomes(commit.welcomes().iter(), Some(&seals.audited))
+                    }
                     Err(error) => log_refused_welcome_bind(&error),
                 }
             }
@@ -4345,11 +4353,12 @@ where
         };
         let welcomes = sealed.iter().map(|seal| seal.message.clone()).collect();
         if !sealed.is_empty() {
-            self.note_prepared_seals(&sealed);
+            let audited = self.note_prepared_seals(&sealed);
             // A prepared commit can be superseded before its caller returns.
             self.prepared_welcome_seals
                 .retain(|pending, _| self.session.pending_group_id(*pending).is_ok());
-            self.prepared_welcome_seals.insert(pending, sealed);
+            self.prepared_welcome_seals
+                .insert(pending, CommitWelcomeSeals { sealed, audited });
         }
         Ok(PreparedSessionSend::Commit(PreparedSessionCommit {
             effects,
@@ -6282,7 +6291,10 @@ where
                 pending,
                 kind: FanoutPendingKind::CreateGroup,
                 post_confirmation_welcomes,
-                bind: sealed,
+                bind: CommitWelcomeSeals {
+                    sealed,
+                    ..Default::default()
+                },
             }),
             None,
             output,
@@ -6393,7 +6405,7 @@ where
             // Bind for the refusal audit if possible. A bind error does not
             // undo the size verdict or let the queue stage the invite again.
             match self.session.bind_sealed_welcomes(&sealed, None) {
-                Ok(()) => self.note_retained_welcomes(&welcomes),
+                Ok(()) => self.note_retained_welcomes(welcomes.iter(), None),
                 Err(error) => log_refused_welcome_bind(&error),
             }
             let effects = self.rollback_sealing_commit(pending).await?;
@@ -6410,7 +6422,10 @@ where
                 pending,
                 kind: self.session.pending_fanout_kind(pending)?,
                 post_confirmation_welcomes: welcomes,
-                bind: sealed,
+                bind: CommitWelcomeSeals {
+                    sealed,
+                    ..Default::default()
+                },
             }),
             None,
             output,
@@ -6755,7 +6770,7 @@ where
                 pending,
                 kind: self.session.pending_fanout_kind(pending)?,
                 post_confirmation_welcomes: Vec::new(),
-                bind: Vec::new(),
+                bind: CommitWelcomeSeals::default(),
             }),
             None => None,
         };
@@ -6787,7 +6802,7 @@ where
                 continuation.post_confirmation_welcomes,
                 continuation.bind,
             ),
-            None => (None, None, Vec::new(), Vec::new()),
+            None => (None, None, Vec::new(), CommitWelcomeSeals::default()),
         };
         if matches!(message.envelope, TransportEnvelope::GroupMessage { .. }) || pending.is_some() {
             let target = match self.routing.publish_target(&message) {
@@ -6890,10 +6905,11 @@ where
             }
             // The first fanout write binds its sealed Welcomes in the same
             // transaction, so a restart finds both or neither.
-            let frozen = if bind.is_empty() {
+            let frozen = if bind.sealed.is_empty() {
                 self.session.put_outbound_fanout(&fanout)
             } else {
-                self.session.bind_sealed_welcomes(&bind, Some(&fanout))
+                self.session
+                    .bind_sealed_welcomes(&bind.sealed, Some(&fanout))
             };
             if let Err(error) = frozen {
                 self.rollback_unstaged_pending(pending, output, queue)
@@ -6905,11 +6921,13 @@ where
             }
             // Welcomes of a create or commit first reach the runtime here,
             // once their sealed rows exist.
-            if !bind.is_empty() {
-                let welcomes: Vec<TransportMessage> =
-                    bind.into_iter().map(|sealed| sealed.message).collect();
-                self.note_retained_welcomes(&welcomes);
+            if !bind.sealed.is_empty() {
+                self.note_retained_welcomes(
+                    bind.sealed.iter().map(|seal| &seal.message),
+                    Some(&bind.audited),
+                );
             }
+            drop(bind);
             if let Some(started) = stage_started {
                 // Sum only local application-message preparation, before relay I/O.
                 output.local_accept_duration =

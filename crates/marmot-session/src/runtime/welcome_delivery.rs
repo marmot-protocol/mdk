@@ -500,7 +500,7 @@ where
         if let Some(seal) = self
             .prepared_welcome_seals
             .values()
-            .flatten()
+            .flat_map(|seals| &seals.sealed)
             .find(|seal| &seal.message.id == message_id)
         {
             return Ok(self.session.withdraw_sent_welcome(&seal.local_id)?);
@@ -869,7 +869,7 @@ where
     /// and holds back none of the others.
     async fn seal_owed_welcomes(&mut self) -> AccountResult<bool> {
         let messages = self.session.seal_owed_founding_welcomes().await?;
-        self.note_retained_welcomes(&messages);
+        self.note_retained_welcomes(messages.iter(), None);
         Ok(!messages.is_empty())
     }
 

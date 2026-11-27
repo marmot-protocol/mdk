@@ -1038,6 +1038,13 @@ async fn an_invite_prepared_row_names_the_key_package_its_welcome_answers() {
     )
     .await;
     phone.publish().await;
+    bob.routing.update(|routing| {
+        routing.with_group_route(
+            group_id.clone(),
+            vec![0x5a; 32],
+            vec![TransportEndpoint("wss://group.example".into())],
+        )
+    });
     let audit_path = dir.path().join("bob-audit-v5.jsonl");
     bob.runtime
         .audit_recorder()
@@ -1063,12 +1070,40 @@ async fn an_invite_prepared_row_names_the_key_package_its_welcome_answers() {
     let laptop_ref = marmot_forensics::v5::NostrEventRef::from_validated_event_id(
         &<[u8; 32]>::try_from(publication_id(&laptop.key_package).as_slice()).unwrap(),
     );
-    let named = v5_audit_rows(&audit_path)
-        .into_iter()
-        .filter(|row| row["event"]["type"] == "welcome_prepared")
-        .map(|row| row["event"]["key_package_event_ref"].clone())
-        .collect::<Vec<_>>();
-    assert_eq!(named, [laptop_ref.as_str()]);
+    let preparations = || {
+        v5_audit_rows(&audit_path)
+            .into_iter()
+            .filter(|row| row["event"]["type"] == "welcome_prepared")
+            .collect::<Vec<_>>()
+    };
+    let before = preparations();
+    let [row] = before.as_slice() else {
+        panic!("one prepared Welcome")
+    };
+    assert_eq!(row["event"]["key_package_event_ref"], laptop_ref.as_str());
+    assert_eq!(row["event"]["retention"], "not_attempted");
+
+    let (effects, welcomes) = commit.into_effects_and_welcomes();
+    let published = bob
+        .runtime
+        .publish_prepared_session_effects_with_audit_context(effects, Default::default())
+        .await
+        .unwrap();
+    assert!(matches!(
+        published.pending.as_slice(),
+        [PendingResolution::Confirmed { .. }]
+    ));
+    assert!(
+        bob.runtime
+            .session()
+            .stored_sent_welcome(&welcomes[0].id)
+            .is_ok()
+    );
+    assert_eq!(
+        preparations(),
+        before,
+        "binding must not record another preparation"
+    );
 }
 
 /// A Welcome from a device of the joiner's own account, in a group that

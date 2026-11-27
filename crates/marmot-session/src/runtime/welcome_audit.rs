@@ -125,8 +125,12 @@ where
     /// on (none for a founding Welcome) and the KeyPackage it answers.
     /// Each is watched once its sealed row exists. Deferred Welcomes can
     /// have their preparation recorded earlier, from the local row.
-    pub(super) fn note_retained_welcomes(&mut self, welcomes: &[TransportMessage]) {
-        self.watch_welcomes(welcomes.iter().map(|welcome| welcome.id.clone()));
+    pub(super) fn note_retained_welcomes<'a>(
+        &mut self,
+        welcomes: impl Iterator<Item = &'a TransportMessage> + Clone,
+        audited: Option<&HashSet<cgka_traits::MessageId>>,
+    ) {
+        self.watch_welcomes(welcomes.clone().map(|welcome| welcome.id.clone()));
         if !self.audit.records_v5() {
             return;
         }
@@ -134,38 +138,55 @@ where
             if self.v5_prepared_welcomes.contains(&welcome.id) {
                 continue;
             }
-            let Ok(Some(facts)) = self.session.outbound_welcome_audit_facts(&welcome.id) else {
-                continue;
-            };
-            self.record_welcome_preparation(welcome, facts);
+            if !audited.is_some_and(|ids| ids.contains(&welcome.id)) {
+                let Ok(Some(facts)) = self.session.outbound_welcome_audit_facts(&welcome.id) else {
+                    continue;
+                };
+                self.record_welcome_preparation(welcome, facts, audit_v5::Retention::Committed);
+            }
+            if self.v5_prepared_welcomes.len() >= MAX_PREPARED_WELCOMES_REMEMBERED {
+                self.v5_prepared_welcomes.clear();
+            }
+            self.v5_prepared_welcomes.insert(welcome.id.clone());
         }
     }
 
-    pub(super) fn note_prepared_seals(&mut self, seals: &[SealedWelcome]) {
+    pub(super) fn note_prepared_seals(
+        &self,
+        seals: &[SealedWelcome],
+    ) -> HashSet<cgka_traits::MessageId> {
+        let mut audited = HashSet::new();
         if !self.audit.records_v5() {
-            return;
+            return audited;
         }
         for seal in seals {
+            if audited.contains(&seal.message.id) {
+                continue;
+            }
             if self.v5_prepared_welcomes.contains(&seal.message.id) {
+                audited.insert(seal.message.id.clone());
                 continue;
             }
             if let Ok(Some(facts)) = self.session.engine.prepared_welcome_audit_facts(seal) {
-                self.record_welcome_preparation(&seal.message, facts);
+                self.record_welcome_preparation(
+                    &seal.message,
+                    facts,
+                    audit_v5::Retention::NotAttempted,
+                );
+                audited.insert(seal.message.id.clone());
             }
         }
+        audited
     }
 
     fn record_welcome_preparation(
-        &mut self,
+        &self,
         welcome: &TransportMessage,
         facts: cgka_engine::engine::OutboundWelcomeAuditFacts,
+        retention: audit_v5::Retention,
     ) {
-        if self.v5_prepared_welcomes.len() >= MAX_PREPARED_WELCOMES_REMEMBERED {
-            self.v5_prepared_welcomes.clear();
-        }
-        self.v5_prepared_welcomes.insert(welcome.id.clone());
         if let Some(v5) = self.v5_welcome_of(facts) {
-            self.record_v5_welcome_prepared(&v5);
+            self.record_v5_welcome_prepared(&v5, retention);
             self.record_v5_welcome_size(&v5, welcome);
         }
     }
@@ -176,12 +197,12 @@ where
     pub(super) fn note_founding_welcomes(&mut self, effects: &SessionEffects) {
         for work in &effects.publish {
             if let PublishWork::FoundingGroupCreated { welcomes } = work {
-                self.note_retained_welcomes(welcomes);
+                self.note_retained_welcomes(welcomes.iter(), None);
             }
         }
     }
 
-    fn record_v5_welcome_prepared(&self, v5: &V5Welcome) {
+    fn record_v5_welcome_prepared(&self, v5: &V5Welcome, retention: audit_v5::Retention) {
         // A constructed row names the KeyPackage it answers.
         let Some(key_package_ref) = v5
             .facts
@@ -215,9 +236,7 @@ where
                 key_package_event_ref: Some(key_package_ref),
                 outer_event_ref: Some(v5.outer.clone()),
                 construction: audit_v5::Construction::Constructed,
-                // Retained: canonical for a founding Welcome, staged with its
-                // commit for an invite's.
-                retention: audit_v5::Retention::Committed,
+                retention,
                 failure_stage: None,
                 reason: None,
                 elapsed_us: None,
