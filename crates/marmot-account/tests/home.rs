@@ -2018,6 +2018,8 @@ fn account_home_nip49_export_rejects_public_only_account() {
 #[derive(Default)]
 struct MemorySecretStore {
     keys: Mutex<HashMap<String, String>>,
+    account_id_keyed: AtomicBool,
+    fail_account_id_lookup: AtomicBool,
     fail_lookup: AtomicBool,
     hide_presence: AtomicBool,
     load_error: Mutex<Option<AccountHomeError>>,
@@ -2035,8 +2037,24 @@ impl AccountSecretStore for MemorySecretStore {
                 "injected locked vault".into(),
             ));
         }
+        if self.account_id_keyed.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
         Ok(!self.hide_presence.load(Ordering::SeqCst)
             && self.keys.lock().unwrap().contains_key(label))
+    }
+
+    fn has_secret_for_account_id(&self, account_id_hex: &str) -> AccountHomeResult<bool> {
+        if !self.account_id_keyed.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        if self.fail_account_id_lookup.load(Ordering::SeqCst) {
+            return Err(AccountHomeError::SecretStore(
+                "injected account-id lookup failure".into(),
+            ));
+        }
+        Ok(!self.hide_presence.load(Ordering::SeqCst)
+            && self.keys.lock().unwrap().contains_key(account_id_hex))
     }
 
     fn write_secret(
@@ -2048,10 +2066,15 @@ impl AccountSecretStore for MemorySecretStore {
             !self.interrupt_before_write.load(Ordering::SeqCst),
             "interrupted before vault write"
         );
+        let key = if self.account_id_keyed.load(Ordering::SeqCst) {
+            account.account_id_hex.clone()
+        } else {
+            account.label.clone()
+        };
         self.keys
             .lock()
             .unwrap()
-            .insert(account.label.clone(), keys.secret_key().to_secret_hex());
+            .insert(key, keys.secret_key().to_secret_hex());
         if self.fail_write.load(Ordering::SeqCst) {
             return Err(AccountHomeError::SecretStore(
                 "injected write failure".into(),
@@ -2071,12 +2094,17 @@ impl AccountSecretStore for MemorySecretStore {
         if let Some(error) = self.load_error.lock().unwrap().take() {
             return Err(error);
         }
+        let lookup_key = if self.account_id_keyed.load(Ordering::SeqCst) {
+            &account.account_id_hex
+        } else {
+            &account.label
+        };
         let secret = self
             .keys
             .lock()
             .unwrap()
-            .get(&account.label)
-            .ok_or_else(|| AccountHomeError::SecretNotFound(account.label.clone()))?
+            .get(lookup_key)
+            .ok_or_else(|| AccountHomeError::SecretNotFound(lookup_key.clone()))?
             .clone();
         nostr::prelude::Keys::parse(&secret).map_err(|_| AccountHomeError::InvalidSecretKey)
     }
@@ -2087,7 +2115,12 @@ impl AccountSecretStore for MemorySecretStore {
                 "injected removal failure".into(),
             ));
         }
-        self.keys.lock().unwrap().remove(&account.label);
+        let lookup_key = if self.account_id_keyed.load(Ordering::SeqCst) {
+            &account.account_id_hex
+        } else {
+            &account.label
+        };
+        self.keys.lock().unwrap().remove(lookup_key);
         if self.fail_remove_after_delete.load(Ordering::SeqCst) {
             return Err(AccountHomeError::SecretStore(
                 "injected post-delete failure".into(),
@@ -2198,5 +2231,300 @@ fn replaceable_record_floors_only_advance_and_survive_reopen() {
         .permissions()
         .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn wipe_tombstones_directory_is_created_owner_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("tombstone-mode").unwrap();
+    home.remove_account(&account.label).unwrap();
+    let tombstone_root = dir.path().join(".wipe-tombstones");
+    assert_eq!(file_mode(&tombstone_root), 0o700);
+}
+
+#[test]
+fn account_home_rejects_windows_reserved_names_and_unsafe_labels() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let secret_hex = nostr::prelude::Keys::generate()
+        .secret_key()
+        .to_secret_hex();
+
+    for label in [
+        "CON", "con", "CON.json", "PRN", "AUX", "NUL", "COM1", "com9.txt", "LPT1", "lpt9",
+        "alice.", "alice ", " alice", "a<b", "a>b", "a\"b", "a|b", "a?b", "a*b",
+    ] {
+        assert!(
+            matches!(
+                home.import_account(label, &secret_hex),
+                Err(AccountHomeError::InvalidAccountLabel(rejected)) if rejected == label
+            ),
+            "label {label:?} must be rejected on import"
+        );
+        assert!(
+            matches!(
+                home.create_account(label),
+                Err(AccountHomeError::InvalidAccountLabel(rejected)) if rejected == label
+            ),
+            "label {label:?} must be rejected on create"
+        );
+    }
+
+    for traversal in ["", ".", "..", "../escape", "a/b", "a\\b", "a:b", "a\0b"] {
+        assert!(
+            matches!(
+                home.try_account_dir(traversal),
+                Err(AccountHomeError::InvalidAccountLabel(rejected)) if rejected == traversal
+            ),
+            "try_account_dir must reject {traversal:?}"
+        );
+    }
+
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = home.account_dir("../escape");
+        }))
+        .is_err()
+    );
+
+    // A tampered on-disk account.json with a traversal label must be rejected
+    // when read rather than flowing into account_dir.
+    let valid = home.create_account("tampered").unwrap();
+    let record_path = home.account_dir(&valid.label).join("account.json");
+    let mut bad = valid.clone();
+    bad.label = "../escape".to_owned();
+    fs_private::write_private(&record_path, &serde_json::to_vec(&bad).unwrap()).unwrap();
+    assert!(matches!(
+        home.account("tampered"),
+        Err(AccountHomeError::InvalidAccountLabel(label)) if label == "../escape"
+    ));
+    assert!(matches!(
+        home.accounts_strict(),
+        Err(AccountHomeError::InvalidAccountLabel(label)) if label == "../escape"
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_unix_account_labels_remain_readable_and_removable_on_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+
+    // Simulate accounts created on Unix before stricter portable label rules
+    // rejected trailing dots, Windows device names, or `?` on create/import.
+    let mut legacy_accounts = Vec::new();
+    for label in ["bot.", "CON", "a?b"] {
+        let keys = nostr::prelude::Keys::generate();
+        let summary = AccountSummary {
+            label: label.to_owned(),
+            account_id_hex: keys.public_key().to_hex(),
+            local_signing: true,
+            external_signing: false,
+            signed_out: false,
+            unlinked: false,
+        };
+        let account_dir = dir.path().join("accounts").join(label);
+        fs_private::create_dir_all_private(&account_dir).unwrap();
+        fs_private::write_private(
+            &account_dir.join("account.json"),
+            &serde_json::to_vec_pretty(&summary).unwrap(),
+        )
+        .unwrap();
+        fs_private::write_private(
+            &account_dir.join("secret.json"),
+            &serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "backend": "local-dev-file",
+                "secret_key_hex": keys.secret_key().to_secret_hex(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        legacy_accounts.push((summary, keys));
+    }
+
+    assert_eq!(home.accounts().unwrap().len(), 3);
+    assert_eq!(home.accounts_strict().unwrap().len(), 3);
+
+    for (summary, keys) in &legacy_accounts {
+        assert_eq!(home.account(&summary.label).unwrap(), *summary);
+        assert_eq!(
+            home.try_account_dir(&summary.label).unwrap(),
+            dir.path().join("accounts").join(&summary.label)
+        );
+        assert_eq!(
+            home.account_dir(&summary.label),
+            dir.path().join("accounts").join(&summary.label)
+        );
+        assert_eq!(
+            home.load_signing_keys(&summary.label).unwrap().public_key(),
+            keys.public_key()
+        );
+        let secret_hex = keys.secret_key().to_secret_hex();
+        // Idempotent import must reuse an existing legacy label.
+        assert_eq!(
+            home.import_account_idempotent(&summary.label, &secret_hex)
+                .unwrap(),
+            *summary
+        );
+        // Updating existing legacy records (sign-out, sign-in, signed-out
+        // idempotent import, and marking unlinked) must continue to work.
+        let signed_out = home.set_account_signed_out(&summary.label, true).unwrap();
+        assert!(signed_out.signed_out);
+        let signed_in = home.set_account_signed_out(&summary.label, false).unwrap();
+        assert!(!signed_in.signed_out);
+        home.set_account_signed_out(&summary.label, true).unwrap();
+        let reactivated = home
+            .import_account_idempotent(&summary.label, &secret_hex)
+            .unwrap();
+        assert!(!reactivated.signed_out);
+        // Removing the local secret and re-running idempotent import must also
+        // repair the existing legacy label rather than rejecting it.
+        std::fs::remove_file(home.account_dir(&summary.label).join("secret.json")).unwrap();
+        assert_eq!(
+            home.import_account_idempotent(&summary.label, &secret_hex)
+                .unwrap(),
+            *summary
+        );
+        assert_eq!(
+            home.load_signing_keys(&summary.label).unwrap().public_key(),
+            keys.public_key()
+        );
+        let unlinked = home.mark_account_unlinked(&summary.label).unwrap();
+        assert!(unlinked.unlinked);
+        home.remove_account(&summary.label).unwrap();
+    }
+    assert!(home.accounts_strict().unwrap().is_empty());
+
+    // Once removed, creating a brand-new account under a legacy non-portable
+    // label via idempotent import is rejected.
+    let fresh_secret = nostr::prelude::Keys::generate()
+        .secret_key()
+        .to_secret_hex();
+    assert!(matches!(
+        home.import_account_idempotent("bot.", &fresh_secret),
+        Err(AccountHomeError::InvalidAccountLabel(label)) if label == "bot."
+    ));
+}
+
+#[test]
+fn remove_account_resolves_shared_credential_lookup_before_tombstone_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySecretStore::default());
+    store.account_id_keyed.store(true, Ordering::SeqCst);
+    let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+    let account = home.create_account("lookup-fails").unwrap();
+
+    store.fail_account_id_lookup.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        home.remove_account(&account.label),
+        Err(AccountHomeError::SecretStore(_))
+    ));
+    assert_eq!(
+        home.account(&account.label).unwrap(),
+        account,
+        "a pre-commit lookup failure must leave the account live"
+    );
+    assert!(
+        !dir.path().join(".wipe-tombstones").exists(),
+        "no tombstone may be created when pre-commit policy lookup fails"
+    );
+    assert_eq!(store.keys.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn remove_account_post_commit_secret_removal_failure_still_scrubs_and_deletes_tombstone() {
+    use std::io::Read;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySecretStore::default());
+    store.account_id_keyed.store(true, Ordering::SeqCst);
+    let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+    let account = home.create_account("post-commit-fail").unwrap();
+
+    // Plant both local secret files inside the account directory so we can
+    // prove neither scrub is skipped when secret_store.remove_secret fails.
+    let account_dir = home.account_dir(&account.label);
+    let local_secret = account_dir.join("secret.json");
+    let external_secret = account_dir.join(marmot_account::EXTERNAL_SQLCIPHER_SECRET_FILE);
+    fs_private::write_private(&local_secret, b"local-signing-secret-bytes").unwrap();
+    fs_private::write_private(&external_secret, b"external-sqlcipher-secret-bytes").unwrap();
+
+    #[cfg(unix)]
+    let (mut local_handle, mut external_handle) = (
+        std::fs::File::open(&local_secret).unwrap(),
+        std::fs::File::open(&external_secret).unwrap(),
+    );
+
+    store.fail_remove.store(true, Ordering::SeqCst);
+    home.remove_account(&account.label)
+        .expect("committed wipe must succeed even when post-commit secret removal fails");
+
+    assert!(matches!(
+        home.account(&account.label),
+        Err(AccountHomeError::UnknownAccount(_))
+    ));
+    assert!(!account_dir.exists());
+    let remaining_tombstones: Vec<_> = std::fs::read_dir(dir.path().join(".wipe-tombstones"))
+        .unwrap()
+        .collect();
+    assert!(
+        remaining_tombstones.is_empty(),
+        "tombstone directory must be removed after scrubbing"
+    );
+
+    #[cfg(unix)]
+    {
+        let mut local_bytes = Vec::new();
+        local_handle.read_to_end(&mut local_bytes).unwrap();
+        assert!(!local_bytes.is_empty());
+        assert!(
+            local_bytes.iter().all(|b| *b == 0),
+            "tombstoned secret.json must be scrubbed"
+        );
+        let mut external_bytes = Vec::new();
+        external_handle.read_to_end(&mut external_bytes).unwrap();
+        assert!(!external_bytes.is_empty());
+        assert!(
+            external_bytes.iter().all(|b| *b == 0),
+            "tombstoned .external-sqlcipher-secret must be scrubbed"
+        );
+    }
+
+    // Also verify an external-signer account whose external DB credential
+    // removal fails post-commit still scrubs local secret files and deletes
+    // its tombstone without returning an error.
+    let ext_keys = nostr::prelude::Keys::generate();
+    let external = home
+        .add_external_signer_account(&ext_keys.public_key().to_hex())
+        .unwrap();
+    home.external_database_secret(&external.label, ExternalSecretMode::Create)
+        .unwrap();
+    let ext_dir = home.account_dir(&external.label);
+    let ext_local_secret = ext_dir.join(marmot_account::EXTERNAL_SQLCIPHER_SECRET_FILE);
+    fs_private::write_private(&ext_local_secret, b"legacy-external-sqlcipher-key").unwrap();
+    #[cfg(unix)]
+    let mut ext_local_handle = std::fs::File::open(&ext_local_secret).unwrap();
+
+    home.remove_account(&external.label)
+        .expect("committed external wipe must succeed even when post-commit removal fails");
+    assert!(matches!(
+        home.account(&external.label),
+        Err(AccountHomeError::UnknownAccount(_))
+    ));
+    assert!(!ext_dir.exists());
+    let remaining_tombstones: Vec<_> = std::fs::read_dir(dir.path().join(".wipe-tombstones"))
+        .unwrap()
+        .collect();
+    assert!(remaining_tombstones.is_empty());
+    #[cfg(unix)]
+    {
+        let mut ext_bytes = Vec::new();
+        ext_local_handle.read_to_end(&mut ext_bytes).unwrap();
+        assert!(!ext_bytes.is_empty());
+        assert!(ext_bytes.iter().all(|b| *b == 0));
     }
 }

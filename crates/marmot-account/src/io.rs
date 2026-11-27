@@ -16,6 +16,12 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Bound on re-reads of a secret file that keeps being replaced mid-read.
 const SECRET_READ_ATTEMPTS: usize = 8;
 
+/// Upper bound on a local `secret.json` file's byte length.
+const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
+
+/// Fixed chunk size used when overwriting secret files with zeros in place.
+static ZERO_SCRUB_CHUNK: [u8; 64 * 1024] = [0u8; 64 * 1024];
+
 pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(
     path: impl AsRef<Path>,
 ) -> AccountHomeResult<T> {
@@ -101,18 +107,39 @@ pub(crate) fn read_secret_json<T: for<'de> Deserialize<'de>>(
 /// Read key material that a concurrent [`FileMode::Secret`] replacement or
 /// [`remove_file_then_scrub`] may race.
 ///
-/// Both zero the old inode after unlinking it, so a reader that opened it
-/// first can read zeros. A read counts only if its inode was still linked once
-/// the read finished, which puts it before that scrub. A removal whose unlink
-/// fails zeroes the linked file in place; that read fails to parse instead of
-/// yielding a key. `after_open` lets tests replace the file inside that window.
+/// Both zero the old file after detaching it from the live path, so a reader
+/// that opened it first can read zeros. A read counts only if its handle still
+/// refers to the live path once the read finished, which puts it before that
+/// scrub. A removal whose unlink fails zeroes the linked file in place; that
+/// read fails to parse instead of yielding a key. `after_open` lets tests
+/// replace the file inside that window.
 fn read_linked_secret(path: &Path, mut after_open: impl FnMut()) -> io::Result<Zeroizing<Vec<u8>>> {
     for _ in 0..SECRET_READ_ATTEMPTS {
-        let mut file = File::open(path)?;
+        let mut file =
+            fs_private::open_existing_regular_nofollow(path, OpenOptions::new().read(true))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            if file.metadata()?.permissions().mode() & 0o7177 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "secret file permissions are too permissive",
+                ));
+            }
+        }
         after_open();
         let mut bytes = Zeroizing::new(Vec::new());
-        file.read_to_end(&mut bytes)?;
-        if still_linked(&file)? {
+        Read::by_ref(&mut file)
+            .take(MAX_SECRET_FILE_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_SECRET_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "secret file exceeds size limit",
+            ));
+        }
+        if still_linked(&file, path)? {
             return Ok(bytes);
         }
     }
@@ -122,15 +149,121 @@ fn read_linked_secret(path: &Path, mut after_open: impl FnMut()) -> io::Result<Z
 }
 
 #[cfg(unix)]
-fn still_linked(file: &File) -> io::Result<bool> {
+fn still_linked(file: &File, _path: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
 
     Ok(file.metadata()?.nlink() > 0)
 }
 
-/// Without a portable link count, other platforms accept every read.
-#[cfg(not(unix))]
-fn still_linked(_file: &File) -> io::Result<bool> {
+/// On Windows, check both that the handle itself is still linked and not
+/// delete-pending AND that `path` still names the same file identity. Moving
+/// an old secret aside leaves `number_of_links == 1` if removing the moved
+/// name fails or has not completed yet, so a moved-aside file must never count
+/// as the live secret.
+#[cfg(windows)]
+fn still_linked(file: &File, path: &Path) -> io::Result<bool> {
+    use std::ffi::c_void;
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::io::AsRawHandle;
+
+    const FILE_STANDARD_INFO_CLASS: i32 = 1;
+
+    #[repr(C)]
+    struct FileTime {
+        low_date_time: u32,
+        high_date_time: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    #[repr(C)]
+    struct FileStandardInfo {
+        allocation_size: i64,
+        end_of_file: i64,
+        number_of_links: u32,
+        delete_pending: u8,
+        directory: u8,
+    }
+
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut c_void,
+            file_information: *mut ByHandleFileInformation,
+        ) -> i32;
+        fn GetFileInformationByHandleEx(
+            file: *mut c_void,
+            file_information_class: i32,
+            file_information: *mut c_void,
+            buffer_size: u32,
+        ) -> i32;
+    }
+
+    fn query_identity(handle: &File) -> io::Result<(ByHandleFileInformation, FileStandardInfo)> {
+        // SAFETY: Both structs are plain old data; zero-initialization is valid
+        // and `handle` stays open for both calls.
+        let mut info: ByHandleFileInformation = unsafe { zeroed() };
+        if unsafe { GetFileInformationByHandle(handle.as_raw_handle().cast(), &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut standard: FileStandardInfo = unsafe { zeroed() };
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                handle.as_raw_handle().cast(),
+                FILE_STANDARD_INFO_CLASS,
+                (&mut standard as *mut FileStandardInfo).cast(),
+                size_of::<FileStandardInfo>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((info, standard))
+    }
+
+    let (opened_info, opened_standard) = query_identity(file)?;
+    if opened_info.number_of_links == 0 || opened_standard.delete_pending != 0 {
+        return Ok(false);
+    }
+
+    let current =
+        match fs_private::open_existing_regular_nofollow(path, OpenOptions::new().read(true)) {
+            Ok(current) => current,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(err) => return Err(err),
+        };
+    let (current_info, current_standard) = query_identity(&current)?;
+    Ok(
+        opened_info.volume_serial_number == current_info.volume_serial_number
+            && opened_info.file_index_high == current_info.file_index_high
+            && opened_info.file_index_low == current_info.file_index_low
+            && current_info.number_of_links > 0
+            && current_standard.delete_pending == 0,
+    )
+}
+
+/// Without a portable link count or handle-identity check, other platforms
+/// accept every read.
+#[cfg(not(any(unix, windows)))]
+fn still_linked(_file: &File, _path: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
@@ -172,8 +305,10 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        fs_private::create_dir_all_private(parent)?;
+    }
     let parent = parent.unwrap_or_else(|| Path::new("."));
-    fs_private::create_dir_all_private(parent)?;
 
     let (mut file, temp_path) = create_temp_file(parent, path)?;
     let result = (|| -> AccountHomeResult<()> {
@@ -253,25 +388,12 @@ pub(crate) fn overwrite_file_with_zeros(path: &Path) -> io::Result<()> {
 }
 
 fn open_file_for_zero_overwrite(path: &Path) -> io::Result<File> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options.open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.file_type().is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "secret scrub target must be a regular file",
-        ));
-    }
+    let file =
+        fs_private::open_existing_regular_nofollow(path, fs::OpenOptions::new().write(true))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
+        if file.metadata()?.nlink() != 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "secret scrub target must have exactly one hard link",
@@ -282,13 +404,19 @@ fn open_file_for_zero_overwrite(path: &Path) -> io::Result<File> {
 }
 
 fn overwrite_open_file_with_zeros(file: &mut File) -> io::Result<()> {
-    let len = file.metadata()?.len();
-    if len > 0 {
-        let zeros = vec![0u8; len as usize];
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&zeros)?;
-        file.sync_all()?;
+    let mut remaining = file.metadata()?.len();
+    if remaining == 0 {
+        return Ok(());
     }
+    file.seek(SeekFrom::Start(0))?;
+    while remaining > 0 {
+        let chunk = usize::try_from(remaining)
+            .unwrap_or(ZERO_SCRUB_CHUNK.len())
+            .min(ZERO_SCRUB_CHUNK.len());
+        file.write_all(&ZERO_SCRUB_CHUNK[..chunk])?;
+        remaining -= chunk as u64;
+    }
+    file.sync_all()?;
     Ok(())
 }
 
@@ -378,7 +506,42 @@ fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_account_label(label: &str) -> AccountHomeResult<()> {
+fn is_windows_reserved_name(label: &str) -> bool {
+    let stem = label.split('.').next().unwrap_or(label);
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+/// Path-safety validation for existing on-disk account labels and directory
+/// lookups. Always rejects path traversal, separators, colons, and control
+/// characters so `accounts/<label>` can never escape the accounts root; on
+/// Windows also rejects Windows-reserved device names and forbidden filename
+/// characters. Existing Unix labels that predate stricter portable creation
+/// rules remain readable and removable on upgrade.
+pub(crate) fn validate_existing_account_label(label: &str) -> AccountHomeResult<()> {
     let mut components = Path::new(label).components();
     let is_single_normal_component =
         matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
@@ -388,6 +551,34 @@ pub(crate) fn validate_account_label(label: &str) -> AccountHomeResult<()> {
         || label.contains('\\')
         || label.contains(':')
         || label.chars().any(char::is_control)
+    {
+        return Err(AccountHomeError::InvalidAccountLabel(label.to_owned()));
+    }
+
+    #[cfg(windows)]
+    if label.ends_with('.')
+        || label.ends_with(' ')
+        || label.starts_with(' ')
+        || label.contains(['<', '>', '"', '|', '?', '*'])
+        || is_windows_reserved_name(label)
+    {
+        return Err(AccountHomeError::InvalidAccountLabel(label.to_owned()));
+    }
+
+    Ok(())
+}
+
+/// Strict portable validation for newly created or imported account labels.
+/// Enforces single-component path safety plus cross-platform rejection of
+/// Windows-reserved device names, leading/trailing spaces, trailing dots, and
+/// Windows-forbidden filename characters.
+pub(crate) fn validate_account_label(label: &str) -> AccountHomeResult<()> {
+    validate_existing_account_label(label)?;
+    if label.ends_with('.')
+        || label.ends_with(' ')
+        || label.starts_with(' ')
+        || label.contains(['<', '>', '"', '|', '?', '*'])
+        || is_windows_reserved_name(label)
     {
         return Err(AccountHomeError::InvalidAccountLabel(label.to_owned()));
     }
@@ -601,6 +792,58 @@ mod tests {
         assert!(!scrubbed.is_empty());
         assert!(scrubbed.iter().all(|byte| *byte == 0));
     }
+
+    #[test]
+    fn read_linked_secret_rejects_symlinks_permissive_modes_oversized_and_fifos() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target.json");
+        write_secret_json(&target, &serde_json::json!({ "secret": "ok" })).unwrap();
+
+        // 1. Symlink must be refused without following.
+        let link = root.path().join("link.json");
+        symlink(&target, &link).unwrap();
+        assert!(
+            read_linked_secret(&link, || {}).is_err(),
+            "symlink must be refused"
+        );
+
+        // 2. Permissive mode (0644) must be refused.
+        let permissive = root.path().join("permissive.json");
+        write_secret_json(&permissive, &serde_json::json!({ "secret": "ok" })).unwrap();
+        fs::set_permissions(&permissive, fs::Permissions::from_mode(0o644)).unwrap();
+        let err = read_linked_secret(&permissive, || {}).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+
+        // 3. Oversized file (> 64 KiB) must be refused.
+        let oversized = root.path().join("oversized.json");
+        fs_private::write_private(&oversized, &vec![b'a'; 64 * 1024 + 1]).unwrap();
+        let err = read_linked_secret(&oversized, || {}).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+
+        // 4. FIFO must be refused without hanging.
+        let fifo = root.path().join("secret.fifo");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        let err = read_linked_secret(&fifo, || {}).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+    }
+
+    #[test]
+    fn overwrite_open_file_with_zeros_scrubs_multi_chunk_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large-secret.bin");
+        let len = 2 * 64 * 1024 + 123;
+        fs_private::write_private(&path, &vec![0x5a; len]).unwrap();
+
+        overwrite_file_with_zeros(&path).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), len);
+        assert!(bytes.iter().all(|byte| *byte == 0));
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -637,5 +880,91 @@ mod windows_tests {
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert_eq!(fs::read(&path).unwrap(), b"old-key");
         drop(reader);
+    }
+
+    #[test]
+    fn secret_read_retries_past_a_replacement_that_scrubbed_its_handle() {
+        let root = tempfile::tempdir().unwrap();
+        let secret_path = root.path().join("account").join("secret.json");
+        write_secret_json(&secret_path, &serde_json::json!({ "secret": "old-key" })).unwrap();
+        let mut opens = 0;
+
+        let bytes = read_linked_secret(&secret_path, || {
+            opens += 1;
+            if opens == 1 {
+                let mut old_handle = File::open(&secret_path).unwrap();
+                write_secret_json(&secret_path, &serde_json::json!({ "secret": "new-key" }))
+                    .unwrap();
+                let mut scrubbed = Vec::new();
+                old_handle.read_to_end(&mut scrubbed).unwrap();
+                assert!(!scrubbed.is_empty());
+                assert!(scrubbed.iter().all(|byte| *byte == 0));
+            }
+        })
+        .unwrap();
+
+        assert_eq!(opens, 2);
+        let secret: serde_json::Value = serde_json::from_slice(bytes.as_slice()).unwrap();
+        assert_eq!(secret["secret"], "new-key");
+    }
+
+    #[test]
+    fn secret_read_rejects_a_still_named_moved_aside_file() {
+        let root = tempfile::tempdir().unwrap();
+        let secret_path = root.path().join("account").join("secret.json");
+        let aside_path = root.path().join("account").join(".secret.json.aside");
+        write_secret_json(&secret_path, &serde_json::json!({ "secret": "old-key" })).unwrap();
+        let mut opens = 0;
+
+        let bytes = read_linked_secret(&secret_path, || {
+            opens += 1;
+            if opens == 1 {
+                // Move the old file aside without deleting its moved name,
+                // install a fresh secret at the live path, and scrub the aside
+                // copy: still_linked must reject the moved-aside handle.
+                fs::rename(&secret_path, &aside_path).unwrap();
+                write_secret_json(&secret_path, &serde_json::json!({ "secret": "new-key" }))
+                    .unwrap();
+                overwrite_file_with_zeros(&aside_path).unwrap();
+            }
+        })
+        .unwrap();
+
+        assert_eq!(opens, 2);
+        assert!(aside_path.exists());
+        let secret: serde_json::Value = serde_json::from_slice(bytes.as_slice()).unwrap();
+        assert_eq!(secret["secret"], "new-key");
+    }
+
+    #[test]
+    fn secret_read_reports_a_removal_instead_of_its_scrubbed_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let secret_path = root.path().join("account").join("secret.json");
+        write_secret_json(&secret_path, &serde_json::json!({ "secret": "old-key" })).unwrap();
+
+        let err = read_linked_secret(&secret_path, || {
+            remove_file_then_scrub(&secret_path).unwrap();
+        })
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn secret_read_gives_up_rather_than_return_a_scrubbed_handle() {
+        let root = tempfile::tempdir().unwrap();
+        let secret_path = root.path().join("account").join("secret.json");
+        write_secret_json(&secret_path, &serde_json::json!({ "secret": 0 })).unwrap();
+        let mut replacements = 0;
+
+        let err = read_linked_secret(&secret_path, || {
+            replacements += 1;
+            write_secret_json(&secret_path, &serde_json::json!({ "secret": replacements }))
+                .unwrap();
+        })
+        .unwrap_err();
+
+        assert_eq!(replacements, SECRET_READ_ATTEMPTS);
+        assert_eq!(err.kind(), io::ErrorKind::Other);
     }
 }
