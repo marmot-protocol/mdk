@@ -926,6 +926,10 @@ fn verify_regular_file(file: &std::fs::File) -> io::Result<()> {
 /// Open an existing regular file with `options` without following a final
 /// symlink (or Windows reparse point) and without blocking on a FIFO.
 /// Refuses any non-regular file with [`io::ErrorKind::InvalidInput`].
+///
+/// Overwrites `custom_flags` on `options` (`O_NOFOLLOW | O_NONBLOCK` on Unix,
+/// `FILE_FLAG_OPEN_REPARSE_POINT` on Windows), so callers should pass only
+/// portable access options (`read`, `write`, `append`).
 pub fn open_existing_regular_nofollow(
     path: &Path,
     options: &mut OpenOptions,
@@ -1281,75 +1285,15 @@ impl BoundUnixListener {
     }
 }
 
+/// Serializes in-process private Unix socket staging, binding, linking, and
+/// cleanup so two threads in the same PID cannot race on the same staging
+/// directory while `socket_staging_dir` stays thread-independent.
 #[cfg(unix)]
-struct SocketStagingSlotPool {
-    next: usize,
-    free: Vec<usize>,
-}
-
-#[cfg(unix)]
-impl SocketStagingSlotPool {
-    const fn new() -> Self {
-        Self {
-            next: 0,
-            free: Vec::new(),
-        }
-    }
-
-    fn acquire(&mut self) -> usize {
-        if let Some(slot) = self.free.pop() {
-            slot
-        } else {
-            let slot = self.next;
-            self.next = self.next.saturating_add(1);
-            slot
-        }
-    }
-
-    fn release(&mut self, slot: usize) {
-        self.free.push(slot);
-    }
-}
-
-#[cfg(unix)]
-static SOCKET_STAGING_SLOTS: std::sync::Mutex<SocketStagingSlotPool> =
-    std::sync::Mutex::new(SocketStagingSlotPool::new());
-
-#[cfg(unix)]
-struct SocketStagingSlot(usize);
-
-#[cfg(unix)]
-impl SocketStagingSlot {
-    fn acquire() -> Self {
-        let mut pool = SOCKET_STAGING_SLOTS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self(pool.acquire())
-    }
-}
-
-#[cfg(unix)]
-impl Drop for SocketStagingSlot {
-    fn drop(&mut self) {
-        let mut pool = SOCKET_STAGING_SLOTS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pool.release(self.0);
-    }
-}
-
-#[cfg(unix)]
-std::thread_local! {
-    static SOCKET_STAGING_THREAD_ID: SocketStagingSlot = SocketStagingSlot::acquire();
-}
+static SOCKET_BIND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The staging directory `bind_unix_listener_private` binds through for
-/// `final_path` on the current thread. Exposed so callers and tests can assert
-/// staging cleanup without re-deriving the (otherwise private) naming scheme.
-///
-/// Thread slots are recycled on thread exit, so the 2-hex-digit slot field
-/// keeps the staging path length stable across thread churn up to 256
-/// simultaneously live binding threads.
+/// `final_path`. Exposed so callers and tests can assert staging cleanup
+/// without re-deriving the (otherwise private) naming scheme.
 #[cfg(unix)]
 pub fn socket_staging_dir(final_path: &Path) -> std::path::PathBuf {
     let parent = match final_path.parent() {
@@ -1357,14 +1301,11 @@ pub fn socket_staging_dir(final_path: &Path) -> std::path::PathBuf {
         _ => Path::new("."),
     };
     let name = final_path.file_name().unwrap_or_default();
-    let thread_id = SOCKET_STAGING_THREAD_ID.with(|slot| slot.0);
-    // Keyed by pid, recycled per-thread slot, and target name so concurrent
-    // binds across processes, threads, or different sockets never share
-    // staging state. Hex pid + 2-hex-digit recycled slot keeps the prefix
-    // shorter than the legacy `.sock.<pid>.` form and length-stable within
-    // `sun_path` limits across long-lived blocking-pool thread churn.
+    // Keyed by pid and target name so concurrent binds across processes or for
+    // different sockets never share staging state; same-process concurrency is
+    // serialized by `SOCKET_BIND_LOCK`.
     parent.join(format!(
-        ".s{:x}.{thread_id:02x}.{}",
+        ".sock.{}.{}",
         std::process::id(),
         name.to_string_lossy()
     ))
@@ -1372,10 +1313,6 @@ pub fn socket_staging_dir(final_path: &Path) -> std::path::PathBuf {
 
 /// Check the final and staging addresses before creating or removing artifacts.
 /// Use the standard library's platform-specific pathname validation.
-///
-/// Note that the staging directory length is checked for the calling thread's
-/// slot; slots stay 2 hex digits for up to 256 concurrent binding threads and
-/// recycle when threads exit.
 #[cfg(unix)]
 pub fn validate_private_unix_socket_path(final_path: &Path) -> io::Result<()> {
     use std::os::unix::net::SocketAddr;
@@ -1398,8 +1335,8 @@ pub fn validate_private_unix_socket_path(final_path: &Path) -> io::Result<()> {
 /// (failing with `AddrInUse` if `final_path` already exists, matching plain
 /// `bind` semantics so callers keep their stale-socket recovery).
 ///
-/// The staging directory name stays short (`.s<pid_hex>.<tid_hex>.<name>`) to
-/// respect `sun_path` length limits.
+/// The staging directory name stays short (`.sock.<pid>.<name>`) to respect
+/// `sun_path` length limits.
 #[cfg(unix)]
 pub fn bind_unix_listener_private(
     final_path: &Path,
@@ -1422,9 +1359,12 @@ pub fn bind_unix_listener_private_tracked(
         io::Error::new(io::ErrorKind::InvalidInput, "socket path has no file name")
     })?;
     validate_private_unix_socket_path(final_path)?;
+    let _bind_guard = SOCKET_BIND_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let staging_dir = socket_staging_dir(final_path);
-    // A leftover staging dir can only be ours (pid+thread-suffixed, 0700) from
-    // an earlier failed run; clear it without following symlinks so the atomic
+    // A leftover staging dir can only be ours (pid-suffixed, 0700) from an
+    // earlier failed run; clear it without following symlinks so the atomic
     // 0700 create succeeds.
     if let Ok(metadata) = staging_dir.symlink_metadata() {
         if metadata.file_type().is_dir() {
@@ -2933,8 +2873,7 @@ mod unix_tests {
     }
 
     #[test]
-    fn concurrent_same_pid_binds_for_same_socket_use_distinct_staging_dirs() {
-        use std::collections::HashSet;
+    fn concurrent_same_pid_binds_for_same_socket_serialize_cleanly() {
         use std::sync::{Arc, Barrier};
 
         // Keep the root short on macOS where the default temp dir eats most of sun_path.
@@ -2948,24 +2887,16 @@ mod unix_tests {
                 let socket = Arc::clone(&socket);
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
-                    let staging = socket_staging_dir(&socket);
                     barrier.wait();
-                    let result = bind_unix_listener_private(&socket, 0o600);
-                    (staging, result)
+                    bind_unix_listener_private(&socket, 0o600)
                 })
             })
             .collect();
 
-        let mut staging_dirs = HashSet::new();
         let mut winners = Vec::new();
         let mut addr_in_use = 0usize;
         for handle in handles {
-            let (staging, result) = handle.join().unwrap();
-            assert!(
-                staging_dirs.insert(staging),
-                "each thread in the same process must get a distinct staging dir"
-            );
-            match result {
+            match handle.join().unwrap() {
                 Ok(listener) => winners.push(listener),
                 Err(error) if error.kind() == io::ErrorKind::AddrInUse => addr_in_use += 1,
                 Err(error) => panic!("unexpected concurrent bind error: {error}"),
@@ -2978,28 +2909,11 @@ mod unix_tests {
         let client = std::os::unix::net::UnixStream::connect(&*socket).unwrap();
         let (_server, _addr) = winners[0].accept().unwrap();
         drop(client);
+        assert!(!socket_staging_dir(&socket).exists());
         let entries: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("shared.sock")]);
-    }
-
-    #[test]
-    fn socket_staging_dir_recycles_thread_slots_across_thread_churn() {
-        let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
-        let socket = dir.path().join("churn.sock");
-        let baseline_len = socket_staging_dir(&socket).as_os_str().len();
-
-        for _ in 0..300 {
-            let socket = socket.clone();
-            let len = std::thread::spawn(move || socket_staging_dir(&socket).as_os_str().len())
-                .join()
-                .unwrap();
-            assert_eq!(
-                len, baseline_len,
-                "recycled thread slots must keep staging dir length bounded across thread churn"
-            );
-        }
     }
 }

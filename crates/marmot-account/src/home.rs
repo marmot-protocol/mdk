@@ -1533,12 +1533,14 @@ impl AccountHome {
         // The wipe already committed. Never return early from post-commit
         // cleanup failures: always attempt independent secret-store deletion,
         // both tombstoned local secret-file scrubs, and recursive tombstone
-        // deletion.
+        // deletion before propagating any credential-removal failure so local
+        // plaintext key material is always scrubbed and callers are never told
+        // an independent credential was removed when its deletion failed.
+        let mut post_commit_secret_err: Option<AccountHomeError> = None;
         if account.external_signing
-            && self
+            && let Err(err) = self
                 .secret_store
                 .remove_secret(&external_database_credential(&account))
-                .is_err()
         {
             tracing::warn!(
                 target: TRACE_TARGET,
@@ -1546,6 +1548,7 @@ impl AccountHome {
                 kind = "external_database",
                 "failed to remove independent credential after wipe commit"
             );
+            post_commit_secret_err = Some(err);
         }
 
         // Drop the signing secret unless a twin record still depends on a
@@ -1554,13 +1557,16 @@ impl AccountHome {
         // a no-op (NotFound -> Ok); the tombstoned secret file is scrubbed below
         // before recursive directory deletion. For the keychain store the entry
         // is independent of the directory and is removed here.
-        if remove_signing_secret && self.secret_store.remove_secret(&account).is_err() {
+        if remove_signing_secret && let Err(err) = self.secret_store.remove_secret(&account) {
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "remove_account",
                 kind = "signing",
                 "failed to remove independent credential after wipe commit"
             );
+            if post_commit_secret_err.is_none() {
+                post_commit_secret_err = Some(err);
+            }
         }
 
         // For the local-file secret store, the signing secret moved into the
@@ -1599,6 +1605,9 @@ impl AccountHome {
                 method = "remove_account",
                 "failed to delete wiped account tombstone; bytes are orphaned but no live account remains"
             );
+        }
+        if let Some(err) = post_commit_secret_err {
+            return Err(err);
         }
         Ok(())
     }

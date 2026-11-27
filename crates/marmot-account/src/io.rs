@@ -124,7 +124,7 @@ fn read_linked_secret(path: &Path, mut after_open: impl FnMut()) -> io::Result<Z
             if file.metadata()?.permissions().mode() & 0o7177 != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "secret file permissions are too permissive",
+                    "secret file permissions are too permissive; restrict mode to 0600",
                 ));
             }
         }
@@ -507,10 +507,16 @@ fn sync_directory(_path: &Path) -> io::Result<()> {
 }
 
 fn is_windows_reserved_name(label: &str) -> bool {
-    let stem = label.split('.').next().unwrap_or(label);
+    let stem = label
+        .split('.')
+        .next()
+        .unwrap_or(label)
+        .trim_end_matches(' ');
     matches!(
         stem.to_ascii_uppercase().as_str(),
         "CON"
+            | "CONIN$"
+            | "CONOUT$"
             | "PRN"
             | "AUX"
             | "NUL"
@@ -523,6 +529,9 @@ fn is_windows_reserved_name(label: &str) -> bool {
             | "COM7"
             | "COM8"
             | "COM9"
+            | "COM\u{00B9}"
+            | "COM\u{00B2}"
+            | "COM\u{00B3}"
             | "LPT1"
             | "LPT2"
             | "LPT3"
@@ -532,7 +541,18 @@ fn is_windows_reserved_name(label: &str) -> bool {
             | "LPT7"
             | "LPT8"
             | "LPT9"
+            | "LPT\u{00B9}"
+            | "LPT\u{00B2}"
+            | "LPT\u{00B3}"
     )
+}
+
+fn is_non_portable_account_label(label: &str) -> bool {
+    label.ends_with('.')
+        || label.ends_with(' ')
+        || label.starts_with(' ')
+        || label.contains(['<', '>', '"', '|', '?', '*'])
+        || is_windows_reserved_name(label)
 }
 
 /// Path-safety validation for existing on-disk account labels and directory
@@ -540,7 +560,7 @@ fn is_windows_reserved_name(label: &str) -> bool {
 /// characters so `accounts/<label>` can never escape the accounts root; on
 /// Windows also rejects Windows-reserved device names and forbidden filename
 /// characters. Existing Unix labels that predate stricter portable creation
-/// rules remain readable and removable on upgrade.
+/// rules remain readable, updatable, and removable on upgrade.
 pub(crate) fn validate_existing_account_label(label: &str) -> AccountHomeResult<()> {
     let mut components = Path::new(label).components();
     let is_single_normal_component =
@@ -556,12 +576,7 @@ pub(crate) fn validate_existing_account_label(label: &str) -> AccountHomeResult<
     }
 
     #[cfg(windows)]
-    if label.ends_with('.')
-        || label.ends_with(' ')
-        || label.starts_with(' ')
-        || label.contains(['<', '>', '"', '|', '?', '*'])
-        || is_windows_reserved_name(label)
-    {
+    if is_non_portable_account_label(label) {
         return Err(AccountHomeError::InvalidAccountLabel(label.to_owned()));
     }
 
@@ -574,12 +589,8 @@ pub(crate) fn validate_existing_account_label(label: &str) -> AccountHomeResult<
 /// Windows-forbidden filename characters.
 pub(crate) fn validate_account_label(label: &str) -> AccountHomeResult<()> {
     validate_existing_account_label(label)?;
-    if label.ends_with('.')
-        || label.ends_with(' ')
-        || label.starts_with(' ')
-        || label.contains(['<', '>', '"', '|', '?', '*'])
-        || is_windows_reserved_name(label)
-    {
+    #[cfg(not(windows))]
+    if is_non_portable_account_label(label) {
         return Err(AccountHomeError::InvalidAccountLabel(label.to_owned()));
     }
     Ok(())

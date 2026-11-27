@@ -2254,8 +2254,30 @@ fn account_home_rejects_windows_reserved_names_and_unsafe_labels() {
         .to_secret_hex();
 
     for label in [
-        "CON", "con", "CON.json", "PRN", "AUX", "NUL", "COM1", "com9.txt", "LPT1", "lpt9",
-        "alice.", "alice ", " alice", "a<b", "a>b", "a\"b", "a|b", "a?b", "a*b",
+        "CON",
+        "con",
+        "CON.json",
+        "CON .txt",
+        "CONIN$",
+        "CONOUT$",
+        "PRN",
+        "AUX",
+        "NUL",
+        "COM1",
+        "com9.txt",
+        "COM\u{00B9}",
+        "LPT1",
+        "lpt9",
+        "LPT\u{00B3}",
+        "alice.",
+        "alice ",
+        " alice",
+        "a<b",
+        "a>b",
+        "a\"b",
+        "a|b",
+        "a?b",
+        "a*b",
     ] {
         assert!(
             matches!(
@@ -2460,8 +2482,13 @@ fn remove_account_post_commit_secret_removal_failure_still_scrubs_and_deletes_to
     );
 
     store.fail_remove.store(true, Ordering::SeqCst);
-    home.remove_account(&account.label)
-        .expect("committed wipe must succeed even when post-commit secret removal fails");
+    assert!(
+        matches!(
+            home.remove_account(&account.label),
+            Err(AccountHomeError::SecretStore(_))
+        ),
+        "post-commit secret-store deletion failure must still be surfaced after local cleanup completes"
+    );
 
     assert!(matches!(
         home.account(&account.label),
@@ -2496,7 +2523,7 @@ fn remove_account_post_commit_secret_removal_failure_still_scrubs_and_deletes_to
 
     // Also verify an external-signer account whose external DB credential
     // removal fails post-commit still scrubs local secret files and deletes
-    // its tombstone without returning an error.
+    // its tombstone before returning the secret-store error.
     let ext_keys = nostr::prelude::Keys::generate();
     let external = home
         .add_external_signer_account(&ext_keys.public_key().to_hex())
@@ -2509,8 +2536,13 @@ fn remove_account_post_commit_secret_removal_failure_still_scrubs_and_deletes_to
     #[cfg(unix)]
     let mut ext_local_handle = std::fs::File::open(&ext_local_secret).unwrap();
 
-    home.remove_account(&external.label)
-        .expect("committed external wipe must succeed even when post-commit removal fails");
+    assert!(
+        matches!(
+            home.remove_account(&external.label),
+            Err(AccountHomeError::SecretStore(_))
+        ),
+        "post-commit external DB secret deletion failure must still be surfaced after local cleanup completes"
+    );
     assert!(matches!(
         home.account(&external.label),
         Err(AccountHomeError::UnknownAccount(_))

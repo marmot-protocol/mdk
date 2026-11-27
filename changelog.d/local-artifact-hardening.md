@@ -1,3 +1,15 @@
+### Breaking changes
+
+- `fs_private::create_dir_all_private` now routes Unix path creation through `prepare_directory_path`, refusing
+  user-owned symlinked ancestors and world-writable aliases such as `/tmp` on macOS (allowing only trusted root-owned
+  platform aliases) (mdk#3799).
+- `marmot_account::AccountHome` now rejects Windows-reserved device names (`CON`, `CONIN$`, `CONOUT$`, `PRN`, `AUX`,
+  `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, and superscript variants), leading/trailing spaces, trailing dots, and
+  Windows-forbidden filename characters on newly created or imported account labels across all platforms (existing Unix
+  account records remain readable, updatable, and removable), `AccountHome::account_dir` now panics on unsafe
+  path-traversal labels (use `try_account_dir` for untrusted input), and local-file secret reads (`secret.json`) now
+  refuse group/world/executable/special permission bits with `PermissionDenied` (fix with `chmod 600`) (mdk#3799).
+
 ### Added
 
 - Added `fs_private::open_existing_regular_nofollow` to open existing regular files without following symlinks or
@@ -14,16 +26,10 @@
   checked arithmetic.
 - Hardened `marmot-account` account-wipe cleanup and local secret I/O (mdk#3799, mdk#819, mdk#2145): account removal
   now resolves shared-credential checks before the tombstone rename commit and unconditionally scrubs tombstoned local
-  secret files and removes the tombstone directory after commit even when an independent secret store fails; Windows
-  secret reads verify live handle linkage so scrubbed or moved-aside handles are rejected and retried; tombstone roots
-  use owner-only permissions; local secret reads reject symlinks, oversized files, and group/world/executable/special
-  permission bits (`PermissionDenied`) rather than reading permissive key files; zero-scrub overwrites use bounded
-  fixed chunks; newly created or imported account labels reject unsafe or Windows-reserved names while keeping existing
-  Unix account records readable, updatable, and removable; and `AccountHome::account_dir` now panics on unsafe
-  path-traversal labels (callers with untrusted input should use `try_account_dir`).
-- Hardened `fs-private` local directory, file, and Unix socket helpers (mdk#3799): private directory creation walks
-  components without following intermediate symlinks (refusing user-owned symlinked ancestors and allowing only trusted
-  root-owned platform aliases, matching `prepare_directory_path`) and uses non-blocking directory opens, private file
-  helpers verify regular files and tighten permissions before truncating, and private Unix socket staging uses recycled
-  per-thread staging directories so concurrent binds within one process do not collide or grow `sun_path` lengths over
-  thread churn.
+  secret files and removes the tombstone directory post-commit before propagating any independent secret-store deletion
+  error; Windows secret reads verify live handle linkage so scrubbed or moved-aside handles are rejected and retried;
+  tombstone roots use owner-only permissions; local secret reads reject symlinks and oversized files; and zero-scrub
+  overwrites use bounded fixed chunks.
+- Hardened `fs-private` local directory, file, and Unix socket helpers (mdk#3799): directory and file opens pass
+  `O_NONBLOCK`, private file helpers verify regular files and tighten permissions before truncating, and private Unix
+  socket binds serialize staging within a process so concurrent same-PID binds cannot collide.
