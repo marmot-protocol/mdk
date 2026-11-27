@@ -4,7 +4,8 @@
 # Outputs (under <crate>/output/):
 #   lib/libmarmot_c.so       (cdylib, host target)
 #   lib/libmarmot_c.a        (staticlib, host target)
-#   include/marmot.h         (checked-in cbindgen header, copied)
+#   include/marmot.h         (generated from the same checkout)
+#   references/*/API-REFERENCE.md
 #   lib/pkgconfig/marmot-c.pc
 
 set -euo pipefail
@@ -43,6 +44,11 @@ LIB_BASENAME="marmot_c"
 
 cd "$WORKSPACE_DIR"
 
+echo "==> Generating C header"
+bash "$CRATE_DIR/c-header.sh"
+python3 scripts/check_binding_docs.py --with-c
+python3 scripts/classify_release_impact.py --c-abi check
+
 echo "==> Cleaning previous output"
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR/lib/pkgconfig" "$OUT_DIR/include"
@@ -69,6 +75,10 @@ esac
 cp "$TARGET_DIR/release/lib$LIB_BASENAME.$DYLIB_EXT" "$OUT_DIR/lib/"
 cp "$TARGET_DIR/release/lib$LIB_BASENAME.a" "$OUT_DIR/lib/"
 cp "$CRATE_DIR/include/marmot.h" "$OUT_DIR/include/"
+mkdir -p "$OUT_DIR/references/marmot-c" "$OUT_DIR/references/marmot-uniffi"
+sed 's|^\[Header contract\](include/marmot\.h#L|[Header contract](../../include/marmot.h#L|' \
+  "$CRATE_DIR/API-REFERENCE.md" > "$OUT_DIR/references/marmot-c/API-REFERENCE.md"
+cp crates/marmot-uniffi/API-REFERENCE.md "$OUT_DIR/references/marmot-uniffi/"
 
 echo "==> Generating pkg-config file"
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$WORKSPACE_DIR/Cargo.toml" | head -n 1)"

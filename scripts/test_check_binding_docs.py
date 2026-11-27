@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Regression tests for reference refresh, drift rejection and release documentation."""
+"""Regression tests for binding reference generation and release documentation."""
 from pathlib import Path
 import tempfile
 import unittest
 
 from check_binding_docs import (
-    Export, NEEDS_PROSE, REPO, c_exports_in, check, refresh, release_problems,
-    scaffold, uniffi_catalog, uniffi_exports_in,
+    Export, c_exports_in, release_problems, render, uniffi_exports_in,
 )
 
 
@@ -15,47 +14,34 @@ class BindingDocsTests(unittest.TestCase):
         self.key = "Marmot::start"
         self.export = Export("pub async fn start(&self) -> Result<(), Error>", "src/lib.rs#L10")
         self.expected = {self.key: self.export}
-        self.text = scaffold(self.key, self.export, "rust").replace(NEEDS_PROSE, "**Current.** Start account work.\n\nKeep this authored guidance.")
-
-    def test_repository_references_match_source_and_links(self) -> None:
-        self.assertEqual(check((REPO / "crates/marmot-uniffi/API-REFERENCE.md").read_text(), "rust", uniffi_catalog()), [])
-        self.assertEqual(check((REPO / "crates/marmot-c/API-REFERENCE.md").read_text(), "c", c_exports_in((REPO / "crates/marmot-c/include/marmot.h").read_text())), [])
+        self.text = "### `Marmot::start`\n\nStart account work.\n"
 
     def test_rejects_omitted_method(self) -> None:
-        self.assertIn("missing method", "\n".join(check("", "rust", self.expected)))
+        with self.assertRaisesRegex(ValueError, "missing method: Marmot::start"):
+            render("# Guide\n", "rust", self.expected)
 
-    def test_rejects_removed_method_without_deleting_guidance(self) -> None:
-        self.assertIn("removed/unknown", "\n".join(check(self.text, "rust", {})))
-        self.assertEqual(refresh(self.text, "rust", {}), self.text)
+    def test_rejects_removed_method(self) -> None:
+        with self.assertRaisesRegex(ValueError, "removed/unknown method: Marmot::start"):
+            render(self.text, "rust", {})
 
-    def test_rejects_duplicate_entries_and_refuses_write(self) -> None:
-        text = self.text + self.text
-        self.assertIn("duplicate", "\n".join(check(text, "rust", self.expected)))
-        with self.assertRaisesRegex(ValueError, "duplicate"):
-            refresh(text, "rust", self.expected)
+    def test_rejects_duplicate_entries(self) -> None:
+        with self.assertRaisesRegex(ValueError, "duplicate documented method: Marmot::start"):
+            render(self.text + self.text, "rust", self.expected)
 
-    def test_signature_error_shows_actual_and_expected(self) -> None:
-        text = self.text.replace("pub async fn", "pub fn")
-        error = "\n".join(check(text, "rust", self.expected))
-        self.assertIn("changed signature", error)
-        self.assertIn("actual:   pub fn", error)
-        self.assertIn("expected: pub async fn", error)
+    def test_does_not_count_next_section_as_guidance(self) -> None:
+        with self.assertRaisesRegex(ValueError, "missing authored guidance: Marmot::start"):
+            render("### `Marmot::start`\n\n## Unrelated\n\nSome text.\n", "rust", self.expected)
 
-    def test_source_line_shift_fails_and_write_preserves_prose(self) -> None:
-        stale = self.text.replace("#L10", "#L9").replace("pub async fn", "pub fn")
-        self.assertIn("changed source link", "\n".join(check(stale, "rust", self.expected)))
-        written = refresh(stale, "rust", self.expected)
-        self.assertEqual(written, self.text)
-        self.assertEqual(refresh(written, "rust", self.expected), written)
-        self.assertEqual(check(written, "rust", self.expected), [])
-
-    def test_new_export_scaffold_requires_editorial_work(self) -> None:
-        text = refresh("# Reference\n", "rust", self.expected)
-        self.assertIn("### `Marmot::start`", text)
-        self.assertIn(self.export.signature, text)
-        self.assertIn(self.export.source, text)
-        self.assertEqual(check(text, "rust", self.expected), [f"missing authored guidance: {self.key}"])
-        self.assertEqual(refresh(text, "rust", self.expected), text)
+    def test_rejects_generated_docs(self) -> None:
+        guide = self.text + "\n```rust\npub fn begin(&self)\n```\n"
+        for text in (guide, self.text + "\n[Source](src/lib.rs#L8)\n"):
+            with self.assertRaisesRegex(ValueError, "generated signature or source link in guide"):
+                render(text, "rust", self.expected)
+        c = {"marmot_start": Export("MarmotStatus marmot_start(void);", "include/marmot.h#L1")}
+        with self.assertRaisesRegex(ValueError, "generated signature or source link in guide"):
+            render("### `marmot_start`\n\nStart runtime.\n\n```c\nint marmot_begin(void);\n```\n", "c", c)
+        example = self.text + "\n```rust\nlet outcome = marmot.start().await;\n```\n"
+        self.assertIn(example.split("\n\n", 1)[1], render(example, "rust", self.expected))
 
     def test_nested_indentation_and_free_function_names(self) -> None:
         source = """mod nested {
@@ -83,13 +69,14 @@ class BindingDocsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported UniFFI export shape"):
             uniffi_exports_in("#[uniffi::export] export_macro!();", "lib.rs")
 
-    def test_source_shift_updates_anchor_without_signature_change(self) -> None:
+    def test_source_shift_updates_reference_without_editing_guide(self) -> None:
         source = "#[uniffi::export]\nimpl Marmot {\n    pub fn get(&self) -> bool { true }\n}\n"
-        old = uniffi_exports_in(source, "lib.rs")["Marmot::get"]
-        new = uniffi_exports_in("// comment\n" + source, "lib.rs")["Marmot::get"]
-        self.assertEqual(old.signature, new.signature)
-        self.assertEqual(old.source, "src/lib.rs#L3")
-        self.assertEqual(new.source, "src/lib.rs#L4")
+        guide = "### `Marmot::get`\n\nRead the current value.\n"
+        old = render(guide, "rust", uniffi_exports_in(source, "lib.rs"))
+        new = render(guide, "rust", uniffi_exports_in("// comment\n" + source, "lib.rs"))
+        self.assertIn("[Source](src/lib.rs#L3)", old)
+        self.assertEqual(new, old.replace("#L3", "#L4"))
+        self.assertIn("\n\nRead the current value.\n", new)
 
     def test_unsupported_export_and_unrecognized_methods_fail(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported UniFFI export shape"):
@@ -97,14 +84,11 @@ class BindingDocsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no exported methods"):
             uniffi_exports_in("#[uniffi::export]\nimpl Marmot { methods!(); }", "lib.rs")
 
-    def test_c_comment_offsets_and_signature_and_anchor_refresh(self) -> None:
+    def test_c_reference_links_to_declaration_after_multiline_comment(self) -> None:
         source = "/* intro\n * doc */\nMarmotStatus marmot_start(\n  const struct MarmotClient *client);\n"
-        expected = c_exports_in(source)
-        self.assertEqual(expected["marmot_start"].source, "include/marmot.h#L3")
-        text = scaffold("marmot_start", expected["marmot_start"], "c").replace(NEEDS_PROSE, "Start runtime.")
-        drifted = text.replace("const struct", "struct").replace("#L3", "#L2")
-        self.assertEqual(len(check(drifted, "c", expected)), 2)
-        self.assertEqual(refresh(drifted, "c", expected), text)
+        text = render("### `marmot_start`\n\nStart runtime.\n", "c", c_exports_in(source))
+        self.assertIn("```c\nMarmotStatus marmot_start( const struct MarmotClient *client);\n```", text)
+        self.assertIn("[Header contract](include/marmot.h#L3)", text)
 
 
 class ReleaseDocsTests(unittest.TestCase):

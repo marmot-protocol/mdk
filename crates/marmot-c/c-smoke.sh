@@ -4,7 +4,8 @@
 # argument (default: cc). Runs the shared build under valgrind when
 # available. The default release build is the packaging/release gate; PR CI
 # uses --debug so it can reuse test-profile dependencies while still proving
-# the checked-in header compiles and both linkage models work.
+# the generated header compiles and both linkage models work.
+# Generate include/marmot.h first (`just c-header`), or run `just c-smoke`.
 # Usage: c-smoke.sh [--debug] [cc...]
 
 set -euo pipefail
@@ -22,6 +23,10 @@ fi
 
 CRATE_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_DIR="$(cd "$CRATE_DIR/../.." && pwd)"
+if [[ ! -f "$CRATE_DIR/include/marmot.h" ]]; then
+    echo "Generate the C header first: just c-header" >&2
+    exit 1
+fi
 TARGET_DIR="${CARGO_TARGET_DIR:-$WORKSPACE_DIR/target}"
 PROFILE=release
 PROFILE_DIR=release

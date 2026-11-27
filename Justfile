@@ -220,7 +220,6 @@ promote-rc rc_version override_version="" dry_run="false":
 # GitHub CI owns compilation, tests, and artifact builds for this stage.
 release-pr-preflight version:
     git diff --check
-    python3 scripts/check_binding_docs.py --release-version {{version}}
     ./scripts/check_agent_install_docs.sh
     ./scripts/cut-full-release.sh --dry-run {{version}}
 
@@ -696,14 +695,15 @@ naming-gate:
         exit 1
     fi
 
-# Regenerate the checked-in C header from crates/marmot-c (CI diff-gates it).
-# RUSTC_BOOTSTRAP=1 lets cbindgen expand the mirror-generating macros on
-# the stable toolchain; it only affects header generation, not builds.
+# Generate the C header from crates/marmot-c.
 c-header:
-    RUSTC_BOOTSTRAP=1 cbindgen --config crates/marmot-c/cbindgen.toml --crate marmot-c --output crates/marmot-c/include/marmot.h crates/marmot-c
+    bash crates/marmot-c/c-header.sh
+
+c-abi-write: c-header
+    python3 scripts/classify_release_impact.py --c-abi write
 
 # Build marmot-c and compile+run the C smoke test (valgrind when available).
-c-smoke:
+c-smoke: c-header
     ./crates/marmot-c/c-smoke.sh
 
 # Generate host bindings and run chat-screen DTO round trips (swift or kotlin).
@@ -716,8 +716,13 @@ uniffi-projections-smoke language="swift":
 c-parity-gate:
     python3 scripts/check_c_binding_parity.py
 
-# Keep the complete client method inventories aligned with source/header signatures.
-binding-docs-gate:
+# Generate both complete API references and test the generator.
+binding-docs-gate: c-header
+    python3 scripts/check_binding_docs.py --with-c
+    python3 scripts/classify_release_impact.py --c-abi check
+    python3 scripts/test_check_binding_docs.py
+
+uniffi-docs-gate:
     python3 scripts/check_binding_docs.py
     python3 scripts/test_check_binding_docs.py
 
@@ -752,11 +757,6 @@ binding-build-gate:
     python3 crates/marmot-uniffi/test-build-phases.py
     python3 crates/marmot-uniffi/test-android-artifact.py
 
-# Refresh mechanical signatures/source links while preserving integration prose.
-# New exports are scaffolded and remain failing until an author completes their guidance.
-binding-docs-update:
-    python3 scripts/check_binding_docs.py --write
-
 # Keep convergence policy, resource, scheduler, and history-recovery constants
 # attached to reviewed convergence-constant ledger entries.
 convergence-ledger-gate:
@@ -782,6 +782,6 @@ release-profile-gate:
 # passes, and the release pin proof. Run it once for shared build-input or
 # workflow changes; ordinary pushes use the scoped checks in AGENTS.md.
 # GitHub CI invokes the static gates directly and runs the full test matrix.
-fast-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate changelog-gate pr-trailers-contract bisect-agent-contract rc-release-contract binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate tracing-audit c-parity-gate uniffi-docs-gate changelog-gate pr-trailers-contract bisect-agent-contract rc-release-contract binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin
 
 ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate changelog-gate pr-trailers-contract bisect-agent-contract rc-release-contract binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin test

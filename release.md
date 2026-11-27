@@ -208,8 +208,8 @@ Starting with **0.10.2**, each release has two companion documents:
   update the [integration index](docs/integration/README.md).
 
 The binding [README](crates/marmot-uniffi/README.md) is the current conceptual integration
-reference; its [method inventory](crates/marmot-uniffi/API-REFERENCE.md) and the
-[C symbol inventory](crates/marmot-c/API-REFERENCE.md) must match the release source.
+reference; its [method inventory](crates/marmot-uniffi/API-GUIDE.md) and the
+[C symbol inventory](crates/marmot-c/API-GUIDE.md) must match the release source.
 These current references and versioned guides serve different purposes: avoid copying
 an entire current reference into every release note.
 
@@ -240,8 +240,8 @@ Before the release commit:
    upgrades. Keep known limitations and unresolved release blockers explicit.
 6. Run `just binding-docs-gate`, verify local Markdown links and source signatures,
    review examples against generated sources, then run the normal release preflight.
-   This gate checks exported names, signatures and source links; it cannot establish semantic prose,
-   DTO compatibility or platform adoption.
+   The gate checks that each export has a guide entry and generates signatures and source links.
+   Review prose, DTO compatibility, and platform adoption separately.
 
 Publish pointers to **both documents** in the MDK, MarmotKit and C GitHub Release bodies
 (and WN Agent when applicable). Existing auto-generated notes/workflow bodies do not
@@ -293,7 +293,8 @@ git status --short --branch
 git fetch origin
 ```
 
-Confirm the version, release notes, companion integration guide and complete method inventory:
+Check release notes and guide coverage before tagging. The source-only preflight checks the
+UniFFI guide. `just binding-docs-gate` also generates the C header and checks the C guide:
 
 ```sh
 release_version="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
@@ -306,7 +307,9 @@ The versioned check requires both `docs/release/$release_version.md` and
 `docs/integration/$release_version.md` from 0.10.2 onward and verifies their reciprocal
 links. It also rejects a supplied version that differs from the workspace. The full-cohort
 release coordinator runs this check before any tag/release mutation, including dry runs.
-A successful check verifies existence/linkage, not the accuracy or completeness of prose.
+Before creating tags, the coordinator also generates the C header with cbindgen 0.29.4
+and checks both binding guides at the exact release commit. Dry runs stay source-only.
+These checks verify links and export coverage, not the accuracy of the prose.
 
 Required GitHub CI on the exact release commit is the authoritative workspace check. Do not repeat that matrix locally
 after the initial release PR merges. If the intended release commit was changed after CI, or required CI did not cover
@@ -316,6 +319,7 @@ the relevant surface, run the missing checks before tagging:
 just fmt-check
 just check
 just clippy
+just binding-docs-gate
 just test
 ```
 

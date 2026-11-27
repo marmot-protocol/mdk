@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import io
 import json
 import os
 import subprocess
@@ -144,6 +146,37 @@ MarmotStatus marmot_list_accounts(void *client, MarmotAccountSummary **out);
 
 
 class ReleaseImpactClassifierTests(unittest.TestCase):
+    def test_generated_abi_cutover(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _init_synthetic_repo(repo)
+            header = repo / classifier.C_HEADER_PATH
+            original = header.read_text(encoding="utf-8")
+            header.write_text("/* Comment-only change. */\n" + original, encoding="utf-8")
+            args = ["--root", str(repo), "--c-abi"]
+            self.assertEqual(classifier.main([*args, "write"]), 0)
+            header.unlink()
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-m", "Replace tracked header with declarations")
+            cutover = _git(repo, "rev-parse", "HEAD")
+
+            _, delta = classifier.classify_range(repo, target_ref=cutover)
+            self.assertEqual(delta["c_abi"]["breaking"], [])
+            self.assertEqual(delta["c_abi"]["functions"]["added"], [])
+            _git(repo, "tag", "-a", "v0.19.1", "-m", "mdk v0.19.1", cutover)
+
+            header.write_text(original.replace("void *client", "unsigned client"), encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()) as error:
+                self.assertEqual(classifier.main([*args, "check"]), 1)
+            self.assertIn("differs from the generated header", error.getvalue())
+            self.assertEqual(classifier.main([*args, "write"]), 0)
+            header.unlink()
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-m", "Change C function signature")
+
+            _, delta = classifier.classify_range(repo, baseline_ref="v0.19.1", target_ref="HEAD")
+            self.assertEqual(delta["c_abi"]["breaking"], ["changed C signature `marmot_list_accounts`"])
+
     def test_additive_uniffi_and_c_exports_classify_as_patch(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

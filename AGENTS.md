@@ -152,7 +152,8 @@ no merge queue. The shipping flow is:
   version, workspace package versions in `Cargo.lock`, or vector `conformance_version` values during feature, fix,
   binding, or review-feedback work unless the user explicitly requests that version bump. The post-release move of
   master to the next `X.Y.0-dev` is one of those release operations; see `release.md#development-versions`.
-- Keep binding READMEs and complete method references current with API changes; run `just binding-docs-gate`.
+- Keep binding READMEs and authored `API-GUIDE.md` files current with API changes. Run `just binding-docs-gate`;
+  do not commit the generated references or header.
   Starting with 0.10.2, every release requires concise `docs/release/<version>.md` notes and a detailed
   `docs/integration/<version>.md` companion, indexed and linked both ways. Follow `release.md#release-documentation`:
   distinguish required changes, new defaults, optional adoption and automatic fixes; preserve supported lower-level
@@ -169,8 +170,9 @@ no merge queue. The shipping flow is:
 Local verification proves your change before merge, and post-merge `Canary` runs continuously verify `master` across
 the full suite. Keep local runs scoped to your change: several agents usually build on the same machine, so
 workspace-wide builds and suites run locally only when a rule below calls for one. On team pull requests, `Required CI`
-runs a ~1-minute static gate (verified commit signatures, `cargo fmt --check`, static/contract gates, `cargo audit`,
-and commit-trailer checks, advisory except the `just dependents-nextest` record) with zero Rust compile. External/fork pull requests and PRs labelled `ci:full` run
+runs static checks: verified commit signatures, `cargo fmt --check`, contract gates, `cargo audit`, and commit trailers
+(advisory except the `just dependents-nextest` record). Changes to bindings or their generators also generate the C
+header and both API references for review. External/fork pull requests and PRs labelled `ci:full` run
 the full `ci.yml` matrix on GitHub-hosted runners; `ci:apple` adds both macOS jobs on a team PR regardless of changed
 paths. Master pushes only refresh CI's Rust caches, and only when a dependency or toolchain input changes.
 

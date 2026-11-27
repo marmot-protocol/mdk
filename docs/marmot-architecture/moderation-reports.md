@@ -15,7 +15,7 @@ account level, for example by refusing an npub on the relays it operates.
 
 This page is the wire contract for the operator's reader. The implementation lives in
 `crates/marmot-app/src/moderation_reports.rs`. The host API is `submit_moderation_report` in
-[MarmotKit](../../crates/marmot-uniffi/API-REFERENCE.md#marmotsubmit_moderation_report).
+[MarmotKit](../../crates/marmot-uniffi/API-GUIDE.md#marmotsubmit_moderation_report).
 
 ## What a report contains
 

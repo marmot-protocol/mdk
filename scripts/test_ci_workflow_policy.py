@@ -472,6 +472,25 @@ class MergeGatePolicyTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode == 0, expected)
 
+    def test_requires_selected_c_job(self):
+        script = workflow_step("ci.yml", "Require every selected core CI job to succeed")
+        needs = {name: {"result": "success"} for name in ("signatures", "changes", "rust-format", "rust-audit")}
+        for selected, result, expected in (
+            ("false", "skipped", True),
+            ("true", "skipped", False),
+            ("true", "failure", False),
+            ("true", "success", True),
+        ):
+            with self.subTest(selected=selected, result=result):
+                needs["c-smoke"] = {"result": result}
+                run = subprocess.run(
+                    ["bash", "-c", script], capture_output=True, timeout=10,
+                    env={**os.environ, "EVENT_NAME": "pull_request", "CI_MODE": "fast",
+                         "IS_TEAM_PR": "true", "APPLE_OPT_IN": "false", "RUN_C": selected,
+                         "TREE_STATE": "green", "NEEDS": json.dumps(needs)},
+                )
+                self.assertEqual(run.returncode == 0, expected)
+
     def test_read_tree_state_blocks_red_or_malformed_and_defaults_green_when_absent(self):
         script = workflow_step("ci.yml", "Read tree state")
         labels_script = workflow_step("ci.yml", "Check CI opt-in labels")
@@ -596,8 +615,12 @@ class MergeGatePolicyTests(unittest.TestCase):
         self.assertIn("run: just android-check", android_job)
         self.assertIn("cargo check --locked --target aarch64-linux-android -p marmot-uniffi", justfile)
         self.assertIn("aarch64-linux-android26-clang", justfile)
-        # Every checkout in ci.yml must honor optional inputs.source_sha for Canary pinning.
-        checkouts = workflow.count("uses: actions/checkout@")
+        # Honor the Canary pin except when checking out the other side of a PR ABI diff.
+        abi_base = workflow.split("      - name: Check out exact PR base for C ABI comparison\n", 1)[1]
+        abi_base = abi_base.split("\n      - name:", 1)[0]
+        self.assertIn("if: github.event_name == 'pull_request'", abi_base)
+        self.assertIn("ref: ${{ needs.changes.outputs.pr_base }}", abi_base)
+        checkouts = workflow.count("uses: actions/checkout@") - abi_base.count("uses: actions/checkout@")
         pinned = workflow.count("ref: ${{ inputs.source_sha }}")
         self.assertEqual(checkouts, pinned)
         self.assertGreaterEqual(checkouts, 24)
