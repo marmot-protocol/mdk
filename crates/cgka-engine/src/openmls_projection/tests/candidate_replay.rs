@@ -227,8 +227,10 @@ async fn graph_seed_keeps_stale_commits() {
     let commit = rival_commit(&storage, &alice.self_id(), &group_id);
     admit_rival(&storage, &group_id, &commit, epoch);
 
+    let rewinds = crate::snapshot_guard::Rewinds::default();
     let retained =
-        super::seed_stored_openmls_graph_inputs(&storage, &group_id, epoch, None).unwrap();
+        super::seed_stored_openmls_graph_inputs(&storage, &rewinds, &group_id, epoch, None)
+            .unwrap();
     assert!(
         retained
             .commit_messages
@@ -236,7 +238,8 @@ async fn graph_seed_keeps_stale_commits() {
             .any(|row| row.message.id == commit.id)
     );
     let stale =
-        super::seed_stored_openmls_graph_inputs(&storage, &group_id, epoch + 1, None).unwrap();
+        super::seed_stored_openmls_graph_inputs(&storage, &rewinds, &group_id, epoch + 1, None)
+            .unwrap();
     assert!(stale.commit_messages.is_empty());
     assert!(stale.stale_commit_drops.iter().any(|row| {
         row.message_id == hex::encode(commit.id.as_slice())
@@ -865,7 +868,14 @@ async fn resumable_search_matches_original_bfs_without_repeating_probes() {
         );
     }
     let before = replay_state(&storage, &group_id);
-    let inputs = super::seed_stored_openmls_graph_inputs(&storage, &group_id, 0, None).unwrap();
+    let inputs = super::seed_stored_openmls_graph_inputs(
+        &storage,
+        &crate::snapshot_guard::Rewinds::default(),
+        &group_id,
+        0,
+        None,
+    )
+    .unwrap();
     let mut reference_budget = super::ReplayBudget::for_pass(messages.len(), 64);
     let reference = super::build_stored_openmls_candidate_paths_reference(
         &storage,
@@ -1377,8 +1387,14 @@ async fn candidate_reconstruction_measurement() {
                 admit_rival(&storage, &group_id, message, epoch);
             }
             let before = replay_state(&storage, &group_id);
-            let inputs =
-                super::seed_stored_openmls_graph_inputs(&storage, &group_id, 0, None).unwrap();
+            let inputs = super::seed_stored_openmls_graph_inputs(
+                &storage,
+                &crate::snapshot_guard::Rewinds::default(),
+                &group_id,
+                0,
+                None,
+            )
+            .unwrap();
             let mut budget = super::ReplayBudget::for_pass(messages.len(), 64);
             let start = std::time::Instant::now();
             let result = super::build_stored_openmls_candidate_paths(
@@ -1841,8 +1857,14 @@ async fn own_checkpoint_checks_parent() {
     let sibling = rival_commit(&peer, &bob.self_id(), &group_id);
     confirmed_update(&mut alice, &group_id).await;
     let next = confirmed_update(&mut alice, &group_id).await;
-    let inputs =
-        super::seed_stored_openmls_graph_inputs(&storage, &group_id, source_epoch, None).unwrap();
+    let inputs = super::seed_stored_openmls_graph_inputs(
+        &storage,
+        &crate::snapshot_guard::Rewinds::default(),
+        &group_id,
+        source_epoch,
+        None,
+    )
+    .unwrap();
     let mut selected = super::canonicalize_stored_openmls_messages(
         &storage,
         &group_id,
@@ -2381,8 +2403,14 @@ async fn own_private_checkpoint_refused() {
     storage
         .update_message_state(&message.id, MessageState::ConvergenceDeferred)
         .unwrap();
-    let inputs =
-        super::seed_stored_openmls_graph_inputs(&storage, &group_id, source_epoch, None).unwrap();
+    let inputs = super::seed_stored_openmls_graph_inputs(
+        &storage,
+        &crate::snapshot_guard::Rewinds::default(),
+        &group_id,
+        source_epoch,
+        None,
+    )
+    .unwrap();
     selected.accepted_commits = vec![hex::encode(message.id.as_slice())];
     selected.selected_tip = Some(source_epoch + 1);
     selected.selected_fork_epoch = Some(source_epoch);
@@ -3048,7 +3076,14 @@ async fn candidate_context_capture_keeps_a_late_native_storage_error() {
     for message in &messages {
         admit_rival(&storage, &group_id, message, 1);
     }
-    let inputs = super::seed_stored_openmls_graph_inputs(&storage, &group_id, 0, None).unwrap();
+    let inputs = super::seed_stored_openmls_graph_inputs(
+        &storage,
+        &crate::snapshot_guard::Rewinds::default(),
+        &group_id,
+        0,
+        None,
+    )
+    .unwrap();
     let mut budget = super::ReplayBudget::for_pass(messages.len(), V1_MAX_REWIND_COMMITS);
     let paths = super::build_stored_openmls_candidate_paths(
         &storage,

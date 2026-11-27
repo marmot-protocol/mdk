@@ -1320,6 +1320,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let msg_epoch = EpochId(proto.epoch().as_u64());
         let msg_content_type = proto.content_type();
+        let below_this_copys_history = self.epoch_below_this_copys_history(&group_id, msg_epoch);
 
         // Pre-membership classification (mdk#339): an application
         // message whose MLS epoch precedes this device's join epoch can
@@ -1328,8 +1329,7 @@ impl<S: StorageProvider> Engine<S> {
         // OpenMLS processing instead of feeding it the retry lifecycle.
         if msg_content_type == ContentType::Application
             && msg_epoch < current_epoch
-            && self.epoch_below_this_copys_history(&group_id, msg_epoch)
-                == Some(BelowCopyHistory::PreMembership)
+            && below_this_copys_history == Some(BelowCopyHistory::PreMembership)
         {
             let tag = crate::message_disposition::MessageDisposition::PreMembershipEvent.tag();
             self.persist_openmls_wire_message_with_processed_transport_id(
@@ -1378,9 +1378,21 @@ impl<S: StorageProvider> Engine<S> {
         // cannot read the rival either, having halted on the same missing
         // checkpoint or the same budget. Routing traffic there restores no
         // symmetry; it only adds noise.
+        //
+        // Never admit a message whose claimed epoch predates this copy's own
+        // history (`join_epoch` / `local_copy_install_epoch`): candidate
+        // branches only extend states at or above that floor, so anything
+        // below it belongs to the stale direct-rejection arms below. Commits
+        // always take the single history/anchor gate in
+        // `commit_should_enter_convergence` below so a candidate-branch outer
+        // wrapper cannot smuggle an unanchored or out-of-horizon past commit
+        // into convergence.
         let evidence_for_a_contested_pass =
             msg_content_type == ContentType::Application && sweep.has_branch_contexts();
-        if recovered_from_candidate_branch || evidence_for_a_contested_pass {
+        if below_this_copys_history.is_none()
+            && msg_content_type != ContentType::Commit
+            && (recovered_from_candidate_branch || evidence_for_a_contested_pass)
+        {
             return reported(self.buffer_openmls_message_into_convergence(
                 group_id,
                 &openmls_msg,
@@ -1399,15 +1411,16 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         // Set when convergence admission is refused ONLY because the
-        // fork-source anchor snapshot is gone. Within the rewind horizon
+        // fork-source anchor snapshot is gone for an epoch authenticated local
+        // history proves this copy actually held. Within the rewind horizon
         // that absence is abnormal by construction — every canonical
         // advance retains a source-epoch anchor and pruning runs only
         // beyond the horizon — so the WrongEpoch arm below must fail
         // closed loudly instead of silently classifying the rival stale.
-        // Commits forking from below this copy's own history — before the
-        // device's join epoch, or before the current copy was installed — are
-        // the legitimate in-horizon absences and keep the stale fallback; see
-        // `commit_is_below_this_copys_history`.
+        // Commits claiming epochs below this copy's own history — before the
+        // device's join epoch, before the current copy was installed, or
+        // unanchored epochs never traversed by a creator / legacy record —
+        // keep the stale fallback.
         //
         // One rule for every member: an in-horizon rival commit enters
         // distributed convergence whether or not this device is itself
@@ -1417,7 +1430,9 @@ impl<S: StorageProvider> Engine<S> {
         // an observer does.
         let mut convergence_refused_for_missing_anchor = false;
         let commit_should_enter_convergence = if msg_content_type == ContentType::Commit {
-            if msg_epoch >= current_epoch {
+            if below_this_copys_history.is_some() {
+                false
+            } else if msg_epoch >= current_epoch {
                 true
             } else {
                 let policy = self
@@ -1425,26 +1440,40 @@ impl<S: StorageProvider> Engine<S> {
                     .map_err(|e| EngineError::Backend(format!("load convergence policy: {e}")))?;
                 let within_rewind_horizon = current_epoch.0.saturating_sub(msg_epoch.0)
                     <= policy.convergence.max_rewind_commits;
-                let active_pass = self
-                    .storage
-                    .convergence_pass(&group_id)?
-                    .is_some_and(|pass| pass.is_active());
-                let has_source_anchor = self.has_retained_anchor_snapshot(&group_id, msg_epoch)?;
-                // Below this copy's own history the commit is not a rival at
-                // all: neither an admission (any anchor at that epoch belongs
-                // to a discarded copy and rewinding onto it is what produces
-                // `CandidateStateUnavailable`) nor the missing-anchor alarm,
-                // which is reserved for a gap in history this copy really had.
-                let below_this_copys_history = self
-                    .epoch_below_this_copys_history(&group_id, msg_epoch)
-                    .is_some();
-                convergence_refused_for_missing_anchor = within_rewind_horizon
-                    && !active_pass
-                    && !has_source_anchor
-                    && !below_this_copys_history;
-                !below_this_copys_history
-                    && within_rewind_horizon
-                    && (active_pass || has_source_anchor)
+                if !within_rewind_horizon {
+                    false
+                } else {
+                    let anchored_epochs: std::collections::BTreeSet<u64> = self
+                        .storage
+                        .list_group_snapshots(&group_id)?
+                        .into_iter()
+                        .filter_map(|name| retained_anchor_epoch_from_snapshot_name(&name))
+                        .collect();
+                    if anchored_epochs.contains(&msg_epoch.0)
+                        || self.active_pass_has_anchored_commit_below(
+                            &group_id,
+                            msg_epoch,
+                            &anchored_epochs,
+                        )?
+                    {
+                        true
+                    } else {
+                        let proven_local_history = match self.live_group_record(&group_id) {
+                            Ok(group) => crate::openmls_projection::missing_anchor_is_proven_local_history_with_anchored_epochs(
+                                &self.storage,
+                                &self.rewinds,
+                                &self.crypto,
+                                &group,
+                                msg_epoch.0,
+                                &anchored_epochs,
+                            )?,
+                            Err(EngineError::Storage(StorageError::NotFound)) => false,
+                            Err(error) => return Err(error),
+                        };
+                        convergence_refused_for_missing_anchor = proven_local_history;
+                        false
+                    }
+                }
             }
         } else {
             false
@@ -1457,12 +1486,19 @@ impl<S: StorageProvider> Engine<S> {
                 &raw_msg_id,
                 msg_epoch,
                 ConvergenceHandoff {
-                    wrapper_retirement_reason: "buffered_into_convergence",
+                    wrapper_retirement_reason: if recovered_from_candidate_branch {
+                        "recovered_under_candidate_branch"
+                    } else {
+                        "buffered_into_convergence"
+                    },
                     drain: sweep.drain_policy(),
                 },
             )?);
         }
-        if msg_content_type == ContentType::Application && msg_epoch > current_epoch {
+        if msg_content_type == ContentType::Application
+            && below_this_copys_history.is_none()
+            && msg_epoch > current_epoch
+        {
             return reported(self.buffer_openmls_message_into_convergence(
                 group_id,
                 &openmls_msg,
@@ -1532,8 +1568,7 @@ impl<S: StorageProvider> Engine<S> {
                 // no state and never will. Above both, the device was a member
                 // at the source epoch and its secrets have simply aged out.
                 use crate::message_disposition::MessageDisposition;
-                let (reason, tag) = match self.epoch_below_this_copys_history(&group_id, msg_epoch)
-                {
+                let (reason, tag) = match below_this_copys_history {
                     Some(BelowCopyHistory::PreMembership) => (
                         StaleReason::PreMembership,
                         MessageDisposition::PreMembershipEvent.tag(),
@@ -2956,13 +2991,37 @@ impl<S: StorageProvider> Engine<S> {
         Ok(context)
     }
 
-    fn has_retained_anchor_snapshot(
+    /// Whether a collecting convergence pass already holds an unresolved commit
+    /// at an anchored source epoch strictly below `msg_epoch`. Only then can
+    /// the active pass replay `msg_epoch` from an existing anchor without
+    /// requiring `openmls-retained-anchor-{msg_epoch}`. Narrowing to
+    /// `Collecting` is intentional: once a pass leaves `Collecting`, its frozen
+    /// member set is fixed and cannot admit a newly arriving commit anyway.
+    fn active_pass_has_anchored_commit_below(
         &self,
         group_id: &GroupId,
-        epoch: EpochId,
+        msg_epoch: EpochId,
+        anchored_epochs: &std::collections::BTreeSet<u64>,
     ) -> Result<bool, EngineError> {
-        for snapshot_name in self.storage.list_group_snapshots(group_id)? {
-            if retained_anchor_epoch_from_snapshot_name(&snapshot_name) == Some(epoch.0) {
+        let Some(pass) = self.storage.convergence_pass(group_id)? else {
+            return Ok(false);
+        };
+        if pass.phase != cgka_traits::ConvergencePassPhase::Collecting {
+            return Ok(false);
+        }
+        for member in &pass.members {
+            if member.role != cgka_traits::ConvergencePassMemberRole::CommitEdge
+                || member.source_epoch >= msg_epoch.0
+                || !anchored_epochs.contains(&member.source_epoch)
+            {
+                continue;
+            }
+            let state = match self.storage.get_message(&member.message_id) {
+                Ok(record) => record.state,
+                Err(StorageError::NotFound) => continue,
+                Err(error) => return Err(EngineError::Storage(error)),
+            };
+            if crate::openmls_projection::unresolved_commit_state(state) {
                 return Ok(true);
             }
         }
