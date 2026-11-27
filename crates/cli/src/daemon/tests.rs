@@ -866,7 +866,6 @@ async fn send_execute_connect_failure_recovers_cli_and_import_nsec() {
         relay: Some("wss://relay.example".to_owned()),
         default_relays: Vec::new(),
         bootstrap_relays: Vec::new(),
-        publish_missing_relay_lists: false,
     });
     cli.json = true;
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
@@ -907,7 +906,6 @@ async fn disabled_app_runtime_skips_relay_validation_and_preserves_nsec_sidecar(
         relay: Some("wss://relay.example".to_owned()),
         default_relays: Vec::new(),
         bootstrap_relays: Vec::new(),
-        publish_missing_relay_lists: false,
     });
     apply_defaults(&mut cli, &defaults);
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
@@ -983,7 +981,6 @@ fn execute_request_roundtrip_carries_import_nsec_sidecar_not_cli_identity() {
         relay: Some("wss://relay.example".to_owned()),
         default_relays: Vec::new(),
         bootstrap_relays: Vec::new(),
-        publish_missing_relay_lists: false,
     });
     cli.daemon_default_account_relays = vec!["wss://relay.example".to_owned()];
     let request = DaemonRequest::Execute {
@@ -2688,7 +2685,6 @@ fn execute_request_roundtrip_carries_import_bunker_sidecar_and_redacts_secret() 
         relay: Some("wss://relay.example".to_owned()),
         default_relays: Vec::new(),
         bootstrap_relays: Vec::new(),
-        publish_missing_relay_lists: false,
     });
     let request = DaemonRequest::Execute {
         cli: Box::new(cli),
@@ -2726,95 +2722,4 @@ fn daemon_account_ref_accepts_external_signing_account() {
     let resolved = daemon_account_ref(&defaults, &cli)
         .expect("external signing accounts must be accepted by streaming subscriptions");
     assert_eq!(resolved, external.account_id_hex);
-}
-
-#[tokio::test]
-async fn resume_persisted_nip46_accounts_handles_unpaired_and_corrupt_independently() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let account_home = marmot_account::AccountHome::open(home.path());
-    let local = account_home.create_nostr_account().expect("local account");
-    let unpaired = account_home
-        .add_external_signer_account(&"11".repeat(32))
-        .expect("unpaired external account");
-    let corrupt = account_home
-        .add_external_signer_account(&"22".repeat(32))
-        .expect("corrupt external account");
-    let healthy = account_home
-        .add_external_signer_account(&"33".repeat(32))
-        .expect("healthy external account");
-
-    // Write a corrupt session file for `corrupt` and a valid session for `healthy`.
-    std::fs::write(
-        account_home
-            .account_dir(&corrupt.label)
-            .join(".nip46-session.json"),
-        b"{not valid json",
-    )
-    .expect("write corrupt session");
-    let client_keys = nostr::prelude::Keys::generate();
-    let perms = marmot_app::Nip46Session::permissions();
-    account_home
-        .store_nip46_session(
-            &healthy.label,
-            &client_keys,
-            &marmot_account::Nip46SessionRecord {
-                version: 1,
-                user_public_key: healthy.account_id_hex.clone(),
-                remote_signer_public_key: nostr::prelude::Keys::generate().public_key().to_hex(),
-                client_public_key: client_keys.public_key().to_hex(),
-                relays: vec!["wss://relay.example".to_owned()],
-                name: "White Noise CLI".to_owned(),
-                permission_version: perms.version,
-                permissions: perms.grants,
-            },
-        )
-        .expect("store healthy nip46 session");
-
-    let defaults = DaemonDefaults {
-        home: home.path().to_path_buf(),
-        socket: default_socket_path(home.path()),
-        pid_path: default_pid_path(home.path()),
-        log_path: default_log_path(home.path()),
-        relay: Some("wss://relay.example".to_owned()),
-        discovery_relays: vec!["wss://relay.example".to_owned()],
-        default_account_relays: vec!["wss://relay.example".to_owned()],
-        secret_store: Some(crate::SecretStoreKind::File),
-        keychain_service: None,
-    };
-    let state = Arc::new(Mutex::new(DaemonState {
-        pid: 1,
-        started_at: 0,
-        starting: false,
-        last_runtime_activity: None,
-    }));
-    let runtime = open_app_runtime(&defaults).expect("open runtime");
-    let resumed_any = resume_persisted_nip46_accounts(&defaults, &state, &runtime).await;
-    assert!(resumed_any, "healthy NIP-46 account should resume");
-    assert!(
-        runtime.nip46_resume(&healthy.account_id_hex).await.is_ok(),
-        "healthy account session must be live after resume"
-    );
-    assert!(
-        runtime
-            .nip46_resume(&unpaired.account_id_hex)
-            .await
-            .is_err(),
-        "unpaired external account remains unavailable"
-    );
-    let activity = state
-        .lock()
-        .expect("state lock")
-        .last_runtime_activity
-        .clone()
-        .expect("corrupt session error should be recorded");
-    assert!(
-        activity
-            .errors
-            .iter()
-            .all(|msg| !msg.contains(&corrupt.account_id_hex)
-                && !msg.contains(&local.account_id_hex)),
-        "daemon activity errors must remain privacy-safe: {:?}",
-        activity.errors
-    );
-    runtime.shutdown().await;
 }

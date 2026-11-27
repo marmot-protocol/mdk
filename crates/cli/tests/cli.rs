@@ -9868,11 +9868,12 @@ struct MockNip46Signer {
 
 impl MockNip46Signer {
     fn start(relay_url: &str) -> Self {
-        Self::start_with_keys(
+        Self::start_with_options(
             relay_url,
             nostr::prelude::Keys::generate(),
             nostr::prelude::Keys::generate(),
             false,
+            None,
         )
     }
 
@@ -9881,6 +9882,16 @@ impl MockNip46Signer {
         user: nostr::prelude::Keys,
         remote: nostr::prelude::Keys,
         reject_sign: bool,
+    ) -> Self {
+        Self::start_with_options(relay_url, user, remote, reject_sign, None)
+    }
+
+    fn start_with_options(
+        relay_url: &str,
+        user: nostr::prelude::Keys,
+        remote: nostr::prelude::Keys,
+        reject_sign: bool,
+        hold_sign: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     ) -> Self {
         use nostr::event::FinalizeEvent;
         use nostr::prelude::{EventBuilder, Filter, Kind, PublicKey, Tags, Timestamp, nip44};
@@ -9908,6 +9919,7 @@ impl MockNip46Signer {
             let remote = remote.clone();
             let user = user.clone();
             let relay_url = url.clone();
+            let mut hold_sign = hold_sign;
             runtime.spawn(async move {
                 let mut seen = std::collections::HashSet::new();
                 while let Some(notification) = notifications.next().await {
@@ -9981,16 +9993,21 @@ impl MockNip46Signer {
                             serde_json::json!({ "id": id, "result": decrypted })
                         }
                         "sign_event" => {
+                            let unsigned: Value =
+                                serde_json::from_str(params[0].as_str().expect("sign_event param"))
+                                    .expect("unsigned event json");
+                            if unsigned["kind"].as_u64() == Some(30443)
+                                && let Some((seen_notify, release_notify)) = hold_sign.take()
+                            {
+                                seen_notify.notify_one();
+                                release_notify.notified().await;
+                            }
                             if reject_sign {
                                 serde_json::json!({
                                     "id": id,
                                     "error": "user rejected",
                                 })
                             } else {
-                                let unsigned: Value = serde_json::from_str(
-                                    params[0].as_str().expect("sign_event param"),
-                                )
-                                .expect("unsigned event json");
                                 let signed = EventBuilder::new(
                                     serde_json::from_value::<Kind>(unsigned["kind"].clone())
                                         .expect("kind"),
@@ -10252,14 +10269,17 @@ fn nip46_bunker_login_restart_messaging_rebind_and_remove() {
     assert_eq!(bob["external_signing"], true);
     assert_eq!(bob["signing_mode"], "external");
 
-    // Verify daemon log never recorded the bunker secret.
-    let log_path = home.path().join("dev").join("wnd.log");
-    if let Ok(log_contents) = std::fs::read_to_string(&log_path) {
-        assert!(
-            !log_contents.contains(secret_token),
-            "bunker secret must never appear in daemon logs"
-        );
-    }
+    // Verify daemon log exists and never recorded the bunker secret.
+    let daemon_status = run_json(home.path(), &["--socket", socket_arg, "daemon", "status"]);
+    let log_path = daemon_status["log"]
+        .as_str()
+        .expect("daemon status reports log");
+    let log_contents =
+        std::fs::read_to_string(log_path).expect("daemon log file must exist and be readable");
+    assert!(
+        !log_contents.contains(secret_token),
+        "bunker secret must never appear in daemon logs"
+    );
 
     // 4. Inspect accounts list, accounts status, whoami, nip46 status, and export-nsec.
     let list = run_json(home.path(), &["--socket", socket_arg, "accounts", "list"]);
@@ -10296,6 +10316,38 @@ fn nip46_bunker_login_restart_messaging_rebind_and_remove() {
         &["--socket", socket_arg, "export-nsec", &bob_id],
     );
     assert_eq!(export_err["code"], "private_key_export_disabled");
+
+    // 4b. Send immediately after daemon-hosted bunker login (before any restart).
+    let pre_restart_group = run_json(
+        home.path(),
+        &[
+            "--socket",
+            socket_arg,
+            "--account",
+            &bob_id,
+            "groups",
+            "create",
+            "nip46-immediate",
+            &alice_id,
+        ],
+    );
+    let pre_restart_group_id = pre_restart_group["group_id"]
+        .as_str()
+        .expect("pre-restart group id");
+    let immediate_send = run_json(
+        home.path(),
+        &[
+            "--socket",
+            socket_arg,
+            "--account",
+            &bob_id,
+            "messages",
+            "send",
+            pre_restart_group_id,
+            "hello before restart",
+        ],
+    );
+    assert_eq!(immediate_send["published"], 1);
 
     // 5. Restart wnd cleanly and confirm Bob's NIP-46 session auto-resumes without re-login.
     stop_daemon_cleanly(&socket);
@@ -10432,6 +10484,59 @@ fn nip46_bunker_login_restart_messaging_rebind_and_remove() {
             .any(|msg| msg["plaintext"] == "hello from nip46"),
         "removing NIP-46 credentials must preserve encrypted local history"
     );
+
+    // Pure local group reads must also remain available after removing NIP-46 credentials.
+    let preserved_admins = run_json(
+        home.path(),
+        &[
+            "--socket",
+            socket_arg,
+            "--account",
+            &bob_id,
+            "groups",
+            "admins",
+            &group_id,
+        ],
+    );
+    assert!(preserved_admins["admins"].is_array());
+    let preserved_relays = run_json(
+        home.path(),
+        &[
+            "--socket",
+            socket_arg,
+            "--account",
+            &bob_id,
+            "groups",
+            "relays",
+            &group_id,
+        ],
+    );
+    assert!(preserved_relays["relays"].is_array());
+    let preserved_invites = run_json(
+        home.path(),
+        &[
+            "--socket",
+            socket_arg,
+            "--account",
+            &bob_id,
+            "groups",
+            "invites",
+        ],
+    );
+    assert!(preserved_invites["invites"].is_array());
+    let preserved_retention = run_json(
+        home.path(),
+        &[
+            "--socket",
+            socket_arg,
+            "--account",
+            &bob_id,
+            "groups",
+            "retention",
+            &group_id,
+        ],
+    );
+    assert_eq!(preserved_retention["group_id"], group_id);
 
     // 9. Rebind Bob via `accounts nip46 register --bunker-stdin --approve-permissions`, then
     // verify the freshly bound session can sign and send again.
@@ -10652,5 +10757,164 @@ fn nip46_offline_signer_and_rejection_handle_gracefully() {
     assert_eq!(alice_sent["published"], 1);
 
     drop(rejecting_signer);
+    stop_daemon_cleanly(&socket);
+}
+
+/// A blocked NIP-46 pairing on `wnd` must not stall unrelated accounts on the daemon's global
+/// workers lock, and disconnecting the pairing client early cleanly abandons the unbound session.
+#[test]
+fn nip46_blocked_pairing_does_not_stall_other_accounts_and_cancels_on_disconnect() {
+    use std::io::{BufRead, BufReader};
+
+    let relay = TestRelay::new();
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("wnd.sock");
+    let socket_arg = socket.to_str().expect("socket utf8");
+    let _daemon = DaemonGuard::detached(&socket);
+
+    start_daemon_on_relay(home.path(), &socket, relay.url());
+    let alice = run_json(home.path(), &["--socket", socket_arg, "create-identity"]);
+    let alice_id = alice["account_id"].as_str().expect("alice id").to_owned();
+
+    // Start a nostrconnect pairing with no remote signer answering so it stays blocked in connect.
+    let mut stalled_child = wn(home.path())
+        .args([
+            "--socket",
+            socket_arg,
+            "login",
+            "--nostrconnect",
+            "--signer-relays",
+            relay.url(),
+            "--approve-permissions",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stalled nostrconnect");
+
+    let stderr = stalled_child.stderr.take().expect("piped stderr");
+    let mut reader = BufReader::new(stderr);
+    let mut line = String::new();
+    let mut saw_offer = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        line.clear();
+        let read = reader.read_line(&mut line).expect("read stderr line");
+        if read == 0 {
+            break;
+        }
+        if line.trim().starts_with("nostrconnect://") {
+            saw_offer = true;
+            break;
+        }
+    }
+    assert!(saw_offer, "expected nostrconnect:// offer URI on stderr");
+
+    // While the pairing is blocked awaiting a remote signer, Alice's hosted commands must proceed
+    // immediately without stalling on the daemon workers lock.
+    let alice_group = run_json(
+        home.path(),
+        &[
+            "--socket",
+            socket_arg,
+            "--account",
+            &alice_id,
+            "groups",
+            "create",
+            "concurrent-while-pairing",
+        ],
+    );
+    let group_id = alice_group["group_id"].as_str().expect("group id");
+    let alice_sent = run_json(
+        home.path(),
+        &[
+            "--socket",
+            socket_arg,
+            "--account",
+            &alice_id,
+            "messages",
+            "send",
+            group_id,
+            "not blocked by pairing",
+        ],
+    );
+    assert_eq!(alice_sent["published"], 1);
+
+    // Kill the pairing client mid-flight (simulating Ctrl-C) and confirm wnd stays healthy.
+    let _ = stalled_child.kill();
+    let _ = stalled_child.wait();
+
+    // Now block a `bunker://` login mid-adoption (holding Bob's onboarding transaction while
+    // waiting on `sign_event`) and confirm Alice's hosted command still completes without stalling.
+    let sign_seen = Arc::new(tokio::sync::Notify::new());
+    let sign_release = Arc::new(tokio::sync::Notify::new());
+    let signer = MockNip46Signer::start_with_options(
+        relay.url(),
+        nostr::prelude::Keys::generate(),
+        nostr::prelude::Keys::generate(),
+        false,
+        Some((sign_seen.clone(), sign_release.clone())),
+    );
+    let bunker_uri = signer.bunker_uri("blocked-adoption-secret");
+    let mut adoption_child = wn(home.path())
+        .args([
+            "--socket",
+            socket_arg,
+            "login",
+            "--bunker-stdin",
+            "--approve-permissions",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn blocked adoption login");
+    adoption_child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(format!("{bunker_uri}\n").as_bytes())
+        .expect("write bunker uri");
+
+    signer.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(15), sign_seen.notified())
+            .await
+            .expect("signer should receive sign_event during nip46_login adoption");
+    });
+
+    // While Bob's adoption holds his onboarding gate, Alice's hosted send must not stall.
+    let alice_during_adoption = run_json(
+        home.path(),
+        &[
+            "--socket",
+            socket_arg,
+            "--account",
+            &alice_id,
+            "messages",
+            "send",
+            group_id,
+            "not blocked by adoption",
+        ],
+    );
+    assert_eq!(alice_during_adoption["published"], 1);
+
+    // Release the remote signer and verify Bob's adoption completes cleanly.
+    sign_release.notify_one();
+    let adoption_out = adoption_child
+        .wait_with_output()
+        .expect("adoption finishes");
+    assert!(
+        adoption_out.status.success(),
+        "released NIP-46 adoption failed\n{}",
+        command_output_summary(&adoption_out)
+    );
+    let adoption_json: Value = serde_json::from_slice(&adoption_out.stdout).expect("adoption json");
+    assert_eq!(adoption_json["ok"], true);
+    assert_eq!(
+        adoption_json["result"]["account_id"],
+        signer.user_pubkey_hex()
+    );
+    assert_eq!(adoption_json["result"]["signing_mode"], "external");
+
     stop_daemon_cleanly(&socket);
 }

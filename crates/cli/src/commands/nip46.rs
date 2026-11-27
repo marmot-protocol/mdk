@@ -6,7 +6,7 @@ use std::pin::Pin;
 
 use cgka_traits::TransportEndpoint;
 use marmot_account::{AccountHome, AccountSummary, Nip46SessionRecord};
-use marmot_app::{AppError, MarmotApp, MarmotAppRuntime, Nip46Error, Nip46Session, Nip46Status};
+use marmot_app::{AppError, MarmotApp, MarmotAppRuntime, Nip46Session, Nip46Status};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
@@ -23,11 +23,11 @@ pub(crate) type PairingOfferCallback<'a> =
     Box<dyn FnMut(String) -> Pin<Box<dyn Future<Output = Result<(), WnError>> + Send>> + Send + 'a>;
 
 pub(crate) struct Nip46LoginOptions {
+    pub(crate) command: &'static str,
     pub(crate) pair: Nip46PairArgs,
     pub(crate) relay: Option<String>,
     pub(crate) default_relays: Vec<String>,
     pub(crate) bootstrap_relays: Vec<String>,
-    pub(crate) publish_missing_relay_lists: bool,
     pub(crate) daemon_default_account_relays: Vec<String>,
     pub(crate) daemon_discovery_relays: Vec<String>,
 }
@@ -37,6 +37,16 @@ pub(crate) fn is_nip46_uri(value: &str) -> bool {
     let trimmed = value.trim();
     let lower = trimmed.to_ascii_lowercase();
     lower.starts_with("bunker://") || lower.starts_with("nostrconnect://")
+}
+
+/// Returns true when a raw CLI argv token passes a `bunker://` or `nostrconnect://` URI
+/// directly (or as `--flag=<uri>`). Used to keep secrets out of clap parse errors.
+pub(crate) fn contains_nip46_uri_arg(arg: &str) -> bool {
+    if is_nip46_uri(arg) {
+        return true;
+    }
+    arg.split_once('=')
+        .is_some_and(|(_, value)| is_nip46_uri(value))
 }
 
 pub(crate) fn is_bunker_uri(value: &str) -> bool {
@@ -155,7 +165,7 @@ pub(crate) async fn nip46_command(
     import_bunker: Option<ImportBunkerUri>,
 ) -> Result<CommandOutput, WnError> {
     if let Nip46Command::Status { account } = command {
-        return nip46_status_command(account_home, None, account_flag, account).await;
+        return nip46_status_command(account_home, account_flag, account);
     }
     let runtime = app.runtime();
     let result = nip46_command_with_runtime(
@@ -194,18 +204,17 @@ pub(crate) async fn nip46_command_with_runtime<'a>(
             relay: login_relay,
             default_relays,
             bootstrap_relays,
-            publish_missing_relay_lists,
         } => {
             nip46_login_with_runtime(
                 account_home,
                 app,
                 runtime,
                 Nip46LoginOptions {
+                    command: "accounts nip46 login",
                     pair,
                     relay: login_relay.or(relay),
                     default_relays,
                     bootstrap_relays,
-                    publish_missing_relay_lists,
                     daemon_default_account_relays,
                     daemon_discovery_relays,
                 },
@@ -232,7 +241,7 @@ pub(crate) async fn nip46_command_with_runtime<'a>(
             .await
         }
         Nip46Command::Status { account } => {
-            nip46_status_command(account_home, Some(runtime), account_flag, account).await
+            nip46_status_command(account_home, account_flag, account)
         }
         Nip46Command::Remove { account } => {
             nip46_remove_with_runtime(account_home, runtime, account_flag, account).await
@@ -268,7 +277,7 @@ pub(crate) async fn nip46_login_with_runtime<'a>(
     import_bunker: Option<ImportBunkerUri>,
     on_pairing_offer: PairingOfferCallback<'a>,
 ) -> Result<CommandOutput, WnError> {
-    validate_nip46_pair_flags("login", &options.pair)?;
+    validate_nip46_pair_flags(options.command, &options.pair)?;
     let (default_relays, bootstrap_relays) = resolve_nip46_login_relays(&mut options)?;
     let fallback_signer_relays = default_relays
         .iter()
@@ -276,6 +285,7 @@ pub(crate) async fn nip46_login_with_runtime<'a>(
         .map(|endpoint| endpoint.0.clone())
         .collect::<Vec<_>>();
     let session = connect_nip46_session(
+        options.command,
         runtime,
         &options.pair,
         fallback_signer_relays,
@@ -341,6 +351,7 @@ pub(crate) async fn nip46_register_with_runtime<'a>(
         ));
     }
     let session = connect_nip46_session(
+        "accounts nip46 register",
         runtime,
         &pair,
         fallback_signer_relays,
@@ -371,21 +382,16 @@ pub(crate) async fn nip46_register_with_runtime<'a>(
     })
 }
 
-pub(crate) async fn nip46_status_command(
+/// Read-only inspection of persisted NIP-46 session metadata without calling `nip46_resume`
+/// (which would rebuild a remotely logged-out or cancelled session).
+pub(crate) fn nip46_status_command(
     account_home: &AccountHome,
-    runtime: Option<&MarmotAppRuntime>,
     account_flag: Option<String>,
     target_account: Option<String>,
 ) -> Result<CommandOutput, WnError> {
     let account = resolve_account(account_home, target_account.or(account_flag))?;
     let npub = npub_for_account_id(&account.account_id_hex)?;
-    let live_session = match runtime {
-        Some(runtime) if account.external_signing && !account.signed_out && !account.unlinked => {
-            runtime.nip46_resume(&account.account_id_hex).await.ok()
-        }
-        _ => None,
-    };
-    let nip46 = nip46_session_summary_json(account_home, &account, live_session.as_ref());
+    let nip46 = nip46_session_summary_json(account_home, &account, None);
     let json = json!({
         "account_id": account.account_id_hex,
         "npub": npub,
@@ -457,6 +463,7 @@ impl Drop for CancelOnDrop {
 }
 
 async fn connect_nip46_session<'a>(
+    command: &'static str,
     runtime: &MarmotAppRuntime,
     pair: &Nip46PairArgs,
     fallback_signer_relays: Vec<String>,
@@ -476,8 +483,13 @@ async fn connect_nip46_session<'a>(
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .unwrap_or(DEFAULT_NIP46_CLIENT_NAME);
-    let config_json =
-        build_nip46_config_json(pair, fallback_signer_relays, client_name, import_bunker)?;
+    let config_json = build_nip46_config_json(
+        command,
+        pair,
+        fallback_signer_relays,
+        client_name,
+        import_bunker,
+    )?;
     let guard = CancelOnDrop(Some(runtime.nip46_new(&config_json)?));
     let reviewed = guard.session().review_permissions();
     guard
@@ -501,6 +513,7 @@ async fn connect_nip46_session<'a>(
 }
 
 fn build_nip46_config_json(
+    command: &'static str,
     pair: &Nip46PairArgs,
     fallback_signer_relays: Vec<String>,
     client_name: &str,
@@ -508,7 +521,7 @@ fn build_nip46_config_json(
 ) -> Result<Zeroizing<String>, WnError> {
     if pair.bunker_stdin {
         let uri = import_bunker
-            .ok_or(WnError::MissingBunkerStdin { command: "login" })?
+            .ok_or(WnError::MissingBunkerStdin { command })?
             .into_inner();
         let config = serde_json::to_string(&json!({
             "uri": uri.as_str(),
@@ -554,13 +567,6 @@ fn resolve_nip46_login_relays(
         } else {
             options.daemon_discovery_relays.clone()
         };
-    }
-    if options.publish_missing_relay_lists && options.default_relays.is_empty() {
-        if !options.daemon_default_account_relays.is_empty() {
-            options.default_relays = options.daemon_default_account_relays.clone();
-        } else if !options.bootstrap_relays.is_empty() {
-            options.default_relays = options.bootstrap_relays.clone();
-        }
     }
     if options.default_relays.is_empty() && options.bootstrap_relays.is_empty() {
         return Err(WnError::MissingRelay);
@@ -632,11 +638,11 @@ fn nip46_record_json(record: Nip46SessionRecord, status: Option<Nip46Status>) ->
     })
 }
 
-/// Returns true when the command is a `--nostrconnect` pairing command that streams its
-/// pairing offer before awaiting remote connection.
-pub(crate) fn is_nip46_nostrconnect_command(command: &crate::Command) -> bool {
+pub(crate) fn nip46_pair_args(command: &crate::Command) -> Option<&Nip46PairArgs> {
     match command {
-        crate::Command::Login { nip46, .. } => nip46.nostrconnect,
+        crate::Command::Login { nip46, .. } if nip46.bunker_stdin || nip46.nostrconnect => {
+            Some(nip46)
+        }
         crate::Command::Account {
             command:
                 crate::AccountCommand::Nip46 {
@@ -648,28 +654,8 @@ pub(crate) fn is_nip46_nostrconnect_command(command: &crate::Command) -> bool {
                 crate::AccountCommand::Nip46 {
                     command: Nip46Command::Login { pair, .. } | Nip46Command::Register { pair, .. },
                 },
-        } => pair.nostrconnect,
-        _ => false,
-    }
-}
-
-/// Returns true when the command performs a NIP-46 login or register (either mode).
-pub(crate) fn is_nip46_pairing_command(command: &crate::Command) -> bool {
-    match command {
-        crate::Command::Login { nip46, .. } => nip46.bunker_stdin || nip46.nostrconnect,
-        crate::Command::Account {
-            command:
-                crate::AccountCommand::Nip46 {
-                    command: Nip46Command::Login { .. } | Nip46Command::Register { .. },
-                },
-        }
-        | crate::Command::Accounts {
-            command:
-                crate::AccountCommand::Nip46 {
-                    command: Nip46Command::Login { .. } | Nip46Command::Register { .. },
-                },
-        } => true,
-        _ => false,
+        } => Some(pair),
+        _ => None,
     }
 }
 
@@ -694,8 +680,15 @@ pub(crate) fn nip46_pair_args_mut(command: &mut crate::Command) -> Option<&mut N
     }
 }
 
-pub(crate) fn nip46_error_is_missing_session(err: &AppError) -> bool {
-    matches!(err, AppError::Nip46(Nip46Error::Unavailable))
+/// Returns true when the command is a `--nostrconnect` pairing command that streams its
+/// pairing offer before awaiting remote connection.
+pub(crate) fn is_nip46_nostrconnect_command(command: &crate::Command) -> bool {
+    nip46_pair_args(command).is_some_and(|pair| pair.nostrconnect)
+}
+
+/// Returns true when the command performs a NIP-46 login or register (either mode).
+pub(crate) fn is_nip46_pairing_command(command: &crate::Command) -> bool {
+    nip46_pair_args(command).is_some()
 }
 
 #[cfg(test)]

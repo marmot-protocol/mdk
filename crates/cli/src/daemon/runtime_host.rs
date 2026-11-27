@@ -113,6 +113,14 @@ pub(crate) async fn handle_app_runtime_nip46_request(
     {
         return None;
     }
+    if crate::commands::nip46::is_nip46_nostrconnect_command(&cli.command) {
+        // `--nostrconnect` must use `DaemonRequest::Nip46Pair` so the pairing offer streams
+        // to the caller instead of ever reaching daemon stderr/logs.
+        return Some(crate::command_output_result(
+            cli.json,
+            Err(crate::WnError::MissingNip46Mode { command: "nip46" }),
+        ));
+    }
     let Some(runtime) = reconcile_and_clone_runtime(defaults, state, events, workers).await else {
         return Some(crate::command_output_result(
             cli.json,
@@ -124,8 +132,8 @@ pub(crate) async fn handle_app_runtime_nip46_request(
         defaults,
         &runtime,
         import_bunker.take(),
-        Box::new(|uri| {
-            Box::pin(async move { crate::commands::nip46::write_pairing_offer_to_stderr(&uri) })
+        Box::new(|_uri| {
+            Box::pin(async move { Err(crate::WnError::MissingNip46Mode { command: "nip46" }) })
         }),
     )
     .await;
@@ -246,7 +254,6 @@ async fn dispatch_hosted_nip46_pairing<'a>(
             relay,
             default_relays,
             bootstrap_relays,
-            publish_missing_relay_lists,
             ..
         } => {
             crate::commands::nip46::nip46_login_with_runtime(
@@ -254,11 +261,11 @@ async fn dispatch_hosted_nip46_pairing<'a>(
                 &app,
                 runtime,
                 crate::commands::nip46::Nip46LoginOptions {
+                    command: "login",
                     pair: nip46,
                     relay: relay.or_else(|| cli.relay.clone()),
                     default_relays,
                     bootstrap_relays,
-                    publish_missing_relay_lists,
                     daemon_default_account_relays: defaults.default_account_relays.clone(),
                     daemon_discovery_relays: defaults.discovery_relays.clone(),
                 },
@@ -509,26 +516,22 @@ async fn dispatch_hosted_runtime_command(
             crate::commands::relay_stats::relay_stats_command_with_runtime(runtime).await
         }
         crate::Command::Account {
-            command: crate::AccountCommand::Nip46 { command },
+            command:
+                crate::AccountCommand::Nip46 {
+                    command: crate::Nip46Command::Remove { account },
+                },
         }
         | crate::Command::Accounts {
-            command: crate::AccountCommand::Nip46 { command },
+            command:
+                crate::AccountCommand::Nip46 {
+                    command: crate::Nip46Command::Remove { account },
+                },
         } => {
-            crate::commands::nip46::nip46_command_with_runtime(
+            crate::commands::nip46::nip46_remove_with_runtime(
                 &account_home,
-                &app,
                 runtime,
-                command,
                 cli.account.clone(),
-                cli.relay.clone(),
-                defaults.default_account_relays.clone(),
-                defaults.discovery_relays.clone(),
-                None,
-                Box::new(|uri| {
-                    Box::pin(
-                        async move { crate::commands::nip46::write_pairing_offer_to_stderr(&uri) },
-                    )
-                }),
+                account,
             )
             .await
         }
@@ -552,13 +555,13 @@ pub(crate) fn is_hosted_runtime_command(cli: &Cli) -> bool {
         crate::Command::Account {
             command:
                 crate::AccountCommand::Nip46 {
-                    command: crate::Nip46Command::Status { .. } | crate::Nip46Command::Remove { .. },
+                    command: crate::Nip46Command::Remove { .. },
                 },
         }
         | crate::Command::Accounts {
             command:
                 crate::AccountCommand::Nip46 {
-                    command: crate::Nip46Command::Status { .. } | crate::Nip46Command::Remove { .. },
+                    command: crate::Nip46Command::Remove { .. },
                 },
         } => true,
         crate::Command::Keys { .. }
@@ -786,20 +789,11 @@ pub(crate) async fn reconcile_app_runtime(
             events.clone(),
             receiver,
         ));
-        // Resume persisted NIP-46 accounts independently after startup so a
-        // corrupt or temporarily unreachable remote signer cannot block local
-        // accounts or crash wnd startup.
-        if resume_persisted_nip46_accounts(defaults, &state, &runtime).await
-            && let Err(err) = runtime.reconcile_accounts().await
-        {
-            record_runtime_activity_error(&state, err.to_string());
-        }
         host.runtime = Some(runtime);
         return;
     }
 
     if let Some(runtime) = &host.runtime {
-        let _ = resume_persisted_nip46_accounts(defaults, &state, runtime).await;
         if let Err(err) = runtime.reconcile_accounts().await {
             record_runtime_activity_error(&state, err.to_string());
         }
@@ -811,47 +805,6 @@ pub(crate) async fn reconcile_app_runtime(
             host.bridge = Some(spawn_app_runtime_bridge(state, events, runtime.subscribe()));
         }
     }
-}
-
-/// Independently resume every active persisted NIP-46 account via
-/// `MarmotAppRuntime::nip46_resume`. Per-account errors are recorded as
-/// privacy-safe daemon activity errors without blocking other accounts or
-/// crashing daemon startup. Returns true if at least one session resumed.
-pub(crate) async fn resume_persisted_nip46_accounts(
-    defaults: &DaemonDefaults,
-    state: &Arc<Mutex<DaemonState>>,
-    runtime: &marmot_app::MarmotAppRuntime,
-) -> bool {
-    let Ok(secret_store) = crate::resolve_secret_store(defaults.secret_store) else {
-        return false;
-    };
-    let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
-    let Ok(account_home) =
-        crate::open_account_home(&defaults.home, secret_store, &keychain_service)
-    else {
-        return false;
-    };
-    let Ok(accounts) = account_home.accounts() else {
-        return false;
-    };
-    let mut resumed_any = false;
-    for account in accounts {
-        if !account.external_signing || account.signed_out || account.unlinked {
-            continue;
-        }
-        match runtime.nip46_resume(&account.account_id_hex).await {
-            Ok(_session) => {
-                resumed_any = true;
-            }
-            Err(err) if crate::commands::nip46::nip46_error_is_missing_session(&err) => {
-                // External account has no stored NIP-46 pairing (e.g. removed via `nip46 remove`).
-            }
-            Err(err) => {
-                record_runtime_activity_error(state, format!("nip46 resume failed: {err}"));
-            }
-        }
-    }
-    resumed_any
 }
 
 pub(crate) fn open_app_runtime(

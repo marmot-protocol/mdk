@@ -563,7 +563,7 @@ async fn groups_command_once(
         }
         GroupsCommand::Admins { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_signing_ready(runtime, &account).await?;
+            ensure_signing_capable(&account)?;
             app.status(&account.label)?;
             let group_id = normalize_group_id_hex(&group_id)?;
             let group = app
@@ -600,7 +600,7 @@ async fn groups_command_once(
         }
         GroupsCommand::Relays { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_signing_ready(runtime, &account).await?;
+            ensure_signing_capable(&account)?;
             app.status(&account.label)?;
             let group_id = normalize_group_id_hex(&group_id)?;
             let group = app
@@ -676,7 +676,7 @@ async fn groups_command_once(
         }
         GroupsCommand::Invites => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_signing_ready(runtime, &account).await?;
+            ensure_signing_capable(&account)?;
             app.status(&account.label)?;
             let invites = app
                 .groups(&account.label)?
@@ -921,7 +921,11 @@ async fn groups_command_once(
         }
         GroupsCommand::Retention { group_id, set } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_signing_ready(runtime, &account).await?;
+            if set.is_some() {
+                ensure_signing_ready(runtime, &account).await?;
+            } else {
+                ensure_signing_capable(&account)?;
+            }
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group_id)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);

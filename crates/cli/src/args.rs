@@ -190,9 +190,6 @@ pub(crate) enum Command {
             help = "Comma-separated bootstrap relays used to find account records (NIP-46 login)"
         )]
         bootstrap_relays: Vec<String>,
-        #[serde(default)]
-        #[arg(long, help = "Publish missing relay-list records during NIP-46 login")]
-        publish_missing_relay_lists: bool,
     },
     #[command(about = "Show current account identities")]
     Whoami,
@@ -463,9 +460,6 @@ pub(crate) enum Nip46Command {
             help = "Comma-separated bootstrap relays used to find account records"
         )]
         bootstrap_relays: Vec<String>,
-        #[serde(default)]
-        #[arg(long, help = "Publish missing relay-list records during NIP-46 login")]
-        publish_missing_relay_lists: bool,
     },
     #[command(
         about = "Re-register or rebind a NIP-46 remote-signing session for an existing external account"
