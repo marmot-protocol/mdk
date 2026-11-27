@@ -397,9 +397,11 @@ class ClassifierTests(unittest.TestCase):
 
         # 1. Deterministic regression (always fails tip, always passes baseline) MUST NOT be
         # suppressed by the leaderboard OR by an open individual `Flaky:` issue.
+        # Confirmation replays each revision consecutively (`tip -> tip -> baseline -> baseline`)
+        # so an alternating, revision-independent failure cannot align with `tip` every time.
         for label, issues, expected_shas in (
             ("leaderboard", leaderboard, [sig.tip_sha, sig.baseline_sha]),
-            ("individual", individual, [sig.tip_sha, sig.baseline_sha, sig.tip_sha, sig.baseline_sha]),
+            ("individual", individual, [sig.tip_sha, sig.tip_sha, sig.baseline_sha, sig.baseline_sha]),
         ):
             with self.subTest(issues=label):
                 seen_shas: list[str] = []
@@ -416,11 +418,12 @@ class ClassifierTests(unittest.TestCase):
                 self.assertEqual(cls.bucket, Bucket.DETERMINISTIC_REGRESSION)
                 self.assertEqual(seen_shas, expected_shas)
 
-        # 1b. Alternating known flake (fails tip shot 1, passes baseline, then passes tip
-        # confirmation; or fails baseline confirmation) stays KNOWN_FLAKE and never enters bisect.
+        # 1b. Revision-independent alternating stream `[FAIL, PASS, FAIL, PASS, ...]` (and
+        # baseline confirmation failure `[FAIL, FAIL, PASS, FAIL]`) on a tracked flake MUST
+        # classify as KNOWN_FLAKE and never enter bisect.
         for label, outcomes in (
-            ("tip_alternates", [RunVerdict.FAIL, RunVerdict.PASS, RunVerdict.PASS]),
-            ("baseline_fails_confirm", [RunVerdict.FAIL, RunVerdict.PASS, RunVerdict.FAIL, RunVerdict.FAIL]),
+            ("alternating_stream", [RunVerdict.FAIL, RunVerdict.PASS, RunVerdict.FAIL, RunVerdict.PASS]),
+            ("baseline_fails_confirm", [RunVerdict.FAIL, RunVerdict.FAIL, RunVerdict.PASS, RunVerdict.FAIL]),
         ):
             with self.subTest(alternating=label):
                 seq = iter(outcomes)
@@ -432,7 +435,40 @@ class ClassifierTests(unittest.TestCase):
                 self.assertEqual(alt_cls.bucket, Bucket.KNOWN_FLAKE)
                 self.assertEqual(alt_cls.matched_issue, 4001)
 
-        # 1c. Non-locally-reproducible signal (e.g. Windows) honors individual `Flaky:` issues
+        # 1c. Missing or equal baseline still runs tracked-flake confirmation on `tip` before
+        # returning UNREPRODUCIBLE so an intermittent tracked flake does not trigger Meltdown.
+        for baseline_sha in ("", sig.tip_sha):
+            with self.subTest(missing_baseline=baseline_sha or "empty"):
+                no_base_sig = FailureSignal(**{**sig.__dict__, "baseline_sha": baseline_sha})
+                # First tip replay fails, second passes -> KNOWN_FLAKE (not UNREPRODUCIBLE).
+                seq = iter([RunVerdict.FAIL, RunVerdict.PASS])
+                flaky_no_base = classify_failure(
+                    no_base_sig,
+                    run_on_sha=lambda _s, _c: (next(seq), "observed"),
+                    open_flake_issues=individual,
+                )
+                self.assertEqual(flaky_no_base.bucket, Bucket.KNOWN_FLAKE)
+                self.assertEqual(flaky_no_base.matched_issue, 4001)
+
+                # Both tip replays fail -> genuinely persistent with no baseline -> UNREPRODUCIBLE.
+                persist_no_base = classify_failure(
+                    no_base_sig,
+                    run_on_sha=lambda _s, _c: (RunVerdict.FAIL, "target test failed"),
+                    open_flake_issues=individual,
+                )
+                self.assertEqual(persist_no_base.bucket, Bucket.UNREPRODUCIBLE)
+
+                # Leaderboard-only test with no baseline returns UNREPRODUCIBLE after single shot.
+                board_calls: list[str] = []
+                board_no_base = classify_failure(
+                    no_base_sig,
+                    run_on_sha=lambda s, _c: (board_calls.append(s) or RunVerdict.FAIL, "target test failed"),
+                    open_flake_issues=leaderboard,
+                )
+                self.assertEqual(board_no_base.bucket, Bucket.UNREPRODUCIBLE)
+                self.assertEqual(board_calls, [sig.tip_sha])
+
+        # 1d. Non-locally-reproducible signal (e.g. Windows) honors individual `Flaky:` issues
         # to avoid false Meltdowns, while still ignoring `"Flaky test leaderboard"`.
         win_sig = FailureSignal(
             source="hosted_canary",

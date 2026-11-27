@@ -716,18 +716,20 @@ def classify_failure(
 ) -> ClassificationResult:
     """Classify a FailureSignal into one of the MDK Canary buckets.
 
-    For locally reproducible signals, always runs single-shot `tip` (and `baseline` on
-    `tip` failure) reproduction before consulting individual `Flaky:` issues so a
+    For locally reproducible signals, always runs `tip` (and `baseline` on `tip`
+    failure) reproduction before consulting individual `Flaky:` issues so a
     deterministic regression is never suppressed. Individual `Flaky:` issues (never
     `"Flaky test leaderboard"`) are consulted:
       - on the locally-unreproducible fallback (non-Linux / Relay-E2E) so human-tracked
         non-Linux flakes do not escalate into false Meltdowns;
       - when `tip` passes single retry (intermittent), skipping stress runs;
+      - immediately on a second consecutive `tip` replay (before the missing-baseline
+        check or `baseline` replay) so alternating or missing-baseline tracked flakes
+        stay `KNOWN_FLAKE` instead of triggering false Meltdowns or bogus reverts;
       - when both `tip` and `baseline` fail; and
-      - to require one confirmation pass on `tip` (and on `baseline` when it passed)
-        before promoting a test with an open individual `Flaky:` issue to
-        `DETERMINISTIC_REGRESSION`, preventing alternating flakes from triggering
-        unisolatable-bisect Meltdowns.
+      - on a second consecutive `baseline` replay when `baseline` passed (`tip -> tip
+        -> baseline -> baseline`), confirming repeatability before returning
+        `DETERMINISTIC_REGRESSION`.
     """
     # Bucket 1: Runner/network/disk infrastructure error.
     # Never let diagnostic tail strings override a concrete parsed nextest test failure.
@@ -769,6 +771,25 @@ def classify_failure(
         )
 
     if tip_verdict == RunVerdict.FAIL:
+        if matched_issue is not None:
+            # Confirm repeatability on `tip` consecutively (`tip -> tip`) BEFORE checking
+            # for a missing baseline or replaying `baseline`, so an alternating flake or
+            # a tracked flake without a distinct green baseline stays `KNOWN_FLAKE`.
+            tip_confirm, tip_confirm_detail = run_on_sha(signal.tip_sha, signal.command)
+            if tip_confirm in {RunVerdict.INCONCLUSIVE, RunVerdict.TEST_ABSENT}:
+                return ClassificationResult(
+                    bucket=Bucket.INFRA_ERROR,
+                    reason=f"inconclusive confirmation on {signal.tip_sha[:9]} ({tip_confirm_detail})",
+                )
+            if tip_confirm == RunVerdict.PASS:
+                return ClassificationResult(
+                    bucket=Bucket.KNOWN_FLAKE,
+                    reason=(
+                        f"mixed tip outcomes on {signal.tip_sha[:9]} (failed then passed); "
+                        f"matches open flake issue #{matched_issue} for {signal.failed_test}"
+                    ),
+                    matched_issue=matched_issue,
+                )
         if not signal.baseline_sha or signal.baseline_sha == signal.tip_sha:
             return ClassificationResult(
                 bucket=Bucket.UNREPRODUCIBLE,
@@ -799,42 +820,25 @@ def classify_failure(
                 bucket=Bucket.INFRA_ERROR,
                 reason=f"inconclusive baseline check on {signal.baseline_sha[:9]} ({base_detail})",
             )
-        if matched_issue is not None:
-            # Confirm repeatability before promoting a test with an open individual
-            # `Flaky:` issue to `DETERMINISTIC_REGRESSION`, so an alternating flake
-            # cannot enter bisect and trigger a false "unisolatable failure" Meltdown.
-            tip_confirm, tip_confirm_detail = run_on_sha(signal.tip_sha, signal.command)
-            if tip_confirm in {RunVerdict.INCONCLUSIVE, RunVerdict.TEST_ABSENT}:
+        if matched_issue is not None and base_verdict == RunVerdict.PASS:
+            # Confirm `baseline` consecutively (`baseline -> baseline`) so the overall
+            # tracked-flake replay order is `tip -> tip -> baseline -> baseline`.
+            base_confirm, base_confirm_detail = run_on_sha(signal.baseline_sha, signal.command)
+            if base_confirm in {RunVerdict.INCONCLUSIVE, RunVerdict.TEST_ABSENT}:
                 return ClassificationResult(
                     bucket=Bucket.INFRA_ERROR,
-                    reason=f"inconclusive confirmation on {signal.tip_sha[:9]} ({tip_confirm_detail})",
+                    reason=f"inconclusive baseline confirmation on {signal.baseline_sha[:9]} ({base_confirm_detail})",
                 )
-            if tip_confirm == RunVerdict.PASS:
+            if base_confirm == RunVerdict.FAIL:
                 return ClassificationResult(
                     bucket=Bucket.KNOWN_FLAKE,
                     reason=(
-                        f"mixed tip outcomes on {signal.tip_sha[:9]} (failed then passed); "
-                        f"matches open flake issue #{matched_issue} for {signal.failed_test}"
+                        f"reproduced on tip {signal.tip_sha[:9]} and failed baseline confirmation "
+                        f"on {signal.baseline_sha[:9]}; matches open flake issue #{matched_issue} "
+                        f"for {signal.failed_test}"
                     ),
                     matched_issue=matched_issue,
                 )
-            if base_verdict == RunVerdict.PASS:
-                base_confirm, base_confirm_detail = run_on_sha(signal.baseline_sha, signal.command)
-                if base_confirm == RunVerdict.INCONCLUSIVE:
-                    return ClassificationResult(
-                        bucket=Bucket.INFRA_ERROR,
-                        reason=f"inconclusive baseline confirmation on {signal.baseline_sha[:9]} ({base_confirm_detail})",
-                    )
-                if base_confirm == RunVerdict.FAIL:
-                    return ClassificationResult(
-                        bucket=Bucket.KNOWN_FLAKE,
-                        reason=(
-                            f"reproduced on tip {signal.tip_sha[:9]} and failed baseline confirmation "
-                            f"on {signal.baseline_sha[:9]}; matches open flake issue #{matched_issue} "
-                            f"for {signal.failed_test}"
-                        ),
-                        matched_issue=matched_issue,
-                    )
         return ClassificationResult(
             bucket=Bucket.DETERMINISTIC_REGRESSION,
             reason=(
