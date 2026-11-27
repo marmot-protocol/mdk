@@ -297,6 +297,8 @@ impl SqliteAppStorage {
         now: u64,
         policy: (&AttachmentDownloadPolicy, bool),
     ) -> StorageResult<(Option<AttachmentTransferStatus>, bool, bool)> {
+        let group = canonical_group_id_hex(group);
+        let group = group.as_ref();
         let index = u32::try_from(selected.attachment_index)
             .map_err(|_| invalid("invalid attachment index"))?;
         self.connection.with_transaction(|| {
@@ -522,6 +524,8 @@ impl SqliteAppStorage {
         digest: [u8; 32],
         now: u64,
     ) -> StorageResult<AttachmentDemand> {
+        let group = canonical_group_id_hex(group);
+        let group = group.as_ref();
         let index = u32::try_from(selected.attachment_index)
             .map_err(|_| invalid("invalid attachment index"))?;
         self.connection.with_transaction(|| {
@@ -989,11 +993,12 @@ impl SqliteAppStorage {
         index: u32,
         now: u64,
     ) -> StorageResult<Option<crate::AttachmentHistoryEntry>> {
+        let group = canonical_group_id_hex(group);
         self.lock()?.query_row("SELECT h.source_epoch,h.sender,h.timeline_at,h.received_at,h.slot_json FROM attachment_history h
             JOIN app_events a USING(group_id_hex,message_id_hex) JOIN account_groups g USING(group_id_hex)
             WHERE h.group_id_hex=?1 AND h.message_id_hex=?2 AND h.source_message_id_hex=?3 AND h.attachment_index=?4
             AND h.visible=1 AND g.pending_confirmation=0 AND length(CAST(h.slot_json AS BLOB))<=16384
-            AND (a.retention_expires_at IS NULL OR a.retention_expires_at>?5)",params![group,message,source,index,u64_to_i64(now)?],|r| {
+            AND (a.retention_expires_at IS NULL OR a.retention_expires_at>?5)",params![group.as_ref(),message,source,index,u64_to_i64(now)?],|r| {
                 let slot:String=r.get(4)?;
                 Ok(crate::AttachmentHistoryEntry { reaction_artwork: false, emoji_tags: Vec::new(),message_id_hex:message.into(),source_message_id_hex:source.into(),attachment_index:index as usize,
                     source_epoch:r.get::<_,Option<i64>>(0)?.map(|v|v as u64),sender:r.get(1)?,timeline_at:nonnegative(r,2)?,received_at:nonnegative(r,3)?,
@@ -1034,6 +1039,8 @@ fn transfer_status(
     automatic: bool,
     next_expiry: &mut Option<u64>,
 ) -> StorageResult<Option<AttachmentTransferStatus>> {
+    let group = canonical_group_id_hex(group);
+    let group = group.as_ref();
     let (message, source, index) = target;
     let source_row: Option<(Option<i64>,String)> = conn.query_row("SELECT a.retention_expires_at,CASE WHEN length(CAST(h.slot_json AS BLOB))<=16384 THEN h.slot_json ELSE '[]' END
         FROM attachment_history h JOIN app_events a USING(group_id_hex,message_id_hex)

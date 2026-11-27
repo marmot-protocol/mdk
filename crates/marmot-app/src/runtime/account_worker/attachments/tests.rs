@@ -268,7 +268,7 @@ fn context() -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
                 crate::runtime::BackupBackgroundConditions::default(),
             )
             .0,
-            worker_lifetime: watch::channel(()).0,
+            tasks: super::WorkerTaskScope::new(),
         },
         rx,
     )
@@ -1484,7 +1484,7 @@ async fn attachment_cancellation_observation_error_is_not_cancellation() {
     // proves an unavailable store did not become a cancellation.
     let observed = tokio::time::timeout(
         Duration::from_secs(5),
-        cancellation_observed(&store, &job, None),
+        cancellation_observed(&super::WorkerTaskScope::new(), &store, &job, None),
     )
     .await
     .expect("cancellation observation must complete");
@@ -1505,7 +1505,13 @@ async fn attachment_cancellation_observation_error_is_not_cancellation() {
     tokio::time::pause();
     let frozen_at = tokio::time::Instant::now();
     crate::media::tests::drive_with_manual_time(async {
-        let watcher = cancelled(store.clone(), job, updates, None);
+        let watcher = cancelled(
+            super::WorkerTaskScope::new(),
+            store.clone(),
+            job,
+            updates,
+            None,
+        );
         tokio::pin!(watcher);
         let reobserved = async {
             reads
@@ -1841,7 +1847,12 @@ async fn promoted_attempt_survives_automatic_revocation_without_extending_lease(
     // the promoted attempt was observed after automatic permission revoked.
     let observed = tokio::time::timeout(
         Duration::from_secs(5),
-        cancellation_observed(&storage, &job, Some(&permission)),
+        cancellation_observed(
+            &super::WorkerTaskScope::new(),
+            &storage,
+            &job,
+            Some(&permission),
+        ),
     )
     .await
     .expect("promoted attempt cancellation observation must complete");
@@ -1862,7 +1873,13 @@ async fn promoted_attempt_survives_automatic_revocation_without_extending_lease(
     crate::media::tests::drive_with_manual_time(async {
         // Keep the original revoked lease on this same watcher through the
         // spurious notification, lease check, and final durable cancellation.
-        let watcher = cancelled(storage.clone(), job, updates, Some(permission));
+        let watcher = cancelled(
+            super::WorkerTaskScope::new(),
+            storage.clone(),
+            job,
+            updates,
+            Some(permission),
+        );
         tokio::pin!(watcher);
         let reobserved = async {
             // Each successful observation locks once for active state and once
@@ -3272,5 +3289,502 @@ async fn reordering_queued_work_wakes_the_worker_only_when_the_order_changes() {
     assert!(
         !work.has_changed().unwrap(),
         "repeating the leading request changes nothing and wakes nothing"
+    );
+}
+
+/// Teardown (`deactivate_account` / `remove_account`) must wait for every
+/// worker-spawned blocking housekeeping task (`media_sweep`, `legacy_migration`,
+/// `upload_promotion`, `wipe_stale`) to drain before dropping caches and
+/// finishing teardown, so zero tasks outlive teardown and zero SQLite handles
+/// are reopened after cache eviction (mdk#3801).
+#[test]
+fn teardown_waits_for_in_flight_blocking_housekeeping_tasks_to_drain() {
+    one_blocking_thread_runtime().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let home = marmot_account::AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let relay = Arc::new(crate::tests::ScriptedPushRelayClient::default());
+        let app =
+            MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+        let runtime = crate::MarmotAppRuntime::new(app.clone());
+        let telemetry = runtime.shared_services().observer.performance().clone();
+        let upload_promotion_in_flight = || {
+            telemetry
+                .snapshot()
+                .runtime_operations
+                .into_iter()
+                .find(|sample| sample.operation == RuntimeOp::WorkerUploadPromotion)
+                .map_or(0, |sample| sample.in_flight)
+        };
+        runtime.reconcile_accounts().await.unwrap();
+        crate::worker_fences::worker_startup_finished(&runtime, "alice")
+            .await
+            .unwrap();
+        let group = runtime
+            .create_group("alice", "housekeeping-drain", &[], None)
+            .await
+            .unwrap()
+            .operation
+            .expect("group created");
+        let group_id_hex = hex::encode(group.as_slice());
+        // Ensure startup housekeeping has finished once so the single blocking
+        // thread is free before we block it.
+        tokio::task::spawn_blocking(|| ()).await.unwrap();
+
+        // Occupy the single blocking thread, then stage a file-backed upload
+        // and wake the worker so `upload_promotion` queues behind `blocker`.
+        // `deactivate_account` itself uses no `spawn_blocking`, so waiting here
+        // proves the worker explicitly drains its tracked blocking tasks.
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = entered_tx.send(());
+            release_rx.recv().unwrap();
+        });
+        entered_rx.await.unwrap();
+
+        {
+            let storage = app.account_storage("alice").unwrap();
+            let app_storage = storage.app_storage();
+            let media = app.account_media_store("alice", &storage).unwrap();
+            let token = app_storage
+                .reserve_attachment_upload(&group_id_hex, 0, crate::unix_now_seconds())
+                .unwrap()
+                .unwrap();
+            let body = b"retained worker bytes";
+            crate::media::outgoing::stage_body(
+                &media,
+                &app_storage.attachment_upload_stage(&token),
+                &mut body.as_slice(),
+                body.len() as u64,
+                &|| false,
+            )
+            .unwrap();
+        }
+        app.presentation_signals.wake_account("alice");
+        // Confirm deterministically that `upload_promotion` was actually
+        // spawned and is queued behind `blocker` on the blocking pool.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while upload_promotion_in_flight() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upload_promotion must be queued behind the blocker");
+
+        let lane = runtime.accounts().worker_lane("alice").await.unwrap();
+        let accounts = runtime.accounts();
+        let teardown = tokio::spawn({
+            let accounts = accounts.clone();
+            async move { accounts.deactivate_account("alice").await }
+        });
+        // Wait until `deactivate_account` has removed the worker from the live
+        // map and is actively awaiting worker exit / task drain.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !runtime.accounts.workers.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deactivate_account reaches worker reaping");
+        // Pump across yields: while `blocker` holds the single blocking thread,
+        // the worker's queued blocking task cannot finish, so the worker must
+        // stay open in `media_http.tasks.end().await` and teardown must wait.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        let completed_early = teardown.is_finished() || lane.commands.is_closed();
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        assert!(
+            !completed_early,
+            "teardown returned while a worker-spawned blocking task was still in flight"
+        );
+        tokio::time::timeout(Duration::from_secs(5), teardown)
+            .await
+            .expect("teardown finishes once blocking tasks drain")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            upload_promotion_in_flight(),
+            0,
+            "upload_promotion must have drained before teardown returned"
+        );
+        // No SQLite handle may have been reopened after cache eviction.
+        assert!(
+            !app.account_storages.lock().unwrap().contains_key("alice"),
+            "deactivated account must not have a reopened storage handle"
+        );
+        accounts.remove_account("alice").await.unwrap();
+        assert!(
+            !app.account_storages.lock().unwrap().contains_key("alice"),
+            "removed account must not have a reopened storage handle"
+        );
+        runtime.shutdown_and_close().await.unwrap();
+    });
+}
+
+/// Even when `ManagedAccountWorker::shutdown_with_timeout` hits its deadline
+/// and aborts the worker task, it must still cancel and drain every tracked
+/// blocking task owned by the worker before returning (mdk#3801).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forced_worker_shutdown_drains_tracked_blocking_tasks_after_abort() {
+    let tasks = super::WorkerTaskScope::new();
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished_in_task = finished.clone();
+    let cancel_token = tasks.token();
+    let _blocking = tasks.spawn_blocking(move || {
+        let _ = entered_tx.send(());
+        release_rx.recv().unwrap();
+        assert!(
+            cancel_token.is_cancelled(),
+            "forced shutdown must cancel the shared WorkerTaskScope token"
+        );
+        finished_in_task.store(true, std::sync::atomic::Ordering::Release);
+    });
+    entered_rx.await.unwrap();
+
+    let (commands, _rx) = crate::runtime::test_worker_channel(1);
+    let (shutdown, _shutdown_rx) = oneshot::channel();
+    // Simulate a stuck worker that ignores the graceful shutdown signal so
+    // `shutdown_with_timeout` aborts it immediately at the deadline.
+    let worker = crate::runtime::account_worker::ManagedAccountWorker {
+        ready: true,
+        handle: tokio::spawn(std::future::pending::<()>()),
+        commands,
+        media_admission: Arc::new(Semaphore::new(1)),
+        shutdown,
+        unit: Default::default(),
+        read_state: Default::default(),
+        relay_checks: watch::channel(Default::default()).1,
+        tasks: tasks.clone(),
+    };
+    let draining = tokio::spawn(worker.shutdown_with_timeout(Duration::ZERO));
+    let cancelled = tasks.token();
+    tokio::time::timeout(Duration::from_secs(5), cancelled.cancelled())
+        .await
+        .expect("forced shutdown cancels WorkerTaskScope");
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !draining.is_finished(),
+        "forced worker shutdown returned while a tracked blocking task was still running"
+    );
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), draining)
+        .await
+        .expect("forced shutdown finishes once tracked blocking task completes")
+        .unwrap();
+    assert!(
+        finished.load(std::sync::atomic::Ordering::Acquire),
+        "blocking task must have finished before shutdown_with_timeout returned"
+    );
+}
+
+/// Worker cancellation/teardown must track and drain blocking upload-staging
+/// and release-on-drop descendants without reopening account storage by label
+/// after cache eviction (mdk#3801).
+#[test]
+fn upload_staging_and_release_drain_without_reopening_storage() {
+    one_blocking_thread_runtime().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let home = marmot_account::AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let relay = Arc::new(crate::tests::ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+        )
+        .with_test_relay_client(relay);
+        let mut client = app.client("alice").await.unwrap();
+        let group = client
+            .create_group("staging-drain", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("group created");
+
+        // 1. Prepare an encrypted media upload, occupy the single blocking
+        // thread so `SendStaging::open` queues behind `blocker`, evict caches,
+        // and verify `WorkerTaskScope::end()` waits for staging to drain
+        // without reopening `account_storages`.
+        let (upload_http, _finish) = client
+            .prepare_encrypted_media_upload(
+                &group,
+                crate::MediaUploadRequest {
+                    attachments: vec![crate::MediaUploadAttachmentRequest {
+                        plaintext: b"upload staging body".to_vec(),
+                        file_name: "note.txt".into(),
+                        media_type: "text/plain".into(),
+                        dim: None,
+                        thumbhash: None,
+                    }],
+                    caption: None,
+                    message_tags: Vec::new(),
+                    send: false,
+                    blossom_server: Some("http://127.0.0.1:9".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let (http, _completions) = context();
+        let tasks = http.tasks.clone();
+        let permit = http.permits.clone().acquire_owned().await.unwrap();
+
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = entered_tx.send(());
+            release_rx.recv().unwrap();
+        });
+        entered_rx.await.unwrap();
+
+        let (respond, _rx) = oneshot::channel();
+        spawn_media_http(
+            &http,
+            permit,
+            upload_http.with_tasks(http.tasks.clone()).run(),
+            move |result| MediaHttpCompletion::Upload {
+                finish: _finish,
+                result: result.map(|(r, u)| (r, Box::new(u))),
+                respond,
+                started_at: std::time::Instant::now(),
+            },
+        );
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        // Evict caches while staging is queued behind `blocker`.
+        app.drop_account_caches("alice");
+        assert!(!app.account_storages.lock().unwrap().contains_key("alice"));
+
+        let draining = tokio::spawn({
+            let tasks = tasks.clone();
+            async move { tasks.end().await }
+        });
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        let completed_early = draining.is_finished();
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), draining)
+            .await
+            .expect("task scope drains once staging finishes")
+            .unwrap();
+        assert!(
+            !completed_early,
+            "WorkerTaskScope::end returned while upload staging blocking task was still in flight"
+        );
+        // Fence behind the blocking pool to observe any untracked task's side effects.
+        tokio::task::spawn_blocking(|| ()).await.unwrap();
+        assert!(
+            !app.account_storages.lock().unwrap().contains_key("alice"),
+            "upload staging descendant must not repopulate evicted account storage cache"
+        );
+
+        // 2. Dropping an armed `OutgoingUploads` after cache eviction must not
+        // reopen account storage by label.
+        let staging = crate::media::outgoing::SendStaging::open(&app, "alice", &group, 0).unwrap();
+        let mut uploads = crate::media::outgoing::OutgoingUploads::new(app.clone(), "alice".into());
+        staging
+            .stage(uploads.tokens_mut(), 4, |media, target| {
+                crate::media::outgoing::stage_body(media, target, &mut &b"body"[..], 4, &|| false)
+            })
+            .unwrap();
+        drop(staging);
+        app.drop_account_caches("alice");
+        assert!(!app.account_storages.lock().unwrap().contains_key("alice"));
+        drop(uploads);
+        tokio::task::spawn_blocking(|| ()).await.unwrap();
+        assert!(
+            !app.account_storages.lock().unwrap().contains_key("alice"),
+            "OutgoingUploads::drop must not reopen evicted account storage by label"
+        );
+
+        // 3. `AttachmentResume` blocking tasks (checkpoint/progress/capacity)
+        // must be tracked by `WorkerTaskScope` so `tasks.end()` waits for them
+        // to drain.
+        let (_dir2, _client2, storage2, reference2) = offline_fixture().await;
+        let app2 = storage2.app_storage();
+        let now = crate::unix_now_seconds();
+        app2.resume_attachment_acquisitions(now, 64).unwrap();
+        admit_demands(&app2, now, true).unwrap();
+        let asset = app2.due_attachment_acquisitions(now, 1).unwrap().remove(0);
+        let job = app2
+            .claim_attachment_acquisition(&asset, now, now + 1200)
+            .unwrap()
+            .unwrap();
+        let tasks3 = super::WorkerTaskScope::new();
+        let resume = crate::media::attachment_resume::AttachmentResume {
+            storage: storage2.clone(),
+            job,
+            ciphertext_digest: hex::decode(&reference2.ciphertext_sha256)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            media: _client2
+                .app
+                .account_media_store("alice", &storage2)
+                .unwrap(),
+            directory: _dir2.path().to_path_buf(),
+            policy: storage_sqlite::AttachmentDownloadPolicy {
+                automatic: true,
+                retained_bytes: 128 * 1024 * 1024,
+                disk_reserve: 0,
+                transfer_limit: 64 * 1024 * 1024,
+            },
+            automatic: true,
+            explicit_permission: Default::default(),
+            permission: None,
+            finishing: Default::default(),
+            updates: None,
+            tasks: tasks3.clone(),
+        };
+        let (entered3_tx, entered3_rx) = oneshot::channel();
+        let (release3_tx, release3_rx) = std::sync::mpsc::channel();
+        let blocker3 = tokio::task::spawn_blocking(move || {
+            let _ = entered3_tx.send(());
+            release3_rx.recv().unwrap();
+        });
+        entered3_rx.await.unwrap();
+
+        let progress_task = tokio::spawn(async move { resume.progress(16, Some(64), false).await });
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        let draining3 = tokio::spawn({
+            let tasks3 = tasks3.clone();
+            async move { tasks3.end().await }
+        });
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        let completed_early3 = draining3.is_finished();
+        release3_tx.send(()).unwrap();
+        blocker3.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), draining3)
+            .await
+            .expect("task scope drains once attachment resume blocking task finishes")
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), progress_task)
+            .await
+            .expect("attachment resume progress finishes");
+        assert!(
+            !completed_early3,
+            "WorkerTaskScope::end returned while AttachmentResume blocking task was still in flight"
+        );
+    });
+}
+
+/// Cancelling a media upload *after* blocking staging has already reserved an
+/// `outgoing_attachment_uploads` row must release that reservation
+/// synchronously inside the tracked blocking closure BEFORE
+/// `WorkerTaskScope::end()` returns, without spawning post-drain cleanup or
+/// reopening evicted storage caches (mdk#3801).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_staging_cancellation_after_reservation_releases_before_scope_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let relay = Arc::new(crate::tests::ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_blob_endpoints(true),
+    )
+    .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group = client
+        .create_group("staging-cancel-after-reserve", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("group created");
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let path = source_dir.path().join("large.bin");
+    let len = 64 * 1024 * 1024u64;
+    std::fs::File::create(&path).unwrap().set_len(len).unwrap();
+    let control = Arc::new(crate::MediaFileTransferControl::default());
+    let request = crate::MediaFileUploadRequest {
+        attachments: vec![crate::MediaFileUploadAttachmentRequest {
+            source_path: path.to_string_lossy().into_owned(),
+            expected_size: Some(len),
+            file_name: "large.bin".into(),
+            media_type: "application/octet-stream".into(),
+            dim: None,
+            thumbhash: None,
+        }],
+        caption: None,
+        send: false,
+        blossom_server: Some("http://127.0.0.1:9".into()),
+        message_tags: Vec::new(),
+    };
+    let (upload_http, finish) = client
+        .prepare_encrypted_media_upload_payload(
+            &group,
+            crate::media::file_transfer::MediaUploadPayload::Files(
+                crate::media::file_transfer::FileUploadSources::Host(request),
+                control.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    // Hold a pre-opened handle for post-drain verification so we can verify
+    // `app.account_storages` stayed evicted without repopulating it.
+    let verify_storage = app.account_storage("alice").unwrap();
+
+    let (http, _completions) = context();
+    let tasks = http.tasks.clone();
+    let permit = http.permits.clone().acquire_owned().await.unwrap();
+    let (respond, _rx) = oneshot::channel();
+    spawn_media_http(
+        &http,
+        permit,
+        upload_http.with_tasks(http.tasks.clone()).run(),
+        move |result| MediaHttpCompletion::Upload {
+            finish,
+            result: result.map(|(r, u)| (r, Box::new(u))),
+            respond,
+            started_at: std::time::Instant::now(),
+        },
+    );
+
+    // Wait until staging has created the reservation row and started copying bytes.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while control.processed_bytes() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("staging reserves and begins processing bytes");
+
+    app.drop_account_caches("alice");
+    assert!(!app.account_storages.lock().unwrap().contains_key("alice"));
+
+    // End the scope while blocking staging holds an active reservation.
+    tokio::time::timeout(Duration::from_secs(10), tasks.end())
+        .await
+        .expect("WorkerTaskScope::end drains staging and its synchronous release");
+
+    // Immediately on return from `tasks.end()` — with zero sleep or extra
+    // blocking fence — the reservation must already be released and caches
+    // must remain evicted.
+    assert!(
+        !app.account_storages.lock().unwrap().contains_key("alice"),
+        "post-cancellation upload release must not reopen evicted account storage"
+    );
+    let remaining_uploads = verify_storage
+        .app_storage()
+        .prune_attachment_uploads(u64::MAX, 64)
+        .unwrap();
+    assert_eq!(
+        remaining_uploads, 0,
+        "reserved upload must be released BEFORE WorkerTaskScope::end returns"
     );
 }

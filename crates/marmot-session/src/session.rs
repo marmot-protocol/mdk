@@ -2662,7 +2662,11 @@ impl AccountDeviceSession {
     }
 
     /// See [`cgka_engine::engine::Engine::open_history`].
-    pub fn open_history(&self, context: &[u8], sealed: &[u8]) -> SessionResult<Option<Vec<u8>>> {
+    pub fn open_history(
+        &self,
+        context: &[u8],
+        sealed: &[u8],
+    ) -> SessionResult<Option<SecretBytes>> {
         Ok(self.engine.open_history(context, sealed)?)
     }
 
@@ -2691,7 +2695,7 @@ impl AccountDeviceSession {
         entropy: &[u8; RECOVERY_ENTROPY_LEN],
         context: &[u8],
         sealed: &[u8],
-    ) -> SessionResult<Option<Vec<u8>>> {
+    ) -> SessionResult<Option<SecretBytes>> {
         Ok(self
             .engine
             .open_with_recovery_key(entropy, context, sealed)?)

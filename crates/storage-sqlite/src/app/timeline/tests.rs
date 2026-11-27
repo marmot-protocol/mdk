@@ -5202,6 +5202,117 @@ fn secure_prune_hands_the_host_only_well_formed_media_hashes() {
     assert_eq!(pruned.media_ciphertext_sha256, vec!["ab".repeat(32)]);
 }
 
+/// Regression for #3798: secure prune must also remove invalidated local edits
+/// targeting a pruned root message, and scrub TEXT columns with their UTF-8
+/// byte length (`octet_length`) rather than character count (`length`).
+#[test]
+fn secure_prune_removes_invalidated_local_edits_and_scrubs_utf8_byte_lengths() {
+    let account = SqliteAccountStorage::in_memory().unwrap();
+    let app = account.app_storage();
+    let group = "11".repeat(32);
+
+    let root_text = "🔥🎉🚀秘密メッセージ"; // 10 chars, 34 UTF-8 bytes
+    assert_ne!(root_text.len(), root_text.chars().count());
+    let mut root = chat("root-utf8", "alice", 10, root_text);
+    root.tags = vec![vec!["note".to_owned(), "秘密🔥".to_owned()]];
+    let root_tags_json = serde_json::to_string(&root.tags).unwrap();
+    assert_ne!(root_tags_json.len(), root_tags_json.chars().count());
+    app.record_app_event(&root).unwrap();
+
+    let edit_text = "秘密の編集🔥"; // 6 chars, 19 UTF-8 bytes
+    let failed_edit = edit("failed-edit", "alice", "root-utf8", 20, edit_text);
+    app.record_app_event(&failed_edit).unwrap();
+    app.invalidate_app_event_by_message_id(&group, "failed-edit", "local_publish_failed")
+        .unwrap();
+
+    // Capture the zeroblob byte lengths written by the scrub UPDATEs before
+    // the subsequent DELETE removes the rows.
+    account
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TEMP TABLE scrub_audit (
+                tbl TEXT NOT NULL,
+                message_id_hex TEXT NOT NULL,
+                plaintext_bytes INTEGER NOT NULL,
+                tags_bytes INTEGER NOT NULL
+             );
+             CREATE TEMP TRIGGER audit_app_events_scrub
+             AFTER UPDATE ON app_events
+             WHEN typeof(NEW.plaintext) = 'blob'
+             BEGIN
+                 INSERT INTO scrub_audit VALUES (
+                     'app_events', NEW.message_id_hex, length(NEW.plaintext), length(NEW.tags_json)
+                 );
+             END;
+             CREATE TEMP TRIGGER audit_timeline_scrub
+             AFTER UPDATE ON message_timeline
+             WHEN typeof(NEW.plaintext) = 'blob'
+             BEGIN
+                 INSERT INTO scrub_audit VALUES (
+                     'message_timeline', NEW.message_id_hex, length(NEW.plaintext), length(NEW.tags_json)
+                 );
+             END;",
+        )
+        .unwrap();
+
+    let pruned = app
+        .secure_prune_app_events_before(&group, 15, "local", &|_, _| false)
+        .unwrap();
+    assert_eq!(pruned.pruned_messages, 2);
+
+    let remaining_failed_edit: i64 = account
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM app_events WHERE group_id_hex = ?1 AND message_id_hex = 'failed-edit'",
+            params![&group],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        remaining_failed_edit, 0,
+        "invalidated local edit targeting pruned root must be deleted from app_events"
+    );
+
+    let scrubbed: Vec<(String, String, i64, i64)> = account
+        .lock()
+        .unwrap()
+        .prepare("SELECT tbl, message_id_hex, plaintext_bytes, tags_bytes FROM scrub_audit ORDER BY tbl, message_id_hex")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        scrubbed.contains(&(
+            "app_events".to_owned(),
+            "root-utf8".to_owned(),
+            root_text.len() as i64,
+            root_tags_json.len() as i64,
+        )),
+        "app_events scrub must zero full UTF-8 byte lengths: {scrubbed:?}"
+    );
+    assert!(
+        scrubbed.contains(&(
+            "app_events".to_owned(),
+            "failed-edit".to_owned(),
+            edit_text.len() as i64,
+            serde_json::to_string(&failed_edit.tags).unwrap().len() as i64,
+        )),
+        "invalidated edit scrub must zero full UTF-8 byte lengths: {scrubbed:?}"
+    );
+    assert!(
+        scrubbed.contains(&(
+            "message_timeline".to_owned(),
+            "root-utf8".to_owned(),
+            root_text.len() as i64,
+            root_tags_json.len() as i64,
+        )),
+        "message_timeline scrub must zero full UTF-8 byte lengths: {scrubbed:?}"
+    );
+}
+
 #[test]
 fn accepted_edit_projection_and_history_survive_encrypted_reopen() {
     let dir = tempfile::tempdir().unwrap();

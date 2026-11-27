@@ -1332,7 +1332,7 @@ async fn empty_routes_do_not_announce_unsigned_or_stale_pending_replacement() {
         ))
         .unwrap();
     let mut roster = DeviceRosterV1 {
-        leaf_tag_key: [0x31; 32],
+        leaf_tag_key: [0x31; 32].into(),
         ..DeviceRosterV1::default()
     };
     roster.devices.insert(

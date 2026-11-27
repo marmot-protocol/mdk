@@ -66,11 +66,12 @@ pub struct RelayTelemetryRollup {
     /// client returned (for example, endpoints abandoned after quorum).
     #[serde(default)]
     pub publish_cancellations: u64,
-    /// Device-wide NIP-77 reconciliation passes, inbox and group routes alike.
+    /// Retained for telemetry snapshot schema stability after `#3789`
+    /// (`#2897`) retired legacy `reconcile_subscription`; remains zero.
     #[serde(default)]
     pub reconciliation_attempts: u64,
-    /// Device-wide group passes that returned nothing because no time order
-    /// covered the history they were missing.
+    /// Retained for telemetry snapshot schema stability after `#3789`
+    /// (`#2897`); remains zero.
     #[serde(default)]
     pub reconciliation_order_unproven_passes: u64,
     /// Device-wide account activations whose every REQ reached every relay.

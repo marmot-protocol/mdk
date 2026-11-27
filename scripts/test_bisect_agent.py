@@ -37,6 +37,7 @@ from scripts.bisect_agent.controller import (
     default_worktree_runner,
     is_wrapper_job,
     main as cli_main,
+    selftest,
 )
 from scripts.bisect_agent.models import (
     AgentState,
@@ -85,6 +86,15 @@ def _commit_file(repo: Path, rel: str, content: str, msg: str) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
+def _commit_at(repo: Path, rel: str, content: str, msg: str, epoch: int) -> str:
+    """Commit with a fixed author and committer date (squash merges carry their merge time)."""
+    (repo / rel).write_text(content, encoding="utf-8")
+    env = {**os.environ, "GIT_AUTHOR_DATE": f"@{epoch} +0000", "GIT_COMMITTER_DATE": f"@{epoch} +0000"}
+    subprocess.run(["git", "-C", str(repo), "add", rel], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", msg], check=True, capture_output=True, env=env)
+    return _git(repo, "rev-parse", "HEAD")
+
+
 def _seed_tree_state(tmp: Path, origin: Path, state: str = "green") -> None:
     ts_work = tmp / "ts-init"
     ts_work.mkdir()
@@ -129,6 +139,7 @@ class StubGitHub:
         self.reruns: list[str] = []
         self.recorded_attempts: list[tuple[str, int, int | None]] = []
         self.dispatches: int = 0
+        self.cancelled: list[int] = []
         self.issues: list[dict] = []
         self.prs: list[dict] = []
 
@@ -141,6 +152,9 @@ class StubGitHub:
     def hosted_run_verification_status(self, run_id: int, *, attempt: int | None = None) -> str:
         self.recorded_attempts.append(("verify", run_id, attempt))
         return self.verification_status_by_run.get(run_id, "skipped")
+
+    def jobs_for_run(self, run_id: int, *, attempt: int | None = None):
+        return self.failed_jobs_by_run.get(run_id, [])
 
     def failed_jobs_for_run(self, run_id: int, *, attempt: int | None = None):
         self.recorded_attempts.append(("failed_jobs", run_id, attempt))
@@ -173,8 +187,16 @@ class StubGitHub:
         self.reruns.append(run_id)
         return True
 
-    def dispatch_canary(self) -> None:
+    def dispatch_canary(self) -> bool:
         self.dispatches += 1
+        return True
+
+    def workflow_runs(self, workflow: str, *, limit: int = 20):
+        return list(self.runs_by_workflow.get(workflow, []))[:limit]
+
+    def cancel_run(self, run_id: int) -> bool:
+        self.cancelled.append(run_id)
+        return True
 
     def open_or_comment_issue(self, *, title: str, body: str, issue_number: int | None = None) -> int | None:
         if self.fail_issue_create:
@@ -314,6 +336,75 @@ class ClassifierTests(unittest.TestCase):
         )
         self.assertEqual(bm.run_url, "")
 
+    def test_infra_text_early_in_a_log_does_not_hide_the_build_failure_that_ends_it(self):
+        # fast-ci's own CI-runner tests print "No space left on device" while simulating a
+        # full disk. The agent read that as an infra failure and never froze or bisected the
+        # clippy error that ended the log (#3826), so master stayed broken under a green tree.
+        log = "\n".join(
+            ["CI evidence write failed: No space left on device"]
+            + [f"    Checking crate-{i} v0.1.0" for i in range(100)]
+            + [
+                "error: method `account_capacity` is never used",
+                "error: could not compile `marmot-app` (lib test) due to 1 previous error",
+                "error: recipe `clippy-default` failed on line 40 with exit code 101",
+            ]
+        )
+        signals = (
+            extract_bare_metal_signal(
+                {"state": "red", "sha": "a" * 40, "canary_sha": "b" * 40, "failed_step": "fast-ci"},
+                log,
+            ),
+            extract_hosted_signal(
+                source="hosted_canary",
+                run_id="3:1",
+                run_url="https://example.com/3",
+                tip_sha="a" * 40,
+                baseline_sha="b" * 40,
+                failed_job="Full cross-platform CI (6 shards) / Rust check and clippy",
+                failed_step="Run clippy",
+                log_text=log,
+            ),
+        )
+        replay = lambda sha, _cmd: (RunVerdict.FAIL if sha == "a" * 40 else RunVerdict.PASS, "")
+        for signal in signals:
+            with self.subTest(job=signal.failed_job):
+                self.assertFalse(signal.infra_hint)
+                self.assertEqual(classify_failure(signal, run_on_sha=replay).bucket, Bucket.DETERMINISTIC_REGRESSION)
+
+        # The local replay of `just fast-ci` prints the same self-test line: it must pass on
+        # a green commit and fail on a red one, not come back inconclusive.
+        fast_ci = ("just", "fast-ci")
+        passing = log.rsplit("\nerror: method", 1)[0] + "\nAll gates passed\n"
+        self.assertEqual(evaluate_command_result(0, passing, fast_ci)[0], RunVerdict.PASS)
+        self.assertEqual(evaluate_command_result(101, log, fast_ci)[0], RunVerdict.FAIL)
+
+        # Exit 0 is a pass even when the last lines carry infra-like test output.
+        self.assertEqual(
+            evaluate_command_result(0, "CI evidence write failed: No space left on device\nok\n", fast_ci)[0],
+            RunVerdict.PASS,
+        )
+
+        # A replay's tail is its chronological tail: infra text a passing step wrote to
+        # stderr early must not land at the end of the captured output.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            early_stderr_then_failure = (
+                "python3",
+                "-u",
+                "-c",
+                "import sys; print('CI evidence write failed: No space left on device', file=sys.stderr); "
+                "[print(f'    Checking crate-{i}') for i in range(100)]; "
+                "print('error: recipe `clippy-default` failed'); sys.exit(101)",
+            )
+            verdict, _ = default_worktree_runner(early_stderr_then_failure)(Path(tmp_str))
+            self.assertEqual(verdict, RunVerdict.FAIL)
+
+        # A real disk-full failure still ends its log and stays infra.
+        disk_full = extract_bare_metal_signal(
+            {"state": "red", "sha": "a" * 40, "canary_sha": "b" * 40, "failed_step": "fast-ci"},
+            "    Compiling marmot-app v0.20.0\nerror: failed to write: No space left on device (os error 28)\n",
+        )
+        self.assertTrue(disk_full.infra_hint)
+
     def test_classification_buckets_missing_baseline_and_stress_rules(self):
         sig = FailureSignal(
             source="bare_metal_canary",
@@ -364,6 +455,214 @@ class ClassifierTests(unittest.TestCase):
         self.assertIn("never auto-reverted", inter_stress.reason)
         self.assertNotIn("1/5", inter_stress.reason)
 
+    def test_deterministic_regression_not_suppressed_by_leaderboard_or_flake_issue(self):
+        sig = FailureSignal(
+            source="hosted_canary",
+            run_id="r-flake-order",
+            run_url="https://example.com/r-flake-order",
+            tip_sha="2" * 40,
+            baseline_sha="1" * 40,
+            failed_job="Full cross-platform CI (6 shards) / Rust tests (1/6)",
+            failed_test="marmot-session::runtime::an_overdue_component_recheck_is_owed_not_due_now",
+            command=nextest_command_for_test(
+                "marmot-session",
+                "runtime",
+                "an_overdue_component_recheck_is_owed_not_due_now",
+                profile="ci",
+            ),
+        )
+        leaderboard = [
+            {
+                "number": 3351,
+                "title": "Flaky test leaderboard",
+                "body": "| 1 | `an_overdue_component_recheck_is_owed_not_due_now` | `marmot-session::runtime` | 0 | 2 |",
+            }
+        ]
+        individual = [
+            {
+                "number": 4001,
+                "title": "Flaky: marmot-session::runtime::an_overdue_component_recheck_is_owed_not_due_now",
+                "body": "",
+            }
+        ]
+
+        # 1. Deterministic regression (always fails tip, always passes baseline) MUST NOT be
+        # suppressed by the leaderboard OR by an open individual `Flaky:` issue.
+        # Confirmation uses palindrome order (`tip -> baseline -> baseline -> tip`) so
+        # neither alternating streams nor early-fail/later-pass bursts align with tip/baseline.
+        for label, issues, expected_shas, expected_issue in (
+            ("leaderboard", leaderboard, [sig.tip_sha, sig.baseline_sha], None),
+            ("individual", individual, [sig.tip_sha, sig.baseline_sha, sig.baseline_sha, sig.tip_sha], 4001),
+        ):
+            with self.subTest(issues=label):
+                seen_shas: list[str] = []
+
+                def det_runner(sha: str, _cmd: tuple[str, ...]) -> tuple[RunVerdict, str]:
+                    seen_shas.append(sha)
+                    return (
+                        (RunVerdict.FAIL, "target test failed")
+                        if sha == sig.tip_sha
+                        else (RunVerdict.PASS, "target test passed")
+                    )
+
+                cls = classify_failure(sig, run_on_sha=det_runner, open_flake_issues=issues)
+                self.assertEqual(cls.bucket, Bucket.DETERMINISTIC_REGRESSION)
+                self.assertEqual(cls.matched_issue, expected_issue)
+                self.assertEqual(seen_shas, expected_shas)
+
+        # 1b. Revision-independent alternating streams AND burst streams on a tracked flake
+        # MUST classify as KNOWN_FLAKE and never enter bisect.
+        for label, outcomes in (
+            ("alternating_stream", [RunVerdict.FAIL, RunVerdict.PASS, RunVerdict.FAIL, RunVerdict.PASS]),
+            ("early_fail_burst_2", [RunVerdict.FAIL, RunVerdict.FAIL, RunVerdict.PASS, RunVerdict.PASS]),
+            ("early_fail_burst_3", [RunVerdict.FAIL, RunVerdict.FAIL, RunVerdict.FAIL, RunVerdict.PASS]),
+            ("single_fail_burst", [RunVerdict.FAIL, RunVerdict.PASS, RunVerdict.PASS, RunVerdict.PASS]),
+            ("baseline_fails_confirm", [RunVerdict.FAIL, RunVerdict.PASS, RunVerdict.FAIL, RunVerdict.FAIL]),
+        ):
+            with self.subTest(stream=label):
+                seq = iter(outcomes)
+                alt_cls = classify_failure(
+                    sig,
+                    run_on_sha=lambda _s, _c: (next(seq), "observed"),
+                    open_flake_issues=individual,
+                )
+                self.assertEqual(alt_cls.bucket, Bucket.KNOWN_FLAKE)
+                self.assertEqual(alt_cls.matched_issue, 4001)
+
+        # 1b-ii. Newly added test (`TEST_ABSENT` on baseline) on a tracked flake still confirms
+        # `tip` a second time (`tip -> baseline(TEST_ABSENT) -> tip`).
+        absent_det_shas: list[str] = []
+
+        def absent_det_runner(sha: str, _cmd: tuple[str, ...]) -> tuple[RunVerdict, str]:
+            absent_det_shas.append(sha)
+            return (
+                (RunVerdict.FAIL, "target test failed")
+                if sha == sig.tip_sha
+                else (RunVerdict.TEST_ABSENT, "test absent on baseline")
+            )
+
+        absent_det = classify_failure(sig, run_on_sha=absent_det_runner, open_flake_issues=individual)
+        self.assertEqual(absent_det.bucket, Bucket.DETERMINISTIC_REGRESSION)
+        self.assertEqual(absent_det.matched_issue, 4001)
+        self.assertEqual(absent_det_shas, [sig.tip_sha, sig.baseline_sha, sig.tip_sha])
+
+        absent_flaky_seq = iter([RunVerdict.FAIL, RunVerdict.TEST_ABSENT, RunVerdict.PASS])
+        absent_flaky = classify_failure(
+            sig,
+            run_on_sha=lambda _s, _c: (next(absent_flaky_seq), "observed"),
+            open_flake_issues=individual,
+        )
+        self.assertEqual(absent_flaky.bucket, Bucket.KNOWN_FLAKE)
+        self.assertEqual(absent_flaky.matched_issue, 4001)
+
+        # 1c. Missing or equal baseline still runs tracked-flake confirmation on `tip` before
+        # returning UNREPRODUCIBLE so an intermittent tracked flake does not trigger Meltdown.
+        for baseline_sha in ("", sig.tip_sha):
+            with self.subTest(missing_baseline=baseline_sha or "empty"):
+                no_base_sig = FailureSignal(**{**sig.__dict__, "baseline_sha": baseline_sha})
+                # First tip replay fails, second passes -> KNOWN_FLAKE (not UNREPRODUCIBLE).
+                seq = iter([RunVerdict.FAIL, RunVerdict.PASS])
+                flaky_no_base = classify_failure(
+                    no_base_sig,
+                    run_on_sha=lambda _s, _c: (next(seq), "observed"),
+                    open_flake_issues=individual,
+                )
+                self.assertEqual(flaky_no_base.bucket, Bucket.KNOWN_FLAKE)
+                self.assertEqual(flaky_no_base.matched_issue, 4001)
+
+                # Both tip replays fail -> genuinely persistent with no baseline -> UNREPRODUCIBLE.
+                persist_no_base = classify_failure(
+                    no_base_sig,
+                    run_on_sha=lambda _s, _c: (RunVerdict.FAIL, "target test failed"),
+                    open_flake_issues=individual,
+                )
+                self.assertEqual(persist_no_base.bucket, Bucket.UNREPRODUCIBLE)
+
+                # Leaderboard-only test with no baseline returns UNREPRODUCIBLE after single shot.
+                board_calls: list[str] = []
+                board_no_base = classify_failure(
+                    no_base_sig,
+                    run_on_sha=lambda s, _c: (board_calls.append(s) or RunVerdict.FAIL, "target test failed"),
+                    open_flake_issues=leaderboard,
+                )
+                self.assertEqual(board_no_base.bucket, Bucket.UNREPRODUCIBLE)
+                self.assertEqual(board_calls, [sig.tip_sha])
+
+        # 1d. Non-locally-reproducible signal (e.g. Windows) honors individual `Flaky:` issues
+        # to avoid false Meltdowns, while still ignoring `"Flaky test leaderboard"`.
+        win_sig = FailureSignal(
+            source="hosted_canary",
+            run_id="r-win-flake",
+            run_url="https://example.com/r-win-flake",
+            tip_sha="2" * 40,
+            baseline_sha="1" * 40,
+            failed_job="Full cross-platform CI (6 shards) / Windows filesystem contracts",
+            failed_test="marmot-session::runtime::an_overdue_component_recheck_is_owed_not_due_now",
+            command=(),
+            reproducible_locally=False,
+        )
+        win_known = classify_failure(
+            win_sig,
+            run_on_sha=lambda _s, _c: (_ for _ in ()).throw(AssertionError("should not run locally")),
+            open_flake_issues=individual,
+        )
+        self.assertEqual(win_known.bucket, Bucket.KNOWN_FLAKE)
+        self.assertEqual(win_known.matched_issue, 4001)
+        win_board = classify_failure(
+            win_sig,
+            run_on_sha=lambda _s, _c: (_ for _ in ()).throw(AssertionError("should not run locally")),
+            open_flake_issues=leaderboard,
+        )
+        self.assertEqual(win_board.bucket, Bucket.UNREPRODUCIBLE)
+
+        # 2. Individual `Flaky:` issue applies when tip passes single retry (intermittent),
+        # skipping the expensive stress loop.
+        retry_calls: list[tuple[str, tuple[str, ...]]] = []
+
+        def pass_retry(sha: str, cmd: tuple[str, ...]) -> tuple[RunVerdict, str]:
+            retry_calls.append((sha, cmd))
+            return RunVerdict.PASS, "target test passed"
+
+        inter_known = classify_failure(
+            sig,
+            run_on_sha=pass_retry,
+            open_flake_issues=individual,
+            stress_count=5,
+        )
+        self.assertEqual(inter_known.bucket, Bucket.KNOWN_FLAKE)
+        self.assertEqual(inter_known.matched_issue, 4001)
+        self.assertEqual(len(retry_calls), 1)
+        self.assertNotIn("--stress-count", retry_calls[0][1])
+
+        # 3. Leaderboard alone never counts as a known-flake issue even on an intermittent pass.
+        inter_board_only = classify_failure(
+            sig,
+            run_on_sha=lambda _s, _c: (RunVerdict.PASS, "target test passed"),
+            open_flake_issues=leaderboard,
+            stress_count=5,
+        )
+        self.assertEqual(inter_board_only.bucket, Bucket.NEW_INTERMITTENT)
+        self.assertIsNone(inter_board_only.matched_issue)
+
+        # 4. Individual `Flaky:` issue also applies when BOTH tip and baseline fail.
+        both_fail_known = classify_failure(
+            sig,
+            run_on_sha=lambda _s, _c: (RunVerdict.FAIL, "target test failed"),
+            open_flake_issues=individual,
+        )
+        self.assertEqual(both_fail_known.bucket, Bucket.KNOWN_FLAKE)
+        self.assertEqual(both_fail_known.matched_issue, 4001)
+
+        # Without a matching individual `Flaky:` issue (including leaderboard-only), both failing
+        # remains an INFRA_ERROR baseline break.
+        both_fail_unknown = classify_failure(
+            sig,
+            run_on_sha=lambda _s, _c: (RunVerdict.FAIL, "target test failed"),
+            open_flake_issues=leaderboard,
+        )
+        self.assertEqual(both_fail_unknown.bucket, Bucket.INFRA_ERROR)
+        self.assertIn("baseline break:", both_fail_unknown.reason)
+
     def test_sanitized_predicate_env_and_live_mode_requires_isolation_prefix(self):
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)
@@ -393,8 +692,177 @@ class ClassifierTests(unittest.TestCase):
             rc = cli_main(["poll", "--live", "--repo-dir", str(tmp), "--no-fetch"])
             self.assertEqual(rc, 2)
 
+    def test_predicate_git_trusts_only_its_own_worktree(self):
+        # The `mdk-runner` sandbox runs git in a worktree `mdk-bot` owns, and git refuses it
+        # ("detected dubious ownership"). Every `just fast-ci` replay failed in
+        # `changelog-gate`, on green commits too, so a fast-ci break read as a baseline break
+        # and was never bisected. Git must trust exactly the replay's worktree.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            wt = Path(tmp_str) / "wt"
+            wt.mkdir()
+            # Hosts may already list other trusted paths (GitHub runners do); this worktree
+            # must be among them.
+            git_trusts_this_worktree = ("sh", "-c", 'git config --get-all safe.directory | grep -Fqx "$(pwd -P)"')
+            verdict, _ = default_worktree_runner(git_trusts_this_worktree)(wt)
+            self.assertEqual(verdict, RunVerdict.PASS)
+
+    def test_isolated_predicate_gets_a_private_tmpdir_it_removes(self):
+        # Gates write fixed paths under TMPDIR (`/tmp/android-elf-tests/...`). Shared with
+        # the bot's own Canary runs, the `mdk-runner` replay hit directories `mdk-bot`
+        # owned and failed `binding-build-gate` on a green commit.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            wt = tmp / "wt"
+            wt.mkdir()
+            record = tmp / "tmpdir.txt"
+            write_under_tmpdir = (
+                "python3",
+                "-c",
+                "import os, pathlib, sys; d = pathlib.Path(os.environ['TMPDIR']); "
+                "(d / 'android-elf-tests').mkdir(); pathlib.Path(sys.argv[1]).write_text(str(d))",
+                str(record),
+            )
+            verdict, _ = default_worktree_runner(write_under_tmpdir, runner_prefix=("env",))(wt)
+            self.assertEqual(verdict, RunVerdict.PASS)
+            private = Path(record.read_text())
+            self.assertNotEqual(private, Path(os.environ.get("TMPDIR", "/tmp")))
+            self.assertFalse(private.exists())
+
+    def test_predicate_nextest_store_lands_in_the_sandbox_target_dir(self):
+        # nextest keeps its store at `<workspace>/target/nextest` whatever `CARGO_TARGET_DIR`
+        # says. The `mdk-runner` sandbox cannot write the bot-owned worktree, so every live
+        # replay exited 96 before running its test. The store must land in the target dir
+        # the sandbox owns.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            wt = tmp / "wt"
+            wt.mkdir()
+            target = tmp / "target-bisect"
+            write_store = (
+                "python3",
+                "-c",
+                "import pathlib; p = pathlib.Path('target/nextest/ci'); "
+                "p.mkdir(parents=True, exist_ok=True); (p / 'probe').write_text('ok')",
+            )
+            verdict, _ = default_worktree_runner(write_store, cargo_target_dir=target)(wt)
+            self.assertEqual(verdict, RunVerdict.PASS)
+            self.assertEqual((target / "nextest" / "ci" / "probe").read_text(), "ok")
+
+    def test_selftest_checks_a_test_shard_log_for_nextest_results(self):
+        # Every live hosted job log came back empty and nothing noticed. `selftest` is the
+        # deploy check that must, on a test shard's log: a planner log or a skip run parses
+        # nothing, so it must not stand in for the logs the agent classifies.
+        planner = {"id": 80, "name": "Full cross-platform CI (6 shards) / Plan", "conclusion": "success"}
+        shard = {"id": 70, "name": "Full cross-platform CI (6 shards) / Rust tests (5/6)", "conclusion": "failure"}
+        cases = (
+            ("", "hosted job log came back empty (run 7, job 70)"),
+            ("plain step output\n", "hosted job log has no nextest results (run 7, job 70)"),
+            ("\x1b[31;1m        FAIL\x1b[0m [   0.1s] marmot-app a::b\n", None),
+        )
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            for shard_log, expected in cases:
+                with self.subTest(shard_log=shard_log):
+                    gh = StubGitHub(
+                        runs_by_workflow={"canary.yml": [{"id": 8}, {"id": 7}]},
+                        failed_jobs_by_run={8: [planner], 7: [planner, shard]},
+                        logs_by_job={80: "plan: skip\n", 70: shard_log},
+                    )
+                    problems = selftest(
+                        gh,
+                        repo_dir=tmp,
+                        worktree_root=tmp / "wt",
+                        cargo_target_dir=tmp / "target",
+                        runner_prefix=("env",),
+                        timeout_secs=30,
+                    )
+                    log_problems = [p for p in problems if p.startswith("hosted job log")]
+                    self.assertEqual(log_problems, [expected] if expected else [])
+
+    def test_job_log_reads_called_workflow_jobs_through_the_jobs_logs_api(self):
+        # `gh run view --job <id> --log` prints nothing and exits 0 for jobs of the reusable
+        # `ci.yml` call ("Full cross-platform CI (6 shards) / ..."), which turned every hosted
+        # Canary failure into an unparsed, unreproducible freeze. gh 2.97+ refuses these
+        # logs' escape sequences without `--allow-escape-sequences`, which gh 2.46 (mdk-ci-1)
+        # rejects as an unknown flag; both must return the raw log.
+        endpoint = "repos/marmot-protocol/mdk/actions/jobs/140455972327/logs"
+        log = "\x1b[31;1m  TRY 2 FAIL\x1b[0m [   4.443s] ( 382/1567) marmot-app client::push::tests::push_batch_delivery\n"
+        fetched = subprocess.CompletedProcess([], 0, stdout=log, stderr="")
+        unknown_flag = subprocess.CompletedProcess([], 1, stdout="", stderr="unknown flag: --allow-escape-sequences\n")
+        for name, responses, calls in (
+            ("gh 2.97+", [fetched], [("api", "--allow-escape-sequences", endpoint)]),
+            ("gh before 2.97", [unknown_flag, fetched], [("api", "--allow-escape-sequences", endpoint), ("api", endpoint)]),
+        ):
+            with self.subTest(name):
+                gh_ops = GitHubOps("marmot-protocol/mdk", dry_run=True)
+                with mock.patch.object(gh_ops, "_run_gh_safe", side_effect=responses) as mocked_gh:
+                    self.assertEqual(gh_ops.job_log(45980601156, 140455972327), log)
+                    self.assertEqual([c.args for c in mocked_gh.call_args_list], calls)
+
 
 class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
+    def test_a_frozen_hosted_canary_stops_waiting_on_runs_that_cannot_clear_it(self):
+        # 2026-11-27: the tree froze on cb02e3694; a Canary run was then started on b836f142f
+        # (merged before the freeze, no fix). The tree-fix merged 16 minutes later, and its
+        # run queued behind the doomed one for ~27 minutes. While frozen, every commit merged
+        # since the freeze is a fix attempt; a run containing none of them can only fail.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            repo, _ = _init_repo(Path(tmp_str))
+            failing = _commit_at(repo, "app.txt", "broken\n", "regression", 1000)
+            before_freeze = _commit_at(repo, "other.txt", "x\n", "merged before the freeze", 1060)
+            fix = _commit_at(repo, "app.txt", "fixed\n", "tree-fix", 1300)
+            second_fix = _commit_at(repo, "app.txt", "fixed again\n", "second tree-fix", 1400)
+            incident = IncidentRecord(started_at=1200.0, reason="frozen", run_url="", tip_sha=failing, source="hosted_canary")
+
+            def supersede(master: str, runs: list[dict]) -> StubGitHub:
+                _git(repo, "update-ref", "refs/remotes/origin/master", master)
+                gh = StubGitHub(runs_by_workflow={"canary.yml": runs})
+                ctrl = BisectController(
+                    repo=repo,
+                    state=AgentState(tree_state="red", active_incidents={"hosted_canary": incident}),
+                    github=gh,
+                    alerter=MarmotAlerter(Roster(), dry_run=True),
+                    tree_state=TreeStateController(repo, dry_run=True, sign_commits=False),
+                    dry_run=False,
+                )
+                ctrl.supersede_doomed_hosted_runs()
+                return gh
+
+            red = {"id": 10, "head_sha": failing, "status": "completed", "conclusion": "failure"}
+            doomed = {"id": 11, "head_sha": before_freeze, "status": "in_progress", "conclusion": None}
+
+            # The fix landed: cancel the run that contains no fix and start one on master.
+            gh = supersede(fix, [doomed, red])
+            self.assertEqual((gh.cancelled, gh.dispatches), ([11], 1))
+
+            # A run on master is already queued or running: nothing to do.
+            gh = supersede(fix, [{"id": 12, "head_sha": fix, "status": "queued", "conclusion": None}, doomed, red])
+            self.assertEqual((gh.cancelled, gh.dispatches), ([11], 0))
+
+            # A run that contains a fix may still clear the tree: keep it, and queue master behind it.
+            gh = supersede(second_fix, [{"id": 13, "head_sha": fix, "status": "in_progress", "conclusion": None}, red])
+            self.assertEqual((gh.cancelled, gh.dispatches), ([], 1))
+
+            # No fix merged since the freeze: leave everything alone.
+            gh = supersede(before_freeze, [doomed, red])
+            self.assertEqual((gh.cancelled, gh.dispatches), ([], 0))
+
+            # A run git cannot judge (not fetched yet, or no commit) is never cancelled: it may
+            # be a tree-fix merged after this poll's fetch.
+            unfetched = {"id": 14, "head_sha": "f" * 40, "status": "in_progress", "conclusion": None}
+            no_commit = {"id": 15, "head_sha": "", "status": "queued", "conclusion": None}
+            gh = supersede(fix, [unfetched, no_commit, {"id": 16, "head_sha": fix, "status": "queued", "conclusion": None}])
+            self.assertEqual((gh.cancelled, gh.dispatches), ([], 0))
+
+            # A cancelled run on master does not count as one: dispatch a replacement.
+            gh = supersede(fix, [{"id": 17, "head_sha": fix, "status": "completed", "conclusion": "cancelled"}, red])
+            self.assertEqual((gh.cancelled, gh.dispatches), ([], 1))
+
+            # Without a usable freeze time nothing can be told apart: do nothing.
+            incident.started_at = 0.0
+            gh = supersede(fix, [doomed, red])
+            self.assertEqual((gh.cancelled, gh.dispatches), ([], 0))
+
     def test_bisect_budget_enforcement_and_detached_dry_run_branch_safety(self):
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)
@@ -887,12 +1355,11 @@ class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
         self.assertIsNone(
             match_known_flake_issue("core::jobs::connect", [{"number": 11, "title": "Flaky: other::connect", "body": ""}])
         )
-        self.assertEqual(
+        self.assertIsNone(
             match_known_flake_issue(
                 "core::jobs::connect",
                 [{"number": 12, "title": "Flaky test leaderboard", "body": "| `core::jobs::connect` | 3 |"}],
             ),
-            12,
         )
         self.assertEqual(
             match_known_flake_issue("core::jobs::connect", [{"number": 13, "title": "Flaky: connect", "body": ""}]),
@@ -998,8 +1465,11 @@ class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
                 dry_run=False,
                 sign_commits=False,
                 worktree_root=tmp / "wts",
-                run_in_wt=lambda wt, _cmd: (
-                    RunVerdict.PASS if (wt / "app.txt").read_text(encoding="utf-8").strip() == "good" else RunVerdict.FAIL,
+                run_in_wt=lambda wt, cmd: (
+                    RunVerdict.PASS
+                    if "known_flake" in " ".join(cmd)
+                    or (wt / "app.txt").read_text(encoding="utf-8").strip() == "good"
+                    else RunVerdict.FAIL,
                     "",
                 ),
             )
@@ -1669,8 +2139,11 @@ class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
                 dry_run=False,
                 sign_commits=False,
                 worktree_root=tmp / "wts",
-                run_in_wt=lambda wt, _cmd: (
-                    RunVerdict.PASS if (wt / "app.txt").read_text(encoding="utf-8").strip() == "good" else RunVerdict.FAIL,
+                run_in_wt=lambda wt, cmd: (
+                    RunVerdict.PASS
+                    if "known_flake" in " ".join(cmd)
+                    or (wt / "app.txt").read_text(encoding="utf-8").strip() == "good"
+                    else RunVerdict.FAIL,
                     "",
                 ),
             )
@@ -1736,7 +2209,7 @@ class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
             self.assertNotIn("fail:hosted_canary:510:1", state_log_err.seen_runs)
             self.assertNotIn("fail:hosted_canary:511:1", state_log_err.seen_runs)
 
-            # GitHubOps.job_log returns None (not "") when `gh run view --log` fails.
+            # GitHubOps.job_log returns None (not "") when the jobs logs API call fails.
             gh_ops = GitHubOps("marmot-protocol/mdk", dry_run=True)
             with mock.patch.object(gh_ops, "_run_gh_safe", return_value=subprocess.CompletedProcess([], 1, stdout="", stderr="err")):
                 self.assertIsNone(gh_ops.job_log(510, 5101))
@@ -1927,6 +2400,8 @@ class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
                 tree_state=TreeStateController(repo, dry_run=True, sign_commits=False),
                 dry_run=False,
                 sign_commits=False,
+                worktree_root=tmp / "wts-drain",
+                run_in_wt=lambda _wt, _cmd: (RunVerdict.PASS, "passed retry"),
             )
             r_err = ctrl_drain.poll_once(hosted_workflows=("canary.yml",), fetch_remote=False)
             self.assertEqual(r_err["actions"][0]["result"], "jobs_api_error")
@@ -2206,6 +2681,200 @@ class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
             )
             self.assertEqual(stress_cls.bucket, Bucket.INFRA_ERROR)
             self.assertIn("bisect wall-clock budget exceeded", stress_cls.reason)
+
+    def test_contradictory_replay_outcomes_never_freeze_or_revert_unrelated_commit(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo, origin = _init_repo(tmp, with_bare_origin=True)
+            assert origin is not None
+            c0 = _commit_file(repo, "app.txt", "good\n", "c0: green baseline")
+            c1_docs = _commit_file(repo, "README.md", "docs tweak\n", "c1: unrelated docs edit")
+            c2 = _commit_file(repo, "app.txt", "broken\n", "c2: tip commit")
+            _git(repo, "push", "origin", "master")
+            _seed_tree_state(tmp, origin, state="green")
+
+            flaky_test = "marmot-session::runtime::flaky_burst_target"
+            flaky_cmd = nextest_command_for_test("marmot-session", "runtime", "flaky_burst_target", profile="ci")
+            tracked_issues = [{"number": 4001, "title": f"Flaky: {flaky_test}", "body": ""}]
+
+            def make_signal(run_id: str) -> FailureSignal:
+                return FailureSignal(
+                    source="hosted_canary",
+                    run_id=run_id,
+                    run_url=f"https://example.com/{run_id}",
+                    tip_sha=c2,
+                    baseline_sha=c0,
+                    failed_job="Full cross-platform CI (6 shards) / Rust tests (1/6)",
+                    failed_test=flaky_test,
+                    command=flaky_cmd,
+                )
+
+            # 1. Early-fail/later-pass burst `[F, F, P, P, F, F]` on tracked flake MUST be caught
+            # during palindrome classification (`tip -> base` sees `F, F`) without entering bisect.
+            burst_stream = iter(
+                [
+                    RunVerdict.FAIL,
+                    RunVerdict.FAIL,
+                    RunVerdict.PASS,
+                    RunVerdict.PASS,
+                    RunVerdict.FAIL,
+                    RunVerdict.FAIL,
+                ]
+            )
+            gh1 = StubGitHub(author="dev", open_issues=tracked_issues)
+            tree1 = TreeStateController(repo, dry_run=False, sign_commits=False)
+            ctrl1 = BisectController(
+                repo=repo,
+                state=AgentState(),
+                github=gh1,
+                alerter=MarmotAlerter(Roster(engineering_group_id="eng"), dry_run=True),
+                tree_state=tree1,
+                dry_run=False,
+                sign_commits=False,
+                worktree_root=tmp / "wts-burst",
+                run_in_wt=lambda _wt, _cmd: (next(burst_stream), "burst"),
+            )
+            cls1, out1 = ctrl1.handle_failure(make_signal("901:1"), master_ref="origin/master", fetch_remote=False)
+            self.assertEqual(cls1.bucket, Bucket.KNOWN_FLAKE)
+            self.assertEqual(cls1.matched_issue, 4001)
+            self.assertIsNone(out1)
+            self.assertEqual(tree1.read_remote_status(), "green")
+            self.assertEqual(gh1.prs, [])
+            self.assertEqual(gh1.reruns, ["901:1"])
+
+            # 2. Revision-independent stream passing palindrome classification (`[F, P, P, F]`)
+            # and then contradicting `baseline` (`c0`) during bisect (`c1=F, c0=F`) MUST NOT
+            # freeze the tree or open a revert PR; downgrades to KNOWN_FLAKE.
+            bisect_contradict_stream = iter(
+                [
+                    RunVerdict.FAIL,  # classify c2
+                    RunVerdict.PASS,  # classify c0
+                    RunVerdict.PASS,  # classify c0 confirm
+                    RunVerdict.FAIL,  # classify c2 confirm
+                    RunVerdict.FAIL,  # bisect mid c1
+                    RunVerdict.FAIL,  # bisect parent c0 -> contradicts c0=PASS!
+                ]
+            )
+            gh2 = StubGitHub(author="dev", open_issues=tracked_issues)
+            tree2 = TreeStateController(repo, dry_run=False, sign_commits=False)
+            ctrl2 = BisectController(
+                repo=repo,
+                state=AgentState(),
+                github=gh2,
+                alerter=MarmotAlerter(Roster(engineering_group_id="eng"), dry_run=True),
+                tree_state=tree2,
+                dry_run=False,
+                sign_commits=False,
+                worktree_root=tmp / "wts-bisect-contradict",
+                run_in_wt=lambda _wt, _cmd: (next(bisect_contradict_stream), "burst"),
+            )
+            cls2, out2 = ctrl2.handle_failure(make_signal("902:1"), master_ref="origin/master", fetch_remote=False)
+            self.assertEqual(cls2.bucket, Bucket.KNOWN_FLAKE)
+            self.assertEqual(cls2.matched_issue, 4001)
+            self.assertIn(c0[:9], cls2.reason)
+            self.assertIsNone(out2)
+            self.assertEqual(tree2.read_remote_status(), "green")
+            self.assertEqual(gh2.prs, [])
+            self.assertEqual(gh2.reruns, ["902:1"])
+            self.assertTrue(any(issue.get("issue_number") == 4001 for issue in gh2.issues))
+
+            # 3. Stream isolating unrelated docs commit `c1_docs` in bisect (`c1=F, c0=P`) and
+            # then contradicting `c2` during live-master revert check (`c2=PASS` vs earlier `FAIL`)
+            # MUST NOT record/open a revert PR for `c1_docs` or freeze the tree.
+            revert_contradict_stream = iter(
+                [
+                    RunVerdict.FAIL,  # classify c2
+                    RunVerdict.PASS,  # classify c0
+                    RunVerdict.PASS,  # classify c0 confirm
+                    RunVerdict.FAIL,  # classify c2 confirm
+                    RunVerdict.FAIL,  # bisect mid c1_docs
+                    RunVerdict.PASS,  # bisect parent c0
+                    RunVerdict.PASS,  # attempt_clean_revert live-master c2 -> contradicts c2=FAIL!
+                ]
+            )
+            gh3 = StubGitHub(author="dev", open_issues=tracked_issues)
+            tree3 = TreeStateController(repo, dry_run=False, sign_commits=False)
+            ctrl3 = BisectController(
+                repo=repo,
+                state=AgentState(),
+                github=gh3,
+                alerter=MarmotAlerter(Roster(engineering_group_id="eng"), dry_run=True),
+                tree_state=tree3,
+                dry_run=False,
+                sign_commits=False,
+                worktree_root=tmp / "wts-revert-contradict",
+                run_in_wt=lambda _wt, _cmd: (next(revert_contradict_stream), "burst"),
+            )
+            cls3, out3 = ctrl3.handle_failure(make_signal("903:1"), master_ref="origin/master", fetch_remote=False)
+            self.assertEqual(cls3.bucket, Bucket.KNOWN_FLAKE)
+            self.assertEqual(cls3.matched_issue, 4001)
+            self.assertIn(c2[:9], cls3.reason)
+            self.assertIsNone(out3)
+            self.assertEqual(tree3.read_remote_status(), "green")
+            self.assertEqual(gh3.prs, [])
+            self.assertEqual(gh3.reruns, ["903:1"])
+
+            # 4. Untracked test (no open `Flaky:` issue) hitting contradictory `baseline` outcomes
+            # between classification (`c0=PASS`) and bisect (`c0=FAIL`) MUST NOT freeze master;
+            # downgrades to NEW_INTERMITTENT.
+            untracked_contradict_stream = iter(
+                [
+                    RunVerdict.FAIL,  # classify c2
+                    RunVerdict.PASS,  # classify c0
+                    RunVerdict.FAIL,  # bisect mid c1_docs
+                    RunVerdict.FAIL,  # bisect parent c0 -> contradicts c0=PASS!
+                ]
+            )
+            gh4 = StubGitHub(author="dev", open_issues=[])
+            tree4 = TreeStateController(repo, dry_run=False, sign_commits=False)
+            ctrl4 = BisectController(
+                repo=repo,
+                state=AgentState(),
+                github=gh4,
+                alerter=MarmotAlerter(Roster(engineering_group_id="eng"), dry_run=True),
+                tree_state=tree4,
+                dry_run=False,
+                sign_commits=False,
+                worktree_root=tmp / "wts-untracked-contradict",
+                run_in_wt=lambda _wt, _cmd: (next(untracked_contradict_stream), "flaky"),
+            )
+            cls4, out4 = ctrl4.handle_failure(make_signal("904:1"), master_ref="origin/master", fetch_remote=False)
+            self.assertEqual(cls4.bucket, Bucket.NEW_INTERMITTENT)
+            self.assertIsNone(cls4.matched_issue)
+            self.assertIn(c0[:9], cls4.reason)
+            self.assertIsNone(out4)
+            self.assertEqual(tree4.read_remote_status(), "green")
+            self.assertEqual(gh4.prs, [])
+            self.assertTrue(any(str(issue.get("title", "")).startswith("New-Intermittent:") for issue in gh4.issues))
+
+            # 5. True deterministic regression on a tracked flake STILL bisects to `c2` (not
+            # `c1_docs`) and opens a verified revert PR cleanly.
+            gh5 = StubGitHub(author="dev", open_issues=tracked_issues)
+            tree5 = TreeStateController(repo, dry_run=False, sign_commits=False)
+            ctrl5 = BisectController(
+                repo=repo,
+                state=AgentState(),
+                github=gh5,
+                alerter=MarmotAlerter(Roster(engineering_group_id="eng"), dry_run=True),
+                tree_state=tree5,
+                dry_run=False,
+                sign_commits=False,
+                worktree_root=tmp / "wts-real-det-tracked",
+                run_in_wt=lambda wt, _cmd: (
+                    RunVerdict.PASS if (wt / "app.txt").read_text(encoding="utf-8").strip() == "good" else RunVerdict.FAIL,
+                    "",
+                ),
+            )
+            cls5, out5 = ctrl5.handle_failure(make_signal("905:1"), master_ref="origin/master", fetch_remote=False)
+            self.assertEqual(cls5.bucket, Bucket.DETERMINISTIC_REGRESSION)
+            self.assertEqual(cls5.matched_issue, 4001)
+            assert out5 is not None
+            self.assertEqual(out5.culprit_sha, c2)
+            self.assertNotEqual(out5.culprit_sha, c1_docs)
+            self.assertTrue(out5.clean_revert and out5.revert_verified)
+            self.assertFalse(out5.meltdown_triggered)
+            self.assertEqual(tree5.read_remote_status(), "green")
+            self.assertEqual(len(gh5.prs), 1)
 
 
 if __name__ == "__main__":

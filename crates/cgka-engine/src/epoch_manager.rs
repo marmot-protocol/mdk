@@ -45,16 +45,49 @@ pub(crate) enum PendingKind {
     Disband,
 }
 
+/// A validated, pre-allocated `Stable -> PendingPublish` transition ready to
+/// install infallibly once its durable staging transaction commits.
+#[must_use = "commit a prepared pending publish after its durable staging transaction succeeds"]
+pub(crate) struct PreparedPendingPublish {
+    group_id: GroupId,
+    pre_commit_epoch: EpochId,
+    new_state: EpochState,
+    pending_ref: PendingStateRef,
+    kind: PendingKind,
+    audit_context: Option<AuditEventContext>,
+}
+
+impl PreparedPendingPublish {
+    pub(crate) fn pending_ref(&self) -> PendingStateRef {
+        self.pending_ref
+    }
+
+    pub(crate) fn group_id(&self) -> &GroupId {
+        &self.group_id
+    }
+
+    pub(crate) fn new_epoch(&self) -> EpochId {
+        self.new_state.epoch()
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct EpochManager {
     states: HashMap<GroupId, EpochState>,
     pending_counter: u64,
     pending: HashMap<PendingStateRef, PendingMeta>,
+    #[cfg(test)]
+    fail_next_prepare_pending: bool,
 }
 
 impl EpochManager {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_prepare_pending_for_test(&mut self) {
+        self.fail_next_prepare_pending = true;
     }
 
     pub(crate) fn pending_refs_for_group(&self, group_id: &GroupId) -> Vec<PendingStateRef> {
@@ -135,14 +168,6 @@ impl EpochManager {
         Ok(())
     }
 
-    pub(crate) fn next_pending_ref(&mut self) -> Result<PendingStateRef, EngineError> {
-        self.pending_counter = self
-            .pending_counter
-            .checked_add(1)
-            .ok_or_else(|| EngineError::Backend("pending reference space exhausted".into()))?;
-        Ok(PendingStateRef::new(self.pending_counter))
-    }
-
     /// Reserve a durable handle without installing a group's pending state.
     /// Construction must reserve every restorable handle before any group
     /// hydrates or stages new work; per-group restoration alone is too late.
@@ -197,16 +222,55 @@ impl EpochManager {
         self.states.insert(group_id, EpochState::stable(epoch));
     }
 
-    /// Begin a pending publish for the given group. Caller must have
-    /// allocated the `pending_ref` via `next_pending_ref` first.
+    /// Validate that `group_id` can enter `PendingPublish` and allocate its
+    /// `PendingStateRef` *before* committing durable staging rows.
     ///
-    /// Stashes `pre_commit_epoch` as the rollback target for
-    /// `rollback_publish`.
-    // Each argument is a distinct piece of the pending-publish transition; a
-    // wrapper struct would only move the same fields behind a name.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn begin_pending(
+    /// On failure, `states`, `pending`, and `pending_counter` remain untouched
+    /// so callers return before writing `Sent` / `DisbandCandidate` / projected
+    /// `group_record` rows to storage. On success, call [`Self::commit_pending`]
+    /// infallibly once the durable staging transaction commits.
+    pub(crate) fn prepare_pending(
         &mut self,
+        group_id: GroupId,
+        pre_commit_epoch: EpochId,
+        new_epoch: EpochId,
+        pending: StagedCommitHandle,
+        kind: PendingKind,
+        audit_context: Option<AuditEventContext>,
+    ) -> Result<PreparedPendingPublish, EngineError> {
+        #[cfg(test)]
+        if self.fail_next_prepare_pending {
+            self.fail_next_prepare_pending = false;
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "FaultInjected",
+                    to: "PendingPublish",
+                    reason: "injected prepare_pending failure",
+                },
+            ));
+        }
+        let next_counter = self
+            .pending_counter
+            .checked_add(1)
+            .ok_or_else(|| EngineError::Backend("pending reference space exhausted".into()))?;
+        let prepared = self.prepare_pending_with_ref(
+            group_id,
+            pre_commit_epoch,
+            new_epoch,
+            pending,
+            PendingStateRef::new(next_counter),
+            kind,
+            audit_context,
+        )?;
+        self.pending_counter = next_counter;
+        Ok(prepared)
+    }
+
+    /// Validate that `group_id` can enter `PendingPublish` under an explicit
+    /// `pending_ref` without mutating any manager state.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_pending_with_ref(
+        &self,
         group_id: GroupId,
         pre_commit_epoch: EpochId,
         new_epoch: EpochId,
@@ -214,34 +278,43 @@ impl EpochManager {
         pending_ref: PendingStateRef,
         kind: PendingKind,
         audit_context: Option<AuditEventContext>,
-    ) -> Result<(), EngineError> {
-        // Atomic in the state map (mirrors the Sm1 fix applied to
-        // confirm_publish / rollback_publish): clone the prior state and run
-        // the fallible transition BEFORE mutating any of self.states /
-        // self.pending. A failing inner transition (e.g. a non-Stable prev →
-        // InvalidTransition) must leave every map untouched so the group's
-        // EpochState entry is never orphaned. Previously the entry was
-        // removed before the transition and never re-inserted on error,
-        // dropping the group to UnknownGroup (mdk#146).
+    ) -> Result<PreparedPendingPublish, EngineError> {
         let prev = self
             .states
             .get(&group_id)
             .cloned()
             .unwrap_or_else(|| EpochState::stable(pre_commit_epoch));
         let new_state = prev.begin_pending(new_epoch, pending, pending_ref)?;
-
-        // The transition succeeded — commit every mutation together.
-        self.states.insert(group_id.clone(), new_state);
-        self.pending.insert(
+        Ok(PreparedPendingPublish {
+            group_id,
+            pre_commit_epoch,
+            new_state,
             pending_ref,
+            kind,
+            audit_context,
+        })
+    }
+
+    /// Infallibly install a transition previously validated by
+    /// [`Self::prepare_pending`].
+    pub(crate) fn commit_pending(&mut self, prepared: PreparedPendingPublish) {
+        debug_assert!(
+            self.states
+                .get(&prepared.group_id)
+                .is_none_or(EpochState::is_stable),
+            "group epoch state changed between prepare_pending and commit_pending"
+        );
+        self.states
+            .insert(prepared.group_id.clone(), prepared.new_state);
+        self.pending.insert(
+            prepared.pending_ref,
             PendingMeta {
-                group_id,
-                prior_epoch: pre_commit_epoch,
-                kind,
-                audit_context,
+                group_id: prepared.group_id,
+                prior_epoch: prepared.pre_commit_epoch,
+                kind: prepared.kind,
+                audit_context: prepared.audit_context,
             },
         );
-        Ok(())
     }
 
     /// Recreate a pending-publish slot from its durable frozen fanout after a
@@ -258,7 +331,7 @@ impl EpochManager {
         kind: PendingKind,
     ) -> Result<(), EngineError> {
         self.reserve_pending_ref(pending_ref);
-        self.begin_pending(
+        let prepared = self.prepare_pending_with_ref(
             group_id,
             pre_commit_epoch,
             new_epoch,
@@ -266,7 +339,9 @@ impl EpochManager {
             pending_ref,
             kind,
             None,
-        )
+        )?;
+        self.commit_pending(prepared);
+        Ok(())
     }
 
     /// Peek at which group a pending publish belongs to without consuming
@@ -473,10 +548,29 @@ mod tests {
     fn pending_ref_does_not_wrap() {
         let mut manager = EpochManager::new();
         manager.reserve_pending_ref(PendingStateRef::new(u64::MAX - 1));
-        assert_eq!(manager.next_pending_ref().unwrap().as_u64(), u64::MAX);
+        let final_prepared = manager
+            .prepare_pending(
+                gid(),
+                EpochId(0),
+                EpochId(1),
+                handle(),
+                PendingKind::GroupEvolution,
+                None,
+            )
+            .expect("final pending ref allocates");
+        assert_eq!(final_prepared.pending_ref().as_u64(), u64::MAX);
         for _ in 0..2 {
-            assert!(matches!(manager.next_pending_ref(),
-                Err(EngineError::Backend(message)) if message == "pending reference space exhausted"));
+            assert!(matches!(
+                manager.prepare_pending(
+                    gid(),
+                    EpochId(0),
+                    EpochId(1),
+                    handle(),
+                    PendingKind::GroupEvolution,
+                    None,
+                ),
+                Err(EngineError::Backend(message)) if message == "pending reference space exhausted"
+            ));
         }
         // Exhaustion prevents new allocations, not restoration/confirmation of
         // the exact final handle that was already persisted.
@@ -496,76 +590,6 @@ mod tests {
         );
     }
 
-    /// Regression for mdk#146: `begin_pending` from a non-Stable state
-    /// must be atomic. A failing inner transition (Unrecoverable →
-    /// InvalidTransition) must leave `states` and `pending` untouched so the
-    /// group is never orphaned to UnknownGroup.
-    #[test]
-    fn begin_pending_failure_leaves_state_intact() {
-        let mut em = EpochManager::new();
-        let group_id = gid();
-
-        // Drive the group into Unrecoverable — a state from which
-        // begin_pending is illegal.
-        em.set_stable(group_id.clone(), EpochId(3));
-        em.mark_unrecoverable(&group_id);
-        assert!(em.is_unrecoverable(&group_id));
-        assert_eq!(em.epoch(&group_id), Some(EpochId(3)));
-
-        let pending_ref = em.next_pending_ref().unwrap();
-        let result = em.begin_pending(
-            group_id.clone(),
-            EpochId(3),
-            EpochId(4),
-            handle(),
-            pending_ref,
-            PendingKind::GroupEvolution,
-            None,
-        );
-
-        // The transition is rejected ...
-        assert!(
-            matches!(result, Err(EngineError::InvalidTransition(ref transition))
-                if transition.from == "Unrecoverable" && transition.to == "PendingPublish"),
-            "begin_pending from Unrecoverable must fail"
-        );
-        // ... and crucially the group's state map entry survives unchanged.
-        assert!(
-            em.is_unrecoverable(&group_id),
-            "state must not be orphaned on failed begin_pending"
-        );
-        assert_eq!(em.epoch(&group_id), Some(EpochId(3)));
-        // The pending meta was never inserted, so the ref is unknown.
-        assert!(em.group_for_pending(pending_ref).is_none());
-    }
-
-    /// The happy path records the pending meta and enters PendingPublish.
-    #[test]
-    fn begin_pending_success_records_all_bookkeeping() {
-        let mut em = EpochManager::new();
-        let group_id = gid();
-        em.set_stable(group_id.clone(), EpochId(7));
-
-        let pending_ref = em.next_pending_ref().unwrap();
-        em.begin_pending(
-            group_id.clone(),
-            EpochId(7),
-            EpochId(8),
-            handle(),
-            pending_ref,
-            PendingKind::GroupEvolution,
-            None,
-        )
-        .expect("begin_pending from Stable succeeds");
-
-        assert_eq!(
-            em.state(&group_id).map(|s| s.name()),
-            Some("PendingPublish")
-        );
-        assert_eq!(em.epoch(&group_id), Some(EpochId(8)));
-        assert_eq!(em.group_for_pending(pending_ref), Some(group_id.clone()));
-    }
-
     /// `rollback_publish` restores the pre-stage Stable state and frees the
     /// pending slot.
     #[test]
@@ -574,17 +598,18 @@ mod tests {
         let group_id = gid();
         em.set_stable(group_id.clone(), EpochId(7));
 
-        let pending_ref = em.next_pending_ref().unwrap();
-        em.begin_pending(
-            group_id.clone(),
-            EpochId(7),
-            EpochId(8),
-            handle(),
-            pending_ref,
-            PendingKind::GroupEvolution,
-            None,
-        )
-        .expect("begin_pending from Stable succeeds");
+        let prepared = em
+            .prepare_pending(
+                group_id.clone(),
+                EpochId(7),
+                EpochId(8),
+                handle(),
+                PendingKind::GroupEvolution,
+                None,
+            )
+            .expect("prepare_pending from Stable succeeds");
+        let pending_ref = prepared.pending_ref();
+        em.commit_pending(prepared);
 
         let (rolled_group, prior) = em
             .rollback_publish(pending_ref)
@@ -621,17 +646,18 @@ mod tests {
         let mut em = EpochManager::new();
         let group_id = gid();
         em.set_stable(group_id.clone(), EpochId(7));
-        let pending_ref = em.next_pending_ref().unwrap();
-        em.begin_pending(
-            group_id.clone(),
-            EpochId(7),
-            EpochId(8),
-            handle(),
-            pending_ref,
-            PendingKind::GroupEvolution,
-            None,
-        )
-        .expect("begin_pending from Stable succeeds");
+        let prepared = em
+            .prepare_pending(
+                group_id.clone(),
+                EpochId(7),
+                EpochId(8),
+                handle(),
+                PendingKind::GroupEvolution,
+                None,
+            )
+            .expect("prepare_pending from Stable succeeds");
+        let pending_ref = prepared.pending_ref();
+        em.commit_pending(prepared);
 
         em.set_stable(group_id.clone(), EpochId(9));
 
@@ -677,5 +703,60 @@ mod tests {
         ));
         assert_eq!(em.state(&group_id).map(|s| s.name()), Some("Stable"));
         assert_eq!(em.epoch(&group_id), Some(EpochId(3)));
+    }
+
+    /// Regression for mdk#146 and mdk#3794: `prepare_pending` validates without
+    /// mutating `states`, `pending`, or `pending_counter`, and `commit_pending`
+    /// installs the validated transition infallibly.
+    #[test]
+    fn prepare_pending_validates_without_mutating_and_commits_infallibly() {
+        let mut em = EpochManager::new();
+        let group_id = gid();
+        em.set_stable(group_id.clone(), EpochId(5));
+        em.mark_unrecoverable(&group_id);
+
+        let rejected = em.prepare_pending(
+            group_id.clone(),
+            EpochId(5),
+            EpochId(6),
+            handle(),
+            PendingKind::GroupEvolution,
+            None,
+        );
+        assert!(matches!(
+            rejected,
+            Err(EngineError::InvalidTransition(t))
+                if t.from == "Unrecoverable" && t.to == "PendingPublish"
+        ));
+        assert_eq!(
+            em.pending_counter, 0,
+            "rejected prepare must not burn a ref"
+        );
+        assert!(em.is_unrecoverable(&group_id));
+        assert_eq!(em.epoch(&group_id), Some(EpochId(5)));
+
+        em.repair_to_stable(&group_id, EpochId(5)).unwrap();
+        let prepared = em
+            .prepare_pending(
+                group_id.clone(),
+                EpochId(5),
+                EpochId(6),
+                handle(),
+                PendingKind::GroupEvolution,
+                None,
+            )
+            .expect("prepare_pending from Stable succeeds");
+        let pending_ref = prepared.pending_ref();
+        // Before commit_pending, EpochManager still shows Stable and no pending slot.
+        assert_eq!(em.state(&group_id).map(|s| s.name()), Some("Stable"));
+        assert!(em.group_for_pending(pending_ref).is_none());
+
+        em.commit_pending(prepared);
+        assert_eq!(
+            em.state(&group_id).map(|s| s.name()),
+            Some("PendingPublish")
+        );
+        assert_eq!(em.epoch(&group_id), Some(EpochId(6)));
+        assert_eq!(em.group_for_pending(pending_ref), Some(group_id));
     }
 }

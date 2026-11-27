@@ -119,7 +119,7 @@ reason in the PR description. A new table needs an owner in `src/base/table_owne
   test helpers `in_memory_for_test()` (which this crate's own unit tests get from `in_memory()`) and
   `relax_storage_for_test_process()` (this crate's own unit tests start relaxed; see README). Keep `test-support`
   inert: nothing changes until a test calls a helper. Never call them from non-test code. The tests that pin the
-  production settings (`encrypted_connection_applies_operational_defaults`, the `pins_cipher_pragmas_before_keying`
+  production settings (`encrypted_connection_applies_operational_defaults`, the `orders_cipher_pragmas_around_keying`
   tests) and the ignored benchmarks of file-backed storage call `use_production_storage_for_test_process()` before
   opening anything; a new one must too.
 - Keep invalidated message records. Applications decide whether to show them.

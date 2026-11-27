@@ -49,6 +49,9 @@ type PermitWait = std::pin::Pin<
 /// across worker select turns preserves Tokio semaphore FIFO fairness.
 #[derive(Default)]
 pub(super) struct Admission {
+    /// Tracks every blocking housekeeping task spawned for this admission so
+    /// worker teardown cancels and drains them before cache eviction (mdk#3801).
+    tasks: super::WorkerTaskScope,
     resumed: bool,
     waiting: Option<PermitWait>,
     permit: Option<OwnedSemaphorePermit>,
@@ -218,14 +221,22 @@ fn spawn_media_sweep(
     }
     let unfinished = latches.sweep_unfinished.clone();
     let rescan = latches.sweep_rescan.clone();
+    let cancel = admission.tasks.token();
     // Timed on the blocking pool (mdk#2923); a batch that never runs or
     // panics drops its span, which records it as cancelled.
     let batch = telemetry.observe(RuntimeOp::WorkerMediaSweep);
-    admission.media_sweep = Some(tokio::task::spawn_blocking(move || {
+    admission.media_sweep = Some(admission.tasks.spawn_blocking(move || {
+        if cancel.is_cancelled() {
+            batch.finish(TelemetryOutcome::Cancelled);
+            return;
+        }
         if restart {
             media.restart_sweep();
         }
         let outcome = loop {
+            if cancel.is_cancelled() {
+                break TelemetryOutcome::Cancelled;
+            }
             match media.sweep(MEDIA_SWEEP_BATCH) {
                 Ok(report) if until_complete && !report.complete => {}
                 Ok(report) => {
@@ -274,8 +285,13 @@ fn spawn_upload_promotion(
         return;
     }
     let after = admission.upload_cursor.take();
+    let cancel = admission.tasks.token();
     let batch = telemetry.observe(RuntimeOp::WorkerUploadPromotion);
-    admission.upload_promotion = Some(tokio::task::spawn_blocking(move || {
+    admission.upload_promotion = Some(admission.tasks.spawn_blocking(move || {
+        if cancel.is_cancelled() {
+            batch.finish(TelemetryOutcome::Cancelled);
+            return (after, false);
+        }
         match crate::media::outgoing::promote_uploads(
             &storage.app_storage(),
             &media,
@@ -374,29 +390,45 @@ pub(super) fn spawn_legacy_migration(
     let legacy_done = latches.legacy_bodies_done.clone();
     let avatars_done = latches.database_avatars_done.clone();
     let compaction_settled = latches.compaction_settled.clone();
-    let app = client.app.clone();
     let label = client.state.label.clone();
+    let media = match client.app.account_media_store(&label, &storage) {
+        Ok(media) => media,
+        Err(_) => {
+            if sweep_keep_media {
+                admission.keep_media_more.store(true, Ordering::Release);
+            }
+            tracing::warn!(target: "marmot_app::storage_maintenance",
+                method = "migrate_legacy_attachments",
+                "legacy attachment migration batch deferred");
+            return;
+        }
+    };
+    let fallback_policy = super::super::attachment_controls::default_policy(&client.app.config);
+    let account_dir = client.app.account_dir(&label);
+    let progress = client.app.legacy_media_migration(&label);
+    let presentation_signals = client.app.presentation_signals.clone();
     let updates = shared.attachment_updates.clone();
     let startup_wal_settled = admission.startup_wal_settled.clone();
     let compaction_due = admission.compaction_due.clone();
     let keep_media_more = admission.keep_media_more.clone();
+    let cancel = admission.tasks.token();
     let batch = shared
         .observer
         .performance()
         .observe(RuntimeOp::WorkerMaintenanceHousekeepingBatch);
-    admission.legacy_migration = Some(tokio::task::spawn_blocking(move || {
-        let started = (|| {
-            let storage = app.account_storage(&label)?;
-            let media = app.account_media_store(&label, &storage)?;
-            let reserve = storage
-                .app_storage()
-                .attachment_download_policy(&super::super::attachment_controls::default_policy(
-                    &app.config,
-                ))?
-                .disk_reserve;
-            Ok::<_, AppError>((storage, media, reserve))
-        })();
-        let Ok((storage, media, reserve)) = started else {
+    admission.legacy_migration = Some(admission.tasks.spawn_blocking(move || {
+        if cancel.is_cancelled() {
+            if sweep_keep_media {
+                keep_media_more.store(true, Ordering::Release);
+            }
+            batch.finish(TelemetryOutcome::Cancelled);
+            return;
+        }
+        let app_storage = storage.app_storage();
+        let Ok(reserve) = app_storage
+            .attachment_download_policy(&fallback_policy)
+            .map(|policy| policy.disk_reserve)
+        else {
             if sweep_keep_media {
                 keep_media_more.store(true, Ordering::Release);
             }
@@ -406,10 +438,7 @@ pub(super) fn spawn_legacy_migration(
             batch.finish(TelemetryOutcome::Failure);
             return;
         };
-        let account_dir = app.account_dir(&label);
         let free = || crate::media::attachment_resume::available_space(&account_dir);
-        let progress = app.legacy_media_migration(&label);
-        let app_storage = storage.app_storage();
         // "Keep media" first, so bodies past the window are not moved only
         // to be removed.
         let mut outcome = TelemetryOutcome::Success;
@@ -443,6 +472,10 @@ pub(super) fn spawn_legacy_migration(
                 }
             }
         }
+        if cancel.is_cancelled() {
+            batch.finish(TelemetryOutcome::Cancelled);
+            return;
+        }
         if legacy_owed {
             let changed = crate::media::legacy_migration::run_batch(
                 &app_storage,
@@ -462,19 +495,31 @@ pub(super) fn spawn_legacy_migration(
                 legacy_done.store(true, Ordering::Release);
             }
         }
+        if cancel.is_cancelled() {
+            batch.finish(TelemetryOutcome::Cancelled);
+            return;
+        }
         // Then images still held in the database move into cache files
         // (mdk#2314 step 9), so compaction can return their pages.
         if avatars_owed {
             if crate::media::avatar_files::run_batch(&app_storage, &media, reserve, &free) {
-                app.presentation_signals.wake_account(&label);
-                let _ = app.presentation_signals.avatars.send(label.clone());
+                presentation_signals.wake_account(&label);
+                let _ = presentation_signals.avatars.send(label.clone());
             }
             if matches!(app_storage.has_database_held_avatars(), Ok(false)) {
                 avatars_done.store(true, Ordering::Release);
             }
         }
+        if cancel.is_cancelled() {
+            batch.finish(TelemetryOutcome::Cancelled);
+            return;
+        }
         if crate::media::storage_compaction::reclaim(&app_storage, startup) && startup {
             startup_wal_settled.store(true, Ordering::Release);
+        }
+        if cancel.is_cancelled() {
+            batch.finish(TelemetryOutcome::Cancelled);
+            return;
         }
         if check_compaction {
             // An incremental database never needs the one-time compaction:
@@ -525,36 +570,48 @@ pub(super) async fn compact_if_due(
     admission
         .compaction_due
         .store(false, std::sync::atomic::Ordering::Release);
-    let app = client.app.clone();
-    let label = client.state.label.clone();
+    let Ok(storage) = client.app.account_storage(&client.state.label) else {
+        return;
+    };
+    let fallback_policy = super::super::attachment_controls::default_policy(&client.app.config);
+    let account_dir = client.app.account_dir(&client.state.label);
+    let progress = client.app.legacy_media_migration(&client.state.label);
     let updates = shared.attachment_updates.clone();
-    let attempted = tokio::task::spawn_blocking(move || {
-        let storage = app.account_storage(&label).ok()?;
-        let reserve = storage
-            .app_storage()
-            .attachment_download_policy(&super::super::attachment_controls::default_policy(
-                &app.config,
+    let cancel = admission.tasks.token();
+    let attempted = admission
+        .tasks
+        .spawn_blocking(move || {
+            if cancel.is_cancelled() {
+                return None;
+            }
+            let app_storage = storage.app_storage();
+            let reserve = app_storage
+                .attachment_download_policy(&fallback_policy)
+                .ok()?
+                .disk_reserve;
+            Some(crate::media::storage_compaction::compact_if_due(
+                &app_storage,
+                reserve,
+                &|| crate::media::attachment_resume::available_space(&account_dir),
+                &progress,
+                // Rare, twice per compaction: reported as a state change, which
+                // costs observers one read each.
+                &|| updates.state_changed(),
             ))
-            .ok()?
-            .disk_reserve;
-        let account_dir = app.account_dir(&label);
-        Some(crate::media::storage_compaction::compact_if_due(
-            &storage.app_storage(),
-            reserve,
-            &|| crate::media::attachment_resume::available_space(&account_dir),
-            &app.legacy_media_migration(&label),
-            // Rare, twice per compaction: reported as a state change, which
-            // costs observers one read each.
-            &|| updates.state_changed(),
-        ))
-    })
-    .await;
+        })
+        .await;
     if let Ok(Some(attempt)) = attempted {
         admission.record_compaction(attempt);
     }
 }
 
 impl Admission {
+    pub(super) fn with_tasks(tasks: super::WorkerTaskScope) -> Self {
+        Self {
+            tasks,
+            ..Self::default()
+        }
+    }
     /// Counts a compaction attempt: one that ran is not repeated under this
     /// worker, and rollbacks stop being retried after
     /// [`MAX_COMPACTION_ROLLBACKS`].
@@ -725,19 +782,28 @@ fn readmit_admission(
 
 /// Complete one real storage observation before deciding whether work is cancelled.
 async fn cancellation_observed(
+    tasks: &super::WorkerTaskScope,
     storage: &SqliteAccountStorage,
     job: &AttachmentAcquisition,
     permission: Option<&super::super::attachment_permission::PermissionLease>,
 ) -> bool {
+    if tasks.is_cancelled() {
+        return true;
+    }
     let store = storage.app_storage();
     let current = job.clone();
-    let active = tokio::task::spawn_blocking(move || {
-        Ok::<_, cgka_traits::StorageError>((
-            store.attachment_transfer_is_active(&current, crate::unix_now_seconds())?,
-            store.attachment_request_is_explicit(&current.reference)?,
-        ))
-    })
-    .await;
+    let cancel = tasks.token();
+    let active = tasks
+        .spawn_blocking(move || {
+            if cancel.is_cancelled() {
+                return Ok((false, false));
+            }
+            Ok::<_, cgka_traits::StorageError>((
+                store.attachment_transfer_is_active(&current, crate::unix_now_seconds())?,
+                store.attachment_request_is_explicit(&current.reference)?,
+            ))
+        })
+        .await;
     // Failure to observe is not cancellation. The transfer deadline and
     // publication fence still bound work while a storage read is unavailable.
     matches!(active, Ok(Ok((false, _))))
@@ -745,16 +811,19 @@ async fn cancellation_observed(
 }
 
 async fn cancelled(
+    tasks: super::WorkerTaskScope,
     storage: SqliteAccountStorage,
     job: AttachmentAcquisition,
     mut updates: watch::Receiver<()>,
     permission: Option<super::super::attachment_permission::PermissionLease>,
 ) {
+    let cancel = tasks.token();
     loop {
-        if cancellation_observed(&storage, &job, permission.as_ref()).await {
+        if cancellation_observed(&tasks, &storage, &job, permission.as_ref()).await {
             return;
         }
         tokio::select! {
+            _ = cancel.cancelled() => return,
             _ = updates.changed()=>{},
             _ = tokio::time::sleep(Duration::from_secs(1))=>{},
         }
@@ -1059,7 +1128,12 @@ pub(super) fn schedule(
         // Handoff copies an earlier process lent out cannot be released any
         // more; this process's live leases are spared.
         let handoffs = crate::media::handoff::handoff_directory(&client.app, &client.state.label);
-        tokio::task::spawn_blocking(move || crate::media::handoff::wipe_stale(&handoffs));
+        let cancel = admission.tasks.token();
+        admission.tasks.spawn_blocking(move || {
+            if !cancel.is_cancelled() {
+                crate::media::handoff::wipe_stale(&handoffs);
+            }
+        });
         // Reclaim whatever a crash left in the media store before new work.
         spawn_media_sweep(
             admission,
@@ -1266,14 +1340,17 @@ pub(super) fn schedule(
             let updates = shared.attachment_updates.clone();
             // Claimed: the row leaves Queued.
             updates.state_changed();
+            let tasks = http.tasks.clone();
             spawn_media_http(
                 http,
                 permit,
                 async move {
                     let attached = {
                         let job = job.clone();
-                        tokio::task::spawn_blocking(move || {
-                            attach_existing_body(&media, &storage.app_storage(), &job)
+                        let cancel = tasks.token();
+                        tasks.spawn_blocking(move || {
+                            !cancel.is_cancelled()
+                                && attach_existing_body(&media, &storage.app_storage(), &job)
                         })
                     };
                     let result = if attached.await.unwrap_or(false) {
@@ -1435,8 +1512,11 @@ pub(super) fn schedule(
             permission: permission.clone(),
             finishing: Default::default(),
             updates: Some(shared.attachment_updates.clone()),
+            tasks: http.tasks.clone(),
         };
+        let tasks = http.tasks.clone();
         let cancel = cancelled(
+            tasks.clone(),
             storage.clone(),
             job.clone(),
             shared.attachment_cancellations.subscribe(),
@@ -1454,8 +1534,10 @@ pub(super) fn schedule(
                 // downloading; the check runs on the blocking pool.
                 let reuse = {
                     let (media, storage, job) = (media, storage.clone(), job.clone());
-                    tokio::task::spawn_blocking(move || {
-                        attach_existing_body(&media, &storage.app_storage(), &job)
+                    let cancel = tasks.token();
+                    tasks.spawn_blocking(move || {
+                        !cancel.is_cancelled()
+                            && attach_existing_body(&media, &storage.app_storage(), &job)
                     })
                 };
                 let result = if reuse.await.unwrap_or(false) {

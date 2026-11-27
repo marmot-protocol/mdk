@@ -178,7 +178,7 @@ fn project_acquisition(
         FiniteEnd::TimedOut => NostrAcquisitionEnd::Deadline,
         FiniteEnd::Disconnected => NostrAcquisitionEnd::Disconnected,
         FiniteEnd::InvalidMessage => NostrAcquisitionEnd::InvalidMessage,
-        FiniteEnd::SetupFailed => NostrAcquisitionEnd::SetupFailed,
+        FiniteEnd::SetupFailed | FiniteEnd::Busy => NostrAcquisitionEnd::SetupFailed,
         // Still refused after the one retry, or no authenticator to retry with.
         FiniteEnd::Closed(reason) if is_auth_required(reason) => {
             NostrAcquisitionEnd::AuthenticationFailed
@@ -2562,7 +2562,13 @@ impl NostrSdkRelayClient {
 
     /// Shut down this SDK context and reap its owned notification monitors.
     pub async fn shutdown(&self) {
+        if let Some(finite) = &self.finite_requests {
+            finite.begin_shutdown();
+        }
         self.client.shutdown().await;
+        if let Some(finite) = &self.finite_requests {
+            finite.join_shutdown().await;
+        }
         let monitors = {
             let mut state = self
                 .frontier

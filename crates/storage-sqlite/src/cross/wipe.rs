@@ -73,6 +73,11 @@ impl SqliteAccountStorage {
         let group_id = hex::decode(group_id_hex).map_err(|error| {
             StorageError::Serialization(format!("invalid local group id: {error}"))
         })?;
+        // Normalize once to canonical lowercase hex; migration 0228 and write
+        // boundary canonicalization keep every group-scoped table lowercase so
+        // every read and delete below uses plain indexed `group_id_hex = ?1`.
+        let group_id_hex = hex::encode(&group_id);
+        let group_id_hex = group_id_hex.as_str();
 
         let newly_deleted = retry_on_busy(|| {
             let mut conn = self.lock()?;
@@ -252,7 +257,7 @@ impl SqliteAccountStorage {
                                 local_group_deletion_frontiers.pending_confirmation
                             )",
                         params![
-                            hex::encode(&group_id),
+                            group_id_hex,
                             message_insert_order,
                             prior_nostr_routes_json,
                             pending_confirmation,
@@ -269,7 +274,7 @@ impl SqliteAccountStorage {
                     )?;
                     tx.execute_cached(
                         "DELETE FROM local_group_deletion_frontiers WHERE group_id_hex = ?1",
-                        params![hex::encode(&group_id)],
+                        params![group_id_hex],
                     )
                     .storage()?;
                     deleted = deleted.saturating_add(
@@ -314,8 +319,8 @@ impl SqliteAccountStorage {
                         "history_delivery_sends",
                         "app_pending_welcome_delivery",
                         "pending_push_registration_removals",
-                        "app_prepared_group_image_upload",
                         "message_drafts",
+                        "app_prepared_group_image_upload",
                         "chat_pin_positions",
                     ] {
                         tx.execute_cached(
@@ -390,9 +395,9 @@ fn active_trusted_device_group_forget(
 ) -> StorageResult<bool> {
     let record: Option<Vec<u8>> = tx
         .query_row_cached(
-            "SELECT g.record FROM cgka_groups g JOIN device_groups d
-         ON d.group_id_hex = ?1 WHERE g.id = ?2 AND d.trust IN ('created','linked')",
-            params![group_hex, group_id],
+            "SELECT g.record FROM cgka_groups g JOIN device_groups d ON d.group_id_hex = ?2
+             WHERE g.id = ?1 AND d.trust IN ('created','linked')",
+            params![group_id, group_hex],
             |row| row.get(0),
         )
         .optional()

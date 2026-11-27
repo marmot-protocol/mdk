@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::SqliteAccountStorage;
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use std::fmt;
 
 use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
@@ -380,6 +380,8 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         updated_at: u64,
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
+        let group_id_hex = group_id_hex.as_ref();
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
         let changed = tx

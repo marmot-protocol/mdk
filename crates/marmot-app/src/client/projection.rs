@@ -797,7 +797,7 @@ impl AppClient {
             // Terminal settlement deletes live MLS state before emitting its
             // effects. Preserve the last display components and project the
             // authoritative tombstone instead of querying deleted MLS state.
-            let previous = match self.state_group_record(group_id) {
+            let mut previous = match self.state_group_record(group_id) {
                 Some(previous) => previous,
                 None => self
                     .app
@@ -818,11 +818,11 @@ impl AppClient {
                 avatar_url: previous.avatar_url,
                 encrypted_media: previous.encrypted_media,
                 image: AppGroupImageInput {
-                    image_hash_hex: previous.image.image_hash_hex,
-                    image_key_hex: previous.image.image_key_hex,
-                    image_nonce_hex: previous.image.image_nonce_hex,
-                    image_upload_key_hex: previous.image.image_upload_key_hex,
-                    media_type: previous.image.media_type,
+                    image_hash_hex: std::mem::take(&mut previous.image.image_hash_hex),
+                    image_key_hex: std::mem::take(&mut previous.image.image_key_hex),
+                    image_nonce_hex: std::mem::take(&mut previous.image.image_nonce_hex),
+                    image_upload_key_hex: std::mem::take(&mut previous.image.image_upload_key_hex),
+                    media_type: previous.image.media_type.take(),
                 },
                 observed_at_secs: unix_now_seconds(),
             });

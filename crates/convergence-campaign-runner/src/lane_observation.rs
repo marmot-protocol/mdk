@@ -153,10 +153,17 @@ impl NextestStats {
             return;
         }
         let remainder = fields.collect::<Vec<_>>().join(" ");
-        let test_name = remainder
+        let mut test_name = remainder
             .split_once(']')
             .map_or(remainder.as_str(), |(_, identity)| identity)
             .trim();
+        // cargo-nextest 0.9.132 emits an optional progress counter `( N/M)` before the test id.
+        if let Some(after_progress) = test_name
+            .strip_prefix('(')
+            .and_then(|rest| rest.split_once(')').map(|(_, identity)| identity.trim()))
+        {
+            test_name = after_progress;
+        }
         if test_name.is_empty() {
             return;
         }
@@ -638,10 +645,14 @@ mod tests {
         stats.record_line("TRY 2 PASS [ 0.1s] crate::tests flaky_case");
         stats.record_line("TRY 1 FAIL [ 0.1s] other::tests flaky_case");
         stats.record_line("TRY 3 PASS [ 0.1s] other::tests flaky_case");
+        // cargo-nextest 0.9.132 emits an optional progress counter `( N/M)` after `]`.
+        stats.record_line("TRY 1 FAIL [ 0.1s] ( 1/10) progress::tests retry_with_counter");
+        stats.record_line("TRY 2 FAIL [ 0.1s] ( 2/10) progress::tests retry_with_counter");
+        stats.record_line("TRY 3 PASS [ 0.1s] ( 3/10) progress::tests retry_with_counter");
         stats.record_line("RETRY 9 PASS [ 0.1s] ordinary command output");
         assert_eq!(stats.executed_cases, 8);
-        assert_eq!(stats.flaky_cases(), 2);
-        assert_eq!(stats.flake_retries(), 3);
+        assert_eq!(stats.flaky_cases(), 3);
+        assert_eq!(stats.flake_retries(), 5);
     }
 
     #[test]

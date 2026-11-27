@@ -100,9 +100,12 @@ pub(crate) fn established(
     use RelayHealthState::{Failing, Healthy, Suspected};
     // The offline rule: a relay that did not connect or answer in time says
     // something about itself only beside one that answered in the same run.
-    let answered = results
-        .values()
-        .any(|result| !matches!(result, Err(Unreachable | TimedOut | InvalidRequest)));
+    let answered = results.values().any(|result| {
+        !matches!(
+            result,
+            Err(Unreachable | TimedOut | InvalidRequest | LocalBusy)
+        )
+    });
     // Only the account's own key always answers a NIP-42 challenge; under a
     // remote or host signer a refusal may be the signer's silence.
     let refused = if local_key { Failing } else { Suspected };
@@ -136,6 +139,7 @@ pub(crate) fn established(
                     | AuthenticationRateLimited
                     | InvalidRequest
                     | Incomplete
+                    | LocalBusy
                     | Partial { .. },
                 ) => None,
             };

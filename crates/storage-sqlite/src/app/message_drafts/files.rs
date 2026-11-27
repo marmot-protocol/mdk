@@ -411,6 +411,7 @@ impl SqliteAppStorage {
     /// The staged files a group's draft owns, so a caller can unlink the
     /// ones a later write released.
     pub fn message_draft_attachment_files(&self, group: &str) -> StorageResult<Vec<FileId>> {
+        let group = canonical_group_id_hex(group);
         let conn = self.lock()?;
         let mut statement = conn
             .prepare_cached(
@@ -419,7 +420,7 @@ impl SqliteAppStorage {
             )
             .storage()?;
         let files = statement
-            .query_map([group], |row| row.get::<_, Vec<u8>>(0))
+            .query_map([group.as_ref()], |row| row.get::<_, Vec<u8>>(0))
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()?;

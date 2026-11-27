@@ -103,6 +103,7 @@ impl SqliteAppStorage {
         &self,
         after: Option<&str>,
     ) -> StorageResult<Vec<ChatPresentationInput>> {
+        let after = canonical_group_id_hex_opt(after);
         self.connection.with_transaction(|| {
             let groups = {
                 let conn = self.lock()?;
@@ -114,7 +115,10 @@ impl SqliteAppStorage {
                     .storage()?;
                 query
                     .query_map(
-                        params![after.unwrap_or(""), CHAT_PRESENTATION_BATCH_LIMIT as i64],
+                        params![
+                            after.as_deref().unwrap_or(""),
+                            CHAT_PRESENTATION_BATCH_LIMIT as i64
+                        ],
                         |row| row.get::<_, String>(0),
                     )
                     .storage()?
@@ -141,21 +145,22 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         mention_classifier: &crate::app::chat_list::MentionClassifier<'_>,
     ) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.connection.with_transaction(|| {
             let queued = || -> StorageResult<bool> {
                 self.lock()?.query_row(
                     "SELECT EXISTS(SELECT 1 FROM chat_presentation_row_work WHERE group_id_hex=?1)",
-                    [group_id_hex], |row| row.get(0),
+                    [group_id_hex.as_ref()], |row| row.get(0),
                 ).storage()
             };
             if !queued()? {
                 return Ok(false);
             }
-            self.refresh_chat_list_row(local_account_id_hex, group_id_hex, mention_classifier)?;
+            self.refresh_chat_list_row(local_account_id_hex, &group_id_hex, mention_classifier)?;
             self.lock()?
                 .execute_cached(
                     "DELETE FROM chat_presentation_row_work WHERE group_id_hex=?1",
-                    [group_id_hex],
+                    [group_id_hex.as_ref()],
                 )
                 .storage()?;
             if queued()? {

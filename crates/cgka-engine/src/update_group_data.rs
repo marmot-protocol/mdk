@@ -2,7 +2,6 @@
 //! `marmot.group.profile.v1`.
 
 use crate::engine::Engine;
-use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
     APP_OWNED_APP_COMPONENT_ID_START, AccountEntryV1, AppComponentData, AppComponentId,
@@ -250,7 +249,7 @@ impl<S: StorageProvider> Engine<S> {
         slot: DeviceSlotId,
         expected: DeviceEntryV1,
     ) -> Result<SendResult, EngineError> {
-        let valid = crate::device_tag::own_device_slot(&self.storage)? == Some(slot)
+        let valid = crate::device_tag::own_device_slot(self.storage.as_ref())? == Some(slot)
             && self.with_mls_group(&group_id, |group| {
                 let Some(roster) = crate::app_components::device_roster_of_group(group) else {
                     return Ok(false);
@@ -490,8 +489,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
-        let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+        let pending_commit_guard = self.arm_pending_commit_guard(group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
@@ -638,25 +636,25 @@ impl<S: StorageProvider> Engine<S> {
                 group.description = description;
             }
         }
+        let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
+        let staged = StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
+        let prepared_pending = self.epoch_manager.prepare_pending(
+            group_id.clone(),
+            pre_commit_epoch,
+            new_epoch,
+            staged,
+            crate::epoch_manager::PendingKind::GroupEvolution,
+            self.current_audit_context.clone(),
+        )?;
+        let pending_ref = prepared_pending.pending_ref();
         self.record_sent_openmls_message_with_group(
             &wrapped,
             commit_bytes.as_slice(),
             &group,
             pre_commit_epoch,
         )?;
-        let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
-        let pending_ref = self.epoch_manager.next_pending_ref()?;
-        let staged = StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
         self.invalidate_deferred_peel_candidate_cache(&group_id);
-        self.epoch_manager.begin_pending(
-            group_id.clone(),
-            pre_commit_epoch,
-            new_epoch,
-            staged,
-            pending_ref,
-            crate::epoch_manager::PendingKind::GroupEvolution,
-            self.current_audit_context.clone(),
-        )?;
+        self.epoch_manager.commit_pending(prepared_pending);
         self.audit_group(
             &group_id,
             crate::audit_helpers::epoch_state_changed_event(

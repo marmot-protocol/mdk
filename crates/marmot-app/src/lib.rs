@@ -2298,16 +2298,18 @@ impl MarmotApp {
         relay_plane: &MarmotRelayPlane,
         lifecycle: runtime::RuntimeLifecycle,
         startup_progress: Option<&AccountStartupProgress>,
+        tasks: Option<&runtime::account_worker::WorkerTaskScope>,
     ) -> Result<AppClient, AppError> {
         // Deferred hydration (mdk#1161): the account worker drives the
         // background per-group hydration pipeline after signalling local
         // readiness, so runtime opens stay flat in stored-group count.
-        self.local_client_with_relay_plane_and_hydration(
+        self.local_client_with_relay_plane_and_hydration_scoped(
             label,
             relay_plane,
             Some(lifecycle),
             true,
             startup_progress,
+            tasks,
         )
         .await
     }
@@ -2354,6 +2356,26 @@ impl MarmotApp {
         defer_group_hydration: bool,
         startup_progress: Option<&AccountStartupProgress>,
     ) -> Result<AppClient, AppError> {
+        self.local_client_with_relay_plane_and_hydration_scoped(
+            label,
+            relay_plane,
+            lifecycle,
+            defer_group_hydration,
+            startup_progress,
+            None,
+        )
+        .await
+    }
+
+    async fn local_client_with_relay_plane_and_hydration_scoped(
+        &self,
+        label: &str,
+        relay_plane: &MarmotRelayPlane,
+        lifecycle: Option<runtime::RuntimeLifecycle>,
+        defer_group_hydration: bool,
+        startup_progress: Option<&AccountStartupProgress>,
+        tasks: Option<&runtime::account_worker::WorkerTaskScope>,
+    ) -> Result<AppClient, AppError> {
         let app = self.clone();
         // Resolve every supported account ref before touching label-keyed
         // caches or the session-owner registry.
@@ -2365,11 +2387,12 @@ impl MarmotApp {
                 marmot_account::AccountHomeError::AccountUnlinked(account.label),
             ));
         }
+        let account_id_hex = account.account_id_hex;
         let label = account.label;
         let relay_plane_for_open = relay_plane.clone();
         let permit = lifecycle
             .as_ref()
-            .map(runtime::RuntimeLifecycle::begin_account_open)
+            .map(|lifecycle| lifecycle.begin_account_open(&account_id_hex))
             .transpose()?;
         // Only a starting worker records stage spans; other opens pass `None`.
         let enter_stage = |progress: Option<&AccountStartupProgress>, stage| {
@@ -2379,21 +2402,49 @@ impl MarmotApp {
         };
         enter_stage(startup_progress, AccountStartupStage::OpenQueued);
         let blocking_progress = startup_progress.cloned();
-        let open = blocking_app_task(move || {
+        let cancel = tasks.map(runtime::account_worker::WorkerTaskScope::token);
+        // Transfer the opened account through a oneshot inside the blocking
+        // closure so if this future is cancelled or aborted while opening, the
+        // rejected `OpenedAccount` (and its session-owner guard) drops BEFORE
+        // `_permit` and the `WorkerTaskScope` token drop (mdk#3801).
+        let (open_tx, open_rx) = tokio::sync::oneshot::channel();
+        let run_open = move || {
             let _permit = permit;
+            if cancel
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                let _ = open_tx.send(Err(AppError::TransportClosed));
+                return;
+            }
             enter_stage(
                 blocking_progress.as_ref(),
                 AccountStartupStage::AccountState,
             );
-            app.ensure_account_state(&label)?;
-            enter_stage(blocking_progress.as_ref(), AccountStartupStage::SessionOpen);
-            let open = app.open_account(&label, &relay_plane_for_open, defer_group_hydration);
-            #[cfg(test)]
-            app.local_open_gates
-                .wait(&label, AccountStartupStage::SessionOpen);
-            open
-        })
-        .await?;
+            let open = match app.ensure_account_state(&label) {
+                Ok(()) => {
+                    enter_stage(blocking_progress.as_ref(), AccountStartupStage::SessionOpen);
+                    let open =
+                        app.open_account(&label, &relay_plane_for_open, defer_group_hydration);
+                    #[cfg(test)]
+                    app.local_open_gates
+                        .wait(&label, AccountStartupStage::SessionOpen);
+                    open
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(rejected) = open_tx.send(open) {
+                drop(rejected);
+            }
+        };
+        if let Some(tasks) = tasks {
+            tasks.spawn_blocking(run_open);
+        } else {
+            tokio::task::spawn_blocking(run_open);
+        }
+        let open = open_rx
+            .await
+            .map_err(|_| AppError::BlockingTask("blocking account open task failed".into()))??;
         enter_stage(startup_progress, AccountStartupStage::ClientRestore);
         if let Some(lifecycle) = &lifecycle {
             lifecycle.ensure_running()?;
@@ -3666,6 +3717,22 @@ impl MarmotApp {
         self.spawn_account_publication_copy(account_id_hex, copy.run());
     }
 
+    /// Return the current cached or persisted replaceable-record timestamp
+    /// floor for `(pubkey, kind)` without mutating it.
+    pub(crate) fn replaceable_identity_floor(
+        &self,
+        account_ref: &str,
+        pubkey: &str,
+        kind: u64,
+    ) -> Result<u64, AppError> {
+        let latest = self
+            .replaceable_identity_created_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (pubkey.to_owned(), kind);
+        self.read_replaceable_identity_floor_locked(&latest, account_ref, &key)
+    }
+
     /// Sign a replaceable identity record (kind 0, kind 3, relay lists) with a
     /// `created_at` strictly after the previous version authored for the same
     /// account and kind. Relays keep the lower event id on a timestamp tie, so
@@ -3678,42 +3745,71 @@ impl MarmotApp {
         signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
         event: &NostrTransportEvent,
     ) -> Result<NostrTransportEvent, AppError> {
-        let created_at = self.reserve_replaceable_identity_created_at(account_ref, event)?;
-        let event = NostrTransportEvent::new_unsigned_at(
-            event.pubkey.clone(),
-            event.kind,
-            event.tags.clone(),
-            event.content.clone(),
-            created_at,
-        );
-        sign_account_publication_event(signer, &event).await
+        let created_at = match self.reserve_replaceable_identity_created_at_within(
+            account_ref,
+            event,
+            u64::MAX,
+        )? {
+            Ok(created_at) | Err(created_at) => created_at,
+        };
+        sign_replaceable_identity_event_at(signer, event, created_at).await
     }
 
-    fn reserve_replaceable_identity_created_at(
+    /// Sign a replaceable identity event only if the effective timestamp
+    /// (`max(event.created_at, floor + 1)`) does not exceed `max_created_at`.
+    /// When exceeded, refuses without advancing the persisted floor or calling
+    /// the signer.
+    pub(crate) async fn sign_replaceable_identity_event_bounded(
+        &self,
+        account_ref: &str,
+        signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+        event: &NostrTransportEvent,
+        max_created_at: u64,
+        on_exceeded: impl FnOnce(u64) -> AppError,
+    ) -> Result<NostrTransportEvent, AppError> {
+        let created_at = self
+            .reserve_replaceable_identity_created_at_within(account_ref, event, max_created_at)?
+            .map_err(on_exceeded)?;
+        sign_replaceable_identity_event_at(signer, event, created_at).await
+    }
+
+    fn read_replaceable_identity_floor_locked(
+        &self,
+        latest: &std::collections::HashMap<(String, u64), u64>,
+        account_ref: &str,
+        key: &(String, u64),
+    ) -> Result<u64, AppError> {
+        match latest.get(key) {
+            Some(floor) => Ok(*floor),
+            None => Ok(self
+                .account_home()
+                .replaceable_record_floors(account_ref)?
+                .get(&key.1)
+                .copied()
+                .unwrap_or(0)),
+        }
+    }
+
+    fn reserve_replaceable_identity_created_at_within(
         &self,
         account_ref: &str,
         event: &NostrTransportEvent,
-    ) -> Result<u64, AppError> {
-        let kind = event.kind;
+        max_created_at: u64,
+    ) -> Result<Result<u64, u64>, AppError> {
         let mut latest = self
             .replaceable_identity_created_at
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let key = (event.pubkey.clone(), kind);
-        let floor = match latest.get(&key) {
-            Some(floor) => *floor,
-            None => self
-                .account_home()
-                .replaceable_record_floors(account_ref)?
-                .get(&kind)
-                .copied()
-                .unwrap_or(0),
-        };
+        let key = (event.pubkey.clone(), event.kind);
+        let floor = self.read_replaceable_identity_floor_locked(&latest, account_ref, &key)?;
         let created_at = event.created_at.max(floor.saturating_add(1));
+        if created_at > max_created_at {
+            return Ok(Err(created_at));
+        }
         self.account_home()
-            .advance_replaceable_record_floor(account_ref, kind, created_at)?;
+            .advance_replaceable_record_floor(account_ref, key.1, created_at)?;
         latest.insert(key, created_at);
-        Ok(created_at)
+        Ok(Ok(created_at))
     }
 
     pub(crate) fn spawn_quorum_cancelled_delivery(&self, delivery: QuorumCancelledDelivery) {
@@ -3922,6 +4018,19 @@ impl MarmotApp {
                 now_seconds,
                 skew_now_seconds,
             )?)
+    }
+
+    pub(crate) fn groups_with_expiring_app_events(
+        &self,
+        label: &str,
+        now_seconds: u64,
+    ) -> Result<Vec<String>, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .groups_with_expiring_app_events(now_seconds)?)
     }
 
     pub fn message_edit_history(
@@ -8432,7 +8541,9 @@ impl MarmotApp {
         account_id_hex: &str,
         signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     ) -> Arc<dyn NostrRelayClient> {
-        let stop = self.account_publish_stop(account_id_hex);
+        let entry = self.account_publish_stop_entry_resolved(account_id_hex);
+        let app = self.clone();
+        let account_id_owned = account_id_hex.to_owned();
         // The publisher sends nothing once the account is unlinked, and no
         // event over a relay's known limit (mdk#2334).
         let guard = |client: Arc<dyn NostrRelayClient>| -> Arc<dyn NostrRelayClient> {
@@ -8440,8 +8551,11 @@ impl MarmotApp {
                 client,
                 self.relay_event_limits(),
             ));
-            Arc::new(unlinked_publish_gate::UnlinkedPublishGate::new(
-                client, stop,
+            Arc::new(unlinked_publish_gate::UnlinkedPublishGate::for_account(
+                client,
+                app,
+                account_id_owned,
+                entry,
             ))
         };
         #[cfg(test)]
@@ -9648,6 +9762,21 @@ fn unique_transport_endpoints(
         }
     }
     unique
+}
+
+async fn sign_replaceable_identity_event_at(
+    signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+    event: &NostrTransportEvent,
+    created_at: u64,
+) -> Result<NostrTransportEvent, AppError> {
+    let unsigned = NostrTransportEvent::new_unsigned_at(
+        event.pubkey.clone(),
+        event.kind,
+        event.tags.clone(),
+        event.content.clone(),
+        created_at,
+    );
+    sign_account_publication_event(signer, &unsigned).await
 }
 
 async fn sign_account_publication_event(

@@ -1,0 +1,8 @@
+### Fixed
+
+- `marmot-app` account workers now track, cancel, and drain all worker-spawned async and blocking tasks (media HTTP transfers, attachment and avatar store completion, housekeeping/sweep/migration passes, retry timers, and post-create catch-up) before teardown evicts caches or removes account directories, and pass already-open storage handles instead of reopening databases in background tasks.
+- `marmot-app` now acquires account teardown fences in one canonical order across `remove_account`, `deactivate_account`, and `reset_incomplete_account_setup`, preventing lock-order inversions and unfenced setup resets.
+- `marmot-app` now splits host group-scoped and account-wide worker channels so parking account-wide commands at `PARKED_LIMIT` during `CheckSignIns` no longer starves group commands, and bounds in-memory deferred worker command queues with channel backpressure.
+- `UnlinkedPublishGate` now caches per-account resolution without rescanning `account.json` on every call and always returns the shared account stop handle so recovery or `lift_failed_link_publish_stop` unblocks existing publishers after transient lookup errors.
+- Dropping `subscribe_messages`, `subscribe_timeline_messages`, `subscribe_chats`, `subscribe_group_state`, or `subscribe_notifications` now exits its background forwarding task immediately instead of leaking broadcast receivers until runtime shutdown.
+- Hardened low-level runtime hygiene in `marmot-app`: replaced unchecked mutex `.lock().unwrap()` calls in `client/sync.rs`, stopped emitting rejected or device-group-kind application messages into `SyncSummary.events`, and made reconnect `drain_deferred_hydration` cancellation-aware on shutdown.

@@ -669,26 +669,28 @@ pub(crate) async fn download_file(
         let decryption_control = control.clone();
         let verify_key = key.clone();
         let verify_aad = aad.clone();
-        let (encrypted, result) = tokio::task::spawn_blocking(move || {
-            let mut encrypted = encrypted;
-            let (len, digest) = (encrypted.len, encrypted.digest);
-            let result = encrypted.reader().and_then(|mut input| {
-                decrypt_file_to_writer(
-                    input.as_mut(),
-                    len,
-                    digest,
-                    &verify_key,
-                    &nonce,
-                    &verify_aad,
-                    plaintext_hash,
-                    &decryption_control,
-                    &mut std::io::sink(),
-                )
-            });
-            (encrypted, result)
-        })
-        .await
-        .map_err(|_| AppError::BlockingTask("file media verification failed".into()))?;
+        let (encrypted, result) = observation
+            .tasks
+            .spawn_blocking(move || {
+                let mut encrypted = encrypted;
+                let (len, digest) = (encrypted.len, encrypted.digest);
+                let result = encrypted.reader().and_then(|mut input| {
+                    decrypt_file_to_writer(
+                        input.as_mut(),
+                        len,
+                        digest,
+                        &verify_key,
+                        &nonce,
+                        &verify_aad,
+                        plaintext_hash,
+                        &decryption_control,
+                        &mut std::io::sink(),
+                    )
+                });
+                (encrypted, result)
+            })
+            .await
+            .map_err(|_| AppError::BlockingTask("file media verification failed".into()))?;
         control.check()?;
         match result {
             Ok(()) => {

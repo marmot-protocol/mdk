@@ -95,13 +95,31 @@ impl FileKey {
     }
 }
 
-/// On-disk length of a complete file holding `plaintext_bytes`: the header,
-/// the plaintext and one tag per segment (an empty plaintext has one).
-pub fn file_bytes(plaintext_bytes: u64) -> u64 {
+/// Checked on-disk length of a complete file holding `plaintext_bytes`,
+/// returning `None` if the framed length overflows `u64`.
+pub fn checked_file_bytes(plaintext_bytes: u64) -> Option<u64> {
     let segments = plaintext_bytes
         .div_ceil(SEGMENT_PLAINTEXT_BYTES as u64)
         .max(1);
-    HEADER_BYTES as u64 + plaintext_bytes + segments * TAG_BYTES as u64
+    let tags = segments.checked_mul(TAG_BYTES as u64)?;
+    (HEADER_BYTES as u64)
+        .checked_add(plaintext_bytes)?
+        .checked_add(tags)
+}
+
+/// On-disk length of a complete file holding `plaintext_bytes`: the header,
+/// the plaintext and one tag per segment (an empty plaintext has one).
+/// Saturates at `u64::MAX` if the framed length overflows `u64`.
+pub fn file_bytes(plaintext_bytes: u64) -> u64 {
+    checked_file_bytes(plaintext_bytes).unwrap_or(u64::MAX)
+}
+
+/// Whether `total_bytes` is a structurally valid complete media file length
+/// (header plus a valid framed payload).
+pub(crate) fn is_valid_file_len(total_bytes: u64) -> bool {
+    total_bytes
+        .checked_sub(HEADER_BYTES as u64)
+        .is_some_and(|payload| PayloadLayout::from_payload_bytes(payload).is_ok())
 }
 
 pub fn header_bytes(file_id: &[u8; FILE_ID_BYTES]) -> [u8; HEADER_BYTES] {
@@ -268,7 +286,7 @@ pub struct MediaFileWriter<W: Write> {
     inner: W,
     cipher: SegmentCipher,
     index: u64,
-    buffer: Vec<u8>,
+    buffer: Zeroizing<Vec<u8>>,
     plaintext_bytes: u64,
     /// Set while a segment is being sealed and written, cleared on success:
     /// after a failure the buffer may hold a sealed segment whose nonce was
@@ -293,7 +311,7 @@ impl<W: Write> MediaFileWriter<W> {
             inner,
             cipher: SegmentCipher::new(key)?,
             index: 0,
-            buffer: Vec::with_capacity(SEGMENT_CIPHERTEXT_BYTES),
+            buffer: Zeroizing::new(Vec::with_capacity(SEGMENT_CIPHERTEXT_BYTES)),
             plaintext_bytes: 0,
             poisoned: false,
         })
@@ -344,13 +362,19 @@ impl<W: Write> Write for MediaFileWriter<W> {
             self.seal_buffered(false)?;
         }
         let accepted = data.len().min(SEGMENT_PLAINTEXT_BYTES - self.buffer.len());
+        self.plaintext_bytes = self
+            .plaintext_bytes
+            .checked_add(accepted as u64)
+            .ok_or_else(|| io::Error::from(MediaFormatError::InvalidLength))?;
         self.buffer.extend_from_slice(&data[..accepted]);
-        self.plaintext_bytes += accepted as u64;
         Ok(accepted)
     }
 
     /// Flushes sealed segments only; the open segment stays buffered.
     fn flush(&mut self) -> io::Result<()> {
+        if self.poisoned {
+            return Err(MediaFormatError::Poisoned.into());
+        }
         self.inner.flush()
     }
 }
@@ -386,11 +410,14 @@ impl<R: Read + Seek> MediaFileReader<R> {
         })?;
         parse_header(&header, expected_id)?;
         let total = inner.seek(SeekFrom::End(0))?;
+        let payload_bytes = total
+            .checked_sub(HEADER_BYTES as u64)
+            .ok_or(MediaFormatError::InvalidLength)?;
         Self::with_payload_key(
             inner,
             &PayloadKey::for_file(file_key, &header),
             HEADER_BYTES as u64,
-            total - HEADER_BYTES as u64,
+            payload_bytes,
         )
     }
 
@@ -423,7 +450,13 @@ impl<R: Read + Seek> MediaFileReader<R> {
         }
         self.cached = None;
         let ciphertext_bytes = self.layout.segment_ciphertext_bytes(index);
-        let offset = self.payload_start + index * SEGMENT_CIPHERTEXT_BYTES as u64;
+        let segment_offset = index
+            .checked_mul(SEGMENT_CIPHERTEXT_BYTES as u64)
+            .ok_or(MediaFormatError::InvalidLength)?;
+        let offset = self
+            .payload_start
+            .checked_add(segment_offset)
+            .ok_or(MediaFormatError::InvalidLength)?;
         self.segment.resize(ciphertext_bytes, 0);
         self.inner.seek(SeekFrom::Start(offset))?;
         self.inner.read_exact(&mut self.segment)?;
@@ -440,7 +473,9 @@ impl<R: Read + Seek> MediaFileReader<R> {
     pub fn read_at(&mut self, offset: u64, out: &mut [u8]) -> MediaFormatResult<usize> {
         let mut filled = 0;
         while filled < out.len() {
-            let at = offset + filled as u64;
+            let Some(at) = offset.checked_add(filled as u64) else {
+                break;
+            };
             if at >= self.layout.plaintext_bytes {
                 break;
             }
@@ -477,4 +512,21 @@ pub(crate) fn open_payload(key: &PayloadKey, payload: &[u8]) -> MediaFormatResul
     let read = reader.read_at(0, &mut plaintext)?;
     debug_assert_eq!(read, plaintext.len());
     Ok(plaintext)
+}
+
+#[cfg(test)]
+mod writer_hygiene_tests {
+    use super::*;
+    use zeroize::ZeroizeOnDrop;
+
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>(_: &T) {}
+
+    #[test]
+    fn writer_plaintext_buffer_is_zeroized_on_drop() {
+        let key = FileKey::from_bytes([0x42; FILE_KEY_BYTES]);
+        let mut writer = MediaFileWriter::new(Vec::new(), &key, &[7; FILE_ID_BYTES]).unwrap();
+        writer.write_all(b"sensitive plaintext").unwrap();
+        assert_zeroize_on_drop(&writer.buffer);
+        drop(writer);
+    }
 }

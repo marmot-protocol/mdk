@@ -42,7 +42,12 @@ fn create_on_connection(
              FROM cgka_group_state_checkpoints
              WHERE group_id = ?1 AND checkpoint_id = ?2",
             params![group_id.as_slice(), checkpoint.id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    SensitiveBytes::new(row.get::<_, Vec<u8>>(1)?),
+                ))
+            },
         )
         .optional()
         .storage()?;
@@ -51,7 +56,7 @@ fn create_on_connection(
             // Existing checkpoints can remain as untagged legacy JSON after
             // upgrade. Canonicalize their decoded state before comparing so
             // an exact retry stays idempotent across storage formats.
-            let existing_state = snapshot_format::decode_checkpoint(&existing_blob)?;
+            let existing_state = snapshot_format::decode_checkpoint(existing_blob.as_slice())?;
             let existing_blob = snapshot_format::encode_checkpoint(&existing_state)?;
             if existing_blob.as_slice() == blob.as_slice() {
                 return Ok(());

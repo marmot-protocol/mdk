@@ -17,8 +17,10 @@ Shared-store migrations are separate (`../../shared/migrations.rs`).
   expression directly in its seed `INSERT` before triggers are created. When replay after the cutoff measurably slows
   fresh opens, refresh the baseline in a separate change: raise `BASELINE_VERSION` (up to `HEAD`) and regenerate the
   file with `MDK_WRITE_MIGRATION_BASELINE=1 cargo test -p storage-sqlite baseline_file_matches_a_full_replay`.
-- A body must roll back completely when the runner's transaction fails: no `COMMIT`, no PRAGMA it relies on inside
-  the transaction (declare `suspend_foreign_keys` instead). `tests::every_migration_body_rolls_back_completely` in
+- A body must roll back completely when the runner's transaction fails: no `COMMIT`, no PRAGMA that outlives the
+  transaction (declare `suspend_foreign_keys` instead when a table rebuild needs `foreign_keys = OFF`;
+  `PRAGMA defer_foreign_keys = ON` is allowed when a body updates parent/child keys in place without dropping tables,
+  because SQLite resets it automatically on commit or rollback). `tests::every_migration_body_rolls_back_completely` in
   `../migrations.rs` walks every registered body this way, so a migration's own tests need no apply/rollback probe.
 - A per-migration test stops at its own version (`run_through(N)`) unless its contract is the head path. Tests that
   ran to head and compared whole rows or trigger sets broke whenever a later migration touched the same table

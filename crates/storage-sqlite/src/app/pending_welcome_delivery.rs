@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::SqliteAccountStorage;
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::StorageResult;
 use rusqlite::params;
@@ -54,6 +54,7 @@ impl SqliteAppStorage {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
         for record in records {
+            let group_id_hex = canonical_group_id_hex(&record.group_id_hex);
             tx.execute_cached(
                 "INSERT INTO app_pending_welcome_delivery (
                     message_id_hex, group_id_hex, recipient_hex, recorded_at, size_class
@@ -66,7 +67,7 @@ impl SqliteAppStorage {
                     size_class = excluded.size_class",
                 params![
                     record.message_id_hex,
-                    record.group_id_hex,
+                    group_id_hex.as_ref(),
                     record.recipient_hex,
                     u64_to_i64(record.recorded_at)?,
                     record.size_class.map(cgka_traits::EventSizeClass::as_str)
@@ -84,6 +85,7 @@ impl SqliteAppStorage {
         &self,
         record: &PendingWelcomeDeliveryRecord,
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(&record.group_id_hex);
         self.lock()?
             .execute_cached(
                 "INSERT INTO app_pending_welcome_delivery (
@@ -92,7 +94,7 @@ impl SqliteAppStorage {
                  ON CONFLICT(message_id_hex) DO UPDATE SET size_class = excluded.size_class",
                 params![
                     record.message_id_hex,
-                    record.group_id_hex,
+                    group_id_hex.as_ref(),
                     record.recipient_hex,
                     u64_to_i64(record.recorded_at)?,
                     record.size_class.map(cgka_traits::EventSizeClass::as_str)

@@ -6,7 +6,7 @@
 //! setter, which requeues the row. P2 wires both lifecycle paths before enabling its worker.
 mod maintenance;
 pub(crate) mod row_contract;
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex, canonical_group_id_hex_opt};
 use crate::{ChatListAvatar, SqliteAppStorage, SqliteResultExt, serialize, u64_to_i64};
 use cgka_traits::app_components::GROUP_AVATAR_URL_COMPONENT_ID;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -186,13 +186,14 @@ impl SqliteAppStorage {
     /// Missing/pending are explicit; this read never writes or hydrates. Same-subject dirty
     /// values remain renderable as LastKnown. Membership changes erase old-subject evidence.
     pub fn chat_presentation(&self, group: &str) -> StorageResult<ChatPresentationRead> {
+        let group = canonical_group_id_hex(group);
         let conn = self.lock()?;
         let row: Option<(Option<Vec<u8>>, bool)> = conn
             .query_row(
                 "SELECT presentation_json,
                         presentation_applied_source_revision != presentation_source_revision
                  FROM chat_list_rows WHERE group_id_hex = ?1",
-                [group],
+                [group.as_ref()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
@@ -335,6 +336,7 @@ impl SqliteAppStorage {
             {
                 return Ok(ChatPresentationWrite::Stale);
             }
+            let group_id_hex = canonical_group_id_hex(&input.group_id_hex);
             let conn = self.lock()?;
             let existing: Option<(Option<Vec<u8>>, i64, String)> = conn
                 .query_row(
@@ -343,7 +345,7 @@ impl SqliteAppStorage {
                  WHERE r.group_id_hex = ?1 AND r.presentation_source_revision = ?2
                    AND m.id = 1 AND m.store_epoch = ?3 AND r.presentation_row_epoch = ?4",
                     params![
-                        input.group_id_hex,
+                        group_id_hex.as_ref(),
                         u64_to_i64(input.source_version.revision)?,
                         input.source_version.store_epoch,
                         input.row_epoch,
@@ -392,7 +394,7 @@ impl SqliteAppStorage {
                     presentation_applied_source_revision = presentation_source_revision,
                     search_text = ?3
                  WHERE group_id_hex = ?1",
-                params![input.group_id_hex, bytes, search_text],
+                params![group_id_hex.as_ref(), bytes, search_text],
             )
             .storage()?;
             if changed {
@@ -404,7 +406,7 @@ impl SqliteAppStorage {
             }
             conn.execute_cached(
                 "DELETE FROM chat_presentation_dependencies WHERE group_id_hex = ?1",
-                [&input.group_id_hex],
+                [group_id_hex.as_ref()],
             )
             .storage()?;
             let presentation = &value.presentation;
@@ -423,7 +425,7 @@ impl SqliteAppStorage {
                     "INSERT INTO chat_presentation_dependencies(group_id_hex, member_id_hex, roles)
                      VALUES (?1, ?2, ?3)",
                     params![
-                        input.group_id_hex,
+                        group_id_hex.as_ref(),
                         peer,
                         i64::from(title) + 2 * i64::from(avatar) + 4
                     ],
@@ -432,7 +434,7 @@ impl SqliteAppStorage {
             }
             drop(conn);
             self.maintain_chat_avatar(
-                &input.group_id_hex,
+                &group_id_hex,
                 old.as_ref().map(|old| &old.value.presentation.avatar),
                 &value.presentation.avatar,
             )?;
@@ -444,6 +446,7 @@ impl SqliteAppStorage {
         member: &str,
         after: Option<&str>,
     ) -> StorageResult<Vec<String>> {
+        let after = canonical_group_id_hex_opt(after);
         let conn = self.lock()?;
         let mut query = conn
             .prepare_cached(
@@ -455,7 +458,7 @@ impl SqliteAppStorage {
             .query_map(
                 params![
                     member,
-                    after.unwrap_or(""),
+                    after.as_deref().unwrap_or(""),
                     CHAT_PRESENTATION_BATCH_LIMIT as i64
                 ],
                 |r| r.get::<_, String>(0),
@@ -471,6 +474,7 @@ pub(crate) fn replace_members_tx(
     group: &str,
     members: &[String],
 ) -> StorageResult<()> {
+    let group = canonical_group_id_hex(group);
     let mut normalized: Vec<_> = if members.len() == 2 {
         members
             .iter()
@@ -491,7 +495,7 @@ pub(crate) fn replace_members_tx(
         )
         .storage()?;
     let previous = query
-        .query_map([group], |row| row.get::<_, String>(0))
+        .query_map([group.as_ref()], |row| row.get::<_, String>(0))
         .storage()?
         .collect::<rusqlite::Result<Vec<_>>>()
         .storage()?;
@@ -501,13 +505,13 @@ pub(crate) fn replace_members_tx(
     }
     conn.execute_cached(
         "DELETE FROM chat_presentation_members WHERE group_id_hex = ?1",
-        [group],
+        [group.as_ref()],
     )
     .storage()?;
     for member in normalized {
         conn.execute_cached(
             "INSERT INTO chat_presentation_members(group_id_hex, member_id_hex) VALUES (?1, ?2)",
-            params![group, member],
+            params![group.as_ref(), member],
         )
         .storage()?;
     }
@@ -515,12 +519,12 @@ pub(crate) fn replace_members_tx(
         "UPDATE chat_list_rows SET presentation_json = NULL,
                     presentation_source_revision = presentation_source_revision + 1
                  WHERE group_id_hex = ?1",
-        [group],
+        [group.as_ref()],
     )
     .storage()?;
     conn.execute_cached(
         "DELETE FROM chat_presentation_dependencies WHERE group_id_hex = ?1",
-        [group],
+        [group.as_ref()],
     )
     .storage()?;
     Ok(())
@@ -579,6 +583,8 @@ impl SqliteAppStorage {
         query: crate::ChatListQuery,
         group: Option<&str>,
     ) -> StorageResult<Option<PresentedChatListSnapshot>> {
+        let group = canonical_group_id_hex_opt(group);
+        let group = group.as_deref();
         let conn = self.lock()?;
         // Keep this guard until the read transaction ends and use only `tx` below:
         // never release/reacquire the account lock or call another storage method here.
@@ -669,6 +675,7 @@ pub(crate) fn presentation_input_tx(
     conn: &rusqlite::Connection,
     group: &str,
 ) -> StorageResult<Option<ChatPresentationInput>> {
+    let group = canonical_group_id_hex(group);
     let input = conn
         .query_row(
             "SELECT m.store_epoch, r.presentation_source_revision, a.profile_name, a.member_count,
@@ -679,7 +686,7 @@ pub(crate) fn presentation_input_tx(
                 r.presentation_row_epoch, a.self_membership, a.profile_description
          FROM chat_list_rows r JOIN account_groups a ON a.group_id_hex = r.group_id_hex
          CROSS JOIN chat_presentation_meta m WHERE r.group_id_hex = ?1 AND m.id = 1",
-            params![group, GROUP_AVATAR_URL_COMPONENT_ID],
+            params![group.as_ref(), GROUP_AVATAR_URL_COMPONENT_ID],
             |row| {
                 let hash: String = row.get(4)?;
                 let avatar = if hash.is_empty() {
@@ -695,7 +702,7 @@ pub(crate) fn presentation_input_tx(
                 };
                 let component: Option<String> = row.get(9)?;
                 Ok(ChatPresentationInput {
-                    group_id_hex: group.to_owned(),
+                    group_id_hex: group.as_ref().to_owned(),
                     row_epoch: row.get(10)?,
                     self_membership: crate::SelfMembership::from_storage(
                         &row.get::<_, String>(11)?,
@@ -728,7 +735,7 @@ pub(crate) fn presentation_input_tx(
         )
         .storage()?;
     input.members = query
-        .query_map([group], |row| row.get::<_, String>(0))
+        .query_map([group.as_ref()], |row| row.get::<_, String>(0))
         .storage()?
         .collect::<rusqlite::Result<Vec<_>>>()
         .storage()?;

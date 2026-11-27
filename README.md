@@ -222,7 +222,8 @@ just ci                      # full local parity with GitHub CI (slow)
 
 Team pull requests run a ~1-minute static gate (there is no merge queue):
 verified commit signatures, formatting, static/contract gates (the tracing audit
-among them), `cargo-audit`, and advisory commit-trailer checks. External/fork
+among them), `cargo-audit`, and commit-trailer checks (advisory, except that a
+Rust crate change must record `just dependents-nextest`). External/fork
 pull requests, read-only org members, and `ci:full` / manual runs execute the
 full `ci.yml` matrix on GitHub-hosted runners: workspace clippy, WASM build,
 Android arm64-v8a cross-check, every workspace test with the `ci` nextest
@@ -275,6 +276,7 @@ just android-check                                                  # compile-ch
 just tamarin                                                        # formal models
 just flake-report                                                   # rank tests that failed an attempt in recent CI runs
 just flake-stress <package> '<filter>' [count]                      # rerun a filter with no retries to prove a flake fix
+just dependents-nextest [base]                                      # test changed crates and every crate depending on them
 just test-timing-ratchet                                            # fail when test files gain sleeps or sub-second timeouts
 just pr-trailers-check                                              # validate Local-Checks, Local-Review, and Release-Impact trailers
 just bisect-agent-contract                                          # run unit and synthetic-repo tests for the revert-only Bisect Agent

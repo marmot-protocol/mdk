@@ -506,16 +506,16 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
         proposal_ref: &ProposalRef,
     ) -> Result<(), Self::Error> {
         let group_key = Self::group_key(group_id)?;
-        self.remove_entity(
-            PROPOSAL_QUEUE_REFS_LABEL,
-            group_key.clone(),
-            Some(group_key),
-            proposal_ref,
-        )?;
-        self.delete_value(
-            QUEUED_PROPOSAL_LABEL,
-            serde_json::to_vec(&(group_id, proposal_ref))?,
-        )
+        let proposal_key = serde_json::to_vec(&(group_id, proposal_ref))?;
+        self.connection.with_transaction(|| {
+            self.remove_entity(
+                PROPOSAL_QUEUE_REFS_LABEL,
+                group_key.clone(),
+                Some(group_key),
+                proposal_ref,
+            )?;
+            self.delete_value(QUEUED_PROPOSAL_LABEL, proposal_key)
+        })
     }
 
     fn delete_own_leaf_nodes<GroupId: traits::GroupId<CURRENT_VERSION>>(
@@ -633,16 +633,15 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
         epoch: &EpochKey,
         leaf_index: u32,
     ) -> Result<(), Self::Error> {
-        // Delete both encodings so a delete cannot leave a stale legacy-key row
-        // behind that a later read would resurrect (see #158 read fallback).
-        self.delete_value(
-            EPOCH_KEY_PAIRS_LABEL,
-            epoch_key_pairs_id(group_id, epoch, leaf_index)?,
-        )?;
-        self.delete_value(
-            EPOCH_KEY_PAIRS_LABEL,
-            epoch_key_pairs_id_legacy(group_id, epoch, leaf_index)?,
-        )
+        let current_key = epoch_key_pairs_id(group_id, epoch, leaf_index)?;
+        let legacy_key = epoch_key_pairs_id_legacy(group_id, epoch, leaf_index)?;
+        // Delete both encodings atomically so a failure or crash between them
+        // cannot leave a stale legacy-key row behind that a later read would
+        // resurrect (see #158 read fallback).
+        self.connection.with_transaction(|| {
+            self.delete_value(EPOCH_KEY_PAIRS_LABEL, current_key)?;
+            self.delete_value(EPOCH_KEY_PAIRS_LABEL, legacy_key)
+        })
     }
 
     fn delete_key_package<KeyPackageRef: traits::HashReference<CURRENT_VERSION>>(
@@ -1239,6 +1238,114 @@ mod tests {
         assert_eq!(
             mls.key_package::<_, TestKeyPackage>(&kept).unwrap(),
             Some(TestKeyPackage(vec![7]))
+        );
+    }
+
+    /// Regression for #3798: multi-statement deletes (`remove_proposal` and
+    /// `delete_encryption_epoch_key_pairs`) must execute in one transaction so
+    /// a failure on the second delete rolls back the first instead of leaving
+    /// torn OpenMLS state.
+    #[test]
+    fn remove_proposal_and_epoch_key_pair_deletes_are_atomic() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let group_id = TestGroupId(vec![9, 8, 7, 6]);
+        let prop_ref = TestProposalRef(vec![0xaa, 0xbb]);
+        let proposal = TestQueuedProposal(vec![0xcc, 0xdd]);
+        mls.queue_proposal(&group_id, &prop_ref, &proposal).unwrap();
+
+        // Abort deletion of the queued proposal body after the ref list update.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_queued_proposal_delete
+                 BEFORE DELETE ON openmls_values
+                 WHEN OLD.label = CAST('QueuedProposal' AS BLOB)
+                 BEGIN
+                     SELECT RAISE(ABORT, 'inject_proposal_delete_fail');
+                 END;",
+            )
+            .unwrap();
+        let err = mls.remove_proposal(&group_id, &prop_ref).unwrap_err();
+        assert!(
+            err.to_string().contains("inject_proposal_delete_fail"),
+            "{err:?}"
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_queued_proposal_delete;")
+            .unwrap();
+
+        let remaining: Vec<(TestProposalRef, TestQueuedProposal)> =
+            mls.queued_proposals(&group_id).unwrap();
+        assert_eq!(
+            remaining,
+            vec![(prop_ref, proposal)],
+            "failed proposal delete must roll back the ref-list removal"
+        );
+
+        // Seed both tuple-key and legacy-key epoch key pairs, then abort the
+        // second (legacy) delete and confirm the tuple-key row is rolled back.
+        let epoch = TestEpochKey(11);
+        let leaf_index = 3u32;
+        let legacy_key = epoch_key_pairs_id_legacy(&group_id, &epoch, leaf_index).unwrap();
+        let legacy_storage_key =
+            super::super::labels::build_key(EPOCH_KEY_PAIRS_LABEL.as_bytes(), legacy_key);
+        mls.write_value(
+            EPOCH_KEY_PAIRS_LABEL,
+            epoch_key_pairs_id_legacy(&group_id, &epoch, leaf_index).unwrap(),
+            Some(SqliteOpenMlsStorage::group_key(&group_id).unwrap()),
+            serde_json::to_vec(&vec![TestHpkeKeyPair(vec![0x11])]).unwrap(),
+        )
+        .unwrap();
+        let current_pairs = vec![TestHpkeKeyPair(vec![0x22])];
+        mls.write_encryption_epoch_key_pairs(&group_id, &epoch, leaf_index, &current_pairs)
+            .unwrap();
+
+        let legacy_hex = hex::encode(&legacy_storage_key);
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_legacy_epoch_delete
+                 BEFORE DELETE ON openmls_values
+                 WHEN OLD.storage_key = X'{legacy_hex}'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'inject_legacy_epoch_delete_fail');
+                 END;"
+            ))
+            .unwrap();
+        let err = mls
+            .delete_encryption_epoch_key_pairs(&group_id, &epoch, leaf_index)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("inject_legacy_epoch_delete_fail"),
+            "{err:?}"
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_legacy_epoch_delete;")
+            .unwrap();
+
+        let current_storage_key = super::super::labels::build_key(
+            EPOCH_KEY_PAIRS_LABEL.as_bytes(),
+            epoch_key_pairs_id(&group_id, &epoch, leaf_index).unwrap(),
+        );
+        let current_exists: i64 = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM openmls_values WHERE storage_key = ?1",
+                rusqlite::params![current_storage_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            current_exists, 1,
+            "failed legacy epoch-key-pair delete must roll back the current-key delete"
         );
     }
 }

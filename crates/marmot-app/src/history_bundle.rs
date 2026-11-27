@@ -24,13 +24,15 @@
 //! `history_delivery.rs` carries bundles to a sibling through the device
 //! group.
 
+use std::fmt;
+
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use cgka_traits::MarmotAppEvent;
 use cgka_traits::app_event::AppMessageRetentionDecision;
@@ -101,12 +103,32 @@ pub(crate) struct BundledEvent {
 /// One attachment's `file_key`, named by the `ciphertext_sha256` of the media
 /// reference it opens. The key depends on the file's type and name as well as
 /// its content, so the plaintext hash alone cannot name it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `key` is secret symmetric key material: it is redacted in [`fmt::Debug`]
+/// and erased on drop.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FileKey {
     pub(crate) ciphertext_sha256: String,
     pub(crate) key: String,
 }
+
+impl fmt::Debug for FileKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileKey")
+            .field("ciphertext_sha256", &self.ciphertext_sha256)
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for FileKey {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for FileKey {}
 
 /// An optional member is absent or holds a value, never `null`.
 pub(crate) fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -307,11 +329,11 @@ impl BundledEvent {
                 .keys
                 .unwrap_or_default()
                 .into_iter()
-                .filter_map(|key| {
+                .filter_map(|mut key| {
                     let mut bytes = Zeroizing::new([0_u8; 32]);
                     hex::decode_to_slice(&key.key, bytes.as_mut_slice()).ok()?;
                     Some(ImportedFileKey {
-                        ciphertext_sha256: key.ciphertext_sha256,
+                        ciphertext_sha256: std::mem::take(&mut key.ciphertext_sha256),
                         key: bytes,
                     })
                 })

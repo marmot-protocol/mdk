@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -37,6 +37,9 @@ const SQLCIPHER_MIGRATION_MARKER_SUFFIX: &str = ".salt-migrating";
 const SQLCIPHER_RAW_MARKER_SUFFIX: &str = ".raw-key-migrating";
 const SQLCIPHER_RAW_MARKER_V1: &[u8] = b"raw-key-v1\n";
 const SQLCIPHER_SALT_LEN: usize = 32;
+/// Maximum bytes read from a SQLCipher salt file (64 hex chars plus optional
+/// surrounding whitespace). Rejects oversized files without unbounded allocation.
+const SQLCIPHER_SALT_MAX_FILE_BYTES: usize = 128;
 const SQLCIPHER_KEY_LEN: usize = 32;
 
 /// Bound on the in-process v2-open verdict cache. Three databases per account
@@ -434,11 +437,22 @@ fn sqlcipher_migration_marker_path(db_path: &Path) -> PathBuf {
 }
 
 fn read_sqlcipher_salt(path: &Path) -> Result<[u8; SQLCIPHER_SALT_LEN], AppError> {
-    let raw = fs::read_to_string(path)?;
+    let file = File::open(path)?;
+    let mut raw = Vec::new();
+    file.take((SQLCIPHER_SALT_MAX_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut raw)?;
+    if raw.len() > SQLCIPHER_SALT_MAX_FILE_BYTES {
+        return Err(AppError::SqlcipherKeyDerivation(
+            "SQLCipher salt file exceeds maximum size".to_owned(),
+        ));
+    }
+    let raw = std::str::from_utf8(&raw).map_err(|_| {
+        AppError::SqlcipherKeyDerivation("SQLCipher salt file is not valid UTF-8".to_owned())
+    })?;
     let bytes = hex::decode(raw.trim())?;
-    bytes.try_into().map_err(|_| {
-        AppError::SqlcipherKeyDerivation(format!("invalid salt length in {}", path.display()))
-    })
+    bytes
+        .try_into()
+        .map_err(|_| AppError::SqlcipherKeyDerivation("invalid SQLCipher salt length".to_owned()))
 }
 
 fn sqlcipher_raw_marker_path(db_path: &Path) -> PathBuf {
@@ -677,9 +691,9 @@ fn rekey_legacy_sqlcipher_database(
 ) -> Result<(), AppError> {
     fs_private::ensure_private_db_files(db_path)?;
     let conn = Connection::open(db_path)?;
-    // Pin cipher_compatibility and enable cipher_memory_security before keying,
-    // matching storage-sqlite, so the rekey open does not depend on SQLCipher
-    // defaults and key material is wiped from the heap.
+    // Enable cipher_memory_security before keying and pin cipher_compatibility
+    // after keying, matching storage-sqlite, so the rekey open does not depend
+    // on SQLCipher defaults and key material is wiped from the heap.
     open_hardened_sqlcipher(&conn, legacy_key, SqlCipherHardening::cipher_only())?;
     rekey_sqlcipher_connection(db_path, &conn, new_key)
 }
@@ -1774,6 +1788,51 @@ mod tests {
         cache.record(path.clone(), salt);
         assert!(cache.contains(&path, &salt));
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn read_sqlcipher_salt_rejects_oversized_files_and_omits_account_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let account_label = "secret-account-label-98765";
+        let account_dir = dir.path().join(account_label);
+        fs::create_dir_all(&account_dir).unwrap();
+
+        // Valid 32-byte hex salt with trailing newline still parses.
+        let valid_path = account_dir.join("valid.sqlite.salt");
+        fs::write(
+            &valid_path,
+            format!("{}\n", "5a".repeat(SQLCIPHER_SALT_LEN)),
+        )
+        .unwrap();
+        assert_eq!(
+            read_sqlcipher_salt(&valid_path).unwrap(),
+            [0x5a; SQLCIPHER_SALT_LEN]
+        );
+
+        let wrong_len_path = account_dir.join("session.sqlite.salt");
+        fs::write(&wrong_len_path, "abcd").unwrap();
+        let wrong_len_err = read_sqlcipher_salt(&wrong_len_path).unwrap_err();
+        assert!(matches!(wrong_len_err, AppError::SqlcipherKeyDerivation(_)));
+        let rendered = wrong_len_err.to_string();
+        assert!(
+            !rendered.contains(account_label),
+            "salt length error must not leak account path: {rendered}"
+        );
+
+        // Oversized file filled with invalid-hex non-whitespace bytes must be
+        // rejected on size cap as SqlcipherKeyDerivation, not Hex/unbounded read.
+        let oversized_path = account_dir.join("oversized.sqlite.salt");
+        fs::write(&oversized_path, "z".repeat(4096)).unwrap();
+        let oversized_err = read_sqlcipher_salt(&oversized_path).unwrap_err();
+        assert!(
+            matches!(oversized_err, AppError::SqlcipherKeyDerivation(_)),
+            "oversized salt file must be rejected before hex decode, got: {oversized_err:?}"
+        );
+        let rendered = oversized_err.to_string();
+        assert!(
+            !rendered.contains(account_label),
+            "oversized salt error must not leak account path: {rendered}"
+        );
     }
 }
 

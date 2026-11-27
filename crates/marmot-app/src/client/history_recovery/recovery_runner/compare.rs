@@ -214,6 +214,7 @@ fn verdict(end: CompareEnd, first_unproven: u64, sweeps_otherwise: bool) -> Swee
         CompareEnd::SaturatedWindow { second } => SweepEnd::SaturatedSecond { second },
         CompareEnd::RateLimited => SweepEnd::RateLimited,
         CompareEnd::Unreachable(kind) => SweepEnd::Unreachable(kind),
+        CompareEnd::LocalBusy => SweepEnd::LocalBusy,
         CompareEnd::SinkFailed => SweepEnd::SinkFailed,
     }
 }

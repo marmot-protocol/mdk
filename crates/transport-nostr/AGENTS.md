@@ -25,7 +25,7 @@ drop: storage imports loss by count, so a token's count must cover every drop un
 | --- | --- |
 | `src/lib.rs` | `MarmotRelayPlane`: relay sessions, per-account delivery queues and publish clients, notification forwarding, native replay admission bridge, publish accounting, `nostr_builder()`. |
 | `src/delivery_spill.rs` | The plane's side of the durable overflow tail: when a full queue spills and how it reports the disposition. |
-| `src/directory.rs`, `src/directory_wire.rs` | Directory fetches and subscriptions, and their relay wire handling. |
+| `src/directory.rs` | Directory fetches (plain, strict, public, inspection) and live directory subscriptions. |
 | `src/known_limits.rs` | `RelayEventLimits` and the one refusal of relays an event is over the known limit of, shared by the adapter's publish and `KnownLimitPublishClient`, which wraps every account publisher. |
 | `src/read_back.rs` | `read_back`, a pending commit's exact-event read (mdk#2332), and its per-account, per-relay hourly cap. |
 | `src/safety.rs` | `RelaySafetyPolicy`: the host-safety chokepoint every relay endpoint passes before a connect. |
@@ -52,10 +52,18 @@ drop: storage imports loss by count, so a token's count must cover every drop un
   account, and its events reach no ingest, sweep cursor or coverage ledger. Only a copy that verifies as the exact
   event is `Found`, and only an EOSE is `NotFound`. It runs when the session asks; it is not history acquisition and
   not a recovery-runner quantum.
-- One-shot directory reads (`fetch_directory_events`, `fetch_public_events`, `inspect_directory_events`) send each
-  relay's REQ as one of the adapter's finite requests, on an owned client built with `FiniteRequests::install`: each
-  relay's reply keeps its own end (EOSE, CLOSED reason, cut, deadline), and a relay that requires NIP-42 is asked once
-  more after the signer authenticates. A pending signer callback at the inspection deadline is
+- One-shot directory reads (`fetch_directory_events`, `fetch_directory_events_with_completion`, `fetch_public_events`,
+  `inspect_directory_events`) send each relay's REQ as one of the adapter's finite requests, on an owned client built
+  with `FiniteRequests::install`: each
+  relay's reply keeps its own end (EOSE, CLOSED reason, cut, deadline) and exact per-REQ raw-vs-admitted EVENT counts
+  (`raw_items == received_items` replaces the retired `DirectoryWireTransport` prefilter counter for strict absence
+  proofs), and a relay that requires NIP-42 is asked once
+  more after the signer authenticates. `NostrSdkDirectoryRelayFetcher` holds no idle `Client`; every read builds and
+  tears down a `ScopedDirectoryClient`. `DirectoryRelayPlane` coalesces
+  identical in-flight plain and strict fetches with waiter-counted ownership and a `CancellationToken`: cancelling one
+  waiter leaves shared work running for remaining waiters, losing the final waiter cancels and tears down the shared
+  fetch, and `MarmotRelayPlane::shutdown()` cancels and joins active coalesced fetches within
+  `RELAY_PLANE_SHUTDOWN_WAIT`. A pending signer callback at the inspection deadline is
   `AuthenticationTimedOut`; other deadlines are `TimedOut`. Inspection watches authentication from before the dial with
   `AUTH_CHALLENGE_WAIT` (so a bare `auth-required:` CLOSED with no `AUTH` challenge ends as `AuthenticationRequired`
   instead of waiting out the EOSE window, while an `AUTH` challenge still waits until the deadline), so a refusal on
@@ -96,9 +104,9 @@ drop: storage imports loss by count, so a token's count must cover every drop un
   `deactivate_account_context` runs (which also tears down that account's cached and retired signer-bound publish
   clients). Unfinished `loss_marker_tasks` are never aborted on
   timeout; bounded shutdown still cannot guarantee marker persistence if storage stays `Retryable` until the host
-  closes SQLite (write-ahead cursor fencing for that case is tracked in `#3813`). Directory fetch tasks are not yet
-  joined here (tracked for coalesced fetch cancellation). The plane registers nothing in the app's close registry
-  (`#2341`).
+  closes SQLite (write-ahead cursor fencing for that case is tracked in `#3813`). Active coalesced directory fetch
+  tasks are cancelled and joined within `RELAY_PLANE_SHUTDOWN_WAIT` (`DirectoryRelayPlane::shutdown`). The plane
+  registers nothing in the app's close registry (`#2341`).
 - Dropping the last plane handle without shutdown aborts the same router and forwarder tasks
   (`Drop for MarmotRelayPlaneInner`). They hold the transport, so without it every short-lived plane (one per `wnd`
   Execute request) stayed alive with its SDK clients. Never give those tasks a `MarmotRelayPlane` clone, or the

@@ -12,7 +12,8 @@ these helpers is
 ## What this crate does
 
 - Creates files with `O_CREAT` at the target mode (no post-create chmod on reachable paths): `write_private`,
-  `create_new_private`, `open_private_append`, `ensure_private_file`, `ensure_private_db_files`.
+  `create_new_private`, `open_private_append`, `ensure_private_file`, `ensure_private_db_files`, and opens existing
+  regular files without following symlinks or blocking on FIFOs (`open_existing_regular_nofollow`).
 - Prepares SQLite databases without disturbing live connections (`ensure_private_db_files`): it never opens an
   existing database or sidecar, because closing that descriptor would drop the connection's POSIX locks.
 - Creates directories atomically at mode `0700` (`create_dir_all_private`), and prepares directory paths

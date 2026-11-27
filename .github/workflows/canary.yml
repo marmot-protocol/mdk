@@ -175,16 +175,12 @@ jobs:
 
   # GitHub validates caller permissions against the union of all callee jobs'
   # declared permissions before evaluating job `if:` conditions. `ci.yml`
-  # declares `pull-requests: read` on `changes` and `actions: write` +
-  # `checks: read` on `merge-group-fail-fast` (which remains skipped outside
-  # `merge_group`). Top-level Canary permissions stay read-only.
+  # declares `pull-requests: read` on `changes`, keeping Canary strictly read-only.
   verify-ci:
     name: Full cross-platform CI (6 shards)
     needs: plan
     if: needs.plan.outputs.should_run == 'true'
     permissions:
-      actions: write
-      checks: read
       contents: read
       pull-requests: read
     uses: ./.github/workflows/ci.yml

@@ -33,7 +33,7 @@ INFRA_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"command timed out after \d+s", re.IGNORECASE),
 )
 
-# Nextest terminal failure statuses (matches pinned cargo-nextest 0.9.132/0.9.148
+# Nextest terminal failure statuses (matches pinned cargo-nextest 0.9.132
 # `status_str` / `short_status_str`, optional retry `TRY <n>`, duration `[...s]`,
 # optional post-duration stress counter `[1/10]` or `[1]`, and optional progress
 # `( 988/1564)` or `(─────────)`):
@@ -289,6 +289,15 @@ def normalize_log_text(log_text: str) -> str:
     return "\n".join(lines)
 
 
+def log_tail(cleaned: str) -> str:
+    """Return the last lines of a normalized log, where a job's terminal failure is printed.
+
+    Infra patterns are matched only here: earlier output includes passing tests that print
+    infra-like text on purpose (fast-ci's CI-runner tests simulate a full disk).
+    """
+    return "\n".join(cleaned.splitlines()[-80:])
+
+
 def is_infra_failure(log_excerpt: str, conclusion: str = "failure") -> bool:
     """Return True when logs or conclusion point to runner/network/infra failure.
 
@@ -398,14 +407,14 @@ def evaluate_command_result(
         # relay/network test output mentioning TLS/HTTP/connection resets is never misread.
         if NEXTEST_FAIL_RE.search(cleaned):
             return RunVerdict.FAIL, "target test failed"
-        if is_infra_failure(cleaned):
+        if is_infra_failure(log_tail(cleaned)):
             return RunVerdict.INCONCLUSIVE, f"infrastructure or timeout error (exit {returncode})"
         return RunVerdict.INCONCLUSIVE, f"nextest failed before executing target test (exit {returncode})"
 
-    if is_infra_failure(cleaned):
-        return RunVerdict.INCONCLUSIVE, f"infrastructure or timeout error (exit {returncode})"
     if returncode == 0:
         return RunVerdict.PASS, "command passed"
+    if is_infra_failure(log_tail(cleaned)):
+        return RunVerdict.INCONCLUSIVE, f"infrastructure or timeout error (exit {returncode})"
     return RunVerdict.FAIL, f"command exited with status {returncode}"
 
 
@@ -427,7 +436,7 @@ def extract_bare_metal_signals(
     tip_sha = str(status_doc.get("sha") or "")
     baseline_sha = str(status_doc.get("canary_sha") or status_doc.get("previous_canary") or "")
     cleaned = normalize_log_text(log_text)
-    excerpt = "\n".join(cleaned.splitlines()[-80:])
+    excerpt = log_tail(cleaned)
     public_url = run_url if run_url.startswith(("http://", "https://")) else ""
     base_run_id = f"bare-metal:{tip_sha[:12]}:{status_doc.get('updated_at', '')}"
 
@@ -473,7 +482,7 @@ def extract_bare_metal_signals(
             log_excerpt=excerpt,
             conclusion="failure",
             reproducible_locally=bool(command),
-            infra_hint=is_infra_failure(cleaned),
+            infra_hint=is_infra_failure(excerpt),
         )
     ]
 
@@ -508,7 +517,7 @@ def extract_hosted_signals(
     nextest jobs with their originating `--profile` / `--test-threads`.
     """
     cleaned = normalize_log_text(log_text)
-    excerpt = "\n".join(cleaned.splitlines()[-80:])
+    excerpt = log_tail(cleaned)
     non_linux = is_non_linux_job(failed_job)
     parsed_failures = parse_nextest_failures(cleaned)
     base_run_id = str(run_id)
@@ -533,7 +542,7 @@ def extract_hosted_signals(
                 log_excerpt=excerpt,
                 conclusion=conclusion,
                 reproducible_locally=True,
-                infra_hint=False if parsed_failures else is_infra_failure(cleaned, conclusion),
+                infra_hint=False if parsed_failures else is_infra_failure(excerpt, conclusion),
             )
         ]
 
@@ -586,7 +595,7 @@ def extract_hosted_signals(
             log_excerpt=excerpt,
             conclusion=conclusion,
             reproducible_locally=False,
-            infra_hint=is_infra_failure(cleaned, conclusion),
+            infra_hint=is_infra_failure(excerpt, conclusion),
         )
     ]
 
@@ -665,7 +674,7 @@ def match_known_flake_issue(
             continue
         title = str(issue.get("title") or "")
         body = str(issue.get("body") or "")
-        is_flake_issue = title.lower().startswith("flaky:") or title == "Flaky test leaderboard"
+        is_flake_issue = title.lower().startswith("flaky:")
         if not is_flake_issue:
             continue
         if any(_contains_exact_test_token(title, tok) or _contains_exact_test_token(body, tok) for tok in full_tokens):
@@ -716,11 +725,21 @@ def classify_failure(
 ) -> ClassificationResult:
     """Classify a FailureSignal into one of the MDK Canary buckets.
 
-    Only regressions that reproduce on `tip` and do not fail on a distinct `baseline`
-    enter `DETERMINISTIC_REGRESSION` for automated bisect/revert. Signals without a
-    distinct baseline stay in `UNREPRODUCIBLE` so a single missing-baseline run never
-    immediately freezes `master`. Intermittent failures (including stress-only hits)
-    stay in `NEW_INTERMITTENT` or `KNOWN_FLAKE` and never trigger automated reverts.
+    For locally reproducible signals, always runs `tip` (and `baseline` on `tip`
+    failure) reproduction before consulting individual `Flaky:` issues so a
+    deterministic regression is never suppressed. Individual `Flaky:` issues (never
+    `"Flaky test leaderboard"`) are consulted:
+      - on the locally-unreproducible fallback (non-Linux / Relay-E2E) so human-tracked
+        non-Linux flakes do not escalate into false Meltdowns;
+      - when `tip` passes single retry (intermittent), skipping stress runs;
+      - on a second `tip` replay before returning `UNREPRODUCIBLE` when no distinct
+        green baseline is available, so intermittent tracked flakes without a baseline
+        stay `KNOWN_FLAKE` instead of triggering false Meltdowns;
+      - when both `tip` and `baseline` fail; and
+      - in palindrome confirmation order (`tip -> baseline -> baseline -> tip`, or
+        `tip -> baseline(TEST_ABSENT) -> tip` for newly added tests), defeating both
+        alternating and early-fail/later-pass burst streams before returning
+        `DETERMINISTIC_REGRESSION`.
     """
     # Bucket 1: Runner/network/disk infrastructure error.
     # Never let diagnostic tail strings override a concrete parsed nextest test failure.
@@ -730,17 +749,19 @@ def classify_failure(
             reason=f"infrastructure failure detected in {signal.failed_job} ({signal.conclusion})",
         )
 
-    # Bucket 2a: Known flake matching an open `Flaky:` issue.
     matched_issue = match_known_flake_issue(signal.failed_test, open_flake_issues)
-    if matched_issue is not None:
-        return ClassificationResult(
-            bucket=Bucket.KNOWN_FLAKE,
-            reason=f"matches open flake issue #{matched_issue} for {signal.failed_test}",
-            matched_issue=matched_issue,
-        )
 
     # Platform-specific or unparsed failure with no local reproduction command.
     if not signal.reproducible_locally or not signal.command:
+        if matched_issue is not None:
+            return ClassificationResult(
+                bucket=Bucket.KNOWN_FLAKE,
+                reason=(
+                    f"non-locally-reproducible failure in `{signal.failed_job}` matches "
+                    f"open flake issue #{matched_issue} for {signal.failed_test}"
+                ),
+                matched_issue=matched_issue,
+            )
         step_note = f" (step `{signal.failed_step}`)" if signal.failed_step else ""
         if is_non_linux_job(signal.failed_job):
             reason = f"non-Linux job `{signal.failed_job}`{step_note} is not locally reproducible on this host"
@@ -751,7 +772,7 @@ def classify_failure(
             reason=reason,
         )
 
-    # Single-shot reproduction on tip.
+    # Single-shot reproduction on tip BEFORE consulting open `Flaky:` issues.
     tip_verdict, tip_detail = run_on_sha(signal.tip_sha, signal.command)
     if tip_verdict in {RunVerdict.INCONCLUSIVE, RunVerdict.TEST_ABSENT}:
         return ClassificationResult(
@@ -760,13 +781,49 @@ def classify_failure(
         )
 
     if tip_verdict == RunVerdict.FAIL:
+        def _confirm_tracked_tip() -> ClassificationResult | None:
+            tip_confirm, tip_confirm_detail = run_on_sha(signal.tip_sha, signal.command)
+            if tip_confirm in {RunVerdict.INCONCLUSIVE, RunVerdict.TEST_ABSENT}:
+                return ClassificationResult(
+                    bucket=Bucket.INFRA_ERROR,
+                    reason=f"inconclusive confirmation on {signal.tip_sha[:9]} ({tip_confirm_detail})",
+                )
+            if tip_confirm == RunVerdict.PASS:
+                return ClassificationResult(
+                    bucket=Bucket.KNOWN_FLAKE,
+                    reason=(
+                        f"mixed tip outcomes on {signal.tip_sha[:9]} (failed then passed); "
+                        f"matches open flake issue #{matched_issue} for {signal.failed_test}"
+                    ),
+                    matched_issue=matched_issue,
+                )
+            return None
+
         if not signal.baseline_sha or signal.baseline_sha == signal.tip_sha:
+            if matched_issue is not None:
+                # Confirm repeatability on `tip` before returning UNREPRODUCIBLE so a
+                # tracked flake without a distinct green baseline stays KNOWN_FLAKE.
+                tip_check = _confirm_tracked_tip()
+                if tip_check is not None:
+                    return tip_check
             return ClassificationResult(
                 bucket=Bucket.UNREPRODUCIBLE,
                 reason=f"reproduced on {signal.tip_sha[:9]} but no distinct green baseline is available to bisect",
+                matched_issue=matched_issue,
             )
+
         base_verdict, base_detail = run_on_sha(signal.baseline_sha, signal.command)
         if base_verdict == RunVerdict.FAIL:
+            if matched_issue is not None:
+                return ClassificationResult(
+                    bucket=Bucket.KNOWN_FLAKE,
+                    reason=(
+                        f"fails on both tip {signal.tip_sha[:9]} and baseline "
+                        f"{signal.baseline_sha[:9]}; matches open flake issue "
+                        f"#{matched_issue} for {signal.failed_test}"
+                    ),
+                    matched_issue=matched_issue,
+                )
             return ClassificationResult(
                 bucket=Bucket.INFRA_ERROR,
                 reason=(
@@ -780,15 +837,52 @@ def classify_failure(
                 bucket=Bucket.INFRA_ERROR,
                 reason=f"inconclusive baseline check on {signal.baseline_sha[:9]} ({base_detail})",
             )
+        if matched_issue is not None:
+            # Confirm in palindrome order (`tip -> baseline -> baseline -> tip`) so
+            # neither alternating (`[F, P, F, P]`) nor early-fail/later-pass burst
+            # streams (`[F, F, P, P]`, `[F, P, P, P]`) align with tip/baseline.
+            if base_verdict == RunVerdict.PASS:
+                base_confirm, base_confirm_detail = run_on_sha(signal.baseline_sha, signal.command)
+                if base_confirm in {RunVerdict.INCONCLUSIVE, RunVerdict.TEST_ABSENT}:
+                    return ClassificationResult(
+                        bucket=Bucket.INFRA_ERROR,
+                        reason=f"inconclusive baseline confirmation on {signal.baseline_sha[:9]} ({base_confirm_detail})",
+                    )
+                if base_confirm == RunVerdict.FAIL:
+                    return ClassificationResult(
+                        bucket=Bucket.KNOWN_FLAKE,
+                        reason=(
+                            f"reproduced on tip {signal.tip_sha[:9]} and failed baseline confirmation "
+                            f"on {signal.baseline_sha[:9]}; matches open flake issue #{matched_issue} "
+                            f"for {signal.failed_test}"
+                        ),
+                        matched_issue=matched_issue,
+                    )
+            tip_check = _confirm_tracked_tip()
+            if tip_check is not None:
+                return tip_check
         return ClassificationResult(
             bucket=Bucket.DETERMINISTIC_REGRESSION,
             reason=(
                 f"reproduced on {signal.tip_sha[:9]} and did not fail on "
                 f"baseline {signal.baseline_sha[:9]} ({base_verdict.value})"
             ),
+            matched_issue=matched_issue,
         )
 
-    # Passed single retry. Only run differential stress on targeted `cargo nextest run` commands
+    # Passed single retry (intermittent). Check open individual `Flaky:` issues before
+    # spending time on differential stress runs.
+    if matched_issue is not None:
+        return ClassificationResult(
+            bucket=Bucket.KNOWN_FLAKE,
+            reason=(
+                f"passed single retry on {signal.tip_sha[:9]}; matches open flake issue "
+                f"#{matched_issue} for {signal.failed_test}"
+            ),
+            matched_issue=matched_issue,
+        )
+
+    # Only run differential stress on targeted `cargo nextest run` commands
     # (never loop heavy workspace commands like `just fast-ci`).
     if not is_nextest_command(signal.command) or stress_count <= 1:
         return ClassificationResult(

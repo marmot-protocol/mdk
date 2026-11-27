@@ -1662,4 +1662,120 @@ mod runtime {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(fixture.publisher.publishes().len(), 1);
     }
+
+    /// `deactivate_account` must acquire the generated-setup fence BEFORE the
+    /// moderation-report fence, matching `remove_account` so concurrent
+    /// teardowns cannot invert lock order (mdk#3801).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deactivate_account_fences_generated_setup_before_moderation_reports() {
+        let fixture = runtime_fixture(Mode::Refuse).await;
+        let slot = fixture.app.moderation_reports.slot(&fixture.label);
+        let work_guard = slot.work.lock().await;
+        let accounts = fixture.runtime.accounts();
+        let deactivate = accounts.deactivate_account(&fixture.account_id);
+        tokio::pin!(deactivate);
+        assert!(
+            futures::poll!(deactivate.as_mut()).is_pending(),
+            "deactivation must wait for in-flight moderation-report work"
+        );
+        assert!(
+            fixture
+                .runtime
+                .generated_setup_fenced_for_test(&fixture.account_id),
+            "generated-setup fence must be acquired before moderation-report fence"
+        );
+        drop(work_guard);
+        tokio::time::timeout(Duration::from_secs(5), deactivate)
+            .await
+            .expect("deactivation completes once moderation-report work finishes")
+            .unwrap();
+        fixture.runtime.shutdown_and_close().await.unwrap();
+    }
+
+    /// A rejected `reset_incomplete_account_setup` must preserve the live
+    /// account's queued moderation reports (mdk#3801).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_reset_incomplete_account_setup_preserves_moderation_reports() {
+        let fixture = runtime_fixture(Mode::Refuse).await;
+        fixture.queue_one().await;
+        assert_eq!(fixture.pending_count(), 1);
+        let secret = fixture
+            .app
+            .account_home()
+            .load_signing_keys(&fixture.label)
+            .unwrap()
+            .secret_key()
+            .to_secret_hex();
+        let error = fixture
+            .runtime
+            .reset_incomplete_account_setup(&secret, true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AppError::AccountSetupResetNotApplicable
+                    | AppError::AccountSetupRetryRequired
+                    | AppError::AccountSetupKeyPackageRecoveryAvailable
+            ),
+            "unexpected error for active account reset: {error:?}"
+        );
+        assert_eq!(
+            fixture.pending_count(),
+            1,
+            "a rejected setup reset must not purge queued moderation reports"
+        );
+        fixture.runtime.shutdown_and_close().await.unwrap();
+    }
+
+    /// A `reset_incomplete_account_setup` that passes the non-DB preflight and
+    /// is then rejected by the storage check under the worker transaction must
+    /// also preserve the account's queued moderation reports (mdk#3801).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_storage_check_reset_incomplete_account_setup_preserves_moderation_reports() {
+        let fixture = runtime_fixture(Mode::Refuse).await;
+        fixture.queue_one().await;
+        assert_eq!(fixture.pending_count(), 1);
+        // Set up an ambiguous legacy account that passes non-DB preflight
+        // (cutover replacement pending, no setup journal, no JSON record file)
+        // but fails the second-stage SQLite check because a KeyPackage
+        // lifecycle row exists in storage.
+        crate::tests::account_database_from_an_older_build(&fixture.app, &fixture.label);
+        fixture
+            .app
+            .ensure_strict_cutover_replacement_intent_before_session_open(&fixture.label)
+            .unwrap();
+        let record_path = fixture.app.key_package_record_path(&fixture.label);
+        if record_path.exists() {
+            std::fs::remove_file(&record_path).unwrap();
+        }
+        let storage = fixture.app.account_storage(&fixture.label).unwrap();
+        cgka_traits::MaintenanceStorage::put_key_package_lifecycle(
+            &storage,
+            &cgka_traits::KeyPackageLifecycleState::slot_only("stored-slot".into()),
+        )
+        .unwrap();
+        let secret = fixture
+            .app
+            .account_home()
+            .load_signing_keys(&fixture.label)
+            .unwrap()
+            .secret_key()
+            .to_secret_hex();
+        let error = fixture
+            .runtime
+            .reset_incomplete_account_setup(&secret, true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AppError::AccountSetupKeyPackageRecoveryAvailable),
+            "expected storage-stage AccountSetupKeyPackageRecoveryAvailable, got {error:?}"
+        );
+        assert_eq!(
+            fixture.pending_count(),
+            1,
+            "a storage-rejected setup reset must preserve queued moderation reports"
+        );
+        fixture.runtime.shutdown_and_close().await.unwrap();
+    }
 }

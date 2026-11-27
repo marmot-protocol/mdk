@@ -13,10 +13,56 @@
 use crate::types::EpochId;
 use std::collections::HashMap;
 use std::fmt;
-use zeroize::Zeroizing;
+use std::ops::Deref;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-/// Heap-owned secret bytes that are wiped when dropped.
-pub type SecretBytes = Zeroizing<Vec<u8>>;
+/// Heap-owned secret bytes that are wiped when dropped and redacted from `Debug`.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SecretBytes(Zeroizing<Vec<u8>>);
+
+impl SecretBytes {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl Deref for SecretBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for SecretBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl From<Vec<u8>> for SecretBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::new(bytes)
+    }
+}
+
+impl Zeroize for SecretBytes {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for SecretBytes {}
+
+impl fmt::Debug for SecretBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretBytes(<redacted>)")
+    }
+}
 
 /// Engine-internal live view of a group. Application code can query this via
 /// `CgkaEngine::group_context`. Peeler code must not — the peeler uses
@@ -113,5 +159,22 @@ mod tests {
 
         assert!(!rendered.contains("super secret bytes"));
         assert!(rendered.contains("exporter_secret_count"));
+    }
+
+    #[test]
+    fn secret_bytes_debug_redacts_bytes_and_zeroizes_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<SecretBytes>();
+
+        let secret = SecretBytes::new(vec![0xde, 0xad, 0xbe, 0xef, 0x42, 0x99]);
+        let rendered = format!("{secret:?}");
+        assert!(
+            rendered.contains("<redacted>"),
+            "SecretBytes Debug must render redaction marker: {rendered}"
+        );
+        assert!(
+            !rendered.contains("222, 173, 190, 239") && !rendered.contains("deadbeef"),
+            "SecretBytes Debug must not expose raw bytes: {rendered}"
+        );
     }
 }

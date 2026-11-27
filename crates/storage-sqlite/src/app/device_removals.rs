@@ -1,7 +1,7 @@
 //! The removals of other devices this device's user decided (mdk#2628 item
 //! 3.6b). See migration 0146 for what a row owes.
 
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::StorageResult;
 use rusqlite::params;
@@ -30,13 +30,14 @@ impl SqliteAppStorage {
         slot_hex: &str,
         requested_at: u64,
     ) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let changed = self
             .lock()?
             .execute_cached(
                 "INSERT INTO device_removals (group_id_hex, slot_hex, requested_at)
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT (group_id_hex, slot_hex) DO NOTHING",
-                params![group_id_hex, slot_hex, u64_to_i64(requested_at)?],
+                params![group_id_hex.as_ref(), slot_hex, u64_to_i64(requested_at)?],
             )
             .storage()?;
         Ok(changed != 0)
@@ -45,10 +46,11 @@ impl SqliteAppStorage {
     /// Whether this device decided to remove this exact group/slot. This
     /// keyed existence read does not decode unrelated historical decisions.
     pub fn has_device_removal(&self, group_id_hex: &str, slot_hex: &str) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM device_removals WHERE group_id_hex = ?1 AND slot_hex = ?2)",
-                params![group_id_hex, slot_hex],
+                params![group_id_hex.as_ref(), slot_hex],
                 |row| row.get(0),
             )
             .storage()
@@ -99,13 +101,14 @@ impl SqliteAppStorage {
         slot_hex: &str,
         slot_withdrawn_at: Option<u64>,
     ) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let slot_withdrawn_at = slot_withdrawn_at.map(u64_to_i64).transpose()?;
         let changed = self
             .lock()?
             .execute_cached(
                 "UPDATE device_removals SET slot_withdrawn_at = ?3
                  WHERE group_id_hex = ?1 AND slot_hex = ?2",
-                params![group_id_hex, slot_hex, slot_withdrawn_at],
+                params![group_id_hex.as_ref(), slot_hex, slot_withdrawn_at],
             )
             .storage()?;
         Ok(changed != 0)

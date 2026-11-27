@@ -99,6 +99,41 @@ class ClassifyCiChangesTests(unittest.TestCase):
         self.assertTrue(result["run_formal"])
         self.assertTrue(result["run_conformance"])
 
+    def test_formal_pairing_runs_only_formal_specialist(self) -> None:
+        for path in [
+            "formal/pairing/device_pairing_v1.spthy",
+            "formal/pairing/verify_pairing.py",
+            "formal/pairing/test_verify_pairing.py",
+        ]:
+            with self.subTest(path=path):
+                result = classify([path])
+                self.assertTrue(result["run_full"])
+                self.assertTrue(result["run_binaries"])
+                self.assertTrue(result["run_formal"])
+                self.assertFalse(result["run_c"])
+                self.assertFalse(result["run_conformance"])
+                self.assertFalse(result["run_ios"])
+                self.assertFalse(result["run_hermes"])
+                self.assertFalse(result["run_openclaw"])
+                self.assertFalse(result["run_installers"])
+
+    def test_marmot_pairing_crate_runs_formal_and_its_compiled_consumers(self) -> None:
+        for path in [
+            "crates/marmot-pairing/src/sas.rs",
+            "crates/marmot-pairing/testdata/pairing-v1.json",
+        ]:
+            with self.subTest(path=path):
+                result = classify([path])
+                self.assertTrue(result["run_full"])
+                self.assertTrue(result["run_binaries"])
+                self.assertTrue(result["run_c"])
+                self.assertTrue(result["run_conformance"])
+                self.assertTrue(result["run_formal"])
+                self.assertFalse(result["run_ios"])
+                self.assertFalse(result["run_hermes"])
+                self.assertFalse(result["run_openclaw"])
+                self.assertFalse(result["run_installers"])
+
     def test_tla_liveness_inputs_run_only_the_conformance_specialist(self) -> None:
         for path in [
             "formal/liveness/ConvergenceLifecycle.tla",

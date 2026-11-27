@@ -202,7 +202,7 @@ class SignaturePolicyTests(unittest.TestCase):
                     return bool(needs) and any(gated(parent, visited | {job}) for parent in
                         re.findall(r"[a-z0-9][a-z0-9-]*", needs[1]))
                 for job, body in jobs.items():
-                    if job not in {"required-ci", "merge-group-fail-fast"}:
+                    if job != "required-ci":
                         self.assertTrue(gated(job), f"{path.name}:{job} can run before signatures")
                         self.assertNotRegex(body, r"(?m)^    if:.*(?:always|failure|cancelled)\(")
 
@@ -326,7 +326,6 @@ class MergeGatePolicyTests(unittest.TestCase):
             ("pull_request", "true", "true", "6", "full", "14"),
             ("pull_request", "false", "false", "6", "full", "14"),
             ("pull_request", "false", "", "", "full", "14"),
-            ("merge_group", "false", "false", "6", "full", "14"),
             ("workflow_dispatch", "false", "false", "", "full", "14"),
             ("workflow_dispatch", "false", "false", "6", "full", "6"),
             ("schedule", "false", "false", "6", "full", "6"),
@@ -426,11 +425,6 @@ class MergeGatePolicyTests(unittest.TestCase):
             ("pull_request", "full", "false", "false", skipped, False),
             ("pull_request", "full", "true", "true", skipped, False),
             ("pull_request", "", "true", "false", skipped, False),
-            ("merge_group", "full", "false", "false", passed, True),
-            ("merge_group", "full", "false", "false", skipped, False),
-            ("merge_group", "full", "false", "false", cancelled, False),
-            ("merge_group", "fast", "true", "false", skipped, False),
-            ("merge_group", "", "false", "false", skipped, False),
             ("push", "warm", "false", "false", skipped, True),
         ]:
             with self.subTest(event=event, mode=mode, is_team=is_team, apple=apple_opt_in, needs=needs):
@@ -615,9 +609,9 @@ class MergeGatePolicyTests(unittest.TestCase):
         jobs = set(re.findall(r"(?m)^  ([a-z0-9-]+):\n", workflow.split("\njobs:\n", 1)[1]))
         required = workflow.split("\n  required-ci:\n", 1)[1].split("\n    runs-on:", 1)[0]
         needs = re.findall(r"(?m)^      - ([a-z0-9-]+)$", required)
-        # The layout experiment runs only on request; the watcher must never fail a run.
+        # The layout experiment runs only on request.
         self.assertEqual(sorted(needs),
-                         sorted(jobs - {"archive-layout-experiment", "merge-group-fail-fast", "required-ci"}))
+                         sorted(jobs - {"archive-layout-experiment", "required-ci"}))
 
     def test_full_runs_use_nextest_profiles_without_a_default_filter(self):
         profiles = tomllib.loads((ROOT / ".config/nextest.toml").read_text())["profile"]
@@ -643,134 +637,18 @@ class MergeGatePolicyTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertNotIn("--profile precheck", workflow)
 
-    def test_only_the_merge_group_watcher_can_cancel_and_it_cannot_fail_the_run(self):
+    def test_ci_has_no_dead_merge_group_triggers_or_write_permissions(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-        watcher = workflow.split("\n  merge-group-fail-fast:\n", 1)[1].split("\n  required-ci:\n", 1)[0]
-        self.assertIn("    if: github.event_name == 'merge_group'\n", watcher)
-        self.assertIn("    continue-on-error: true\n    permissions:\n      actions: write\n      checks: read\n      contents: read\n\n",
-                      watcher)
-        # The branch lookup must name this run's own group and commit.
-        self.assertIn("          HEAD_REF: ${{ github.ref }}\n          HEAD_SHA: ${{ github.sha }}\n", watcher)
-        # Build and test jobs run third-party code; none of them may cancel or dispatch runs.
-        self.assertEqual(len(re.findall(r"(?m)^ +actions: write$", workflow)), 1)
-        # A job-level continue-on-error reads as success in `needs` but as a failed job to the watcher.
-        self.assertEqual(len(re.findall(r"(?m)^    continue-on-error:", workflow)), 1)
-        timeout = int(re.search(r"(?m)^    timeout-minutes: (\d+)$", watcher).group(1))
-        watch = int(re.search(r"deadline=\$\(\(SECONDS \+ (\d+) \* 60\)\)", watcher).group(1))
-        self.assertLess(watch, timeout)
-        # Required CI must still run, and fail, once the watcher cancels the run.
+        self.assertNotIn("merge_group", workflow)
+        self.assertNotIn("merge-group-fail-fast", workflow)
+        # Build and test jobs run third-party code; none of them may hold write permissions
+        # or job-level continue-on-error.
+        self.assertEqual(len(re.findall(r"(?m)^ +[a-z-]+: write$", workflow)), 0)
+        self.assertEqual(len(re.findall(r"(?m)^    continue-on-error:", workflow)), 0)
+        # Required CI must still run and fail on cancelled runs.
         self.assertIn("\n  required-ci:\n    name: Required CI\n", workflow)
         required = workflow.split("\n  required-ci:\n", 1)[1].split("\n    needs:\n", 1)[0]
         self.assertRegex(required, r"(?m)^    if: always\(\)$")
-
-    def test_merge_group_watcher_cancels_a_failed_or_dropped_group(self):
-        script = workflow_step("ci.yml", "Cancel the run when a job fails")
-        # gh applies the trailing --jq filter itself; the fake runs it with jq.
-        # Request n to an endpoint reads its response n, and later requests
-        # repeat its last response.
-        fakes = textwrap.dedent("""\
-            gh() {
-              if [[ "$1" == api ]]; then
-                echo "gh ${*:1:$#-1}" >> "$STATE/calls"
-                if [[ "$2" == */annotations ]]; then
-                  printf '%s' '[{"annotation_level":"failure","message":"No space left on device"}]' | jq -r "${@: -1}"
-                  return
-                fi
-                local kind=jobs
-                [[ "$*" != *matching-refs* ]] || kind=refs
-                local count=$(( $(cat "$STATE/$kind") + 1 ))
-                echo "$count" > "$STATE/$kind"
-                local last=$(ls "$STATE/$kind".*.json | wc -l)
-                local response="$STATE/$kind.$(( count < last ? count : last )).json"
-                [[ "$(cat "$response")" != error ]] || return 1
-                jq -r "${@: -1}" "$response"
-              else
-                echo "gh $*" >> "$STATE/calls"
-                local cancels=$(( $(cat "$STATE/cancels") + 1 ))
-                echo "$cancels" > "$STATE/cancels"
-                (( cancels > REFUSED_CANCELS ))
-              fi
-            }
-            sleep() { echo "sleep $1" >> "$STATE/calls"; SECONDS=$((SECONDS + $1)); }
-        """)
-
-        def job(name, status, conclusion=None):
-            return {"name": name, "status": status, "conclusion": conclusion}
-
-        group = "refs/heads/gh-readonly-queue/master/pr-7-" + "b" * 40
-        commit = "c" * 40
-
-        def branch(sha, ref=group):
-            return [{"ref": ref, "object": {"type": "commit", "sha": sha}}]
-
-        live, gone, reused = branch(commit), [], branch("d" * 40)
-        running = [job("Classify CI changes", "completed", "success"),
-                   job("Rust tests (1/7)", "in_progress"), job("Rust WASM check", "completed", "skipped")]
-        failed = running + [job("Relay runtime tests (2/2)", "completed", "failure")]
-        finished = [job("Rust tests (1/7)", "completed", "success"), job("Required CI", "queued")]
-        poll = "gh api --paginate repos/o/r/actions/runs/42/jobs?per_page=100 --jq"
-        look = f"gh api repos/o/r/git/matching-refs/{group.removeprefix('refs/')} --jq"
-        wait, cancel = "sleep 60", "gh run cancel 42"
-        for name, jobs, refs, refused, expected, env in [
-            ("failure cancels at once", [failed], [live], 0, [poll, cancel], {}),
-            ("dead runner annotations survive cancellation",
-             [running + [{**job("Rust tests (1/14)", "completed", "failure"),
-                          "check_run_url": "https://api.github.com/repos/o/r/check-runs/7"}]],
-             [live], 0, [poll, "gh api https://api.github.com/repos/o/r/check-runs/7/annotations --jq", cancel], {}),
-            ("timeout or cancellation counts as a failure",
-             [running + [job("Windows filesystem contracts", "completed", "cancelled")]], [live], 0,
-             [poll, cancel], {}),
-            ("success, skips and running jobs on a live branch keep watching", [running, finished], [live], 0,
-             [poll, look, wait, poll], {}),
-            ("Required CI means nothing is left to stop",
-             [finished + [job("Rust tests (2/7)", "completed", "failure")]], [gone], 0, [poll], {}),
-            ("failed request is retried", ["error", failed], [live], 0, [poll, wait, poll, cancel], {}),
-            ("refused cancel is retried", [failed], [live], 1, [poll, cancel, wait, poll, cancel], {}),
-            ("watching stops at the deadline", [running], [live], 0, [poll, look, wait] * 150, {}),
-            # The queue deleted the group's branch, or gave its name to a later group on the same base.
-            ("a branch gone for two lookups cancels", [running], [gone], 0,
-             [poll, look, wait, poll, look, cancel], {}),
-            ("a branch reused by another group cancels", [running], [reused], 0,
-             [poll, look, wait, poll, look, cancel], {}),
-            ("another branch sharing the prefix is not this group", [running],
-             [branch(commit, group + "-other")], 0, [poll, look, wait, poll, look, cancel], {}),
-            ("refused cancel of a dropped group is retried", [running], [gone], 1,
-             [poll, look, wait, poll, look, cancel, wait, poll, look, cancel], {}),
-            # A passed group's branch is deleted after Required CI appears, which wins.
-            ("a passed group's deleted branch never cancels", [running, finished], [gone], 0,
-             [poll, look, wait, poll], {}),
-            ("one missing lookup is not enough", [running, running, running, finished], [gone, live, gone], 0,
-             [poll, look, wait, poll, look, wait, poll, look, wait, poll], {}),
-            ("a failed lookup proves nothing", [running, running, running, finished], [gone, "error", gone], 0,
-             [poll, look, wait, poll, look, wait, poll, look, wait, poll], {}),
-            ("a failed jobs request skips the lookup", [running, "error", finished], [gone], 0,
-             [poll, look, wait, poll, wait, poll], {}),
-            ("no group branch, no lookups", [running, finished], [gone], 0, [poll, wait, poll],
-             {"HEAD_REF": ""}),
-            ("a tag is not a group branch", [running, finished], [gone], 0, [poll, wait, poll],
-             {"HEAD_REF": "refs/tags/v1"}),
-            ("a malformed commit disables lookups", [running, finished], [gone], 0, [poll, wait, poll],
-             {"HEAD_SHA": "HEAD"}),
-        ]:
-            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
-                state = Path(tmp)
-                (state / "calls").write_text("")
-                for counter in ("jobs", "refs", "cancels"):
-                    (state / counter).write_text("0")
-                for kind, responses in (("jobs", [{"jobs": r} if r != "error" else r for r in jobs]),
-                                        ("refs", refs)):
-                    for index, response in enumerate(responses, 1):
-                        body = response if response == "error" else json.dumps(response)
-                        (state / f"{kind}.{index}.json").write_text(body)
-                # GitHub runs `run:` steps with `bash -e`.
-                result = subprocess.run(["bash", "-e", "-c", fakes + script], capture_output=True, text=True,
-                                        timeout=60, env={**os.environ, "STATE": tmp, "GH_REPO": "o/r",
-                                                         "RUN_ID": "42", "HEAD_REF": group, "HEAD_SHA": commit,
-                                                         "REFUSED_CANCELS": str(refused), **env})
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual((state / "calls").read_text().splitlines(), expected)
-                if name == "dead runner annotations survive cancellation":
-                    self.assertIn("No space left on device", result.stdout)
 
 
 class CacheBudgetPolicyTests(unittest.TestCase):
@@ -973,6 +851,53 @@ class RcReleasePolicyTests(unittest.TestCase):
             self.assertIn("ref: ${{ inputs.source_sha }}", text)
         sim_text = (ROOT / ".github/workflows/simulator-nightly.yml").read_text()
         self.assertNotIn("\n  schedule:\n", sim_text)
+
+    def test_simulator_nightly_alerts_via_explicit_workflow_call_input_from_scheduled_rc(self):
+        sim = (ROOT / ".github/workflows/simulator-nightly.yml").read_text()
+        rc = (ROOT / ".github/workflows/rc-releases.yml").read_text()
+
+        # `simulator-nightly.yml` has no `schedule` trigger; gating on `github.event_name == 'schedule'`
+        # or `github.workflow == 'Simulator Nightly'` made all three failure alerts dead code.
+        self.assertNotIn("github.workflow == 'Simulator Nightly'", sim)
+        self.assertNotIn("github.event_name == 'schedule'", sim)
+        call_block = sim.split("\n  workflow_call:\n", 1)[1].split("\npermissions:\n", 1)[0]
+        self.assertRegex(
+            call_block,
+            r"(?s)      report_failure:\n(?:        [^\n]+\n)*?        default: false\n        type: boolean\n",
+        )
+        for step_name in (
+            "Report nightly failure",
+            "Report scheduled relay runtime failure",
+            "Report scheduled recovery failure",
+        ):
+            with self.subTest(step=step_name):
+                step = sim.split(f"      - name: {step_name}\n", 1)[1].split("\n      - name:", 1)[0]
+                self.assertIn("        if: ${{ failure() && inputs.report_failure == true }}\n", step)
+
+        rc_sim_job = rc.split("\n  simulator-nightly:\n", 1)[1].split("\n  convergence-hardening:\n", 1)[0]
+        self.assertIn("      issues: write\n", rc_sim_job)
+        self.assertIn("      report_failure: ${{ github.event_name == 'schedule' }}\n", rc_sim_job)
+
+    def test_all_workflows_and_bisect_classifier_align_on_one_cargo_nextest_version(self):
+        expected_version = "0.9.132"
+        found: list[tuple[str, str]] = []
+        for path in sorted((ROOT / ".github/workflows").glob("*.y*ml")):
+            text = path.read_text()
+            for match in re.finditer(r"cargo-nextest@([0-9]+\.[0-9]+\.[0-9]+)", text):
+                found.append((path.name, match.group(1)))
+            for match in re.finditer(
+                r"Install pinned cargo-nextest.*?version=([0-9]+\.[0-9]+\.[0-9]+)", text, re.S
+            ):
+                found.append((path.name, match.group(1)))
+        self.assertTrue(
+            {"ci.yml", "simulator-nightly.yml", "convergence-hardening.yml"} <= {wf for wf, _ in found},
+            f"expected nextest pins in core/scheduled workflows, got {found}",
+        )
+        drifted = [(wf, ver) for wf, ver in found if ver != expected_version]
+        self.assertEqual(drifted, [], f"drifted cargo-nextest pins: {drifted}")
+        classifier = (ROOT / "scripts/bisect_agent/classifier.py").read_text()
+        self.assertIn(expected_version, classifier)
+        self.assertNotIn("0.9.148", classifier)
 
     def test_promote_workflow_skips_test_lanes_and_requires_metadata_diff_guard(self):
         workflow = (ROOT / ".github/workflows/promote-release.yml").read_text()
@@ -1674,9 +1599,12 @@ sha256sum() { shasum -a 256 "$@"; }
         self.assertIn("fetch-depth: 0", changes)
         self.assertIn("run: python3 scripts/test_check_pr_trailers.py", rust_format)
 
-        script = workflow_step("ci.yml", "PR commit trailers (advisory)")
-        self.assertIn("python3 scripts/check_pr_trailers.py --advisory", script)
-        self.assertIn('|| echo "::warning title=PR trailers::', script)
+        script = workflow_step("ci.yml", "PR commit trailers")
+        self.assertIn('python3 scripts/check_pr_trailers.py "${args[@]}"', script)
+        # Team PRs (fast mode) must fail when a crate change skips `just dependents-nextest`,
+        # so the step may not swallow the script's exit status.
+        self.assertIn('if [[ "$CI_MODE" == fast ]]; then\n    args+=(--enforce-dependents)', script)
+        self.assertNotIn("|| echo", script)
         self.assertNotIn("${{", script)
 
         # Execute the exact workflow step in a synthetic PR merge-ref checkout
@@ -1695,9 +1623,12 @@ sha256sum() { shasum -a 256 "$@"; }
             git("config", "commit.gpgsign", "false")
             scripts_dir = repo / "scripts"
             scripts_dir.mkdir()
-            for name in ("check_pr_trailers.py", "changelog.py"):
+            for name in ("check_pr_trailers.py", "changelog.py", "dependents_nextest.py", "classify_ci_changes.py"):
                 (scripts_dir / name).write_text((ROOT / "scripts" / name).read_text())
-            git("add", "scripts")
+            (repo / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/app"]\n')
+            (repo / "crates/app").mkdir(parents=True)
+            (repo / "crates/app/Cargo.toml").write_text('[package]\nname = "app"\n')
+            git("add", "scripts", "Cargo.toml", "crates")
             git("commit", "-m", "Base commit")
             git("checkout", "-b", "pr-branch")
             (repo / "feature.txt").write_text("ok\n")
@@ -1726,6 +1657,7 @@ sha256sum() { shasum -a 256 "$@"; }
                     "EVENT_NAME": "pull_request",
                     "BASE_SHA": base_sha,
                     "HEAD_SHA": head_sha,
+                    "CI_MODE": "fast",
                 },
                 capture_output=True,
                 text=True,
@@ -1733,6 +1665,32 @@ sha256sum() { shasum -a 256 "$@"; }
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("pr-trailers: OK (Release-Impact: patch)", result.stdout)
             self.assertNotIn("::warning", result.stdout)
+
+            # A crate change without `just dependents-nextest` fails a team PR and only
+            # warns when the full CI matrix runs the tests itself.
+            git("checkout", "-b", "crate-branch", base_sha)
+            (repo / "crates/app/lib.rs").write_text("changed\n")
+            git("add", "crates/app/lib.rs")
+            git(
+                "commit", "-m",
+                "Change crate\n\n"
+                "Local-Checks: cargo fmt; cargo clippy -p app\n"
+                "Local-Review: claude + codex merge @ 1234567\n"
+                "Release-Impact: none\n",
+            )
+            crate_head = git("rev-parse", "HEAD")
+            for mode, expected in (("fast", 1), ("full", 0)):
+                with self.subTest(mode=mode):
+                    run = subprocess.run(
+                        ["bash", "-c", script],
+                        cwd=repo,
+                        env={**os.environ, "EVENT_NAME": "pull_request", "BASE_SHA": base_sha,
+                             "HEAD_SHA": crate_head, "CI_MODE": mode},
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(run.returncode, expected, run.stdout + run.stderr)
+                    self.assertIn("just dependents-nextest", run.stdout)
 
 
 class CanaryWorkflowPolicyTests(unittest.TestCase):
@@ -1781,7 +1739,12 @@ class CanaryWorkflowPolicyTests(unittest.TestCase):
             with self.subTest(bp_scope=scope, required=level):
                 self.assertGreaterEqual(rank[verify_bp_granted.get(scope, "none")], rank[level])
 
-        for readonly_name, block in (("plan", plan_block), ("verify-bindings-profile", verify_bp), ("summary", summary_block)):
+        for readonly_name, block in (
+            ("plan", plan_block),
+            ("verify-ci", verify_ci),
+            ("verify-bindings-profile", verify_bp),
+            ("summary", summary_block),
+        ):
             with self.subTest(job=readonly_name):
                 self.assertNotIn(": write", block)
 

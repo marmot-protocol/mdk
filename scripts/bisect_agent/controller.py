@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,8 @@ import time
 from typing import Any, Callable
 
 from .classifier import (
+    NEXTEST_FAIL_RE,
+    NEXTEST_PASS_RE,
     classify_failure,
     evaluate_command_result,
     extract_bare_metal_signal,
@@ -22,6 +25,7 @@ from .classifier import (
     extract_hosted_signals,
     is_non_linux_job,
     match_issue_by_title,
+    normalize_log_text,
 )
 from .models import (
     AgentState,
@@ -57,6 +61,35 @@ DEFAULT_BISECT_BUDGET_SECS = 3600
 
 # Wrapper/planner jobs in hosted Canary (may appear directly or nested as `.../ Required CI`).
 HOSTED_WRAPPER_JOBS = ("Plan Canary batch", "Record Canary summary", "Required CI")
+
+
+class _RevisionVerdictTracker:
+    """Tracks concrete single-shot verdicts per commit SHA across one failure lifecycle."""
+
+    def __init__(self) -> None:
+        self._observed: dict[str, RunVerdict] = {}
+        self.contradiction: tuple[str, RunVerdict, RunVerdict] | None = None
+
+    def record(self, sha: str | None, verdict: RunVerdict) -> bool:
+        """Record a concrete verdict for `sha`. Return True when a contradiction exists."""
+        if self.contradiction is not None:
+            return True
+        if not sha or verdict == RunVerdict.INCONCLUSIVE:
+            return False
+        prior = self._observed.get(sha)
+        if prior is None:
+            self._observed[sha] = verdict
+            return False
+        if (verdict == RunVerdict.FAIL) != (prior == RunVerdict.FAIL):
+            self.contradiction = (sha, prior, verdict)
+            return True
+        return False
+
+    def detail(self) -> str:
+        if self.contradiction is None:
+            return ""
+        sha, first, conflict = self.contradiction
+        return f"contradictory replay outcomes on {sha[:9]} ({first.value} then {conflict.value})"
 
 # Safe environment keys passed to build/test predicates. Explicitly excludes bot
 # credentials (GH_TOKEN, GITHUB_TOKEN, SSH_AUTH_SOCK, GIT_SSH_COMMAND, HOME, etc.).
@@ -196,22 +229,20 @@ class GitHubOps:
         ]
         return "verified" if verified_jobs else "skipped"
 
-    def job_log(self, run_id: int, job_id: int) -> str | None:
+    def job_log(self, _run_id: int, job_id: int) -> str | None:
         """Fetch full job log so failure records earlier than the tail remain detectable.
 
+        Reads the jobs logs API: `gh run view --job <id> --log` prints nothing (exit 0) for
+        jobs of a called workflow, and every hosted Canary test job runs inside `ci.yml`.
+        gh 2.97+ refuses the escape sequences in these logs without `--allow-escape-sequences`,
+        which older gh rejects as an unknown flag. The log is captured, never printed raw.
         Returns `None` on GitHub API/CLI failure or timeout so callers defer and retry
         rather than treating an unavailable log as an empty unparsed job.
         """
-        res = self._run_gh_safe(
-            "run",
-            "view",
-            str(run_id),
-            "--repo",
-            self.repo,
-            "--job",
-            str(job_id),
-            "--log",
-        )
+        endpoint = f"repos/{self.repo}/actions/jobs/{job_id}/logs"
+        res = self._run_gh_safe("api", "--allow-escape-sequences", endpoint)
+        if res is not None and res.returncode != 0 and "unknown flag: --allow-escape-sequences" in res.stderr:
+            res = self._run_gh_safe("api", endpoint)
         if res is None or res.returncode != 0:
             return None
         return res.stdout
@@ -263,10 +294,11 @@ class GitHubOps:
         res = self._run_gh_safe("run", "rerun", base_id, "--failed", "--repo", self.repo)
         return res is not None and res.returncode == 0
 
-    def dispatch_canary(self) -> None:
+    def dispatch_canary(self) -> bool:
+        """Start a hosted Canary run on `master`; return True only when accepted (or dry-run)."""
         if self.dry_run:
-            return
-        self._run_gh_safe(
+            return True
+        res = self._run_gh_safe(
             "workflow",
             "run",
             "canary.yml",
@@ -277,6 +309,27 @@ class GitHubOps:
             "-f",
             "force=true",
         )
+        return res is not None and res.returncode == 0
+
+    def workflow_runs(self, workflow: str, *, limit: int = 20) -> list[dict[str, Any]] | None:
+        """Recent `master` runs of `workflow` in any status, or `None` on API failure."""
+        res = self._run_gh_safe(
+            "api", f"repos/{self.repo}/actions/workflows/{workflow}/runs?branch=master&per_page={limit}"
+        )
+        if res is None or res.returncode != 0:
+            return None
+        try:
+            runs = json.loads(res.stdout).get("workflow_runs")
+        except json.JSONDecodeError:
+            return None
+        return runs if isinstance(runs, list) else None
+
+    def cancel_run(self, run_id: int) -> bool:
+        """Cancel a queued or running workflow run; return True only when accepted (or dry-run)."""
+        if self.dry_run:
+            return True
+        res = self._run_gh_safe("run", "cancel", str(run_id), "--repo", self.repo)
+        return res is not None and res.returncode == 0
 
     def open_or_comment_issue(
         self,
@@ -366,18 +419,35 @@ def default_worktree_runner(
     """Return a WorktreePredicate executing `command` with scrubbed env, timeout, and optional OS isolation."""
 
     def _run(wt: Path) -> tuple[RunVerdict, str]:
+        if cargo_target_dir is not None:
+            # nextest keeps its store at `<workspace>/target/nextest` whatever
+            # `CARGO_TARGET_DIR` says, and the isolated runner cannot write the bot-owned
+            # worktree. Point the worktree's `target` at the target dir the runner owns.
+            cargo_target_dir.mkdir(parents=True, exist_ok=True)
+            worktree_target = wt / "target"
+            if not worktree_target.exists() and not worktree_target.is_symlink():
+                worktree_target.symlink_to(cargo_target_dir.resolve(), target_is_directory=True)
         with tempfile.TemporaryDirectory(prefix="mdk-pred-home-") as home_tmp:
             sandbox = Path(home_tmp)
             env = build_sanitized_predicate_env(
                 sandbox_home=sandbox,
                 cargo_target_dir=cargo_target_dir,
             )
+            # Git refuses a repository another user owns ("dubious ownership"), and the
+            # isolated runner never owns the bot's worktree: trust exactly this one.
+            env.update(
+                {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": str(wt.resolve())}
+            )
             if runner_prefix:
                 # Pass scrubbed env explicitly after `runner_prefix` so `sudo`'s default
                 # `env_reset` does not drop `CARGO_TARGET_DIR`, `ODIN`, or `ANDROID_NDK_HOME`.
                 os.chmod(sandbox, 0o777)
                 env_pairs = [f"{k}={v}" for k, v in sorted(env.items())]
-                argv = [*runner_prefix, "env", "-i", *env_pairs, *command]
+                # A private TMPDIR the runner creates and removes itself: gates write fixed
+                # paths under TMPDIR that the bot's own Canary runs also use, and the bot
+                # cannot delete files the runner writes.
+                private_tmp = ("sh", "-c", 'TMPDIR="$(mktemp -d)" && export TMPDIR && trap \'rm -rf "$TMPDIR"\' EXIT && "$@"', "sh")
+                argv = [*runner_prefix, "env", "-i", *env_pairs, *private_tmp, *command]
             else:
                 argv = list(command)
             try:
@@ -385,15 +455,17 @@ def default_worktree_runner(
                     argv,
                     cwd=wt,
                     env=env,
-                    capture_output=True,
+                    # One chronological stream, so the log tail the classifier reads is the
+                    # end of the run (cargo writes its progress and errors to stderr).
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
                     check=False,
                     timeout=timeout_secs,
                 )
             except subprocess.TimeoutExpired:
                 return RunVerdict.INCONCLUSIVE, f"command timed out after {timeout_secs}s"
-            output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
-            return evaluate_command_result(proc.returncode, output, command)
+            return evaluate_command_result(proc.returncode, proc.stdout or "", command)
 
     return _run
 
@@ -780,6 +852,67 @@ class BisectController:
             escalated = True
         return escalated
 
+    def _contains_fix_attempt(self, incident: IncidentRecord, sha: str) -> bool | None:
+        """Whether `sha` includes a commit merged after `incident` froze the tree, or `None` if unknown.
+
+        While frozen only `tree-fix` and `revert` PRs merge, so any such commit is a fix
+        attempt; squash merges carry their merge time as the committer date. Unknown covers
+        a commit not fetched yet, a missing commit or freeze time, and git failures.
+        """
+        if not sha or incident.started_at <= 0:
+            return None
+        try:
+            res = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.repo),
+                    "rev-list",
+                    "--count",
+                    f"--since={datetime.fromtimestamp(incident.started_at, timezone.utc):%Y-%m-%dT%H:%M:%SZ}",
+                    f"{incident.tip_sha}..{sha}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if res.returncode != 0 or not res.stdout.strip().isdigit():
+            return None
+        return int(res.stdout) > 0
+
+    def supersede_doomed_hosted_runs(self, master_ref: str = "origin/master") -> list[dict[str, Any]]:
+        """While hosted Canary is frozen, cancel runs that cannot clear it and make sure `master` gets one.
+
+        `canary.yml` runs one at a time, so a run on a commit without any fix attempt (certain to
+        fail again) otherwise holds the tree red while the run that could clear it waits behind it.
+        A run that contains a fix attempt is kept, since it may clear the tree first.
+        """
+        incident = self.state.active_incidents.get("hosted_canary")
+        master_sha = resolve_commit(self.repo, master_ref)
+        if incident is None or not master_sha or self._contains_fix_attempt(incident, master_sha) is not True:
+            return []
+        runs = self.github.workflow_runs("canary.yml")
+        if runs is None:
+            return [{"source": "canary.yml", "result": "runs_api_error"}]
+        actions: list[dict[str, Any]] = []
+        for run in runs:
+            sha = str(run.get("head_sha") or "")
+            # Cancel only what git proves holds no fix: an unknown run may be a newer tree-fix.
+            if run.get("status") == "completed" or sha == master_sha or self._contains_fix_attempt(incident, sha) is not False:
+                continue
+            cancelled = self.github.cancel_run(int(run.get("id") or 0))
+            actions.append(
+                {"source": "canary.yml", "run_id": str(run.get("id")), "result": "cancelled" if cancelled else "cancel_failed"}
+            )
+        if not any(
+            str(run.get("head_sha") or "") == master_sha and run.get("conclusion") != "cancelled" for run in runs
+        ):
+            dispatched = self.github.dispatch_canary()
+            actions.append({"source": "canary.yml", "sha": master_sha[:9], "result": "dispatched" if dispatched else "dispatch_failed"})
+        return actions
+
     def _record_open_revert_command(self, culprit_sha: str, command: tuple[str, ...]) -> None:
         if not command:
             return
@@ -863,6 +996,7 @@ class BisectController:
         master_ref: str,
         command: tuple[str, ...],
         fetch_remote: bool,
+        exec_in_wt: Callable[[Path, float | None], tuple[RunVerdict, str]] | None = None,
     ) -> tuple[str, str]:
         """Re-check fresh `master_ref` before triggering Meltdown on an unverified failure.
 
@@ -877,10 +1011,11 @@ class BisectController:
         if master_sha is None:
             return "deferred", f"could not resolve {master_ref} before freezing; will retry"
         verify_deadline = self.now_fn() + self.timeout_secs
+        runner = exec_in_wt or (lambda wt, dl: self._exec_in_wt(wt, command, deadline=dl))
         verdict, detail = run_in_detached_worktree(
             self.repo,
             master_sha,
-            lambda wt: self._exec_in_wt(wt, command, deadline=verify_deadline),
+            lambda wt: runner(wt, verify_deadline),
             worktree_root=self.worktree_root,
             deadline=verify_deadline,
             now_fn=self.now_fn,
@@ -1054,6 +1189,117 @@ class BisectController:
         )
         return True
 
+    def _reset_unreproducible_counters(self, source: str, *, enabled: bool) -> None:
+        if enabled:
+            self.state.consecutive_unreproducible_reds[source] = 0
+            self.state.last_unreproducible_attempt.pop(source, None)
+
+    def _handle_known_flake(
+        self,
+        signal: FailureSignal,
+        classification: ClassificationResult,
+        *,
+        seen_key: str,
+        reset_sibling_counters: bool,
+    ) -> tuple[ClassificationResult, BisectOutcome | None]:
+        rerun_status = self._rerun_once(signal.run_id)
+        if rerun_status == "failed":
+            return classification, None
+        self._reset_unreproducible_counters(signal.source, enabled=reset_sibling_counters)
+        self.state.mark_seen(seen_key)
+        flake_key = signal.failed_test or signal.failed_job
+        counter_key = f"{signal.source}:{flake_key}"
+        hits = self.state.consecutive_flake_blocks.get(counter_key, 0) + 1
+        self.state.consecutive_flake_blocks[counter_key] = hits
+        self._persist()
+        run_line = f"\n\nRun: {signal.run_url}" if signal.run_url else ""
+        self.github.open_or_comment_issue(
+            title=f"Flaky: {flake_key}",
+            body=(
+                f"Canary hit known flake `{flake_key}` on `{signal.tip_sha[:9]}`: "
+                f"{sanitize_single_line(classification.reason)}{run_line}"
+            ),
+            issue_number=classification.matched_issue,
+        )
+        if hits >= 2:
+            ref_suffix = f": {signal.run_url}" if signal.run_url else ""
+            self.alerter.notify_engineering_group(
+                f"MDK known flake `{flake_key}` blocked {signal.source} {hits} times in a row{ref_suffix}"
+            )
+        return classification, None
+
+    def _handle_new_intermittent(
+        self,
+        signal: FailureSignal,
+        classification: ClassificationResult,
+        *,
+        open_issues: list[dict[str, Any]],
+        seen_key: str,
+        reset_sibling_counters: bool,
+    ) -> tuple[ClassificationResult, BisectOutcome | None]:
+        self._reset_unreproducible_counters(signal.source, enabled=reset_sibling_counters)
+        self.state.mark_seen(seen_key)
+        key = signal.failed_test or signal.failed_job
+        hits = self.state.intermittent_hits.get(key, 0) + 1
+        self.state.intermittent_hits[key] = hits
+        self._persist()
+        issue_title = f"New-Intermittent: {key}"
+        existing_issue = match_issue_by_title(issue_title, open_issues)
+        run_line = f"\n\nRun: {signal.run_url}" if signal.run_url else ""
+        body = (
+            f"Suspected new intermittent failure in `{key}` across "
+            f"`{signal.baseline_sha[:9]}..{signal.tip_sha[:9]}` "
+            f"(hit #{hits}; {sanitize_single_line(classification.reason)}).{run_line}"
+        )
+        self.github.open_or_comment_issue(
+            title=issue_title,
+            body=body,
+            issue_number=existing_issue,
+        )
+        ref_suffix = f": {signal.run_url}" if signal.run_url else ""
+        self.alerter.notify_engineering_group(
+            f"MDK New-Intermittent ({key}, hit #{hits}) in {signal.baseline_sha[:9]}..{signal.tip_sha[:9]}{ref_suffix}"
+        )
+        return classification, None
+
+    def _handle_contradiction(
+        self,
+        signal: FailureSignal,
+        *,
+        matched_issue: int | None,
+        tracker: _RevisionVerdictTracker,
+        open_issues: list[dict[str, Any]],
+        seen_key: str,
+        reset_sibling_counters: bool,
+    ) -> tuple[ClassificationResult, BisectOutcome | None]:
+        detail = tracker.detail()
+        if matched_issue is not None:
+            downgraded = ClassificationResult(
+                bucket=Bucket.KNOWN_FLAKE,
+                reason=(
+                    f"{detail}; matches open flake issue #{matched_issue} "
+                    f"for {signal.failed_test or signal.failed_job}"
+                ),
+                matched_issue=matched_issue,
+            )
+            return self._handle_known_flake(
+                signal,
+                downgraded,
+                seen_key=seen_key,
+                reset_sibling_counters=reset_sibling_counters,
+            )
+        downgraded = ClassificationResult(
+            bucket=Bucket.NEW_INTERMITTENT,
+            reason=f"{detail}; non-deterministic failure (never auto-reverted or frozen)",
+        )
+        return self._handle_new_intermittent(
+            signal,
+            downgraded,
+            open_issues=open_issues,
+            seen_key=seen_key,
+            reset_sibling_counters=reset_sibling_counters,
+        )
+
     def handle_failure(
         self,
         signal: FailureSignal,
@@ -1072,16 +1318,27 @@ class BisectController:
         eff_attempt = attempt_key or self._attempt_key_from_run_id(signal.run_id)
         open_issues = self.github.open_flake_issues()
         effective_deadline = poll_deadline if poll_deadline is not None else (self.now_fn() + self.bisect_budget_secs)
-        classification = classify_failure(
-            signal,
-            run_on_sha=lambda sha, cmd: run_in_detached_worktree(
+        tracker = _RevisionVerdictTracker()
+
+        def run_for_classify(sha: str, cmd: tuple[str, ...]) -> tuple[RunVerdict, str]:
+            def exec_and_record(wt: Path) -> tuple[RunVerdict, str]:
+                verdict, detail = self._exec_in_wt(wt, cmd, deadline=effective_deadline)
+                if cmd == signal.command and verdict != RunVerdict.INCONCLUSIVE:
+                    tracker.record(resolve_commit(wt, "HEAD"), verdict)
+                return verdict, detail
+
+            return run_in_detached_worktree(
                 self.repo,
                 sha,
-                lambda wt: self._exec_in_wt(wt, cmd, deadline=effective_deadline),
+                exec_and_record,
                 worktree_root=self.worktree_root,
                 deadline=effective_deadline,
                 now_fn=self.now_fn,
-            ),
+            )
+
+        classification = classify_failure(
+            signal,
+            run_on_sha=run_for_classify,
             open_flake_issues=open_issues,
             stress_count=self.stress_count,
         )
@@ -1104,9 +1361,7 @@ class BisectController:
             rerun_status = self._rerun_once(signal.run_id)
             if rerun_status == "failed":
                 return classification, None
-            if reset_sibling_counters:
-                self.state.consecutive_unreproducible_reds[signal.source] = 0
-                self.state.last_unreproducible_attempt.pop(signal.source, None)
+            self._reset_unreproducible_counters(signal.source, enabled=reset_sibling_counters)
             if self.state.last_infra_attempt.get(signal.source) != eff_attempt:
                 infra_count = self.state.consecutive_infra_failures.get(signal.source, 0) + 1
                 self.state.consecutive_infra_failures[signal.source] = infra_count
@@ -1128,62 +1383,22 @@ class BisectController:
 
         # Bucket 2: Known flake -> comment on existing issue, retry at most once per base run, alert on 2 blocks.
         if classification.bucket == Bucket.KNOWN_FLAKE:
-            rerun_status = self._rerun_once(signal.run_id)
-            if rerun_status == "failed":
-                return classification, None
-            if reset_sibling_counters:
-                self.state.consecutive_unreproducible_reds[signal.source] = 0
-                self.state.last_unreproducible_attempt.pop(signal.source, None)
-            self.state.mark_seen(seen_key)
-            flake_key = signal.failed_test or signal.failed_job
-            counter_key = f"{signal.source}:{flake_key}"
-            hits = self.state.consecutive_flake_blocks.get(counter_key, 0) + 1
-            self.state.consecutive_flake_blocks[counter_key] = hits
-            self._persist()
-            run_line = f"\n\nRun: {signal.run_url}" if signal.run_url else ""
-            self.github.open_or_comment_issue(
-                title=f"Flaky: {flake_key}",
-                body=(
-                    f"Canary hit known flake `{flake_key}` on `{signal.tip_sha[:9]}`: "
-                    f"{sanitize_single_line(classification.reason)}{run_line}"
-                ),
-                issue_number=classification.matched_issue,
+            return self._handle_known_flake(
+                signal,
+                classification,
+                seen_key=seen_key,
+                reset_sibling_counters=reset_sibling_counters,
             )
-            if hits >= 2:
-                ref_suffix = f": {signal.run_url}" if signal.run_url else ""
-                self.alerter.notify_engineering_group(
-                    f"MDK known flake `{flake_key}` blocked {signal.source} {hits} times in a row{ref_suffix}"
-                )
-            return classification, None
 
         # Bucket 3: Suspected new intermittent race -> comment on existing issue (or open once) and notify.
         if classification.bucket == Bucket.NEW_INTERMITTENT:
-            if reset_sibling_counters:
-                self.state.consecutive_unreproducible_reds[signal.source] = 0
-                self.state.last_unreproducible_attempt.pop(signal.source, None)
-            self.state.mark_seen(seen_key)
-            key = signal.failed_test or signal.failed_job
-            hits = self.state.intermittent_hits.get(key, 0) + 1
-            self.state.intermittent_hits[key] = hits
-            self._persist()
-            issue_title = f"New-Intermittent: {key}"
-            existing_issue = match_issue_by_title(issue_title, open_issues)
-            run_line = f"\n\nRun: {signal.run_url}" if signal.run_url else ""
-            body = (
-                f"Suspected new intermittent failure in `{key}` across "
-                f"`{signal.baseline_sha[:9]}..{signal.tip_sha[:9]}` "
-                f"(hit #{hits}; {sanitize_single_line(classification.reason)}).{run_line}"
+            return self._handle_new_intermittent(
+                signal,
+                classification,
+                open_issues=open_issues,
+                seen_key=seen_key,
+                reset_sibling_counters=reset_sibling_counters,
             )
-            self.github.open_or_comment_issue(
-                title=issue_title,
-                body=body,
-                issue_number=existing_issue,
-            )
-            ref_suffix = f": {signal.run_url}" if signal.run_url else ""
-            self.alerter.notify_engineering_group(
-                f"MDK New-Intermittent ({key}, hit #{hits}) in {signal.baseline_sha[:9]}..{signal.tip_sha[:9]}{ref_suffix}"
-            )
-            return classification, None
 
         # Bucket 5: Non-Linux, unparsed, or missing-baseline failure -> rerun once, Meltdown on 2 consecutive runs.
         if classification.bucket == Bucket.UNREPRODUCIBLE:
@@ -1228,11 +1443,29 @@ class BisectController:
             )
 
         # Bucket 4: Deterministic regression -> bounded bisect + strictly revert-only recovery.
-        if reset_sibling_counters:
-            self.state.consecutive_unreproducible_reds[signal.source] = 0
-            self.state.last_unreproducible_attempt.pop(signal.source, None)
+        # Any contradictory outcome on the same commit SHA across classification, bisect, or
+        # revert verification aborts immediately and downgrades to KNOWN_FLAKE / NEW_INTERMITTENT
+        # instead of freezing master or opening a revert PR.
+        def post_classify_exec(wt: Path, deadline: float | None) -> tuple[RunVerdict, str]:
+            if tracker.contradiction is not None:
+                return RunVerdict.INCONCLUSIVE, tracker.detail()
+            verdict, detail = self._exec_in_wt(wt, signal.command, deadline=deadline)
+            if verdict != RunVerdict.INCONCLUSIVE and tracker.record(resolve_commit(wt, "HEAD"), verdict):
+                return RunVerdict.INCONCLUSIVE, tracker.detail()
+            return verdict, detail
+
+        def _on_contradiction() -> tuple[ClassificationResult, BisectOutcome | None]:
+            return self._handle_contradiction(
+                signal,
+                matched_issue=classification.matched_issue,
+                tracker=tracker,
+                open_issues=open_issues,
+                seen_key=seen_key,
+                reset_sibling_counters=reset_sibling_counters,
+            )
+
         bisect_deadline = effective_deadline
-        bisect_predicate = lambda wt: self._exec_in_wt(wt, signal.command, deadline=bisect_deadline)
+        bisect_predicate = lambda wt: post_classify_exec(wt, bisect_deadline)
         culprit_sha, bisect_reason = bisect_culprit(
             self.repo,
             signal.baseline_sha,
@@ -1242,6 +1475,8 @@ class BisectController:
             deadline=bisect_deadline,
             now_fn=self.now_fn,
         )
+        if tracker.contradiction is not None:
+            return _on_contradiction()
         if culprit_sha is None:
             if "bisect wall-clock budget exceeded" in bisect_reason:
                 return classification, BisectOutcome(
@@ -1255,8 +1490,12 @@ class BisectController:
                     master_ref=master_ref,
                     command=signal.command,
                     fetch_remote=True,
+                    exec_in_wt=post_classify_exec,
                 )
+                if tracker.contradiction is not None:
+                    return _on_contradiction()
                 if recheck_status == "healed":
+                    self._reset_unreproducible_counters(signal.source, enabled=reset_sibling_counters)
                     self.state.mark_seen(seen_key)
                     self._persist()
                     return classification, BisectOutcome(
@@ -1272,6 +1511,7 @@ class BisectController:
                         meltdown_triggered=False,
                         reason=recheck_detail,
                     )
+            self._reset_unreproducible_counters(signal.source, enabled=reset_sibling_counters)
             reason = sanitize_single_line(f"unisolatable failure: {bisect_reason}")
             frozen = self._trigger_meltdown(
                 reason=reason,
@@ -1316,11 +1556,13 @@ class BisectController:
                 verdict, verify_detail = run_in_detached_worktree(
                     self.repo,
                     revert_head,
-                    lambda wt: self._exec_in_wt(wt, signal.command, deadline=verify_deadline),
+                    lambda wt: post_classify_exec(wt, verify_deadline),
                     worktree_root=self.worktree_root,
                     deadline=verify_deadline,
                     now_fn=self.now_fn,
                 )
+                if tracker.contradiction is not None:
+                    return _on_contradiction()
                 if verdict == RunVerdict.INCONCLUSIVE:
                     return classification, BisectOutcome(
                         culprit_sha=culprit_sha,
@@ -1336,8 +1578,12 @@ class BisectController:
                             master_ref=master_ref,
                             command=signal.command,
                             fetch_remote=True,
+                            exec_in_wt=post_classify_exec,
                         )
+                        if tracker.contradiction is not None:
+                            return _on_contradiction()
                         if recheck_status == "healed":
+                            self._reset_unreproducible_counters(signal.source, enabled=reset_sibling_counters)
                             self.state.mark_seen(seen_key)
                             self._persist()
                             return classification, BisectOutcome(
@@ -1357,6 +1603,7 @@ class BisectController:
                                 meltdown_triggered=False,
                                 reason=recheck_detail,
                             )
+                    self._reset_unreproducible_counters(signal.source, enabled=reset_sibling_counters)
                     author = self.github.commit_author_login(culprit_sha)
                     safe_reason = sanitize_single_line(
                         f"open revert PR {existing_pr} for {culprit_sha[:9]} did not fix {signal.failed_job} "
@@ -1386,6 +1633,7 @@ class BisectController:
                         meltdown_triggered=frozen,
                         reason=safe_reason,
                     )
+            self._reset_unreproducible_counters(signal.source, enabled=reset_sibling_counters)
             self._record_open_revert_command(culprit_sha, signal.command)
             self.state.mark_seen(seen_key)
             self._persist()
@@ -1403,7 +1651,7 @@ class BisectController:
         # Allocate explicit verification budget AFTER bisect completes so a slow search
         # cannot starve either the live-master recheck or the reverted-tree verification.
         revert_deadline = self.now_fn() + (2 * self.timeout_secs)
-        revert_predicate = lambda wt: self._exec_in_wt(wt, signal.command, deadline=revert_deadline)
+        revert_predicate = lambda wt: post_classify_exec(wt, revert_deadline)
         checks_summary = " ".join(signal.command)
         outcome = attempt_clean_revert(
             self.repo,
@@ -1421,7 +1669,10 @@ class BisectController:
             deadline=revert_deadline,
             now_fn=self.now_fn,
         )
+        if tracker.contradiction is not None:
+            return _on_contradiction()
         if outcome.already_healed:
+            self._reset_unreproducible_counters(signal.source, enabled=reset_sibling_counters)
             self.state.mark_seen(seen_key)
             self._persist()
             return classification, outcome
@@ -1434,6 +1685,7 @@ class BisectController:
             )
             return classification, outcome
 
+        self._reset_unreproducible_counters(signal.source, enabled=reset_sibling_counters)
         author = self.github.commit_author_login(culprit_sha) or outcome.culprit_author_login
         if outcome.clean_revert and outcome.revert_verified:
             self.state.mark_seen(seen_key)
@@ -1869,6 +2121,13 @@ class BisectController:
                     }
                 )
 
+        # 3. Stop a frozen hosted Canary from waiting on runs that cannot clear it.
+        if "canary.yml" in hosted_workflows:
+            try:
+                actions.extend(self.supersede_doomed_hosted_runs(master_ref))
+            except Exception as exc:
+                actions.append({"source": "canary.yml", "error": sanitize_single_line(f"{type(exc).__name__}: {exc}")})
+
         escalated = escalated_early or self.check_escalation()
         result: dict[str, Any] = {
             "dry_run": self.dry_run,
@@ -1883,35 +2142,127 @@ class BisectController:
         return result
 
 
+# A small nextest suite, and a git command as gates such as `changelog-gate` run one.
+SELFTEST_REPLAY_COMMANDS: tuple[tuple[str, ...], ...] = (
+    ("cargo", "nextest", "run", "--locked", "-p", "cgka-traits", "--profile", "ci"),
+    ("git", "ls-files", "--error-unmatch", "Cargo.toml"),
+)
+
+
+def selftest(
+    github: GitHubOps,
+    *,
+    repo_dir: Path,
+    worktree_root: Path,
+    cargo_target_dir: Path,
+    runner_prefix: tuple[str, ...],
+    timeout_secs: int,
+) -> list[str]:
+    """Exercise the live hosted log fetch and sandboxed replay the unit tests fake; return problems found."""
+    problems: list[str] = []
+    job_ref: tuple[int, int] | None = None
+    # A test shard's log is the one the agent must parse; planner jobs and hourly skip runs
+    # carry no nextest output, so look past them.
+    for run in github.recent_workflow_runs("canary.yml", limit=30):
+        jobs = github.jobs_for_run(int(run.get("id") or 0)) or []
+        shards = [
+            job
+            for job in jobs
+            if "/ Rust tests (" in str(job.get("name") or "") and job.get("conclusion") in {"success", "failure"}
+        ]
+        if shards:
+            job_ref = (int(run["id"]), int(shards[0]["id"]))
+            break
+    if job_ref is None:
+        problems.append("no completed Rust tests shard found in the last 30 hosted Canary runs")
+    else:
+        ref = f"(run {job_ref[0]}, job {job_ref[1]})"
+        log = github.job_log(*job_ref)
+        if log is None:
+            problems.append(f"hosted job log fetch failed {ref}")
+        elif not log.strip():
+            problems.append(f"hosted job log came back empty {ref}")
+        else:
+            cleaned = normalize_log_text(log)
+            if not (NEXTEST_PASS_RE.search(cleaned) or NEXTEST_FAIL_RE.search(cleaned)):
+                problems.append(f"hosted job log has no nextest results {ref}")
+
+    sha = resolve_commit(repo_dir, "origin/master")
+    if sha is None:
+        problems.append("origin/master is not available in --repo-dir")
+    else:
+        for command in SELFTEST_REPLAY_COMMANDS:
+            verdict, detail = run_in_detached_worktree(
+                repo_dir,
+                sha,
+                default_worktree_runner(
+                    command,
+                    timeout_secs=timeout_secs,
+                    cargo_target_dir=cargo_target_dir,
+                    runner_prefix=runner_prefix,
+                ),
+                worktree_root=worktree_root,
+            )
+            if verdict != RunVerdict.PASS:
+                problems.append(f"sandboxed `{command[0]} {command[1]}` replay on {sha[:9]} was {verdict.value}: {detail}")
+    return problems
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MDK always-on revert-only Bisect Agent")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    poll = sub.add_parser("poll", help="Run one poll pass across bare-metal and hosted Canary")
-    poll.add_argument("--repo", default="marmot-protocol/mdk")
-    poll.add_argument("--repo-dir", type=Path, default=Path("/srv/mdk/repo"))
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--repo", default="marmot-protocol/mdk")
+    common.add_argument("--repo-dir", type=Path, default=Path("/srv/mdk/repo"))
+    common.add_argument("--worktree-root", type=Path, default=Path("/srv/mdk/worktrees/bisect"))
+    common.add_argument("--cargo-target-dir", type=Path, default=Path("/srv/mdk/target-bisect"))
+    common.add_argument("--timeout-secs", type=int, default=DEFAULT_COMMAND_TIMEOUT_SECS)
+    common.add_argument(
+        "--predicate-runner-prefix",
+        default="",
+        help="Command prefix isolating build/test predicates from the signing bot UID (e.g. 'sudo -n -u mdk-runner --'); required for --live and selftest",
+    )
+
+    poll = sub.add_parser("poll", parents=[common], help="Run one poll pass across bare-metal and hosted Canary")
     poll.add_argument("--state-file", type=Path, default=Path("/srv/mdk/state/bisect-state.json"))
     poll.add_argument("--canary-status", type=Path, default=Path("/srv/mdk/state/canary-status.json"))
     poll.add_argument("--roster", type=Path, default=Path("/srv/mdk/bisect-roster.json"))
-    poll.add_argument("--worktree-root", type=Path, default=Path("/srv/mdk/worktrees/bisect"))
-    poll.add_argument("--cargo-target-dir", type=Path, default=Path("/srv/mdk/target-bisect"))
-    poll.add_argument("--timeout-secs", type=int, default=DEFAULT_COMMAND_TIMEOUT_SECS)
     poll.add_argument("--bisect-budget-secs", type=int, default=DEFAULT_BISECT_BUDGET_SECS)
     poll.add_argument("--stress-count", type=int, default=10)
-    poll.add_argument(
-        "--predicate-runner-prefix",
-        default="",
-        help="Command prefix isolating build/test predicates from the signing bot UID (e.g. 'sudo -n -u mdk-runner --'); required for --live",
-    )
     poll.add_argument("--no-fetch", action="store_true", help="Skip git fetch before polling")
     poll.add_argument("--live", action="store_true", help="Execute real pushes/PRs/alerts (default: dry-run)")
+
+    sub.add_parser(
+        "selftest",
+        parents=[common],
+        help="Fetch a real hosted Canary job log and replay a small nextest suite and a git command in the predicate sandbox",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    dry_run = not args.live
     runner_prefix = tuple(shlex.split(args.predicate_runner_prefix)) if args.predicate_runner_prefix else ()
+    if args.command == "selftest":
+        if not runner_prefix:
+            print("error: selftest requires --predicate-runner-prefix to replay as the live agent does", file=sys.stderr)
+            return 2
+        problems = selftest(
+            GitHubOps(args.repo, dry_run=True),
+            repo_dir=args.repo_dir,
+            worktree_root=args.worktree_root,
+            cargo_target_dir=args.cargo_target_dir,
+            runner_prefix=runner_prefix,
+            timeout_secs=args.timeout_secs,
+        )
+        for problem in problems:
+            print(f"selftest: FAIL: {problem}", file=sys.stderr)
+        if not problems:
+            print("selftest: ok")
+        return 1 if problems else 0
+
+    dry_run = not args.live
     if not dry_run and not runner_prefix:
         print(
             "error: --live requires --predicate-runner-prefix (e.g. 'sudo -n -u mdk-runner --') "

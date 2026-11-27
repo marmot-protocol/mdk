@@ -238,6 +238,9 @@ pub enum SliceReply {
     Closed(ClosedReason),
     /// The relay never answered.
     Unreachable(UnreachableKind),
+    /// Local finite-request queue capacity stayed full before any REQ went out;
+    /// the relay was never asked.
+    Busy,
 }
 
 /// A relay's answer for every event of one second.
@@ -259,6 +262,9 @@ pub enum SecondReply {
     Inconclusive,
     Closed(ClosedReason),
     Unreachable(UnreachableKind),
+    /// Local finite-request queue capacity stayed full before any REQ went out;
+    /// the relay was never asked.
+    Busy,
 }
 
 /// One relay, as a sweep sees it. Implementations issue one filter per REQ,
@@ -427,6 +433,9 @@ pub enum SweepEnd {
     RateLimited,
     Refused(ClosedReason),
     Unreachable(UnreachableKind),
+    /// Local finite-request queue capacity stayed full before a REQ could be
+    /// admitted; neither the relay's nor the route's fault.
+    LocalBusy,
     SinkFailed,
     StoreFailed,
 }
@@ -442,6 +451,7 @@ impl SweepEnd {
             Self::RateLimited => "rate_limited",
             Self::Refused(_) => "refused",
             Self::Unreachable(_) => "unreachable",
+            Self::LocalBusy => "local_busy",
             Self::SinkFailed => "sink_failed",
             Self::StoreFailed => "store_failed",
         }
@@ -508,6 +518,7 @@ impl SweepReport {
             SweepEnd::Cancelled => SweepOutcomeKind::Cancelled,
             SweepEnd::Unreachable(_) => SweepOutcomeKind::RelayUnreachable,
             SweepEnd::Refused(_) | SweepEnd::RateLimited => SweepOutcomeKind::Refused,
+            SweepEnd::LocalBusy => SweepOutcomeKind::Unanswered,
             SweepEnd::DeadlineReached if self.stats.answers == 0 => SweepOutcomeKind::Unanswered,
             SweepEnd::DeadlineReached
             | SweepEnd::SaturatedSecond { .. }
@@ -708,6 +719,7 @@ where
                     Refusal::Stop(end) => return end,
                 },
                 SliceReply::Unreachable(kind) => return SweepEnd::Unreachable(kind),
+                SliceReply::Busy => return SweepEnd::LocalBusy,
                 SliceReply::Answered {
                     events,
                     received,
@@ -791,6 +803,7 @@ where
                     Refusal::Stop(end) => Some(end),
                 },
                 SecondReply::Unreachable(kind) => Some(SweepEnd::Unreachable(kind)),
+                SecondReply::Busy => Some(SweepEnd::LocalBusy),
             };
         }
     }

@@ -179,7 +179,7 @@ async fn recovery_announced_key() {
     .unwrap();
     let slot = DeviceSlotId::try_from(hex::decode(&lifecycle.stable_slot_id).unwrap()).unwrap();
     let mut roster = DeviceRosterV1 {
-        leaf_tag_key: [0x31; 32],
+        leaf_tag_key: [0x31; 32].into(),
         ..DeviceRosterV1::default()
     };
     roster.devices.insert(

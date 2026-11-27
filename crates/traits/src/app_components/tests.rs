@@ -252,6 +252,9 @@ fn blossom_image_codec_rejects_oversized_length_before_reading_body() {
 
 #[test]
 fn blossom_image_debug_redacts_cryptographic_fields() {
+    fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    assert_zeroize_on_drop::<GroupBlossomImageV1>();
+
     let image = GroupBlossomImageV1 {
         image_hash: vec![222; 32],
         image_key: vec![223; 32],

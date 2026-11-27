@@ -93,13 +93,14 @@ pub(crate) fn selected_preview_tx(
     conn: &rusqlite::Connection,
     row: &ChatListRow,
 ) -> StorageResult<SelectedChatPreview> {
+    let group_id_hex = canonical_group_id_hex(&row.group_id_hex);
     // SQL bounds the returned text before Rust allocation; even a huge
     // selected draft never crosses this boundary whole.
     let bytes: Option<Vec<u8>> = conn
         .query_row_cached(
             "SELECT coalesce(substr(CAST(trim(content, ?2) AS BLOB), 1, ?3), x'') FROM message_drafts WHERE group_id_hex=?1",
             params![
-                row.group_id_hex,
+                group_id_hex.as_ref(),
                 DRAFT_WHITE_SPACE,
                 ((CHAT_LIST_DRAFT_PREVIEW_CHARS + 1) * 4) as i64
             ],
@@ -136,7 +137,7 @@ pub(crate) fn selected_preview_tx(
         let mut attachment_count = 0u64;
         let mut attachment_kind = None;
         let kinds = statement
-            .query_map([&row.group_id_hex], |r| {
+            .query_map([group_id_hex.as_ref()], |r| {
                 Ok((r.get::<_, u32>(0)?, super::nonnegative(r, 1)?))
             })
             .storage()?;

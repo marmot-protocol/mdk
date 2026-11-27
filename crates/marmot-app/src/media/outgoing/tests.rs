@@ -254,6 +254,7 @@ async fn upload_with(
         },
         &BlossomHttpTransport::new(true),
         control,
+        &crate::runtime::account_worker::WorkerTaskScope::new(),
     )
     .await
 }

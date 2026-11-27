@@ -1,5 +1,7 @@
 //! `marmot.group.blossom.image.v1` component state and codec.
 
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
 use super::codec::{decode_var_bytes, encode_component_vectors};
 
 const IMAGE_HASH_LEN: usize = 32;
@@ -33,6 +35,15 @@ impl std::fmt::Debug for GroupBlossomImageV1 {
     }
 }
 
+impl Drop for GroupBlossomImageV1 {
+    fn drop(&mut self) {
+        self.image_key.zeroize();
+        self.image_upload_key.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for GroupBlossomImageV1 {}
+
 impl GroupBlossomImageV1 {
     pub fn is_present(&self) -> bool {
         !self.image_hash.is_empty()
@@ -63,10 +74,17 @@ pub fn encode_group_blossom_image_v1(image: &GroupBlossomImageV1) -> Result<Vec<
 pub fn decode_group_blossom_image_v1(bytes: &[u8]) -> Result<GroupBlossomImageV1, String> {
     let mut cursor = bytes;
     let image_hash = decode_var_bytes(&mut cursor, IMAGE_HASH_LEN, "group image hash")?;
-    let image_key = decode_var_bytes(&mut cursor, IMAGE_KEY_LEN, "group image key")?;
+    let mut image_key = Zeroizing::new(decode_var_bytes(
+        &mut cursor,
+        IMAGE_KEY_LEN,
+        "group image key",
+    )?);
     let image_nonce = decode_var_bytes(&mut cursor, IMAGE_NONCE_LEN, "group image nonce")?;
-    let image_upload_key =
-        decode_var_bytes(&mut cursor, IMAGE_UPLOAD_KEY_LEN, "group image upload key")?;
+    let mut image_upload_key = Zeroizing::new(decode_var_bytes(
+        &mut cursor,
+        IMAGE_UPLOAD_KEY_LEN,
+        "group image upload key",
+    )?);
     let media_type = decode_var_bytes(&mut cursor, MEDIA_TYPE_MAX_LEN, "group image media type")?;
     if !cursor.is_empty() {
         return Err("group image component has trailing bytes".into());
@@ -75,9 +93,9 @@ pub fn decode_group_blossom_image_v1(bytes: &[u8]) -> Result<GroupBlossomImageV1
         .map_err(|e| format!("group image media type is not UTF-8: {e}"))?;
     let image = GroupBlossomImageV1 {
         image_hash,
-        image_key,
+        image_key: std::mem::take(&mut *image_key),
         image_nonce,
-        image_upload_key,
+        image_upload_key: std::mem::take(&mut *image_upload_key),
         media_type,
     };
     if !image.is_present() {

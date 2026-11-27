@@ -63,6 +63,7 @@ impl SqliteAppStorage {
         source_epoch: u64,
         now: u64,
     ) -> StorageResult<Option<Vec<u8>>> {
+        let group = canonical_group_id_hex(group);
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let count: i64 = conn
@@ -81,7 +82,7 @@ impl SqliteAppStorage {
                          token,group_id_hex,source_epoch,plaintext_digest,bytes,expires_at)
                      VALUES(randomblob(16),?1,?2,zeroblob(32),x'',?3) RETURNING token",
                     params![
-                        group,
+                        group.as_ref(),
                         u64_to_i64(source_epoch)?,
                         u64_to_i64(now.saturating_add(UPLOAD_TTL_SECONDS))?
                     ],
@@ -131,10 +132,11 @@ impl SqliteAppStorage {
         after: Option<&AttachmentUploadOwner>,
         limit: usize,
     ) -> StorageResult<Vec<AttachmentUploadOwner>> {
+        let after_group = after.map(|owner| canonical_group_id_hex(&owner.group_id_hex));
         let (token, group, message) = after.map_or((&[][..], "", ""), |owner| {
             (
                 owner.token.as_slice(),
-                owner.group_id_hex.as_str(),
+                after_group.as_deref().unwrap_or(""),
                 owner.message_id_hex.as_str(),
             )
         });
@@ -224,7 +226,7 @@ impl SqliteAppStorage {
     ) -> AttachmentUploadPromotion {
         AttachmentUploadPromotion {
             storage: self.clone(),
-            group: group.to_owned(),
+            group: canonical_group_id_hex(group).into_owned(),
             message: message.to_owned(),
             token: token.to_vec(),
             clock,
@@ -519,6 +521,11 @@ fn storage_from_catalog(error: media_store::CatalogError) -> StorageError {
         media_store::CatalogError::Closed => StorageError::Closed("media catalog is closed".into()),
         media_store::CatalogError::Capacity => {
             StorageError::Capacity("media catalog is full".into())
+        }
+        media_store::CatalogError::Backend(message)
+            if message == crate::app::media_catalog::CATALOG_BUSY_DETAIL =>
+        {
+            StorageError::Busy(message)
         }
         media_store::CatalogError::Backend(message) => StorageError::Backend(message),
     }

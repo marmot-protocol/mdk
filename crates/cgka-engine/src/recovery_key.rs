@@ -24,6 +24,7 @@
 
 use crate::engine::Engine;
 use crate::history_key::{open_with_label, seal_with_label};
+use cgka_traits::SecretBytes;
 use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageProvider;
 use openmls_traits::crypto::OpenMlsCrypto;
@@ -88,7 +89,7 @@ pub fn open_with_recovery_key<C: OpenMlsCrypto>(
     entropy: &[u8; RECOVERY_ENTROPY_LEN],
     context: &[u8],
     sealed: &[u8],
-) -> Result<Option<Vec<u8>>, EngineError> {
+) -> Result<Option<SecretBytes>, EngineError> {
     let pair = derive_recovery_key_pair(crypto, entropy)?;
     Ok(open_with_label(
         crypto,
@@ -126,7 +127,7 @@ impl<S: StorageProvider> Engine<S> {
         entropy: &[u8; RECOVERY_ENTROPY_LEN],
         context: &[u8],
         sealed: &[u8],
-    ) -> Result<Option<Vec<u8>>, EngineError> {
+    ) -> Result<Option<SecretBytes>, EngineError> {
         open_with_recovery_key(&self.crypto, entropy, context, sealed)
     }
 }
@@ -188,7 +189,7 @@ mod tests {
 
         assert_eq!(
             open_with_recovery_key(&crypto, &entropy, CONTEXT, &sealed).unwrap(),
-            Some(b"archive key".to_vec())
+            Some(SecretBytes::new(b"archive key".to_vec()))
         );
         assert_eq!(
             open_with_recovery_key(&crypto, &entropy, b"another", &sealed).unwrap(),
@@ -253,7 +254,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             open_with_recovery_key(&crypto, &entropy, CONTEXT, &independently_sealed).unwrap(),
-            Some(b"independent backup".to_vec()),
+            Some(SecretBytes::new(b"independent backup".to_vec())),
         );
         let as_history = seal_history(
             &crypto,
@@ -280,6 +281,30 @@ mod tests {
                 &as_backup
             ),
             None
+        );
+    }
+
+    #[test]
+    fn open_with_recovery_key_result_debug_redacts_decrypted_bytes() {
+        let crypto = RustCrypto::default();
+        let entropy = [9; RECOVERY_ENTROPY_LEN];
+        let public = derive_recovery_key_pair(&crypto, &entropy).unwrap().public;
+        let plaintext = [0xba, 0xad, 0xf0, 0x0d, 0x55, 0xaa, 0x11, 0xee];
+        let sealed = seal_to_recovery_key(&crypto, &public, CONTEXT, &plaintext).unwrap();
+
+        let opened = open_with_recovery_key(&crypto, &entropy, CONTEXT, &sealed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened.as_slice(), &plaintext);
+
+        let rendered = format!("{opened:?}");
+        assert!(
+            rendered.contains("<redacted>"),
+            "open_with_recovery_key Debug must show redaction marker: {rendered}"
+        );
+        assert!(
+            !rendered.contains("186, 173, 240, 13") && !rendered.contains("baadf00d"),
+            "open_with_recovery_key Debug must not expose decrypted bytes: {rendered}"
         );
     }
 }

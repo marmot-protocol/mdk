@@ -333,7 +333,7 @@ async fn a_confirmed_link_creates_a_hidden_device_group_both_devices_trust() {
     // The creating device draws the tag key at random, and the laptop holds the
     // same one.
     let leaf_tag_key = roster(&phone, &group).leaf_tag_key;
-    assert_ne!(leaf_tag_key, [0; 32]);
+    assert_ne!(*leaf_tag_key, [0; 32]);
     assert_eq!(roster(&laptop, &group).leaf_tag_key, leaf_tag_key);
 
     // A roster update reaches the laptop and is never projected either.
@@ -1047,6 +1047,49 @@ async fn a_device_group_welcome_stays_out_of_host_redelivery() {
     relay.fail_publishes_of_kind(1059);
     let group = phone.dev_create_device_group(link).await.unwrap();
     let group_hex = hex::encode(group.as_slice());
+    let pending = phone_app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .list_pending_welcome_deliveries()
+        .unwrap();
+    let device_welcome = pending
+        .iter()
+        .find(|record| record.group_id_hex == group_hex)
+        .expect("the Welcome stays queued");
+    assert!(phone.pending_welcome_deliveries().unwrap().is_empty());
+    assert!(phone.take_pending_welcome_delivery_events().is_empty());
+
+    relay.allow_all_publish_kinds();
+    let published_before = relay.published_event_ids();
+    let error = phone
+        .redeliver_welcome(&device_welcome.message_id_hex)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.as_engine_error(),
+            Some(cgka_traits::EngineError::Storage(
+                cgka_traits::storage::StorageError::NotFound
+            ))
+        ),
+        "host redeliver_welcome must reject the device group's Welcome as engine Storage::NotFound, got {error:?}"
+    );
+    let missing_error = phone.redeliver_welcome(&"ff".repeat(32)).await.unwrap_err();
+    assert!(
+        matches!(
+            missing_error.as_engine_error(),
+            Some(cgka_traits::EngineError::Storage(
+                cgka_traits::storage::StorageError::NotFound
+            ))
+        ),
+        "host redeliver_welcome must report an unknown Welcome as engine Storage::NotFound, got {missing_error:?}"
+    );
+    assert_eq!(
+        relay.published_event_ids(),
+        published_before,
+        "rejected device-group Welcome must not be published"
+    );
     assert!(
         phone_app
             .account_storage("alice")
@@ -1055,11 +1098,9 @@ async fn a_device_group_welcome_stays_out_of_host_redelivery() {
             .list_pending_welcome_deliveries()
             .unwrap()
             .iter()
-            .any(|record| record.group_id_hex == group_hex),
-        "the Welcome stays queued"
+            .any(|record| record.message_id_hex == device_welcome.message_id_hex),
+        "rejected host redelivery must leave the internal pending Welcome queued"
     );
-    assert!(phone.pending_welcome_deliveries().unwrap().is_empty());
-    assert!(phone.take_pending_welcome_delivery_events().is_empty());
 }
 
 /// The host never learns of the device group through a surface built from
@@ -2468,7 +2509,7 @@ async fn each_device_keeps_its_history_key_in_its_own_entry() {
         .unwrap();
     assert_eq!(
         laptop.runtime.open_history(context, &sealed).unwrap(),
-        Some(b"bundle".to_vec())
+        Some(cgka_traits::SecretBytes::new(b"bundle".to_vec()))
     );
     assert_eq!(phone.runtime.open_history(context, &sealed).unwrap(), None);
 

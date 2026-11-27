@@ -2,7 +2,7 @@
 //! it joined through a link whose first commit has not landed yet (mdk#2628
 //! item 3.3b, D40). See migration 0133 for the states.
 
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, params};
@@ -70,6 +70,7 @@ impl SqliteAppStorage {
         leaf_signature_key_hex: &str,
         linked_at: u64,
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .execute_cached(
                 "INSERT INTO device_links
@@ -84,7 +85,7 @@ impl SqliteAppStorage {
                      decided_at = NULL,
                      welcome_withdrawn = 0",
                 params![
-                    group_id_hex,
+                    group_id_hex.as_ref(),
                     slot_hex,
                     key_package_ref_hex,
                     leaf_signature_key_hex,
@@ -103,13 +104,14 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         slot_hex: &str,
     ) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let changed = self
             .lock()?
             .execute_cached(
                 "UPDATE device_links SET welcome_withdrawn = 1
                  WHERE group_id_hex = ?1 AND slot_hex = ?2 AND outcome = 'failed'
                      AND welcome_withdrawn = 0",
-                params![group_id_hex, slot_hex],
+                params![group_id_hex.as_ref(), slot_hex],
             )
             .storage()?;
         Ok(changed != 0)
@@ -120,10 +122,11 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         slot_hex: &str,
     ) -> StorageResult<Option<DeviceLinkRecord>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .query_row_cached(
                 &format!("{SELECT_LINK} WHERE group_id_hex = ?1 AND slot_hex = ?2"),
-                params![group_id_hex, slot_hex],
+                params![group_id_hex.as_ref(), slot_hex],
                 device_link_row,
             )
             .optional()
@@ -161,13 +164,14 @@ impl SqliteAppStorage {
                 "a device link ends linked or failed".into(),
             ));
         }
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let changed = self
             .lock()?
             .execute_cached(
                 "UPDATE device_links SET outcome = ?3, decided_at = ?4
                  WHERE group_id_hex = ?1 AND slot_hex = ?2 AND outcome = 'pending'",
                 params![
-                    group_id_hex,
+                    group_id_hex.as_ref(),
                     slot_hex,
                     outcome.as_str(),
                     u64_to_i64(decided_at)?
@@ -184,11 +188,12 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         joined_at: u64,
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .execute_cached(
                 "INSERT INTO device_group_joins (group_id_hex, joined_at) VALUES (?1, ?2)
                  ON CONFLICT (group_id_hex) DO NOTHING",
-                params![group_id_hex, u64_to_i64(joined_at)?],
+                params![group_id_hex.as_ref(), u64_to_i64(joined_at)?],
             )
             .storage()?;
         Ok(())
@@ -218,11 +223,12 @@ impl SqliteAppStorage {
     /// Forget a join: its first commit landed, or the device left the
     /// group. Returns whether there was one.
     pub fn delete_device_group_join(&self, group_id_hex: &str) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let changed = self
             .lock()?
             .execute_cached(
                 "DELETE FROM device_group_joins WHERE group_id_hex = ?1",
-                params![group_id_hex],
+                params![group_id_hex.as_ref()],
             )
             .storage()?;
         Ok(changed != 0)

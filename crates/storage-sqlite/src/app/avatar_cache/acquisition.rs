@@ -1,7 +1,7 @@
 //! Durable, bounded acquisition intent. Network/source policy belongs to marmot-app.
 use super::*;
 use crate::SqliteAppStorage;
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use crate::{ChatPresentationRead, ChatPresentationVersion, SelectedAvatar};
 
 macro_rules! encrypted_avatar_only {
@@ -147,9 +147,10 @@ impl SqliteAppStorage {
         old: Option<&SelectedAvatar>,
         selected: &SelectedAvatar,
     ) -> StorageResult<()> {
+        let group = canonical_group_id_hex(group);
         if old != Some(selected) {
             let owner = self
-                .avatar_chat_owner(group)?
+                .avatar_chat_owner(&group)?
                 .ok_or_else(|| invalid("avatar conversation missing"))?;
             self.request_avatar_acquisition(&owner, selected, false)?;
             // An unchanged presentation cannot consume upgrade work that has
@@ -157,7 +158,7 @@ impl SqliteAppStorage {
             self.lock()?
                 .execute(
                     "DELETE FROM avatar_acquisition_bootstrap WHERE group_id_hex = ?1",
-                    [group],
+                    [group.as_ref()],
                 )
                 .storage()?;
         }
@@ -402,8 +403,9 @@ impl SqliteAppStorage {
         selected: &SelectedAvatar,
         version: &ChatPresentationVersion,
     ) -> StorageResult<Option<AvatarAssetRef>> {
+        let group = canonical_group_id_hex(group);
         self.connection.with_transaction(|| {
-            let chat_owner = self.avatar_chat_owner(group)?.ok_or_else(|| invalid("avatar conversation missing"))?;
+            let chat_owner = self.avatar_chat_owner(&group)?.ok_or_else(|| invalid("avatar conversation missing"))?;
             let owner = format!("identity:{chat_owner}:{member}");
             validate_key(&owner)?;
             let current = self.identity_avatar_version_current(&owner, version)?;
@@ -417,7 +419,7 @@ impl SqliteAppStorage {
                 VALUES(?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(owner_key) DO UPDATE SET accessed = excluded.accessed,
                     profile_epoch = CASE WHEN ?7 THEN excluded.profile_epoch ELSE profile_epoch END,
                     profile_revision = CASE WHEN ?7 THEN excluded.profile_revision ELSE profile_revision END",
-                params![owner, group, member, accessed, version.store_epoch, u64_to_i64(version.revision)?, current]).storage()?;
+                params![owner, group.as_ref(), member, accessed, version.store_epoch, u64_to_i64(version.revision)?, current]).storage()?;
             conn.execute("DELETE FROM avatar_identity_demand WHERE owner_key IN
                 (SELECT owner_key FROM avatar_identity_demand ORDER BY accessed DESC, owner_key DESC LIMIT -1 OFFSET 2048)", []).storage()?;
             Ok(reference)
@@ -482,10 +484,11 @@ impl SqliteAppStorage {
                     )
                     .storage()?;
                 self.request_avatar_acquisition(&identity.owner, selected, false)?;
+                let group = canonical_group_id_hex(&identity.group);
                 self.lock()?
                     .execute(
                         "INSERT OR IGNORE INTO avatar_identity_demand(owner_key, group_id_hex, member_id_hex, accessed, profile_epoch, profile_revision) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-                        params![identity.owner, identity.group, identity.member, accessed, version.store_epoch, u64_to_i64(version.revision)?],
+                        params![identity.owner, group.as_ref(), identity.member, accessed, version.store_epoch, u64_to_i64(version.revision)?],
                     )
                     .storage()?;
             }
@@ -517,9 +520,10 @@ impl SqliteAppStorage {
 }
 
 fn owner_for_chat(conn: &Connection, group: &str) -> StorageResult<Option<String>> {
+    let group = canonical_group_id_hex(group);
     conn.query_row(
         "SELECT 'chat:' || lower(hex(presentation_row_epoch)) FROM chat_list_rows WHERE group_id_hex = ?1",
-        [group], |r| r.get(0),
+        [group.as_ref()], |r| r.get(0),
     ).optional().storage()
 }
 

@@ -74,7 +74,8 @@ no merge queue. The shipping flow is:
 2. **Fast team PR gate (`Required CI`):** Open a short PR (`.agents/skills/gh-create-pr`). Team PRs (same-repo branch
    by an author with `write`, `maintain`, or `admin` permission) run a ~1-minute static gate with zero Rust compile:
    verified commit signatures, `cargo fmt --all --check`, all static/contract gates, `cargo --locked audit`, and
-   advisory commit-trailer checks. External/fork PRs, read-only org members, and `ci:full` PRs fail closed into the full
+   commit-trailer checks (advisory, except that a Rust crate change must record `just dependents-nextest` in
+   `Local-Checks:`). External/fork PRs, read-only org members, and `ci:full` PRs fail closed into the full
    `ci.yml` matrix on GitHub-hosted runners; `ci:apple` adds both macOS jobs (`ios-account-clippy`,
    `marmotkit-native-host`) to a team PR regardless of changed paths. When Meltdown Mode sets the `tree-state` branch
    (`state.json` = `"red"`), `Required CI` fails at check time unless labelled `tree-fix` or `revert` (PRs whose
@@ -169,7 +170,7 @@ Local verification proves your change before merge, and post-merge `Canary` runs
 the full suite. Keep local runs scoped to your change: several agents usually build on the same machine, so
 workspace-wide builds and suites run locally only when a rule below calls for one. On team pull requests, `Required CI`
 runs a ~1-minute static gate (verified commit signatures, `cargo fmt --check`, static/contract gates, `cargo audit`,
-and advisory commit-trailer checks) with zero Rust compile. External/fork pull requests and PRs labelled `ci:full` run
+and commit-trailer checks, advisory except the `just dependents-nextest` record) with zero Rust compile. External/fork pull requests and PRs labelled `ci:full` run
 the full `ci.yml` matrix on GitHub-hosted runners; `ci:apple` adds both macOS jobs on a team PR regardless of changed
 paths. Master pushes only refresh CI's Rust caches, and only when a dependency or toolchain input changes.
 
@@ -177,13 +178,17 @@ While iterating, run only the test you are working on. Before each push, run onc
 
 ```sh
 cargo fmt --all
-cargo clippy -p <crate> --all-targets --all-features --locked -- -D warnings   # each crate you changed
-cargo nextest run -p <crate> -E 'test(<area>)'                                 # tests covering the change
+cargo clippy -p <crate> --all-targets --locked -- -D warnings                  # each crate you changed, default features
+cargo clippy -p <crate> --all-targets --all-features --locked -- -D warnings   # each crate you changed, all features
+just dependents-nextest                                                        # changed crates and every crate depending on one
 ```
 
-- Take test scope and required features from the nearest `AGENTS.md` Verification section. Run the tests you added
-  or edited plus the test binary or module covering the code you changed; run a whole crate's suite only when the
-  change is crate-wide.
+- `just dependents-nextest` runs the full suites of every crate you changed and of every crate that depends on one,
+  with the Canary's test features, so a change to a lower crate cannot break `marmot-session` or `marmot-app` unseen.
+  When `wn-cli` is affected it also runs its CLI end-to-end suite. Run it once per push, one at a time per machine,
+  and record it in `Local-Checks:`: `Required CI` rejects a team PR that changes a crate without it. Also run any
+  feature-gated suite the nearest `AGENTS.md` Verification section names.
+- Stress every test you added or edited, alone and without retries: `just flake-stress <crate> 'test(=<name>)' 5`.
 - Run the `just` gates the nearest `AGENTS.md` names for the files you touched. Outside crates:
   `.github/workflows/` and CI scripts → `just ci-path-classifier-gate`; installers and install docs →
   `just agent-install-docs-gate` and `just install-example-sha256-gate`; new or renamed paths → `just naming-gate`.
@@ -194,8 +199,7 @@ Widen only for these changes:
 
 - A `pub` item other crates use (type, field, enum variant, trait, signature, feature): run CI's lint once,
   `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`. It compiles every dependent and the
-  feature-gated test targets (`test-crash-hooks`, `test-policy-overrides`) that default builds skip. Test only the
-  dependents whose behavior you changed.
+  feature-gated test targets (`test-crash-hooks`, `test-policy-overrides`) that default builds skip.
 - Shared build inputs (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `Justfile`, `vendor/`) or
   `.github/workflows/`: `just fast-ci` once.
 - Convergence, delivery, branch-selection, or multi-client behavior: `just simulator-smoke` (the Canary smoke

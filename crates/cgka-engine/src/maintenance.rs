@@ -268,7 +268,7 @@ impl<S: StorageProvider> Engine<S> {
         let group = self
             .take_mls_group(group_id)?
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
-        let result = replay_rotation_required(&self.storage, group_id, &group);
+        let result = replay_rotation_required(self.storage.as_ref(), group_id, &group);
         self.return_unmodified_mls_group(group_id, group);
         result
     }
