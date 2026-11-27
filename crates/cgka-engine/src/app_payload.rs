@@ -262,7 +262,7 @@ impl<S: cgka_traits::StorageProvider> crate::engine::Engine<S> {
                 continue;
             }
             let Some(snapshot) =
-                retained_source_snapshot(&self.storage, &request.group_id, request.epoch)?
+                retained_source_snapshot(self.storage.as_ref(), &request.group_id, request.epoch)?
             else {
                 continue;
             };
@@ -283,7 +283,7 @@ impl<S: cgka_traits::StorageProvider> crate::engine::Engine<S> {
                 continue;
             };
             if let Some(source) = historical_source(
-                &self.storage,
+                self.storage.as_ref(),
                 &self.rewinds,
                 &self.crypto,
                 self.entropy.as_ref(),

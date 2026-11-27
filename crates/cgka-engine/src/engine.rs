@@ -281,7 +281,7 @@ pub(crate) struct ScheduledSelfRemoveAutoCommit {
 /// Coordinates authenticated group evolution, durable replay and native events
 /// over the caller-provided storage backend and transport peeler.
 pub struct Engine<S: StorageProvider> {
-    pub(crate) storage: S,
+    pub(crate) storage: Arc<S>,
     pub(crate) crypto: RustCrypto,
     pub(crate) identity: Identity,
     pub(crate) registry: FeatureRegistry,
@@ -823,7 +823,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
 
         let convergence_clock_instance_id = self.entropy.next_u64();
         Ok(Engine {
-            storage: self.storage,
+            storage: Arc::new(self.storage),
             crypto,
             identity,
             registry: self.registry,
@@ -1026,7 +1026,7 @@ impl<S: StorageProvider> Engine<S> {
                     // disband ended, which its candidates for this epoch hold.
                     // Rival disbands of one epoch each count as evidence.
                     let mut evidence = crate::disband::unsettled_disband_evidence(
-                        &self.storage,
+                        self.storage.as_ref(),
                         group_id,
                         EpochId(mls_group.epoch().as_u64()),
                     )?;
@@ -2482,10 +2482,16 @@ impl<S: StorageProvider> Engine<S> {
         // any read (mdk#3272), so this finds none in a group the open
         // seeded; it stays as the check full hydration has always made
         // before loading any MLS or Marmot state.
-        crate::openmls_projection::recover_interrupted_rewind_guard(&self.storage, group_id)
-            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
-        crate::openmls_projection::recover_interrupted_apply_snapshot(&self.storage, group_id)
-            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        crate::openmls_projection::recover_interrupted_rewind_guard(
+            self.storage.as_ref(),
+            group_id,
+        )
+        .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        crate::openmls_projection::recover_interrupted_apply_snapshot(
+            self.storage.as_ref(),
+            group_id,
+        )
+        .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
 
         // The one group-record read for this hydration (mdk#1161): every later
         // consumer (tombstone check, profile mirror check, pending-commit
@@ -2673,7 +2679,7 @@ impl<S: StorageProvider> Engine<S> {
                     return Err(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed);
                 }
                 crate::maintenance::rollback_recovery_stage(
-                    &self.storage,
+                    self.storage.as_ref(),
                     group_id,
                     &preparing[0].id,
                 )
@@ -2885,7 +2891,7 @@ impl<S: StorageProvider> Engine<S> {
             Some(committed) => self.backfill_committed_roster(group_id, &committed)?,
             None => {
                 let evidence = crate::disband::unsettled_disband_evidence(
-                    &self.storage,
+                    self.storage.as_ref(),
                     group_id,
                     EpochId(mls_group.epoch().as_u64()),
                 )
@@ -3223,34 +3229,25 @@ impl<S: StorageProvider> Engine<S> {
             );
             return Ok(true);
         }
-        let pending = self
-            .epoch_manager
-            .next_pending_ref()
-            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+        let prepared_pending = match self.epoch_manager.prepare_pending(
+            group_id.clone(),
+            source_epoch,
+            evolution.target_epoch,
+            cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
+            crate::epoch_manager::PendingKind::GroupEvolution,
+            None,
+        ) {
+            Ok(prepared) => prepared,
+            Err(EngineError::InvalidTransition(_)) => return recovery_failed(),
+            Err(_) => return Err(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed),
+        };
+        let pending = prepared_pending.pending_ref();
         let mut evolution = evolution;
         evolution.pending_ref = Some(pending);
         if maintenance.put_group_evolution(&evolution).is_err() {
             return recovery_failed();
         }
-        if self
-            .epoch_manager
-            .begin_pending(
-                group_id.clone(),
-                source_epoch,
-                evolution.target_epoch,
-                cgka_traits::engine_state::StagedCommitHandle::from_bytes(
-                    group_id.as_slice().to_vec(),
-                ),
-                pending,
-                crate::epoch_manager::PendingKind::GroupEvolution,
-                None,
-            )
-            .is_err()
-        {
-            evolution.pending_ref = None;
-            let _ = maintenance.put_group_evolution(&evolution);
-            return recovery_failed();
-        }
+        self.epoch_manager.commit_pending(prepared_pending);
         self.track_pending_origin_commit(pending, message_id);
         self.auto_publish_buf.push_back(cgka_traits::AutoPublish {
             msg: exact_message,
@@ -3501,7 +3498,7 @@ impl<S: StorageProvider> Engine<S> {
             hasher.update(record.id.as_slice());
             let digest = hasher.finalize();
             let processed = crate::snapshot_guard::SnapshotRollbackGuard::contained(
-                &self.storage,
+                self.storage.as_ref(),
                 &self.rewinds,
                 group_id,
                 crate::snapshot_guard::RewindSite::HydrateSelfRemove,
@@ -5120,7 +5117,7 @@ impl<S: StorageProvider> Engine<S> {
         // A contained window: its own savepoint undoes the rewind, the guard
         // included, if the restore fails.
         crate::openmls_projection::with_retained_anchor_group(
-            &self.storage,
+            self.storage.as_ref(),
             &self.rewinds,
             &self.crypto,
             group_id,
@@ -5786,6 +5783,9 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     }
 }
 
+#[cfg(test)]
+#[path = "engine/begin_pending_rollback_tests.rs"]
+mod begin_pending_rollback_tests;
 #[cfg(test)]
 #[path = "engine/rewind_gate_tests.rs"]
 mod rewind_gate_tests;

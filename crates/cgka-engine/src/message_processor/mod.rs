@@ -3039,7 +3039,9 @@ impl<S: StorageProvider> Engine<S> {
                 .map(Arc::clone);
             let before_enumeration = past_contexts
                 .as_ref()
-                .map(|_| ingest::PastPeelContextCache::replay_state(&self.storage, group_id))
+                .map(|_| {
+                    ingest::PastPeelContextCache::replay_state(self.storage.as_ref(), group_id)
+                })
                 .transpose()?
                 .flatten();
             let enumerated =
@@ -3049,7 +3051,7 @@ impl<S: StorageProvider> Engine<S> {
             self.quarantine_failed_rewinds();
             if let Some(contexts) = past_contexts {
                 let after_enumeration = if matches!(&enumerated, Ok(Some(_))) {
-                    ingest::PastPeelContextCache::replay_state(&self.storage, group_id)?
+                    ingest::PastPeelContextCache::replay_state(self.storage.as_ref(), group_id)?
                 } else {
                     None
                 };
@@ -3445,7 +3447,7 @@ impl<S: StorageProvider> Engine<S> {
             })?;
         let max_rewind_commits = policy.convergence.max_rewind_commits;
         crate::openmls_projection::candidate_branch_peel(
-            &self.storage,
+            self.storage.as_ref(),
             &self.rewinds,
             group_id,
             group.epoch.0.saturating_sub(max_rewind_commits),
@@ -3489,7 +3491,7 @@ impl<S: StorageProvider> Engine<S> {
         let max_rewind = policy.convergence.max_rewind_commits;
         let mut continuation = self.peel_replays.remove(group_id);
         let result = crate::openmls_projection::candidate_peel_slice(
-            &self.storage,
+            self.storage.as_ref(),
             &self.rewinds,
             group_id,
             group.epoch.0.saturating_sub(max_rewind),

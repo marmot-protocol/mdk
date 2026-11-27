@@ -23,6 +23,7 @@ use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{BasicCredential, MlsMessageOut};
 use openmls_traits::OpenMlsProvider as _;
 use std::collections::HashSet;
+use std::sync::Arc;
 use tls_codec::Serialize as _;
 
 /// A staged Commit's Welcome wrapped for one added KeyPackage, not yet
@@ -443,7 +444,7 @@ impl<S: StorageProvider> Engine<S> {
             Some(self.prepare_member_recovery(&group_id, &mls_group, &recovery_sources)?)
         };
         let mut pending_commit_guard =
-            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+            PendingCommitCleanupGuard::arm(Arc::clone(&self.storage), group_id.clone());
         if let Some(evolution) = &recovery_evolution {
             pending_commit_guard.set_recovery_evolution(evolution.id.clone());
             crate::test_crash_hooks::pause_if_requested("recovery_after_preparing");
@@ -587,7 +588,7 @@ impl<S: StorageProvider> Engine<S> {
             )
             .await?;
         crate::capability_manager::check_key_package_profiles(
-            &self.storage,
+            self.storage.as_ref(),
             &group_id,
             &parsed_kps,
         )?;
@@ -627,6 +628,23 @@ impl<S: StorageProvider> Engine<S> {
                 crate::group_lifecycle::projected_members_with_pending(&mls_group, &parsed_kps)?;
         }
 
+        // Validate Stable + allocate PendingStateRef before committing any
+        // durable rows so a pending-state failure leaves no orphaned SQLite
+        // Sent commit, staged Welcomes, or projected group record.
+        let prior_epoch = EpochId(mls_group.epoch().as_u64());
+        let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
+        let staged =
+            cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
+        let prepared_pending = self.epoch_manager.prepare_pending(
+            group_id.clone(),
+            prior_epoch,
+            new_epoch,
+            staged,
+            crate::epoch_manager::PendingKind::GroupEvolution,
+            self.current_audit_context.clone(),
+        )?;
+        let pending_ref = prepared_pending.pending_ref();
+
         if let Some(evolution) = recovery_evolution.as_mut() {
             // Retain ownership before writing the signed-message row. A crash
             // at either boundary can then retire every unexposed artifact.
@@ -657,24 +675,11 @@ impl<S: StorageProvider> Engine<S> {
             storage.put_group_keeping_roster(&group_record)?;
             Ok::<_, EngineError>((welcomes, content_id))
         })?;
-        self.sent_message_ids.insert(commit_msg.id.clone());
-        self.sent_message_ids.insert(content_id);
-        for welcome in &welcomes {
-            self.sent_message_ids.insert(welcome.id.clone());
-        }
 
         if recovery_evolution.is_some() {
             crate::test_crash_hooks::pause_if_requested("recovery_after_staging");
         }
 
-        // State: begin pending at the projected new epoch via EpochManager.
-        // The MLS group is still at the pre-commit epoch, so the projected
-        // post-merge epoch is +1.
-        let prior_epoch = EpochId(mls_group.epoch().as_u64());
-        let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
-        let pending_ref = self.epoch_manager.next_pending_ref()?;
-        let staged =
-            cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
         if let Some(evolution) = recovery_evolution.as_mut() {
             evolution.phase = cgka_traits::maintenance::GroupEvolutionPhase::Prepared;
             evolution.signed_message_id = Some(commit_msg.id.clone());
@@ -692,16 +697,13 @@ impl<S: StorageProvider> Engine<S> {
                 return Err(error);
             }
         }
+        self.sent_message_ids.insert(commit_msg.id.clone());
+        self.sent_message_ids.insert(content_id);
+        for welcome in &welcomes {
+            self.sent_message_ids.insert(welcome.id.clone());
+        }
         self.invalidate_deferred_peel_candidate_cache(&group_id);
-        self.epoch_manager.begin_pending(
-            group_id.clone(),
-            prior_epoch,
-            new_epoch,
-            staged,
-            pending_ref,
-            crate::epoch_manager::PendingKind::GroupEvolution,
-            self.current_audit_context.clone(),
-        )?;
+        self.epoch_manager.commit_pending(prepared_pending);
         self.audit_group(
             &group_id,
             crate::audit_helpers::epoch_state_changed_event(
@@ -901,7 +903,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
         let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+            PendingCommitCleanupGuard::arm(Arc::clone(&self.storage), group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
@@ -1021,6 +1023,19 @@ impl<S: StorageProvider> Engine<S> {
         group_record
             .members
             .retain(|member| !target_set.contains(&member.id));
+        let prior_epoch = EpochId(mls_group.epoch().as_u64());
+        let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
+        let staged =
+            cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
+        let prepared_pending = self.epoch_manager.prepare_pending(
+            group_id.clone(),
+            prior_epoch,
+            new_epoch,
+            staged,
+            crate::epoch_manager::PendingKind::GroupEvolution,
+            self.current_audit_context.clone(),
+        )?;
+        let pending_ref = prepared_pending.pending_ref();
         self.record_sent_openmls_message_with_group(
             &commit_msg,
             commit_bytes.as_slice(),
@@ -1028,21 +1043,8 @@ impl<S: StorageProvider> Engine<S> {
             pre_commit_epoch,
         )?;
 
-        let prior_epoch = EpochId(mls_group.epoch().as_u64());
-        let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
-        let pending_ref = self.epoch_manager.next_pending_ref()?;
-        let staged =
-            cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
         self.invalidate_deferred_peel_candidate_cache(&group_id);
-        self.epoch_manager.begin_pending(
-            group_id.clone(),
-            prior_epoch,
-            new_epoch,
-            staged,
-            pending_ref,
-            crate::epoch_manager::PendingKind::GroupEvolution,
-            self.current_audit_context.clone(),
-        )?;
+        self.epoch_manager.commit_pending(prepared_pending);
         self.audit_group(
             &group_id,
             crate::audit_helpers::epoch_state_changed_event(
@@ -1496,7 +1498,11 @@ impl<S: StorageProvider> Engine<S> {
         // Queued preparation bypasses the public send gate. Never encrypt
         // under an installed checkpoint's possibly reused sender generation,
         // even if a caller reaches this seam before maintenance is confirmed.
-        if crate::maintenance::replay_rotation_required(&self.storage, &group_id, &mls_group)? {
+        if crate::maintenance::replay_rotation_required(
+            self.storage.as_ref(),
+            &group_id,
+            &mls_group,
+        )? {
             self.return_unmodified_mls_group(&group_id, mls_group);
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {

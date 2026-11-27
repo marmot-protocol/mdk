@@ -61,6 +61,7 @@ use cgka_traits::transport::{EncryptedPayload, Timestamp};
 use cgka_traits::types::{EpochId, GroupId};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
+use std::sync::Arc;
 use tls_codec::Serialize as _;
 
 const INTENT: &str = "LinkDevice";
@@ -100,7 +101,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
         let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+            PendingCommitCleanupGuard::arm(Arc::clone(&self.storage), group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let roster_proposal = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
@@ -147,7 +148,7 @@ impl<S: StorageProvider> Engine<S> {
         )?;
         let parsed_kps = vec![parsed_kp];
         crate::capability_manager::check_key_package_profiles(
-            &self.storage,
+            self.storage.as_ref(),
             &group_id,
             &parsed_kps,
         )?;
@@ -181,6 +182,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let mut group_record = existing;
         group_record.members = projected_members;
+        let prepared_pending = self.prepare_device_group_commit(&group_id, pre_commit_epoch)?;
         let (welcomes, content_id) = self.storage.with_transaction(|storage| {
             let content_id = self.persist_sent_openmls_message_with_application_stamp(
                 &commit_msg,
@@ -205,8 +207,7 @@ impl<S: StorageProvider> Engine<S> {
             self.sent_message_ids.insert(welcome.id.clone());
         }
 
-        let pending_ref =
-            self.begin_device_group_commit(&group_id, pre_commit_epoch, &commit_msg)?;
+        let pending_ref = self.commit_device_group_commit(prepared_pending, &commit_msg);
         pending_commit_guard.disarm();
 
         Ok(SendResult::GroupEvolution {
@@ -271,7 +272,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
         let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+            PendingCommitCleanupGuard::arm(Arc::clone(&self.storage), group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let roster_proposal = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
@@ -347,6 +348,7 @@ impl<S: StorageProvider> Engine<S> {
         group_record
             .members
             .retain(|member| member.credential != leaf_signature_key);
+        let prepared_pending = self.prepare_device_group_commit(&group_id, pre_commit_epoch)?;
         self.record_sent_openmls_message_with_group(
             &commit_msg,
             commit_bytes.as_slice(),
@@ -354,8 +356,7 @@ impl<S: StorageProvider> Engine<S> {
             pre_commit_epoch,
         )?;
 
-        let pending_ref =
-            self.begin_device_group_commit(&group_id, pre_commit_epoch, &commit_msg)?;
+        let pending_ref = self.commit_device_group_commit(prepared_pending, &commit_msg);
         pending_commit_guard.disarm();
 
         Ok(SendResult::GroupEvolution {
@@ -365,27 +366,38 @@ impl<S: StorageProvider> Engine<S> {
         })
     }
 
-    /// Put the device group's staged link or unlink Commit pending publish.
-    fn begin_device_group_commit(
+    /// Validate and allocate the device group's pending-publish transition
+    /// before durable rows are committed.
+    fn prepare_device_group_commit(
         &mut self,
         group_id: &GroupId,
         pre_commit_epoch: EpochId,
-        commit_msg: &cgka_traits::transport::TransportMessage,
-    ) -> Result<PendingStateRef, EngineError> {
+    ) -> Result<crate::epoch_manager::PreparedPendingPublish, EngineError> {
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
-        let pending_ref = self.epoch_manager.next_pending_ref()?;
-        self.invalidate_deferred_peel_candidate_cache(group_id);
-        self.epoch_manager.begin_pending(
+        self.epoch_manager.prepare_pending(
             group_id.clone(),
             pre_commit_epoch,
             new_epoch,
             StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
-            pending_ref,
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
-        )?;
+        )
+    }
+
+    /// Infallibly install the device group's staged link or unlink Commit
+    /// once its durable rows have committed.
+    fn commit_device_group_commit(
+        &mut self,
+        prepared: crate::epoch_manager::PreparedPendingPublish,
+        commit_msg: &cgka_traits::transport::TransportMessage,
+    ) -> PendingStateRef {
+        let group_id = prepared.group_id().clone();
+        let new_epoch = prepared.new_epoch();
+        let pending_ref = prepared.pending_ref();
+        self.invalidate_deferred_peel_candidate_cache(&group_id);
+        self.epoch_manager.commit_pending(prepared);
         self.audit_group(
-            group_id,
+            &group_id,
             crate::audit_helpers::epoch_state_changed_event(
                 Some("stable"),
                 "pending_publish",
@@ -398,7 +410,7 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         self.track_pending_origin_commit(pending_ref, commit_msg.id.clone());
-        Ok(pending_ref)
+        pending_ref
     }
 
     /// Parse the KeyPackage to link: this account's, on the group's profile,

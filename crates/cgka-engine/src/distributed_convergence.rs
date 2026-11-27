@@ -630,7 +630,7 @@ impl<S: StorageProvider> Engine<S> {
                 )),
             })?;
         retain_current_group_epoch_snapshot(
-            &self.storage,
+            self.storage.as_ref(),
             group_id,
             policy.convergence.max_rewind_commits,
         )
@@ -1248,7 +1248,7 @@ impl<S: StorageProvider> Engine<S> {
             .0
             .saturating_add(policy.convergence.max_rewind_commits);
         for (message_id, source_epoch) in
-            retire_stale_convergence_deferred_commits(&self.storage, group_id, floor)?
+            retire_stale_convergence_deferred_commits(self.storage.as_ref(), group_id, floor)?
         {
             self.audit_group(
                 group_id,
@@ -2178,7 +2178,7 @@ impl<S: StorageProvider> Engine<S> {
         let result = if let Some(deadline) = deadline {
             let mut continuation = self.canonical_replays.remove(group_id);
             let result = crate::openmls_projection::canonicalize_stored_slice(
-                &self.storage,
+                self.storage.as_ref(),
                 &self.rewinds,
                 group_id,
                 state,
@@ -2207,7 +2207,7 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             self.canonical_replays.remove(group_id);
             canonicalize_stored_openmls_messages_with_profile_policy(
-                &self.storage,
+                self.storage.as_ref(),
                 &self.rewinds,
                 group_id,
                 state,

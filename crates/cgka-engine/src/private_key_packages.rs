@@ -640,7 +640,7 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Every private KeyPackage this device issued, oldest first.
     pub fn issued_private_key_packages(&self) -> Result<Vec<IssuedPrivateKeyPackage>, EngineError> {
-        Ok(private_storage(&self.storage)?.list_issued_private_key_packages()?)
+        Ok(private_storage(self.storage.as_ref())?.list_issued_private_key_packages()?)
     }
 
     /// Record whether the hand-offs of `references` are queued: before they
@@ -702,7 +702,7 @@ impl<S: StorageProvider> Engine<S> {
     /// When the earliest issued private KeyPackage expires, so maintenance
     /// can wake to discard it (mdk#3265). `None` with none issued.
     pub fn private_key_packages_next_expiry(&self) -> Result<Option<u64>, EngineError> {
-        Ok(private_storage(&self.storage)?
+        Ok(private_storage(self.storage.as_ref())?
             .list_issued_private_key_packages()?
             .iter()
             .map(|record| record.not_after)
@@ -722,7 +722,7 @@ impl<S: StorageProvider> Engine<S> {
         let discards = |record: &IssuedPrivateKeyPackage| {
             record.not_after <= now || recipient == Some(&record.recipient_slot)
         };
-        if !private_storage(&self.storage)?
+        if !private_storage(self.storage.as_ref())?
             .list_issued_private_key_packages()?
             .iter()
             .any(discards)

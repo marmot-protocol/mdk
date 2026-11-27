@@ -27,6 +27,7 @@ use openmls::prelude::BasicCredential;
 use openmls_traits::OpenMlsProvider as _;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::sync::Arc;
 use tls_codec::Serialize as _;
 
 impl<S: StorageProvider> Engine<S> {
@@ -306,7 +307,7 @@ impl<S: StorageProvider> Engine<S> {
         ];
 
         self.epoch_manager.ensure_pending_space()?;
-        let guard = PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+        let guard = PendingCommitCleanupGuard::arm(Arc::clone(&self.storage), group_id.clone());
         let context = crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let commit = self
             .stage_commit_with_app_data_updates(
@@ -362,7 +363,16 @@ impl<S: StorageProvider> Engine<S> {
             former_members,
         };
         request.last_prepared_epoch = Some(source_epoch);
-        let pending = self.epoch_manager.next_pending_ref()?;
+        let target_epoch = EpochId(source_epoch.0.saturating_add(1));
+        let prepared_pending = self.epoch_manager.prepare_pending(
+            group_id.clone(),
+            source_epoch,
+            target_epoch,
+            StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
+            crate::epoch_manager::PendingKind::Disband,
+            self.current_audit_context.clone(),
+        )?;
+        let pending = prepared_pending.pending_ref();
         // Keep the earlier irreversible Pending request on failure, while
         // publishing no candidate or sent artifact from this failed attempt.
         let content_id = self.storage.with_transaction(|storage| {
@@ -378,17 +388,8 @@ impl<S: StorageProvider> Engine<S> {
             Ok::<_, EngineError>(content_id)
         })?;
 
-        let target_epoch = EpochId(source_epoch.0.saturating_add(1));
         self.invalidate_deferred_peel_candidate_cache(group_id);
-        self.epoch_manager.begin_pending(
-            group_id.clone(),
-            source_epoch,
-            target_epoch,
-            StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
-            pending,
-            crate::epoch_manager::PendingKind::Disband,
-            self.current_audit_context.clone(),
-        )?;
+        self.epoch_manager.commit_pending(prepared_pending);
         self.track_pending_origin_commit(pending, wrapped.id.clone());
         self.sent_message_ids.insert(wrapped.id.clone());
         self.sent_message_ids.insert(content_id);

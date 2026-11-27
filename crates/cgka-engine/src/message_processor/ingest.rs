@@ -420,7 +420,7 @@ impl<S: StorageProvider> Engine<S> {
         let Some(content_id) = content_id else {
             return Ok(false);
         };
-        if claimed.is_none() || !content_id.is_settled(&self.storage)? {
+        if claimed.is_none() || !content_id.is_settled(self.storage.as_ref())? {
             return Ok(false);
         }
         let lifecycle = match self.storage.maintenance_storage() {
@@ -1926,9 +1926,11 @@ impl<S: StorageProvider> Engine<S> {
         } = context;
         let needs_authority = cgka_traits::reporting::requires_source_authority(app_event.kind);
         let historical_source = if needs_authority && msg_epoch != current_epoch {
-            if let Some(snapshot) =
-                crate::app_payload::retained_source_snapshot(&self.storage, group_id, msg_epoch)?
-            {
+            if let Some(snapshot) = crate::app_payload::retained_source_snapshot(
+                self.storage.as_ref(),
+                group_id,
+                msg_epoch,
+            )? {
                 use sha2::{Digest, Sha256};
                 let request = cgka_traits::app_event::PendingAppMessageAuthority {
                     group_id: group_id.clone(),
@@ -1939,7 +1941,7 @@ impl<S: StorageProvider> Engine<S> {
                     retention: None,
                 };
                 crate::app_payload::historical_source(
-                    &self.storage,
+                    self.storage.as_ref(),
                     &self.rewinds,
                     &self.crypto,
                     self.entropy.as_ref(),
@@ -2275,7 +2277,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
         let mut pending_commit_guard =
-            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+            PendingCommitCleanupGuard::arm(Arc::clone(&self.storage), group_id.clone());
         for queued in queued_proposals {
             let stored_proposal_ref = queued.proposal_reference_ref().clone();
             mls_group
@@ -2372,25 +2374,25 @@ impl<S: StorageProvider> Engine<S> {
         projected
             .members
             .retain(|member| !removed_leaf_keys.contains(&member.credential));
+        let staged =
+            cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
+        let prepared_pending = self.epoch_manager.prepare_pending(
+            group_id.clone(),
+            pre_commit_epoch,
+            new_epoch,
+            staged,
+            crate::epoch_manager::PendingKind::GroupEvolution,
+            self.current_audit_context.clone(),
+        )?;
+        let pending_ref = prepared_pending.pending_ref();
         self.record_sent_openmls_message_with_group(
             &wrapped,
             commit_bytes.as_slice(),
             &projected,
             pre_commit_epoch,
         )?;
-        let pending_ref = self.epoch_manager.next_pending_ref()?;
-        let staged =
-            cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
         self.invalidate_deferred_peel_candidate_cache(group_id);
-        self.epoch_manager.begin_pending(
-            group_id.clone(),
-            pre_commit_epoch,
-            new_epoch,
-            staged,
-            pending_ref,
-            crate::epoch_manager::PendingKind::GroupEvolution,
-            self.current_audit_context.clone(),
-        )?;
+        self.epoch_manager.commit_pending(prepared_pending);
 
         self.track_pending_origin_commit(pending_ref, wrapped.id.clone());
         self.auto_publish_buf.push_back(AutoPublish {
@@ -2942,7 +2944,7 @@ impl<S: StorageProvider> Engine<S> {
                 cache.synchronize_generation(None)?;
             }
             let guard = SnapshotRollbackGuard::rewind(
-                &self.storage,
+                self.storage.as_ref(),
                 &self.rewinds,
                 group_id.clone(),
                 RewindSite::PastPeelContext,
@@ -3044,7 +3046,7 @@ impl<S: StorageProvider> Engine<S> {
         hasher.update(source_epoch.0.to_be_bytes());
         hasher.update(current_epoch.0.to_be_bytes());
         crate::openmls_projection::with_retained_anchor_group(
-            &self.storage,
+            self.storage.as_ref(),
             &self.rewinds,
             &self.crypto,
             group_id,
@@ -3083,7 +3085,7 @@ impl<S: StorageProvider> Engine<S> {
         // A quarantined group's MLS state may load fine; never export it.
         self.ensure_group_live(group_id)?;
         crate::openmls_projection::retained_anchor_media_secret(
-            &self.storage,
+            self.storage.as_ref(),
             &self.rewinds,
             &self.crypto,
             group_id,
