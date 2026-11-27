@@ -682,7 +682,9 @@ class ClassifierTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_str:
             wt = Path(tmp_str) / "wt"
             wt.mkdir()
-            git_trusts_this_worktree = ("sh", "-c", 'test "$(git config --get-all safe.directory)" = "$PWD"')
+            # Hosts may already list other trusted paths (GitHub runners do); this worktree
+            # must be among them.
+            git_trusts_this_worktree = ("sh", "-c", 'git config --get-all safe.directory | grep -Fqx "$(pwd -P)"')
             verdict, _ = default_worktree_runner(git_trusts_this_worktree)(wt)
             self.assertEqual(verdict, RunVerdict.PASS)
 
