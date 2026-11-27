@@ -9,14 +9,14 @@ use crate::app::account_projection::{
     finish_secure_delete_checkpoint_intent, merge_local_group_delete_intent_tx,
     restore_secure_delete_pragma, secure_delete_pragma,
 };
-use crate::base::connection::{CachedSql, matching_group_id_spellings, sql_placeholders};
+use crate::base::connection::CachedSql;
 use crate::{
     SqliteAccountStorage, SqliteResultExt, app::account_projection::DeleteLocalGroupDataResult,
     app::encrypted_media_secrets::retire_all_encrypted_media_secrets_for_group_tx,
     base::connection::retry_on_busy, u64_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
-use rusqlite::{OptionalExtension, TransactionBehavior, params, params_from_iter};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 impl SqliteAccountStorage {
     /// Transactionally removes all app-local data for one group without touching
@@ -73,9 +73,9 @@ impl SqliteAccountStorage {
         let group_id = hex::decode(group_id_hex).map_err(|error| {
             StorageError::Serialization(format!("invalid local group id: {error}"))
         })?;
-        // Normalize once for canonical writes (frontiers, watermarks, intents),
-        // while discovering any persisted uppercase/mixed-case spellings via
-        // covering-index loose index scans so every large table stays indexed.
+        // Normalize once to canonical lowercase hex; migration 0228 and write
+        // boundary canonicalization keep every group-scoped table lowercase so
+        // every read and delete below uses plain indexed `group_id_hex = ?1`.
         let group_id_hex = hex::encode(&group_id);
         let group_id_hex = group_id_hex.as_str();
 
@@ -98,35 +98,30 @@ impl SqliteAccountStorage {
                 // The frontier keeps it so a newer message that recreates the
                 // chat does not turn an unanswered invitation into an
                 // accepted one (mdk#3555).
-                let account_group_spellings =
-                    matching_group_id_spellings(&tx, "account_groups", group_id_hex)?;
                 let (
                     prior_nostr_routes_json,
                     mut pending_confirmation,
                     mut welcomer_account_id_hex,
                     mut via_welcome_message_id_hex,
-                ) = match account_group_spellings.first() {
-                    Some(standing_group_id_hex) => tx
-                        .query_row_cached(
-                            "SELECT prior_nostr_routes_json, pending_confirmation,
-                                    welcomer_account_id_hex, via_welcome_message_id_hex
-                             FROM account_groups
-                             WHERE group_id_hex = ?1",
-                            params![standing_group_id_hex],
-                            |row| {
-                                Ok((
-                                    row.get::<_, String>(0)?,
-                                    Some(row.get::<_, bool>(1)?),
-                                    row.get::<_, Option<String>>(2)?,
-                                    row.get::<_, Option<String>>(3)?,
-                                ))
-                            },
-                        )
-                        .optional()
-                        .storage()?
-                        .unwrap_or_else(|| ("[]".to_owned(), None, None, None)),
-                    None => ("[]".to_owned(), None, None, None),
-                };
+                ) = tx
+                    .query_row_cached(
+                        "SELECT prior_nostr_routes_json, pending_confirmation,
+                                welcomer_account_id_hex, via_welcome_message_id_hex
+                         FROM account_groups
+                         WHERE group_id_hex = ?1",
+                        params![group_id_hex],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                Some(row.get::<_, bool>(1)?),
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .storage()?
+                    .unwrap_or_else(|| ("[]".to_owned(), None, None, None));
                 // A replacement Welcome (generated or un-generated) can commit
                 // in MLS while its app checkpoint fails, leaving `account_groups`
                 // on the old copy's standing until the queued `GroupJoined`
@@ -201,11 +196,13 @@ impl SqliteAccountStorage {
                     "encrypted_media_epoch_secrets",
                     "account_groups",
                 ] {
-                    deleted = deleted.saturating_add(delete_matching_group_rows_indexed_tx(
-                        &tx,
-                        table,
-                        group_id_hex,
-                    )?);
+                    deleted = deleted.saturating_add(
+                        tx.execute_cached(
+                            &format!("DELETE FROM {table} WHERE group_id_hex = ?1"),
+                            params![group_id_hex],
+                        )
+                        .storage()?,
+                    );
                 }
                 let (terminal, active, message_insert_order) = tx
                     .query_row_cached(
@@ -275,11 +272,11 @@ impl SqliteAccountStorage {
                         &tx,
                         &cgka_traits::GroupId::new(group_id.clone()),
                     )?;
-                    delete_matching_group_rows_indexed_tx(
-                        &tx,
-                        "local_group_deletion_frontiers",
-                        group_id_hex,
-                    )?;
+                    tx.execute_cached(
+                        "DELETE FROM local_group_deletion_frontiers WHERE group_id_hex = ?1",
+                        params![group_id_hex],
+                    )
+                    .storage()?;
                     deleted = deleted.saturating_add(
                         tx.execute_cached(
                             "DELETE FROM cgka_groups WHERE id = ?1",
@@ -319,18 +316,15 @@ impl SqliteAccountStorage {
                         "device_group_messages",
                         "history_deliveries_owed",
                         "history_deliveries_parked",
+                        "history_delivery_sends",
                         "app_pending_welcome_delivery",
                         "pending_push_registration_removals",
                         "message_drafts",
+                        "app_prepared_group_image_upload",
                         "chat_pin_positions",
                     ] {
-                        delete_matching_group_rows_indexed_tx(&tx, table, group_id_hex)?;
-                    }
-                    // Small ephemeral queue tables without a leading
-                    // `group_id_hex` index (in-flight sends/uploads only).
-                    for table in ["history_delivery_sends", "app_prepared_group_image_upload"] {
                         tx.execute_cached(
-                            &format!("DELETE FROM {table} WHERE LOWER(group_id_hex) = ?1"),
+                            &format!("DELETE FROM {table} WHERE group_id_hex = ?1"),
                             params![group_id_hex],
                         )
                         .storage()?;
@@ -392,23 +386,6 @@ impl SqliteAccountStorage {
     }
 }
 
-fn delete_matching_group_rows_indexed_tx(
-    tx: &rusqlite::Transaction<'_>,
-    table: &str,
-    canonical_group_id_hex: &str,
-) -> StorageResult<usize> {
-    let spellings = matching_group_id_spellings(tx, table, canonical_group_id_hex)?;
-    if spellings.is_empty() {
-        return Ok(0);
-    }
-    let placeholders = sql_placeholders(spellings.len());
-    tx.execute_cached(
-        &format!("DELETE FROM {table} WHERE group_id_hex IN ({placeholders})"),
-        params_from_iter(spellings.iter()),
-    )
-    .storage()
-}
-
 /// Removal/failed-link cleanup is terminal; a Move has already cut old
 /// trust. Neither owns this deliberate active-copy reset's extra cleanup.
 fn active_trusted_device_group_forget(
@@ -416,24 +393,13 @@ fn active_trusted_device_group_forget(
     group_hex: &str,
     group_id: &[u8],
 ) -> StorageResult<bool> {
-    let spellings = matching_group_id_spellings(tx, "device_groups", group_hex)?;
-    if spellings.is_empty() {
-        return Ok(false);
-    }
-    let in_placeholders = sql_placeholders(spellings.len());
-    let sql = format!(
-        "SELECT g.record FROM cgka_groups g JOIN device_groups d
-         ON d.group_id_hex IN ({in_placeholders})
-         WHERE g.id = ? AND d.trust IN ('created','linked')
-         ORDER BY CASE WHEN d.group_id_hex = ? THEN 0 ELSE 1 END, d.group_id_hex
-         LIMIT 1"
-    );
-    let params = spellings.iter().map(|s| s as &dyn rusqlite::ToSql).chain([
-        &group_id as &dyn rusqlite::ToSql,
-        &group_hex as &dyn rusqlite::ToSql,
-    ]);
     let record: Option<Vec<u8>> = tx
-        .query_row_cached(&sql, params_from_iter(params), |row| row.get(0))
+        .query_row_cached(
+            "SELECT g.record FROM cgka_groups g JOIN device_groups d ON d.group_id_hex = ?2
+             WHERE g.id = ?1 AND d.trust IN ('created','linked')",
+            params![group_id, group_hex],
+            |row| row.get(0),
+        )
         .optional()
         .storage()?;
     let Some(record) = record else {

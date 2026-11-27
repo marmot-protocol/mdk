@@ -1,7 +1,10 @@
 //! Account-private NIP-51 state. Never stored in the shared directory database.
 #[cfg(test)]
 use crate::SqliteAccountStorage;
-use crate::{SqliteAppStorage, SqliteResultExt, base::connection::retry_on_busy};
+use crate::{
+    SqliteAppStorage, SqliteResultExt,
+    base::connection::{canonical_group_id_hex, retry_on_busy},
+};
 use cgka_traits::storage::StorageResult;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -76,11 +79,13 @@ impl SqliteAppStorage {
     }
 
     pub fn direct_conversation_has_blocked_user(&self, group_id_hex: &str) -> StorageResult<bool> {
-        self.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM direct_conversation_members WHERE group_id_hex=?1 AND member_id_hex IN (SELECT public_key FROM user_blocks))",[group_id_hex],|r|r.get(0)).storage()
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
+        self.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM direct_conversation_members WHERE group_id_hex=?1 AND member_id_hex IN (SELECT public_key FROM user_blocks))",[group_id_hex.as_ref()],|r|r.get(0)).storage()
     }
 
     pub fn is_app_author_visible(&self, sender: &str, group_id_hex: &str) -> StorageResult<bool> {
-        self.lock()?.query_row("SELECT NOT EXISTS(SELECT 1 FROM user_blocks WHERE public_key=?1) AND NOT EXISTS(SELECT 1 FROM blocked_pending_invites WHERE group_id_hex=?2)",params![sender,group_id_hex],|r|r.get(0)).storage()
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
+        self.lock()?.query_row("SELECT NOT EXISTS(SELECT 1 FROM user_blocks WHERE public_key=?1) AND NOT EXISTS(SELECT 1 FROM blocked_pending_invites WHERE group_id_hex=?2)",params![sender,group_id_hex.as_ref()],|r|r.get(0)).storage()
     }
 
     pub fn is_user_blocked(&self, public_key: &str) -> StorageResult<bool> {
@@ -213,9 +218,10 @@ impl SqliteAppStorage {
         group_id: &str,
         message_id: &str,
     ) -> StorageResult<bool> {
+        let group_id = canonical_group_id_hex(group_id);
         let conn = self.lock()?;
-        conn.execute("INSERT OR IGNORE INTO blocked_notification_suppressions SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM user_blocks WHERE public_key=?3)",params![group_id,message_id,sender]).storage()?;
-        conn.query_row("SELECT EXISTS(SELECT 1 FROM blocked_notification_suppressions WHERE group_id=?1 AND message_id=?2)",params![group_id,message_id],|r|r.get(0)).storage()
+        conn.execute("INSERT OR IGNORE INTO blocked_notification_suppressions SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM user_blocks WHERE public_key=?3)",params![group_id.as_ref(),message_id,sender]).storage()?;
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM blocked_notification_suppressions WHERE group_id=?1 AND message_id=?2)",params![group_id.as_ref(),message_id],|r|r.get(0)).storage()
     }
 
     pub fn blocked_notification_suppressed(
@@ -223,7 +229,8 @@ impl SqliteAppStorage {
         group_id: &str,
         message_id: &str,
     ) -> StorageResult<bool> {
-        self.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM blocked_notification_suppressions WHERE group_id=?1 AND message_id=?2)",params![group_id,message_id],|r|r.get(0)).storage()
+        let group_id = canonical_group_id_hex(group_id);
+        self.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM blocked_notification_suppressions WHERE group_id=?1 AND message_id=?2)",params![group_id.as_ref(),message_id],|r|r.get(0)).storage()
     }
     pub fn dismiss_blocked_welcome(&self, message_id: &str) -> StorageResult<()> {
         self.lock()?

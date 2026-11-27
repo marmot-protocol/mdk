@@ -3,7 +3,7 @@
 //! before claiming, and authenticate/decrypt the complete body before publishing.
 //! Bytes stay in the account's SQLCipher store; there is no attachment LRU.
 use crate::app::chat_presentation::nonnegative;
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex, canonical_group_id_hex_opt};
 use crate::{SqliteAppStorage, SqliteResultExt, u64_to_i64};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -205,7 +205,8 @@ pub(crate) fn reconcile_attachment_acquisition_tx(
         AND h.source_epoch=attachment_acquisition.source_epoch
         AND h.slot_json=attachment_acquisition.slot_json)"
     );
-    let mut args = vec![rusqlite::types::Value::Text(group.to_owned())];
+    let group = canonical_group_id_hex(group);
+    let mut args = vec![rusqlite::types::Value::Text(group.into_owned())];
     if let Some(message) = message {
         args.push(rusqlite::types::Value::Text(message.to_owned()));
     }
@@ -290,12 +291,13 @@ impl SqliteAppStorage {
         &self,
         demand: &AttachmentWorkerDemand,
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(&demand.group_id_hex);
         self.lock()?
             .execute(
                 "DELETE FROM attachment_worker_demand
             WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3 AND generation=?4",
                 params![
-                    demand.group_id_hex,
+                    group_id_hex.as_ref(),
                     demand.entry.message_id_hex,
                     demand.entry.attachment_index as i64,
                     demand.generation
@@ -322,6 +324,8 @@ impl SqliteAppStorage {
         plaintext_digest: [u8; 32],
         now: u64,
     ) -> StorageResult<AttachmentDemand> {
+        let group = canonical_group_id_hex(group);
+        let group = group.as_ref();
         let message = selected.message_id_hex.as_str();
         let index = u32::try_from(selected.attachment_index)
             .map_err(|_| invalid("invalid attachment index"))?;
@@ -836,6 +840,8 @@ impl SqliteAppStorage {
         digest: [u8; 32],
         now: u64,
     ) -> StorageResult<AttachmentDemand> {
+        let group = canonical_group_id_hex(group);
+        let group = group.as_ref();
         let index = u32::try_from(selected.attachment_index)
             .map_err(|_| invalid("invalid attachment index"))?;
         self.connection.with_transaction(|| {

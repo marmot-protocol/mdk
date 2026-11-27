@@ -37,6 +37,8 @@ pub(super) fn stage(
     budget: u64,
     cancelled: &dyn Fn() -> bool,
 ) -> StorageResult<Vec<Vec<u8>>> {
+    let group = canonical_group_id_hex(group);
+    let group = group.as_ref();
     if sources.is_empty()
         || sources.len() > 64
         || sources
@@ -150,10 +152,11 @@ pub(super) fn verify(
     group: &str,
     message: &str,
 ) -> StorageResult<Verification> {
+    let group = canonical_group_id_hex(group);
     let candidates = {
         let conn = store.lock()?;
         let mut stmt=conn.prepare("SELECT DISTINCT f.token,f.nonce,f.byte_len,f.completed,u.plaintext_digest FROM outgoing_attachment_upload_files f JOIN outgoing_attachment_uploads u USING(token) JOIN attachment_history h ON h.group_id_hex=u.group_id_hex AND h.source_epoch=u.source_epoch AND h.slot_json=u.slot_json WHERE h.group_id_hex=?1 AND h.message_id_hex=?2").storage()?;
-        stmt.query_map(params![group, message], |r| {
+        stmt.query_map(params![group.as_ref(), message], |r| {
             Ok((
                 r.get::<_, Vec<u8>>(0)?,
                 r.get::<_, Vec<u8>>(1)?,

@@ -1,5 +1,5 @@
 //! Device-local submission identity and durable admission before engine work.
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use crate::{SqliteAppStorage, SqliteResultExt};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, params};
@@ -53,20 +53,23 @@ impl SqliteAppStorage {
         group: &str,
         token: &str,
     ) -> StorageResult<Option<LocalSubmission>> {
-        self.lock()?.query_row_cached(&format!("SELECT {COLUMNS} FROM local_message_submissions WHERE group_id_hex=?1 AND client_token=?2"), params![group, token], from_row).optional().storage()
+        let group = canonical_group_id_hex(group);
+        self.lock()?.query_row_cached(&format!("SELECT {COLUMNS} FROM local_message_submissions WHERE group_id_hex=?1 AND client_token=?2"), params![group.as_ref(), token], from_row).optional().storage()
     }
 
     /// Check both retained admissions and source rows, including legacy sends.
     /// Call inside the transaction that inserts the admission and pending row.
     pub fn local_message_identity_exists(&self, group: &str, message: &str) -> StorageResult<bool> {
+        let group = canonical_group_id_hex(group);
         self.lock()?.query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM local_message_submissions WHERE group_id_hex=?1 AND message_id_hex=?2) OR EXISTS(SELECT 1 FROM app_events WHERE group_id_hex=?1 AND message_id_hex=?2)",
-            params![group, message], |row| row.get(0),
+            params![group.as_ref(), message], |row| row.get(0),
         ).storage()
     }
 
     /// Called inside the app transaction that also records the pending source row.
     pub fn insert_local_submission(&self, submission: &LocalSubmission) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(&submission.group_id_hex);
         let conn = self.lock()?;
         let (count, bytes): (i64, i64) = conn.query_row_cached(
             "SELECT count(*), COALESCE(sum(length(payload)+length(request_json)),0) FROM local_message_submissions WHERE state=0", [], |r| Ok((r.get(0)?, r.get(1)?)),
@@ -83,7 +86,7 @@ impl SqliteAppStorage {
         }
         conn.execute_cached(
             "INSERT INTO local_message_submissions(group_id_hex,client_token,message_id_hex,request_hash,payload_hash,payload,request_json) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![submission.group_id_hex, submission.client_token, submission.message_id_hex, submission.request_hash, submission.payload_hash, submission.payload, submission.request_json],
+            params![group_id_hex.as_ref(), submission.client_token, submission.message_id_hex, submission.request_hash, submission.payload_hash, submission.payload, submission.request_json],
         ).storage()?;
         Ok(())
     }
@@ -100,12 +103,13 @@ impl SqliteAppStorage {
         field: &str,
         value: &rusqlite::types::Value,
     ) -> StorageResult<()> {
+        let group = canonical_group_id_hex(group);
         let column = match field {
             "payload_hash" => "payload_hash",
             "app_event_id" => "message_id_hex",
             _ => return Err(StorageError::Backend("invalid acceptance field".to_owned())),
         };
-        conn.execute_cached(&format!("UPDATE local_message_submissions SET state=1, payload=NULL, request_json=NULL WHERE group_id_hex=?1 AND {column}=?2 AND state=0"), params![group, value]).storage()?;
+        conn.execute_cached(&format!("UPDATE local_message_submissions SET state=1, payload=NULL, request_json=NULL WHERE group_id_hex=?1 AND {column}=?2 AND state=0"), params![group.as_ref(), value]).storage()?;
         Ok(())
     }
 
@@ -115,9 +119,10 @@ impl SqliteAppStorage {
         token: &str,
         outcome: Option<&str>,
     ) -> StorageResult<()> {
+        let group = canonical_group_id_hex(group);
         self.lock()?.execute_cached(
             "UPDATE local_message_submissions SET state=CASE WHEN state=0 THEN 3 ELSE state END, payload=NULL, request_json=NULL, outcome_json=?3 WHERE group_id_hex=?1 AND client_token=?2",
-            params![group, token, outcome],
+            params![group.as_ref(), token, outcome],
         ).storage()?;
         Ok(())
     }
@@ -137,12 +142,13 @@ impl SqliteAppStorage {
         field: &str,
         value: &dyn rusqlite::ToSql,
     ) -> StorageResult<()> {
+        let group = canonical_group_id_hex(group);
         let column = match field {
             "client_token" => "client_token",
             "payload_hash" => "payload_hash",
             _ => return Err(StorageError::Backend("invalid refusal field".to_owned())),
         };
-        conn.execute_cached(&format!("UPDATE local_message_submissions SET state=4, payload=NULL, request_json=NULL, outcome_json=NULL WHERE group_id_hex=?1 AND {column}=?2 AND state IN (0, 1)"), params![group, value]).storage()?;
+        conn.execute_cached(&format!("UPDATE local_message_submissions SET state=4, payload=NULL, request_json=NULL, outcome_json=NULL WHERE group_id_hex=?1 AND {column}=?2 AND state IN (0, 1)"), params![group.as_ref(), value]).storage()?;
         Ok(())
     }
 

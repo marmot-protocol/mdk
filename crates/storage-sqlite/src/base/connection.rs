@@ -478,47 +478,30 @@ impl CloseableConnection {
 /// well over a hundred distinct statement texts on the engine paths alone.
 pub(crate) const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 256;
 
+/// Canonicalize a hex-encoded group id to lowercase ASCII at the storage boundary.
+///
+/// Allocates only when the input contains an ASCII uppercase byte, keeping the
+/// normal lowercase production path zero-copy.
+#[inline]
+pub(crate) fn canonical_group_id_hex(group_id_hex: &str) -> std::borrow::Cow<'_, str> {
+    if group_id_hex.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(group_id_hex.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(group_id_hex)
+    }
+}
+
+/// Optional counterpart to [`canonical_group_id_hex`].
+#[inline]
+pub(crate) fn canonical_group_id_hex_opt(
+    group_id_hex: Option<&str>,
+) -> Option<std::borrow::Cow<'_, str>> {
+    group_id_hex.map(canonical_group_id_hex)
+}
+
 /// `Connection::execute` / `Connection::query_row` compile the SQL text on
 /// every call. Every statement this crate issues has a fixed text, so route
 /// the hot paths through the connection's prepared-statement cache instead.
-pub(crate) fn sql_placeholders(count: usize) -> String {
-    std::iter::repeat_n("?", count)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Discover every persisted spelling of `canonical_group_id_hex` (already
-/// lowercase) in an indexed `table` whose leading PK or index column is
-/// `group_id_hex`, using a recursive loose index scan (`O(groups * log N)`
-/// covering-index seeks, never scanning message rows). Canonical lowercase is
-/// ordered first when present.
-pub(crate) fn matching_group_id_spellings(
-    conn: &rusqlite::Connection,
-    table: &str,
-    canonical_group_id_hex: &str,
-) -> StorageResult<Vec<String>> {
-    let sql = format!(
-        "WITH RECURSIVE distinct_groups(g) AS (
-             SELECT MIN(group_id_hex) FROM {table}
-             UNION ALL
-             SELECT (SELECT MIN(group_id_hex) FROM {table} WHERE group_id_hex > g)
-             FROM distinct_groups
-             WHERE g IS NOT NULL
-         )
-         SELECT g
-         FROM distinct_groups
-         WHERE g IS NOT NULL AND LOWER(g) = ?1
-         ORDER BY CASE WHEN g = ?1 THEN 0 ELSE 1 END, g"
-    );
-    let mut stmt = conn.prepare_cached(&sql).storage()?;
-    stmt.query_map(rusqlite::params![canonical_group_id_hex], |row| {
-        row.get::<_, String>(0)
-    })
-    .storage()?
-    .collect::<Result<Vec<_>, _>>()
-    .storage()
-}
-
 pub(crate) trait CachedSql {
     fn execute_cached<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize>;
 

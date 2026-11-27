@@ -5,17 +5,19 @@
 use super::*;
 
 pub(super) fn record(conn: &Connection, event: &StoredAppEvent) -> StorageResult<()> {
+    let group_id_hex = canonical_group_id_hex(&event.group_id_hex);
+    let group_id_hex = group_id_hex.as_ref();
     if event.kind != MARMOT_APP_EVENT_KIND_REMOVE {
         conn.execute_cached(
             "DELETE FROM content_removal_validation WHERE group_id_hex=?1 AND message_id_hex=?2",
-            params![event.group_id_hex, event.message_id_hex],
+            params![group_id_hex, event.message_id_hex],
         )
         .storage()?;
         return Ok(());
     }
     let retained: bool = conn.query_row_cached(
         "SELECT EXISTS(SELECT 1 FROM content_pruned_controls WHERE group_id_hex=?1 AND message_id_hex=?2)",
-        params![event.group_id_hex, event.message_id_hex], |r| r.get(0),
+        params![group_id_hex, event.message_id_hex], |r| r.get(0),
     ).storage()?;
     if retained {
         return Ok(());
@@ -28,7 +30,7 @@ pub(super) fn record(conn: &Connection, event: &StoredAppEvent) -> StorageResult
          VALUES (?1,?2,?3,?4) ON CONFLICT(group_id_hex,message_id_hex) DO UPDATE SET
          state=excluded.state,target_message_id_hex=excluded.target_message_id_hex
          WHERE content_removal_validation.state != 0",
-        params![event.group_id_hex, event.message_id_hex, if target.is_some() { 2 } else { 1 }, target],
+        params![group_id_hex, event.message_id_hex, if target.is_some() { 2 } else { 1 }, target],
     ).storage()?;
     Ok(())
 }
@@ -38,6 +40,8 @@ pub(super) fn targets(
     group: &str,
     control: Option<&str>,
 ) -> StorageResult<BTreeMap<String, BTreeSet<String>>> {
+    let group = canonical_group_id_hex(group);
+    let group = group.as_ref();
     // The single-control form uses the composite key; ordinary incremental
     // updates must not scan all removals in a chat.
     let predicate = if control.is_some() {
@@ -89,6 +93,8 @@ pub(super) fn targeting(
     group: &str,
     target: &str,
 ) -> StorageResult<Vec<RawAppEvent>> {
+    let group = canonical_group_id_hex(group);
+    let group = group.as_ref();
     let mut stmt = conn.prepare_cached(
         "SELECT message_id_hex FROM content_removal_validation
          WHERE group_id_hex=?1 AND state=2 AND target_message_id_hex=?2

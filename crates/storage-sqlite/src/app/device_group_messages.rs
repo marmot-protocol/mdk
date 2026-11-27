@@ -4,7 +4,7 @@
 //! content id), so this is how the app tells which feature's message it was.
 //! See migration 0161 for the columns.
 
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::StorageResult;
 use rusqlite::{OptionalExtension, params};
@@ -33,6 +33,7 @@ impl SqliteAppStorage {
         kind: u64,
         now: u64,
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             conn.execute_cached(
@@ -45,7 +46,7 @@ impl SqliteAppStorage {
                      kind = excluded.kind,
                      recorded_at = excluded.recorded_at",
                 params![
-                    group_id_hex,
+                    group_id_hex.as_ref(),
                     app_event_id,
                     message_id_hex,
                     u64_to_i64(kind)?,
@@ -101,11 +102,12 @@ impl SqliteAppStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             for (group_id_hex, app_event_id, message_id_hex) in sent {
+                let group_id_hex = canonical_group_id_hex(group_id_hex);
                 conn.execute_cached(
                     "UPDATE device_group_messages SET message_id_hex = ?3
                      WHERE group_id_hex = ?1 AND app_event_id = ?2
                        AND message_id_hex IS NULL",
-                    params![group_id_hex, app_event_id, message_id_hex],
+                    params![group_id_hex.as_ref(), app_event_id, message_id_hex],
                 )
                 .storage()?;
             }
@@ -120,11 +122,12 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         message_id_hex: &str,
     ) -> StorageResult<Option<u64>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .query_row_cached(
                 "SELECT kind FROM device_group_messages
                  WHERE group_id_hex = ?1 AND message_id_hex = ?2",
-                params![group_id_hex, message_id_hex],
+                params![group_id_hex.as_ref(), message_id_hex],
                 |row| row.get::<_, i64>(0),
             )
             .optional()
@@ -140,11 +143,12 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         message_id_hex: &str,
     ) -> StorageResult<Option<String>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .query_row_cached(
                 "SELECT app_event_id FROM device_group_messages
                  WHERE group_id_hex = ?1 AND message_id_hex = ?2",
-                params![group_id_hex, message_id_hex],
+                params![group_id_hex.as_ref(), message_id_hex],
                 |row| row.get::<_, String>(0),
             )
             .optional()

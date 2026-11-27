@@ -36,12 +36,13 @@ pub struct ReportDismissalPage {
     pub next_cursor: Option<String>,
 }
 fn raw(conn: &Connection, group: &str, id: &str) -> StorageResult<Option<RawAppEvent>> {
+    let group = canonical_group_id_hex(group);
     conn.query_row_cached(
         "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch,
          direction, sender, plaintext, kind, tags_json, recorded_at, received_at,
          invalidated, invalidation_reason, moderation_grant
          FROM app_events WHERE group_id_hex = ?1 AND message_id_hex = ?2",
-        params![group, id],
+        params![group.as_ref(), id],
         raw_event_from_row,
     )
     .optional()
@@ -51,6 +52,8 @@ fn raw(conn: &Connection, group: &str, id: &str) -> StorageResult<Option<RawAppE
 // One row per event. References can arrive before their targets. If the target
 // is available, a mismatched author cannot mark that message as reported.
 pub(super) fn refresh(conn: &Connection, group: &str, target: &str) -> StorageResult<()> {
+    let group = canonical_group_id_hex(group);
+    let group = group.as_ref();
     let original = raw(conn, group, target)?;
     conn.execute_cached(
         "DELETE FROM content_reports WHERE group_id_hex=?1 AND message_id_hex=?2",
@@ -97,10 +100,14 @@ pub(super) fn hydrate(
         let rows = statement
             .query_map(
                 params_from_iter(chunk.iter().enumerate().flat_map(|(index, m)| {
-                    use rusqlite::types::ToSqlOutput;
+                    use rusqlite::types::{ToSqlOutput, Value};
+                    let group_id = match canonical_group_id_hex(&m.group_id_hex) {
+                        std::borrow::Cow::Borrowed(value) => ToSqlOutput::from(value),
+                        std::borrow::Cow::Owned(value) => ToSqlOutput::Owned(Value::Text(value)),
+                    };
                     [
                         ToSqlOutput::from(index as i64),
-                        ToSqlOutput::from(m.group_id_hex.as_str()),
+                        group_id,
                         ToSqlOutput::from(m.message_id_hex.as_str()),
                         ToSqlOutput::from(m.sender.as_str()),
                     ]
@@ -123,6 +130,8 @@ fn dismissal_page(
     after: Option<&str>,
     limit: usize,
 ) -> StorageResult<ReportDismissalPage> {
+    let group = canonical_group_id_hex(group);
+    let group = group.as_ref();
     let mut labels = Vec::new();
     // Query in bounded batches before parsing: unrelated NIP-32 labels may
     // reference the same report, and do not consume the returned page limit.
@@ -198,6 +207,8 @@ impl SqliteAppStorage {
         id: &str,
         authority: Option<AppMessageAuthority>,
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
+        let group = canonical_group_id_hex(group);
+        let group = group.as_ref();
         let Some(authority) = authority else {
             return Ok(None);
         };
@@ -258,6 +269,8 @@ impl SqliteAppStorage {
         after: Option<&str>,
         limit: usize,
     ) -> StorageResult<ContentReportPage> {
+        let group = canonical_group_id_hex(group);
+        let group = group.as_ref();
         let conn = self.lock()?;
         let limit = limit.clamp(1, 100);
         // Choose an indexed target range for per-message queries; do not scan
@@ -308,6 +321,8 @@ impl SqliteAppStorage {
         after: Option<&str>,
         limit: usize,
     ) -> StorageResult<ReportDismissalPage> {
+        let group = canonical_group_id_hex(group);
+        let group = group.as_ref();
         let conn = self.lock()?;
         if !raw(&conn, group, report)?.is_some_and(|e| e.kind == 1984 && !e.invalidated) {
             return Ok(ReportDismissalPage {
@@ -324,6 +339,8 @@ impl SqliteAppStorage {
         group: &str,
         message: &str,
     ) -> StorageResult<Option<TimelineMessageRecord>> {
+        let group = canonical_group_id_hex(group);
+        let group = group.as_ref();
         let conn = self.lock()?;
         let reported: bool = conn.query_row_cached("SELECT EXISTS(SELECT 1 FROM content_reports WHERE group_id_hex=?1 AND message_id_hex=?2)",params![group,message],|r|r.get(0)).storage()?;
         if !reported {
@@ -353,6 +370,8 @@ pub(super) fn retain_expired_target(
     group: &str,
     target: &str,
 ) -> StorageResult<()> {
+    let group = canonical_group_id_hex(group);
+    let group = group.as_ref();
     let mut retained: bool = conn.query_row_cached(
         "SELECT EXISTS(SELECT 1 FROM message_modifier_edges edges JOIN content_pruned_controls controls
           ON controls.group_id_hex=edges.group_id_hex AND controls.message_id_hex=edges.modifier_message_id_hex
@@ -381,16 +400,19 @@ pub(super) fn retain_expired_target(
 }
 
 pub(super) fn target_expired(conn: &Connection, group: &str, id: &str) -> StorageResult<bool> {
+    let group = canonical_group_id_hex(group);
     conn.query_row_cached(
         "SELECT EXISTS (SELECT 1 FROM content_expired_targets
          WHERE group_id_hex = ?1 AND message_id_hex = ?2)",
-        params![group, id],
+        params![group.as_ref(), id],
         |row| row.get(0),
     )
     .storage()
 }
 
 pub(super) fn rescrub_control(conn: &Connection, group: &str, id: &str) -> StorageResult<()> {
+    let group = canonical_group_id_hex(group);
+    let group = group.as_ref();
     let pruned: bool = conn
         .query_row_cached(
             "SELECT EXISTS (SELECT 1 FROM content_pruned_controls
@@ -466,6 +488,8 @@ pub(super) fn retain_pruned_controls(
     group: &str,
     ids: &mut BTreeSet<String>,
 ) -> StorageResult<usize> {
+    let group = canonical_group_id_hex(group);
+    let group = group.as_ref();
     let mut retained = Vec::new();
     for id in ids.iter() {
         let Some(event) = raw(conn, group, id)? else {
