@@ -894,65 +894,6 @@ impl<S: StorageProvider> Engine<S> {
             _ => Vec::new(),
         };
 
-        let legacy_prepared_pending = if self.new_protocol_profile == ProtocolProfile::Legacy {
-            // Every check that can refuse the creation runs before its first
-            // write. A current-profile create runs them inside its creation
-            // transaction instead.
-            crate::capability_manager::check_key_packages_carry_profile(
-                group_record.protocol_profile,
-                &parsed_kps,
-            )?;
-            crate::capability_manager::check_own_leaf(
-                &mls_group,
-                self.identity.self_id(),
-                self.ciphersuite,
-            )?;
-            let projected_epoch = if welcome_bytes.is_some() {
-                // Multi-member: the pending commit advances to epoch 1.
-                EpochId(1)
-            } else {
-                EpochId(0)
-            };
-            let prepared_pending = self.epoch_manager.prepare_pending(
-                group_id.clone(),
-                EpochId(0),
-                projected_epoch,
-                cgka_traits::engine_state::StagedCommitHandle::from_bytes(
-                    group_id.as_slice().to_vec(),
-                ),
-                crate::epoch_manager::PendingKind::CreateGroup,
-                self.current_audit_context.clone(),
-            )?;
-            // The route may replace an existing group's mapping. Keep it
-            // with every founding artifact so any later Welcome error restores
-            // the previous owner. Hot indexes wait until the pending handoff.
-            self.storage.with_transaction(|storage| {
-                // Message/group foreign keys require this row first.
-                storage.put_group_with_roster(&group_record, &committed_members(&mls_group))?;
-                if let Ok(transport_group_id) =
-                    crate::app_components::transport_group_id_of_group(&mls_group)
-                {
-                    let _ = storage.put_transport_group_route(
-                        &transport_group_id,
-                        &group_id,
-                        EpochId(mls_group.epoch().as_u64()),
-                    );
-                }
-                for welcome in &welcomes {
-                    self.persist_transport_message(
-                        welcome,
-                        &group_id,
-                        EpochId(0),
-                        MessageState::Sent,
-                    )?;
-                }
-                Ok::<_, EngineError>(())
-            })?;
-            Some(prepared_pending)
-        } else {
-            None
-        };
-
         if self.new_protocol_profile == ProtocolProfile::Current {
             let enrolled_at = self.wall_clock.now();
             let unique_welcome_ids = welcomes
@@ -1159,18 +1100,56 @@ impl<S: StorageProvider> Engine<S> {
             return Ok((group_id, SendResult::FoundingGroupCreated { welcomes }));
         }
 
-        // 7. Enter PendingPublish — the caller must confirm_published once
-        //    the transport hands off every welcome. The visible epoch
-        //    becomes the projected post-merge epoch. For multi-member
-        //    create that's epoch 1 (the staged commit's target); for solo
-        //    create it stays 0 (no commit was staged). Tagged
+        // 7. Legacy profile: validate checks and pending-publish transition
+        //    before committing founding rows, then enter PendingPublish — the
+        //    caller must confirm_published once the transport hands off every
+        //    welcome. The visible epoch becomes the projected post-merge epoch.
+        //    For multi-member create that's epoch 1 (the staged commit's
+        //    target); for solo create it stays 0 (no commit was staged). Tagged
         //    `PendingKind::CreateGroup` so confirm emits `GroupCreated`.
-        let Some(prepared_pending) = legacy_prepared_pending else {
-            return Err(EngineError::Backend(
-                "legacy create missing prepared pending publish".into(),
-            ));
+        crate::capability_manager::check_key_packages_carry_profile(
+            group_record.protocol_profile,
+            &parsed_kps,
+        )?;
+        crate::capability_manager::check_own_leaf(
+            &mls_group,
+            self.identity.self_id(),
+            self.ciphersuite,
+        )?;
+        let projected_epoch = if welcome_bytes.is_some() {
+            // Multi-member: the pending commit advances to epoch 1.
+            EpochId(1)
+        } else {
+            EpochId(0)
         };
-        let projected_epoch = prepared_pending.new_epoch();
+        let prepared_pending = self.epoch_manager.prepare_pending(
+            group_id.clone(),
+            EpochId(0),
+            projected_epoch,
+            cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
+            crate::epoch_manager::PendingKind::CreateGroup,
+            self.current_audit_context.clone(),
+        )?;
+        // The route may replace an existing group's mapping. Keep it
+        // with every founding artifact so any later Welcome error restores
+        // the previous owner. Hot indexes wait until the pending handoff.
+        self.storage.with_transaction(|storage| {
+            // Message/group foreign keys require this row first.
+            storage.put_group_with_roster(&group_record, &committed_members(&mls_group))?;
+            if let Ok(transport_group_id) =
+                crate::app_components::transport_group_id_of_group(&mls_group)
+            {
+                let _ = storage.put_transport_group_route(
+                    &transport_group_id,
+                    &group_id,
+                    EpochId(mls_group.epoch().as_u64()),
+                );
+            }
+            for welcome in &welcomes {
+                self.persist_transport_message(welcome, &group_id, EpochId(0), MessageState::Sent)?;
+            }
+            Ok::<_, EngineError>(())
+        })?;
         let pending_ref = prepared_pending.pending_ref();
         self.invalidate_deferred_peel_candidate_cache(&group_id);
         self.epoch_manager.commit_pending(prepared_pending);

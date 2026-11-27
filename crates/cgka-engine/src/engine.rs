@@ -5784,8 +5784,11 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
 }
 
 #[cfg(test)]
-#[path = "engine/begin_pending_rollback_tests.rs"]
-mod begin_pending_rollback_tests;
+#[path = "engine/prepare_pending_rollback_tests.rs"]
+mod prepare_pending_rollback_tests;
 #[cfg(test)]
 #[path = "engine/rewind_gate_tests.rs"]
 mod rewind_gate_tests;
+#[cfg(test)]
+#[path = "engine/test_support.rs"]
+pub(crate) mod test_support;
