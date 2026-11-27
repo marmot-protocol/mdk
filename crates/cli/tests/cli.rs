@@ -10724,11 +10724,8 @@ fn nip46_offline_signer_and_rejection_handle_gracefully() {
             "rotate",
         ],
     );
-    assert!(
-        matches!(
-            rotate_err["code"].as_str(),
-            Some("command_failed" | "nip46_rejected")
-        ),
+    assert_eq!(
+        rotate_err["code"], "command_failed",
         "unexpected rejection error shape: {rotate_err}"
     );
     assert!(
@@ -10795,7 +10792,7 @@ fn nip46_blocked_pairing_does_not_stall_other_accounts_and_cancels_on_disconnect
     let stderr = stalled_child.stderr.take().expect("piped stderr");
     let mut reader = BufReader::new(stderr);
     let mut line = String::new();
-    let mut saw_offer = false;
+    let mut abandoned_offer = None;
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         line.clear();
@@ -10803,12 +10800,13 @@ fn nip46_blocked_pairing_does_not_stall_other_accounts_and_cancels_on_disconnect
         if read == 0 {
             break;
         }
-        if line.trim().starts_with("nostrconnect://") {
-            saw_offer = true;
+        let trimmed = line.trim();
+        if trimmed.starts_with("nostrconnect://") {
+            abandoned_offer = Some(trimmed.to_owned());
             break;
         }
     }
-    assert!(saw_offer, "expected nostrconnect:// offer URI on stderr");
+    let abandoned_offer = abandoned_offer.expect("expected nostrconnect:// offer URI on stderr");
 
     // While the pairing is blocked awaiting a remote signer, Alice's hosted commands must proceed
     // immediately without stalling on the daemon workers lock.
@@ -10840,9 +10838,27 @@ fn nip46_blocked_pairing_does_not_stall_other_accounts_and_cancels_on_disconnect
     );
     assert_eq!(alice_sent["published"], 1);
 
-    // Kill the pairing client mid-flight (simulating Ctrl-C) and confirm wnd stays healthy.
+    // Kill the pairing client mid-flight (simulating Ctrl-C), let the daemon observe socket EOF,
+    // then have a remote signer accept the abandoned offer URI and confirm the cancelled session
+    // never adopts that account.
     let _ = stalled_child.kill();
     let _ = stalled_child.wait();
+    drop(reader);
+    std::thread::sleep(Duration::from_millis(250));
+    let abandoned_signer = MockNip46Signer::start(relay.url());
+    abandoned_signer.accept_nostrconnect(&abandoned_offer);
+    std::thread::sleep(Duration::from_millis(500));
+    let accounts_after_cancel =
+        run_json(home.path(), &["--socket", socket_arg, "accounts", "list"]);
+    assert!(
+        !accounts_after_cancel["accounts"]
+            .as_array()
+            .expect("accounts array")
+            .iter()
+            .any(|row| row["account_id"] == abandoned_signer.user_pubkey_hex()),
+        "abandoned nostrconnect offer must not adopt an account after client disconnect: {accounts_after_cancel}"
+    );
+    drop(abandoned_signer);
 
     // Now block a `bunker://` login mid-adoption (holding Bob's onboarding transaction while
     // waiting on `sign_event`) and confirm Alice's hosted command still completes without stalling.

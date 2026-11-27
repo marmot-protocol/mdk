@@ -324,31 +324,42 @@ async fn run_cli_with_secrets(
     run_cli_local(cli, import_nsec, import_bunker).await
 }
 
-fn validate_secret_input_flags(cli: &Cli) -> Result<(), WnError> {
-    if cli
-        .account
-        .as_deref()
-        .is_some_and(commands::nip46::is_nip46_uri)
-    {
-        return Err(WnError::BunkerArgumentRejected {
-            command: "--account",
-        });
+fn reject_nip46_uri_arg(command: &'static str, value: Option<&str>) -> Result<(), WnError> {
+    if value.is_some_and(commands::nip46::is_nip46_uri) {
+        return Err(WnError::BunkerArgumentRejected { command });
     }
+    Ok(())
+}
+
+fn reject_nip46_uri_list(command: &'static str, values: &[String]) -> Result<(), WnError> {
+    for value in values {
+        reject_nip46_uri_arg(command, Some(value.as_str()))?;
+    }
+    Ok(())
+}
+
+fn validate_secret_input_flags(cli: &Cli) -> Result<(), WnError> {
+    reject_nip46_uri_arg("--account", cli.account.as_deref())?;
+    reject_nip46_uri_arg("--relay", cli.relay.as_deref())?;
+    reject_nip46_uri_list("--discovery-relays", &cli.daemon_discovery_relays)?;
+    reject_nip46_uri_list(
+        "--default-account-relays",
+        &cli.daemon_default_account_relays,
+    )?;
     match &cli.command {
         Command::Login {
             identity,
             nsec_stdin,
             nip46,
+            relay,
             default_relays,
             bootstrap_relays,
-            ..
         } => {
-            if identity
-                .as_deref()
-                .is_some_and(commands::nip46::is_nip46_uri)
-            {
-                return Err(WnError::BunkerArgumentRejected { command: "login" });
-            }
+            reject_nip46_uri_arg("login", identity.as_deref())?;
+            reject_nip46_uri_arg("login", relay.as_deref())?;
+            reject_nip46_uri_list("login", &nip46.signer_relays)?;
+            reject_nip46_uri_list("login", default_relays)?;
+            reject_nip46_uri_list("login", bootstrap_relays)?;
             validate_materialized_secret_identity("login", identity, *nsec_stdin)?;
             let modes = usize::from(identity.is_some())
                 + usize::from(*nsec_stdin)
@@ -389,14 +400,7 @@ fn validate_secret_input_flags(cli: &Cli) -> Result<(), WnError> {
                     ..
                 },
         } => {
-            if identity
-                .as_deref()
-                .is_some_and(commands::nip46::is_nip46_uri)
-            {
-                return Err(WnError::BunkerArgumentRejected {
-                    command: "account create",
-                });
-            }
+            reject_nip46_uri_arg("account create", identity.as_deref())?;
             validate_materialized_secret_identity("account create", identity, *nsec_stdin)
         }
         Command::Account {
@@ -405,41 +409,28 @@ fn validate_secret_input_flags(cli: &Cli) -> Result<(), WnError> {
         | Command::Accounts {
             command: AccountCommand::Nip46 { command },
         } => match command {
-            Nip46Command::Login { pair, .. } => {
+            Nip46Command::Login {
+                pair,
+                relay,
+                default_relays,
+                bootstrap_relays,
+            } => {
+                reject_nip46_uri_arg("accounts nip46 login", relay.as_deref())?;
+                reject_nip46_uri_list("accounts nip46 login", &pair.signer_relays)?;
+                reject_nip46_uri_list("accounts nip46 login", default_relays)?;
+                reject_nip46_uri_list("accounts nip46 login", bootstrap_relays)?;
                 commands::nip46::validate_nip46_pair_flags("accounts nip46 login", pair)
             }
             Nip46Command::Register { account, pair } => {
-                if account
-                    .as_deref()
-                    .is_some_and(commands::nip46::is_nip46_uri)
-                {
-                    return Err(WnError::BunkerArgumentRejected {
-                        command: "accounts nip46 register",
-                    });
-                }
+                reject_nip46_uri_arg("accounts nip46 register", account.as_deref())?;
+                reject_nip46_uri_list("accounts nip46 register", &pair.signer_relays)?;
                 commands::nip46::validate_nip46_pair_flags("accounts nip46 register", pair)
             }
             Nip46Command::Status { account } => {
-                if account
-                    .as_deref()
-                    .is_some_and(commands::nip46::is_nip46_uri)
-                {
-                    return Err(WnError::BunkerArgumentRejected {
-                        command: "accounts nip46 status",
-                    });
-                }
-                Ok(())
+                reject_nip46_uri_arg("accounts nip46 status", account.as_deref())
             }
             Nip46Command::Remove { account } => {
-                if account
-                    .as_deref()
-                    .is_some_and(commands::nip46::is_nip46_uri)
-                {
-                    return Err(WnError::BunkerArgumentRejected {
-                        command: "accounts nip46 remove",
-                    });
-                }
-                Ok(())
+                reject_nip46_uri_arg("accounts nip46 remove", account.as_deref())
             }
         },
         _ => Ok(()),
@@ -474,36 +465,13 @@ fn read_import_nsec_for_cli(cli: &Cli) -> Result<Option<ImportNsec>, WnError> {
 }
 
 fn read_import_bunker_for_cli(cli: &Cli) -> Result<Option<ImportBunkerUri>, WnError> {
-    match &cli.command {
-        Command::Login { nip46, .. } if nip46.bunker_stdin => {
-            Ok(Some(read_bunker_uri_from_stdin("login")?))
-        }
-        Command::Account {
-            command:
-                AccountCommand::Nip46 {
-                    command: Nip46Command::Login { pair, .. },
-                },
-        }
-        | Command::Accounts {
-            command:
-                AccountCommand::Nip46 {
-                    command: Nip46Command::Login { pair, .. },
-                },
-        } if pair.bunker_stdin => Ok(Some(read_bunker_uri_from_stdin("accounts nip46 login")?)),
-        Command::Account {
-            command:
-                AccountCommand::Nip46 {
-                    command: Nip46Command::Register { pair, .. },
-                },
-        }
-        | Command::Accounts {
-            command:
-                AccountCommand::Nip46 {
-                    command: Nip46Command::Register { pair, .. },
-                },
-        } if pair.bunker_stdin => Ok(Some(read_bunker_uri_from_stdin("accounts nip46 register")?)),
-        _ => Ok(None),
+    let Some((command, pair)) = commands::nip46::nip46_pair_command_and_args(&cli.command) else {
+        return Ok(None);
+    };
+    if !pair.bunker_stdin {
+        return Ok(None);
     }
+    Ok(Some(read_bunker_uri_from_stdin(command)?))
 }
 
 fn read_bunker_uri_from_stdin(command: &'static str) -> Result<ImportBunkerUri, WnError> {
@@ -1301,6 +1269,9 @@ pub(crate) fn validate_relay_url(relay: impl AsRef<str>) -> Result<String, WnErr
     let relay = relay.as_ref().trim();
     if relay.is_empty() {
         return Err(WnError::EmptyRelayUrl);
+    }
+    if commands::nip46::is_nip46_uri(relay) {
+        return Err(WnError::BunkerArgumentRejected { command: "relay" });
     }
     let parsed = url::Url::parse(relay).map_err(|_| WnError::InvalidRelayUrl(relay.to_owned()))?;
     let Some(host) = parsed.host() else {
@@ -3528,7 +3499,42 @@ mod tests {
             vec!["wn", "accounts", "nip46", "remove", bunker_uri.as_str()],
             vec!["wn", "--account", bunker_uri.as_str(), "whoami"],
             vec!["wn", flag_uri.as_str(), "whoami"],
+            vec!["wn", "--relay", bunker_uri.as_str(), "whoami"],
+            vec![
+                "wn",
+                "--relay",
+                "wss://relay.example",
+                "login",
+                "--nostrconnect",
+                "--approve-permissions",
+                "--signer-relays",
+                bunker_uri.as_str(),
+            ],
+            vec![
+                "wn",
+                "accounts",
+                "nip46",
+                "login",
+                "--nostrconnect",
+                "--approve-permissions",
+                "--default-relays",
+                bunker_uri.as_str(),
+            ],
+            vec![
+                "wn",
+                "accounts",
+                "nip46",
+                "login",
+                "--nostrconnect",
+                "--approve-permissions",
+                "--bootstrap-relays",
+                bunker_uri.as_str(),
+            ],
         ];
+        assert!(matches!(
+            crate::validate_relay_url(&bunker_uri),
+            Err(WnError::BunkerArgumentRejected { .. })
+        ));
         for base_args in cases {
             for json_mode in [false, true] {
                 let mut args = base_args.clone();

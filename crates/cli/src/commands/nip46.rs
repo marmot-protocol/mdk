@@ -599,11 +599,9 @@ pub(crate) fn nip46_session_summary_json(
     if !account.external_signing {
         return Value::Null;
     }
-    let persisted = match account_home.load_nip46_session(&account.label) {
-        Ok(Some((_keys, record))) => Ok(Some(record)),
-        Ok(None) => Ok(None),
-        Err(err) => Err(err),
-    };
+    let persisted = account_home
+        .load_nip46_session(&account.label)
+        .map(|loaded| loaded.map(|(_keys, record)| record));
     match persisted {
         Ok(Some(record)) => nip46_record_json(record, live_session.map(Nip46Session::status)),
         Ok(None) => json!({
@@ -638,25 +636,29 @@ fn nip46_record_json(record: Nip46SessionRecord, status: Option<Nip46Status>) ->
     })
 }
 
-pub(crate) fn nip46_pair_args(command: &crate::Command) -> Option<&Nip46PairArgs> {
+pub(crate) fn nip46_pair_command_and_args(
+    command: &crate::Command,
+) -> Option<(&'static str, &Nip46PairArgs)> {
     match command {
         crate::Command::Login { nip46, .. } if nip46.bunker_stdin || nip46.nostrconnect => {
-            Some(nip46)
+            Some(("login", nip46))
         }
         crate::Command::Account {
-            command:
-                crate::AccountCommand::Nip46 {
-                    command: Nip46Command::Login { pair, .. } | Nip46Command::Register { pair, .. },
-                },
+            command: crate::AccountCommand::Nip46 { command },
         }
         | crate::Command::Accounts {
-            command:
-                crate::AccountCommand::Nip46 {
-                    command: Nip46Command::Login { pair, .. } | Nip46Command::Register { pair, .. },
-                },
-        } => Some(pair),
+            command: crate::AccountCommand::Nip46 { command },
+        } => match command {
+            Nip46Command::Login { pair, .. } => Some(("accounts nip46 login", pair)),
+            Nip46Command::Register { pair, .. } => Some(("accounts nip46 register", pair)),
+            Nip46Command::Status { .. } | Nip46Command::Remove { .. } => None,
+        },
         _ => None,
     }
+}
+
+pub(crate) fn nip46_pair_args(command: &crate::Command) -> Option<&Nip46PairArgs> {
+    nip46_pair_command_and_args(command).map(|(_, pair)| pair)
 }
 
 pub(crate) fn nip46_pair_args_mut(command: &mut crate::Command) -> Option<&mut Nip46PairArgs> {
