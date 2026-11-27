@@ -922,11 +922,10 @@ impl QuorumCancelledDelivery {
 }
 
 /// Compare relay endpoints the way the transport reports them in receipts.
-pub(crate) fn relay_endpoint_key(endpoint: &TransportEndpoint) -> String {
-    let trimmed = endpoint.as_str().trim();
-    nostr::prelude::RelayUrl::parse(trimmed)
+fn relay_endpoint_key(endpoint: &TransportEndpoint) -> String {
+    nostr::prelude::RelayUrl::parse(endpoint.as_str())
         .map(|url| url.to_string())
-        .unwrap_or_else(|_| trimmed.to_owned())
+        .unwrap_or_else(|_| endpoint.0.clone())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3746,7 +3745,13 @@ impl MarmotApp {
         signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
         event: &NostrTransportEvent,
     ) -> Result<NostrTransportEvent, AppError> {
-        let created_at = self.reserve_replaceable_identity_created_at(account_ref, event)?;
+        let created_at = match self.reserve_replaceable_identity_created_at_within(
+            account_ref,
+            event,
+            u64::MAX,
+        )? {
+            Ok(created_at) | Err(created_at) => created_at,
+        };
         sign_replaceable_identity_event_at(signer, event, created_at).await
     }
 
@@ -3762,12 +3767,9 @@ impl MarmotApp {
         max_created_at: u64,
         on_exceeded: impl FnOnce(u64) -> AppError,
     ) -> Result<NostrTransportEvent, AppError> {
-        let created_at = self.reserve_replaceable_identity_created_at_bounded(
-            account_ref,
-            event,
-            max_created_at,
-            on_exceeded,
-        )?;
+        let created_at = self
+            .reserve_replaceable_identity_created_at_within(account_ref, event, max_created_at)?
+            .map_err(on_exceeded)?;
         sign_replaceable_identity_event_at(signer, event, created_at).await
     }
 
@@ -3788,46 +3790,12 @@ impl MarmotApp {
         }
     }
 
-    fn commit_replaceable_identity_created_at_locked(
-        &self,
-        latest: &mut std::collections::HashMap<(String, u64), u64>,
-        account_ref: &str,
-        key: (String, u64),
-        created_at: u64,
-    ) -> Result<u64, AppError> {
-        self.account_home()
-            .advance_replaceable_record_floor(account_ref, key.1, created_at)?;
-        latest.insert(key, created_at);
-        Ok(created_at)
-    }
-
-    fn reserve_replaceable_identity_created_at(
-        &self,
-        account_ref: &str,
-        event: &NostrTransportEvent,
-    ) -> Result<u64, AppError> {
-        let mut latest = self
-            .replaceable_identity_created_at
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let key = (event.pubkey.clone(), event.kind);
-        let floor = self.read_replaceable_identity_floor_locked(&latest, account_ref, &key)?;
-        let created_at = event.created_at.max(floor.saturating_add(1));
-        self.commit_replaceable_identity_created_at_locked(
-            &mut latest,
-            account_ref,
-            key,
-            created_at,
-        )
-    }
-
-    fn reserve_replaceable_identity_created_at_bounded(
+    fn reserve_replaceable_identity_created_at_within(
         &self,
         account_ref: &str,
         event: &NostrTransportEvent,
         max_created_at: u64,
-        on_exceeded: impl FnOnce(u64) -> AppError,
-    ) -> Result<u64, AppError> {
+    ) -> Result<Result<u64, u64>, AppError> {
         let mut latest = self
             .replaceable_identity_created_at
             .lock()
@@ -3836,14 +3804,12 @@ impl MarmotApp {
         let floor = self.read_replaceable_identity_floor_locked(&latest, account_ref, &key)?;
         let created_at = event.created_at.max(floor.saturating_add(1));
         if created_at > max_created_at {
-            return Err(on_exceeded(created_at));
+            return Ok(Err(created_at));
         }
-        self.commit_replaceable_identity_created_at_locked(
-            &mut latest,
-            account_ref,
-            key,
-            created_at,
-        )
+        self.account_home()
+            .advance_replaceable_record_floor(account_ref, key.1, created_at)?;
+        latest.insert(key, created_at);
+        Ok(Ok(created_at))
     }
 
     pub(crate) fn spawn_quorum_cancelled_delivery(&self, delivery: QuorumCancelledDelivery) {

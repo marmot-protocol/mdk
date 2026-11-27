@@ -115,22 +115,21 @@ fn delete_retry_at(now: u64, attempts: u64) -> u64 {
     now.saturating_add((DELETE_AFTER_SECS << attempts.min(5)).min(MAX_DELETE_WAIT_SECS))
 }
 
-fn backup_pointer_created_at(
-    now: u64,
-    replaces: u64,
-    method: &'static str,
-) -> Result<u64, AppError> {
-    let created_at = now.max(replaces.saturating_add(1));
-    if created_at > now.saturating_add(MAX_POINTER_FUTURE_SKEW_SECS) {
-        tracing::warn!(
-            target: TRACE_TARGET,
-            method = method,
-            skew_secs = created_at.saturating_sub(now),
-            "refusing backup pointer whose timestamp exceeds future skew bound"
-        );
-        return Err(backup_error("backup_pointer_clock_skew"));
-    }
-    Ok(created_at)
+fn pointer_skew_error(now: u64, created_at: u64, method: &'static str) -> AppError {
+    tracing::warn!(
+        target: TRACE_TARGET,
+        method = method,
+        skew_secs = created_at.saturating_sub(now),
+        "refusing backup pointer whose timestamp exceeds future skew bound"
+    );
+    backup_error("backup_pointer_clock_skew")
+}
+
+fn canonical_endpoint_key(endpoint: &TransportEndpoint) -> String {
+    let trimmed = endpoint.as_str().trim();
+    nostr::prelude::RelayUrl::parse(trimmed)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| trimmed.to_owned())
 }
 
 fn backup_error(reason: &'static str) -> AppError {
@@ -188,11 +187,11 @@ pub(super) async fn read_backup_pointer_discovery(
         .fetch_directory_events_with_completion(endpoints.to_vec(), vec![query])
         .await
         .map_err(|_| backup_error("backup_pointer_unavailable"))?;
-    let requested: BTreeSet<String> = endpoints.iter().map(crate::relay_endpoint_key).collect();
+    let requested: BTreeSet<String> = endpoints.iter().map(canonical_endpoint_key).collect();
     let completed: BTreeSet<String> = outcome
         .complete_endpoints
         .iter()
-        .map(crate::relay_endpoint_key)
+        .map(canonical_endpoint_key)
         .collect();
     let requested_endpoints = requested.len();
     let complete_endpoints = requested.intersection(&completed).count();
@@ -339,7 +338,10 @@ impl BackupPass {
             &self.account_id_hex,
             KIND_BACKUP_POINTER,
         )?;
-        backup_pointer_created_at(now, replaces.max(floor), "pass")?;
+        let created_at = now.max(replaces.max(floor).saturating_add(1));
+        if created_at > now.saturating_add(MAX_POINTER_FUTURE_SKEW_SECS) {
+            return Err(pointer_skew_error(now, created_at, "pass"));
+        }
         Ok(())
     }
 
@@ -1016,7 +1018,7 @@ impl AppClient {
             .as_nostr_signer();
         let endpoints = self.app.backup_pointer_endpoints(&summary.account_id_hex);
         let now = unix_now_seconds();
-        let created_at = backup_pointer_created_at(now, replaces, "publish_backup_pointer")?;
+        let created_at = now.max(replaces.saturating_add(1));
         let max_created_at = now.saturating_add(MAX_POINTER_FUTURE_SKEW_SECS);
         let event = self
             .app
@@ -1032,13 +1034,7 @@ impl AppClient {
                 ),
                 max_created_at,
                 |skewed_created_at| {
-                    tracing::warn!(
-                        target: TRACE_TARGET,
-                        method = "publish_backup_pointer",
-                        skew_secs = skewed_created_at.saturating_sub(now),
-                        "refusing backup pointer whose timestamp exceeds future skew bound"
-                    );
-                    backup_error("backup_pointer_clock_skew")
+                    pointer_skew_error(now, skewed_created_at, "publish_backup_pointer")
                 },
             )
             .await?;
