@@ -73,18 +73,23 @@ fileprivate func uniffiRustCallAsync<F, T>(
         freeFunc(rustFuture)
     }
     await withTaskCancellationHandler {
-        var pollResult: Int8
-        repeat {
-            pollResult = await withUnsafeContinuation {
+        while true {
+            if cancellation.canCancel && Task.isCancelled {
+                break
+            }
+            let pollResult = await withUnsafeContinuation {
                 pollFunc(
                     rustFuture,
                     uniffiFutureContinuationCallback,
                     uniffiContinuationHandleMap.insert(obj: $0)
                 )
             }
-        } while pollResult != UNIFFI_RUST_FUTURE_POLL_READY
+            if pollResult == UNIFFI_RUST_FUTURE_POLL_READY {
+                break
+            }
+        }
     } onCancel: {
-        cancellation.cancel()
+        cancellation.scheduleCancel()
     }
 
     var callStatus = RustCallStatus.init()
@@ -97,17 +102,34 @@ fileprivate func uniffiRustCallAsync<F, T>(
 }
 
 // The lock keeps a late cancellation from using the handle after it is freed.
+// `scheduleCancel()` dispatches off Swift's `onCancel` handler because
+// `swift_task_cancelImpl` holds the task's StatusRecordLock while invoking it,
+// whereas `uniffi_core::RustFuture::wake` holds its scheduler Mutex while
+// resuming the continuation (which acquires StatusRecordLock). Calling
+// `cancelFunc` synchronously inside `onCancel` inverts that lock order and
+// deadlocks (mdk#3821).
 fileprivate final class UniffiRustFutureCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var rustFuture: UInt64?
     private let cancelFunc: ((UInt64) -> ())?
+
+    var canCancel: Bool {
+        cancelFunc != nil
+    }
 
     init(_ rustFuture: UInt64, _ cancelFunc: ((UInt64) -> ())?) {
         self.rustFuture = rustFuture
         self.cancelFunc = cancelFunc
     }
 
-    func cancel() {
+    func scheduleCancel() {
+        guard cancelFunc != nil else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.cancel()
+        }
+    }
+
+    private func cancel() {
         lock.lock()
         defer { lock.unlock() }
         if let rustFuture, let cancelFunc {
@@ -235,4 +257,128 @@ fn sorted(symbols: &[&'static str]) -> Vec<&'static str> {
     let mut symbols = symbols.to_vec();
     symbols.sort_unstable();
     symbols
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synthetic_swift_source() -> String {
+        let mut source = String::from(UPSTREAM_RUST_CALL_ASYNC);
+        source.push_str(
+            r#"
+public func cancellableCall() async throws {
+    return
+        try await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_marmot_uniffi_fn_method_marmot_create_group(self.uniffiClonePointer())
+            },
+            pollFunc: ffi_marmot_uniffi_rust_future_poll_void,
+            completeFunc: ffi_marmot_uniffi_rust_future_complete_void,
+            freeFunc: ffi_marmot_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+        )
+}
+
+public func nonThrowingReceive() async {
+    return
+        try! await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_marmot_uniffi_fn_method_eventssubscription_next(self.uniffiClonePointer())
+            },
+            pollFunc: ffi_marmot_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_marmot_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_marmot_uniffi_rust_future_free_rust_buffer,
+            liftFunc: { $0 },
+            errorHandler: nil
+        )
+}
+"#,
+        );
+        for symbol in SWIFT_AWAITS_COMPLETION {
+            source.push_str(&format!(
+                r#"
+public func awaited_{symbol}() async throws {{
+    return
+        try await uniffiRustCallAsync(
+            rustFutureFunc: {{
+                {symbol}(self.uniffiClonePointer())
+            }},
+            pollFunc: ffi_marmot_uniffi_rust_future_poll_void,
+            completeFunc: ffi_marmot_uniffi_rust_future_complete_void,
+            freeFunc: ffi_marmot_uniffi_rust_future_free_void,
+            liftFunc: {{ $0 }},
+            errorHandler: nil
+        )
+}}
+"#
+            ));
+        }
+        source
+    }
+
+    #[test]
+    fn forward_cancellation_wires_throwing_sites_and_skips_awaited_and_nonthrowing() {
+        let output = forward_cancellation(&synthetic_swift_source()).expect("rewrite succeeds");
+        assert_eq!(
+            output
+                .matches("cancelFunc: ffi_marmot_uniffi_rust_future_cancel_void,")
+                .count(),
+            1,
+            "only the one cancellable throwing call site should get cancelFunc"
+        );
+        assert!(
+            !output.contains("cancelFunc: ffi_marmot_uniffi_rust_future_cancel_rust_buffer"),
+            "non-throwing try! call site must not get cancelFunc"
+        );
+        let err = forward_cancellation("// drifted upstream helper")
+            .expect_err("drifted upstream helper must fail closed");
+        assert!(
+            err.contains("uniffiRustCallAsync changed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn generated_on_cancel_dispatches_off_task_lock_and_guards_cancelled_poll() {
+        let output = forward_cancellation(&synthetic_swift_source()).expect("rewrite succeeds");
+
+        // Extract the `onCancel: { ... }` handler body inside `uniffiRustCallAsync`.
+        let on_cancel_start = output
+            .find("} onCancel: {")
+            .expect("generated helper must install a task cancellation handler");
+        let after_on_cancel = &output[on_cancel_start..];
+        let on_cancel_end = after_on_cancel
+            .find("\n    }\n")
+            .expect("onCancel handler closing brace");
+        let on_cancel_body = &after_on_cancel[..on_cancel_end];
+
+        assert!(
+            !on_cancel_body.contains("cancellation.cancel()"),
+            "onCancel must not invoke synchronous cancellation.cancel() while holding AsyncTask StatusRecordLock (mdk#3821):\n{on_cancel_body}"
+        );
+        assert!(
+            output.contains("DispatchQueue.global("),
+            "cancellation must dispatch off Swift's onCancel handler via DispatchQueue.global to avoid ABBA deadlock with RustFuture::wake (mdk#3821)"
+        );
+
+        // Because cancellation is dispatched asynchronously, the poll loop must
+        // check Task.isCancelled before invoking pollFunc so a pre-cancelled or
+        // woken-after-cancel task does not issue another native poll.
+        let handler_start = output
+            .find("await withTaskCancellationHandler {")
+            .expect("withTaskCancellationHandler body");
+        let poll_loop = &output[handler_start..on_cancel_start];
+        let cancel_check_pos = poll_loop
+            .find("Task.isCancelled")
+            .expect("poll loop must check Task.isCancelled before polling");
+        let poll_call_pos = poll_loop
+            .find("pollFunc(")
+            .expect("poll loop must invoke pollFunc");
+        assert!(
+            cancel_check_pos < poll_call_pos,
+            "Task.isCancelled check must precede pollFunc"
+        );
+    }
 }
