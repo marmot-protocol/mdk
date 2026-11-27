@@ -2578,6 +2578,10 @@ fn remove_public_account_scrubs_orphaned_same_id_credential_unless_signing_twin_
             .has_secret_for_account_id(&created.account_id_hex)
             .unwrap()
     );
+    // Simulate uninstall: the previous home directory is gone while the
+    // account-id-keyed vault entry survives.
+    drop(first_home);
+    drop(first_dir);
 
     let reinstall_dir = tempfile::tempdir().unwrap();
     let reinstall_home = AccountHome::open_with_secret_store(reinstall_dir.path(), store.clone());
