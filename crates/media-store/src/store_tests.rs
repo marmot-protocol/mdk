@@ -756,3 +756,306 @@ fn a_failed_best_effort_unlink_owes_a_sweep_once() {
     assert!(store.take_sweep_owed());
     assert!(!store.take_sweep_owed(), "reported once");
 }
+
+#[test]
+fn dual_checkpoint_readers_keep_wire_file_in_flight_until_last_handle_drops() {
+    let (harness, store) = fixture();
+    let target = harness.catalog.checkpoint(0);
+    assert!(store.checkpoint_append(&target, 0, b"recorded").unwrap());
+    let (id, _) = target.current().unwrap().unwrap();
+
+    let first = store.checkpoint_reader(&target).unwrap().unwrap();
+    let mut second = store.checkpoint_reader(&target).unwrap().unwrap();
+
+    // The domain deletes the checkpoint row while both readers are open.
+    harness.catalog.end_checkpoint(0);
+
+    // Finishing the first reader must not unlink the file beneath the second,
+    // nor may a concurrent sweep reclaim it while the second reader is live.
+    first.finish().unwrap();
+    assert!(
+        store.wire_path(&id).exists(),
+        "wire file must stay on disk while a second reader is in flight"
+    );
+    let mut swept_orphans = 0;
+    loop {
+        let batch = store.sweep(64).unwrap();
+        swept_orphans += batch.orphans_unlinked;
+        if batch.complete {
+            break;
+        }
+    }
+    assert_eq!(swept_orphans, 0);
+    assert!(store.wire_path(&id).exists());
+
+    let mut bytes = Vec::new();
+    second.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"recorded");
+    second.finish().unwrap();
+    assert!(
+        !store.wire_path(&id).exists(),
+        "finishing the last reader unlinks the wire file once its row is gone"
+    );
+}
+
+#[test]
+fn read_at_does_not_resurrect_revoked_reader_and_not_found_evicts_cache() {
+    // Part 1: open_file_reader hitting NotFound must evict any cached reader.
+    let (harness, store) = fixture();
+    let id = published(&harness, &store, b"cached-body");
+    let mut out = [0; 11];
+    assert_eq!(store.read_at(&id, 0, &mut out).unwrap(), Some(11));
+    assert_eq!(&out, b"cached-body");
+    std::fs::remove_file(store.path(&id)).unwrap();
+    assert!(store.open_reader(&id).unwrap().is_none());
+    assert_eq!(store.file_state(&id).unwrap(), Some(FileState::Lost));
+    assert_eq!(
+        store.read_at(&id, 0, &mut out).unwrap(),
+        None,
+        "NotFound in open_file_reader must evict the cached reader"
+    );
+
+    // Part 2: a revocation happening while read_at is in flight outside the
+    // reader cache lock must prevent read_at from re-inserting the reader.
+    #[derive(Clone)]
+    struct RevokingCatalog {
+        inner: MemoryCatalog,
+        on_ready_file: Arc<Mutex<Option<Hook>>>,
+    }
+
+    impl MediaCatalog for RevokingCatalog {
+        fn is_closed(&self) -> bool {
+            self.inner.is_closed()
+        }
+        fn insert_pending(&self, file: &NewFile) -> CatalogResult<()> {
+            self.inner.insert_pending(file)
+        }
+        fn abandon_pending(&self, id: FileId) -> CatalogResult<bool> {
+            self.inner.abandon_pending(id)
+        }
+        fn ready_file(&self, id: FileId) -> CatalogResult<Option<crate::catalog::ReadyFile>> {
+            let row = self.inner.ready_file(id)?;
+            if let Some(hook) = self.on_ready_file.lock().unwrap().take() {
+                hook();
+            }
+            Ok(row)
+        }
+        fn file_state(&self, id: FileId) -> CatalogResult<Option<FileState>> {
+            self.inner.file_state(id)
+        }
+        fn mark_lost(&self, id: FileId) -> CatalogResult<bool> {
+            self.inner.mark_lost(id)
+        }
+        fn page(
+            &self,
+            after: Option<FileId>,
+            limit: usize,
+        ) -> CatalogResult<Vec<(FileId, FileState)>> {
+            self.inner.page(after, limit)
+        }
+        fn wire_partial_received(&self, id: FileId) -> CatalogResult<Option<u64>> {
+            self.inner.wire_partial_received(id)
+        }
+        fn staged_file(&self, id: FileId) -> CatalogResult<Option<crate::catalog::ReadyFile>> {
+            self.inner.staged_file(id)
+        }
+        fn abandon_unowned_staged(&self, id: FileId) -> CatalogResult<bool> {
+            self.inner.abandon_unowned_staged(id)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let inner = MemoryCatalog::default();
+    let hook = Arc::new(Mutex::new(None));
+    let catalog = RevokingCatalog {
+        inner: inner.clone(),
+        on_ready_file: Arc::clone(&hook),
+    };
+    let store = MediaStore::new(dir.path().join(MEDIA_DIRECTORY), catalog);
+    let body = b"revoked-mid-read";
+    let PublishOutcome::Published(id) = store
+        .publish(
+            &inner.target(0),
+            Category::Retained,
+            &mut Cursor::new(body.as_slice()),
+            body.len() as u64,
+            digest(body),
+            NOW,
+            &|| false,
+        )
+        .unwrap()
+    else {
+        panic!("expected published file");
+    };
+
+    // Simulate release/revocation firing while read_at holds no cache lock.
+    let store_for_hook = store.clone();
+    let inner_for_hook = inner.clone();
+    *hook.lock().unwrap() = Some(Box::new(move || {
+        inner_for_hook.delete_row(id);
+        store_for_hook.forget_reader(&id);
+    }));
+
+    let mut first_buf = [0; 16];
+    assert_eq!(store.read_at(&id, 0, &mut first_buf).unwrap(), Some(16));
+    let mut second_buf = [0; 16];
+    assert_eq!(
+        store.read_at(&id, 0, &mut second_buf).unwrap(),
+        None,
+        "revoked reader must not be resurrected in cache"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn reopen_paths_refuse_symlinks_without_modifying_victim() {
+    use std::os::unix::fs::symlink;
+
+    let (harness, store) = fixture();
+    let victim = harness.dir.path().join("victim.bin");
+    let victim_bytes = vec![0xab; 4096];
+    std::fs::write(&victim, &victim_bytes).unwrap();
+
+    // 1. open_file_reader refuses a symlinked ready file.
+    let ready_id = published(&harness, &store, b"ready-body");
+    std::fs::remove_file(store.path(&ready_id)).unwrap();
+    symlink(&victim, store.path(&ready_id)).unwrap();
+    assert!(matches!(
+        store.open_reader(&ready_id),
+        Err(MediaError::Io(_))
+    ));
+
+    // 2. open_staged_reader refuses a symlinked staged file.
+    let StageOutcome::Staged { id: staged_id, .. } =
+        stage_body(&store, &harness.catalog, 0, b"staged-body").unwrap()
+    else {
+        panic!("staged");
+    };
+    std::fs::remove_file(store.path(&staged_id)).unwrap();
+    symlink(&victim, store.path(&staged_id)).unwrap();
+    assert!(matches!(
+        store.open_staged_reader(&staged_id),
+        Err(MediaError::Io(_))
+    ));
+
+    // 3. open_wire (restore, reader, append) and trim_wire (sweep) refuse a
+    // symlinked wire file and never truncate the victim.
+    let target = harness.catalog.checkpoint(0);
+    assert!(store.checkpoint_append(&target, 0, b"head").unwrap());
+    let (wire_id, _) = target.current().unwrap().unwrap();
+    std::fs::remove_file(store.wire_path(&wire_id)).unwrap();
+    symlink(&victim, store.wire_path(&wire_id)).unwrap();
+
+    assert!(matches!(
+        store.checkpoint_restore(&target, &mut Vec::new()),
+        Err(MediaError::Io(_))
+    ));
+    assert!(matches!(
+        store.checkpoint_reader(&target),
+        Err(MediaError::Io(_))
+    ));
+    assert!(matches!(
+        store.checkpoint_append(&target, 4, b"tail"),
+        Err(MediaError::Io(_))
+    ));
+    assert!(trim_wire(&store.wire_path(&wire_id), 4).is_err());
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        victim_bytes,
+        "victim file must remain unmodified and untruncated"
+    );
+}
+
+#[test]
+fn wire_append_rejects_length_overflow_without_modifying_file() {
+    let (harness, store) = fixture();
+    let target = harness.catalog.checkpoint(0);
+    assert!(matches!(
+        store.checkpoint_append(&target, u64::MAX - 2, b"abcd"),
+        Err(MediaError::InvalidBody(_))
+    ));
+    assert_eq!(target.current().unwrap(), None);
+
+    let id = FileId([0xaa; 16]);
+    let mut wire = store.create_wire(&id).unwrap();
+    wire.len = u64::MAX - 2;
+    assert!(matches!(
+        wire.append(b"abcd"),
+        Err(MediaError::InvalidBody(_))
+    ));
+    assert_eq!(wire.len, u64::MAX - 2);
+    assert_eq!(std::fs::metadata(store.wire_path(&id)).unwrap().len(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn sweep_rows_marks_non_regular_and_truncated_files_lost() {
+    use std::os::unix::fs::symlink;
+
+    let (harness, store) = fixture();
+    let victim = harness.dir.path().join("outside.bin");
+    std::fs::write(&victim, vec![0x55; 128]).unwrap();
+
+    // Ready file replaced with a symlink.
+    let linked_ready = published(&harness, &store, b"ready-link");
+    assert_eq!(
+        store.read_at(&linked_ready, 0, &mut [0; 4]).unwrap(),
+        Some(4)
+    );
+    std::fs::remove_file(store.path(&linked_ready)).unwrap();
+    symlink(&victim, store.path(&linked_ready)).unwrap();
+
+    // Ready file truncated below a valid header + tag (distinct slot so slot 0 stays referenced).
+    let short_body = b"ready-short";
+    let PublishOutcome::Published(truncated_ready) = publish(
+        &harness,
+        &store,
+        1,
+        short_body,
+        short_body.len() as u64,
+        digest(short_body),
+        &|| false,
+    )
+    .unwrap() else {
+        panic!("expected published file");
+    };
+    std::fs::write(store.path(&truncated_ready), b"short").unwrap();
+
+    // Owned staged file replaced with a symlink.
+    let StageOutcome::Staged {
+        id: linked_staged, ..
+    } = stage_body(&store, &harness.catalog, 2, b"staged-link").unwrap()
+    else {
+        panic!("staged");
+    };
+    std::fs::remove_file(store.path(&linked_staged)).unwrap();
+    symlink(&victim, store.path(&linked_staged)).unwrap();
+
+    let mut lost = 0;
+    loop {
+        let batch = store.sweep(64).unwrap();
+        lost += batch.lost_marked;
+        if batch.complete {
+            break;
+        }
+    }
+    assert_eq!(lost, 3);
+    assert_eq!(
+        store.file_state(&linked_ready).unwrap(),
+        Some(FileState::Lost)
+    );
+    assert_eq!(
+        store.file_state(&truncated_ready).unwrap(),
+        Some(FileState::Lost)
+    );
+    assert_eq!(
+        store.file_state(&linked_staged).unwrap(),
+        Some(FileState::Lost)
+    );
+    assert_eq!(
+        store.read_at(&linked_ready, 0, &mut [0; 4]).unwrap(),
+        None,
+        "sweeping a bad ready file must evict its cached reader"
+    );
+    assert_eq!(std::fs::read(&victim).unwrap(), vec![0x55; 128]);
+}

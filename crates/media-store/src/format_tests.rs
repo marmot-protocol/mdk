@@ -295,6 +295,7 @@ fn empty_and_whole_segment_plaintexts_have_one_final_segment() {
 /// A sink that accepts `remaining` bytes and then fails like a full disk.
 struct FailingSink {
     remaining: usize,
+    flushed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Write for FailingSink {
@@ -308,20 +309,83 @@ impl Write for FailingSink {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        self.flushed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 }
 
 #[test]
 fn a_failed_segment_write_poisons_the_writer() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
     // Room for the header and part of the first segment only.
+    let flushed = Arc::new(AtomicBool::new(false));
     let sink = FailingSink {
         remaining: HEADER_BYTES + 100,
+        flushed: Arc::clone(&flushed),
     };
     let mut writer = MediaFileWriter::new(sink, &key(), &FILE_ID).unwrap();
     let body = plaintext(3 * SEGMENT);
     assert!(writer.write_all(&body).is_err());
-    // Neither more data nor `finish` may reseal the failed segment.
+    // Neither more data, flush, nor `finish` may act on a poisoned writer.
     assert!(writer.write(&body[..10]).is_err());
+    assert!(writer.flush().is_err());
+    assert!(!flushed.load(Ordering::SeqCst));
     assert!(matches!(writer.finish(), Err(MediaFormatError::Poisoned)));
+}
+
+#[test]
+fn file_bytes_saturates_on_overflow_without_panicking() {
+    assert_eq!(checked_file_bytes(u64::MAX), None);
+    assert_eq!(checked_file_bytes(u64::MAX - HEADER_BYTES as u64), None);
+    assert_eq!(file_bytes(u64::MAX), u64::MAX);
+    assert_eq!(file_bytes(u64::MAX - HEADER_BYTES as u64), u64::MAX);
+}
+
+#[test]
+fn reader_open_rejects_concurrent_truncation_below_header_length() {
+    use std::io::{Seek, SeekFrom};
+
+    struct TruncatingAfterHeader {
+        header: [u8; HEADER_BYTES],
+        pos: usize,
+        truncated_len: u64,
+    }
+
+    impl Read for TruncatingAfterHeader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let available = &self.header[self.pos..];
+            let n = available.len().min(out.len());
+            out[..n].copy_from_slice(&available[..n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    impl Seek for TruncatingAfterHeader {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            match pos {
+                SeekFrom::Start(offset) => {
+                    self.pos = offset as usize;
+                    Ok(offset)
+                }
+                SeekFrom::End(0) => Ok(self.truncated_len),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    let source = TruncatingAfterHeader {
+        header: header_bytes(&FILE_ID),
+        pos: 0,
+        truncated_len: (HEADER_BYTES - 1) as u64,
+    };
+    assert!(matches!(
+        MediaFileReader::open(source, &key(), &FILE_ID),
+        Err(MediaFormatError::InvalidLength)
+    ));
 }

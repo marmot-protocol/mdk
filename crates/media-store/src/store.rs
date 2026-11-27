@@ -39,8 +39,8 @@
 //! `pending` rows must be reclaimed. Use one `MediaStore` (and its clones)
 //! per account.
 
-use std::collections::HashSet;
-use std::fs::File;
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,7 +57,8 @@ use crate::catalog::{
 };
 use crate::error::{MediaError, MediaResult, io_error};
 use crate::format::{
-    FILE_ID_BYTES, FILE_KEY_BYTES, FileKey, MediaFileReader, MediaFileWriter, file_bytes,
+    FILE_ID_BYTES, FILE_KEY_BYTES, FileKey, MediaFileReader, MediaFileWriter, checked_file_bytes,
+    is_valid_file_len,
 };
 
 const COPY_CHUNK_BYTES: usize = 1024 * 1024;
@@ -153,6 +154,15 @@ struct CachedReader {
     used: Instant,
 }
 
+#[derive(Default)]
+struct ReaderCache {
+    entries: Vec<CachedReader>,
+    /// Monotonic generation bumped on every reader revocation or close so a
+    /// concurrent `read_at` that completed outside the lock never resurrects a
+    /// revoked reader in cache.
+    generation: u64,
+}
+
 #[cfg(test)]
 type CheckpointWaitHook = Box<dyn FnOnce() + Send>;
 
@@ -160,9 +170,9 @@ struct Inner<C> {
     root: PathBuf,
     catalog: C,
     closed: AtomicBool,
-    in_flight: Mutex<HashSet<FileId>>,
+    in_flight: Mutex<HashMap<FileId, usize>>,
     sweep: Mutex<SweepCursor>,
-    readers: Mutex<Vec<CachedReader>>,
+    readers: Mutex<ReaderCache>,
     /// Keys of checkpoints an operation holds; see [`CheckpointLock`].
     checkpoints: Mutex<Vec<Vec<u8>>>,
     checkpoint_released: Condvar,
@@ -192,9 +202,12 @@ impl<C: MediaCatalog> Inner<C> {
         Ok(())
     }
 
-    /// Drops a cached reader (and the key it holds) for `id`.
+    /// Drops a cached reader (and the key it holds) for `id` and advances the
+    /// cache's revocation generation so in-flight reads cannot re-insert it.
     fn forget_reader(&self, id: &FileId) {
-        lock(&self.readers).retain(|cached| cached.id != *id);
+        let mut cache = lock(&self.readers);
+        cache.generation = cache.generation.wrapping_add(1);
+        cache.entries.retain(|cached| cached.id != *id);
     }
 
     /// A ready file failed verification: it can never be read, so mark its
@@ -229,15 +242,39 @@ impl<C> Clone for MediaStore<C> {
     }
 }
 
-/// In-flight registration, removed however the publish ends.
+fn acquire_in_flight(map: &Mutex<HashMap<FileId, usize>>, id: FileId) {
+    let mut in_flight = lock(map);
+    let count = in_flight.entry(id).or_insert(0);
+    *count = count.checked_add(1).expect("in-flight refcount overflow");
+}
+
+fn release_in_flight(map: &Mutex<HashMap<FileId, usize>>, id: &FileId) {
+    let mut in_flight = lock(map);
+    if let Some(count) = in_flight.get_mut(id) {
+        if *count <= 1 {
+            in_flight.remove(id);
+        } else {
+            *count -= 1;
+        }
+    }
+}
+
+/// In-flight registration, decremented however the publish ends.
 pub(crate) struct InFlight<'a> {
-    set: &'a Mutex<HashSet<FileId>>,
+    map: &'a Mutex<HashMap<FileId, usize>>,
     id: FileId,
+}
+
+impl<'a> InFlight<'a> {
+    fn acquire(map: &'a Mutex<HashMap<FileId, usize>>, id: FileId) -> Self {
+        acquire_in_flight(map, id);
+        Self { map, id }
+    }
 }
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        lock(self.set).remove(&self.id);
+        release_in_flight(self.map, &self.id);
     }
 }
 
@@ -291,9 +328,9 @@ impl<C: MediaCatalog> MediaStore<C> {
                 root: root.into(),
                 catalog,
                 closed: AtomicBool::new(false),
-                in_flight: Mutex::new(HashSet::new()),
+                in_flight: Mutex::new(HashMap::new()),
                 sweep: Mutex::new(SweepCursor::default()),
-                readers: Mutex::new(Vec::new()),
+                readers: Mutex::new(ReaderCache::default()),
                 checkpoints: Mutex::new(Vec::new()),
                 checkpoint_released: Condvar::new(),
                 #[cfg(test)]
@@ -319,7 +356,11 @@ impl<C: MediaCatalog> MediaStore<C> {
     /// to release.
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
-        lock(&self.inner.readers).clear();
+        {
+            let mut cache = lock(&self.inner.readers);
+            cache.generation = cache.generation.wrapping_add(1);
+            cache.entries.clear();
+        }
         *lock(&self.inner.sweep) = SweepCursor::default();
     }
 
@@ -375,8 +416,12 @@ impl<C: MediaCatalog> MediaStore<C> {
     /// or wrong-length file is absent (its cached reader dropped first), and
     /// any other failure is an error that must leave the row untouched.
     pub(crate) fn present(&self, id: FileId, byte_len: u64) -> CatalogResult<FilePresence> {
+        let Some(expected_len) = checked_file_bytes(byte_len) else {
+            self.forget_reader(&id);
+            return Ok(FilePresence::Absent);
+        };
         match std::fs::symlink_metadata(self.path(&id)) {
-            Ok(metadata) if metadata.is_file() && metadata.len() == file_bytes(byte_len) => {
+            Ok(metadata) if metadata.is_file() && metadata.len() == expected_len => {
                 Ok(FilePresence::Present)
             }
             Ok(_) => {
@@ -565,10 +610,15 @@ impl<C: MediaCatalog> MediaStore<C> {
         let Some(row) = self.inner.catalog.staged_file(*id)? else {
             return Ok(None);
         };
-        let file = match File::open(self.path(id)) {
+        let file = match fs_private::open_existing_regular_nofollow(
+            &self.path(id),
+            OpenOptions::new().read(true),
+        ) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.inner.lose(id);
+                self.forget_reader(id);
+                self.inner.catalog.mark_lost(*id)?;
+                self.inner.ensure_open()?;
                 return Ok(None);
             }
             Err(error) => return Err(io_error(&error)),
@@ -603,11 +653,7 @@ impl<C: MediaCatalog> MediaStore<C> {
     ) -> MediaResult<(FileId, FileKey, InFlight<'_>)> {
         let id = FileId(random::<FILE_ID_BYTES>()?);
         let key = Zeroizing::new(random::<FILE_KEY_BYTES>()?);
-        let in_flight = InFlight {
-            set: &self.inner.in_flight,
-            id,
-        };
-        lock(&self.inner.in_flight).insert(id);
+        let in_flight = InFlight::acquire(&self.inner.in_flight, id);
         self.inner.catalog.insert_pending(&NewFile {
             id,
             key: FileKey::from_bytes(*key),
@@ -668,7 +714,9 @@ impl<C: MediaCatalog> MediaStore<C> {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(io_error(&error)),
             };
-            written += read as u64;
+            written = written
+                .checked_add(read as u64)
+                .ok_or(MediaError::InvalidBody("media body longer than declared"))?;
             if written > byte_len {
                 return Err(MediaError::InvalidBody("media body longer than declared"));
             }
@@ -756,10 +804,15 @@ impl<C: MediaCatalog> MediaStore<C> {
         let Some(row) = self.inner.catalog.ready_file(*id)? else {
             return Ok(None);
         };
-        let file = match File::open(self.path(id)) {
+        let file = match fs_private::open_existing_regular_nofollow(
+            &self.path(id),
+            OpenOptions::new().read(true),
+        ) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.forget_reader(id);
                 self.inner.catalog.mark_lost(*id)?;
+                self.inner.ensure_open()?;
                 return Ok(None);
             }
             Err(error) => return Err(io_error(&error)),
@@ -787,13 +840,18 @@ impl<C: MediaCatalog> MediaStore<C> {
     /// dropped on close, release, loss and any read error.
     pub fn read_at(&self, id: &FileId, offset: u64, out: &mut [u8]) -> MediaResult<Option<usize>> {
         self.inner.ensure_open()?;
-        let cached = {
-            let mut readers = lock(&self.inner.readers);
-            readers.retain(|cached| cached.used.elapsed() < READER_CACHE_IDLE);
-            readers
+        let (cached, start_gen) = {
+            let mut cache = lock(&self.inner.readers);
+            cache
+                .entries
+                .retain(|cached| cached.used.elapsed() < READER_CACHE_IDLE);
+            let generation = cache.generation;
+            let cached = cache
+                .entries
                 .iter()
                 .position(|cached| cached.id == *id)
-                .map(|index| readers.remove(index).reader)
+                .map(|index| cache.entries.remove(index).reader);
+            (cached, generation)
         };
         let mut reader = match cached {
             Some(reader) => reader,
@@ -805,10 +863,12 @@ impl<C: MediaCatalog> MediaStore<C> {
         let read = self
             .inner
             .lose_on_corruption(id, reader.read_at(offset, out).map_err(MediaError::from))?;
-        // Read outside the lock; return the reader only after success.
-        let mut readers = lock(&self.inner.readers);
-        if !self.inner.is_closed() {
-            readers.insert(
+        // Read outside the lock; return the reader only after success and only
+        // if no revocation or close occurred while this read was in flight.
+        let mut cache = lock(&self.inner.readers);
+        if !self.inner.is_closed() && cache.generation == start_gen {
+            cache.entries.retain(|cached| cached.id != *id);
+            cache.entries.insert(
                 0,
                 CachedReader {
                     id: *id,
@@ -816,7 +876,7 @@ impl<C: MediaCatalog> MediaStore<C> {
                     used: Instant::now(),
                 },
             );
-            readers.truncate(READER_CACHE_ENTRIES);
+            cache.entries.truncate(READER_CACHE_ENTRIES);
         }
         Ok(Some(read))
     }
@@ -850,6 +910,9 @@ impl<C: MediaCatalog> MediaStore<C> {
         if bytes.is_empty() {
             return Ok(false);
         }
+        let received = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or(MediaError::InvalidBody("wire checkpoint length overflow"))?;
         let _held = self.lock_checkpoint(target.key());
         let (id, mut wire) = if offset == 0 {
             let Some(start) = target.begin()? else {
@@ -861,10 +924,12 @@ impl<C: MediaCatalog> MediaStore<C> {
             (start.wire, self.create_wire(&start.wire)?)
         } else {
             match target.current()? {
-                Some((id, received)) if received == offset => match self.open_wire(&id, offset)? {
-                    Some(wire) => (id, wire),
-                    None => return Ok(false),
-                },
+                Some((id, current_received)) if current_received == offset => {
+                    match self.open_wire(&id, offset)? {
+                        Some(wire) => (id, wire),
+                        None => return Ok(false),
+                    }
+                }
                 _ => return Ok(false),
             }
         };
@@ -874,7 +939,6 @@ impl<C: MediaCatalog> MediaStore<C> {
             }
             return Err(error);
         }
-        let received = offset.saturating_add(bytes.len() as u64);
         match target.record(id, received) {
             Ok(true) => Ok(true),
             Ok(false) => {
@@ -1000,11 +1064,10 @@ impl<C: MediaCatalog> MediaStore<C> {
     /// `received` were never recorded and are dropped. `None` means the file
     /// is missing or shorter than recorded: the checkpoint cannot resume.
     fn open_wire(&self, id: &FileId, received: u64) -> MediaResult<Option<WireFile<C>>> {
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.wire_path(id))
-        {
+        let file = match fs_private::open_existing_regular_nofollow(
+            &self.wire_path(id),
+            OpenOptions::new().read(true).write(true),
+        ) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(io_error(&error)),
@@ -1029,7 +1092,7 @@ impl<C: MediaCatalog> MediaStore<C> {
     /// lock that the sweep holds from its check through any trim, so a trim
     /// never cuts bytes a live handle wrote.
     fn wire_in_flight(&self, id: &FileId) -> FileId {
-        lock(&self.inner.in_flight).insert(*id);
+        acquire_in_flight(&self.inner.in_flight, *id);
         *id
     }
 
@@ -1121,7 +1184,7 @@ impl<C: MediaCatalog> MediaStore<C> {
                 return Err(MediaError::Io(io::ErrorKind::Other));
             }
             report.rows_checked += 1;
-            if lock(&self.inner.in_flight).contains(id) {
+            if lock(&self.inner.in_flight).contains_key(id) {
                 continue;
             }
             match state {
@@ -1131,16 +1194,7 @@ impl<C: MediaCatalog> MediaStore<C> {
                         report.pending_removed += 1;
                     }
                 }
-                FileState::Ready => match std::fs::symlink_metadata(self.path(id)) {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        self.forget_reader(id);
-                        if self.inner.catalog.mark_lost(*id)? {
-                            report.lost_marked += 1;
-                        }
-                    }
-                    Err(error) => return Err(io_error(&error)),
-                },
+                FileState::Ready => self.check_swept_file_or_mark_lost(id, report)?,
                 FileState::Lost => {}
                 // An owned staged row is kept across restarts; only one no
                 // owner holds is released, key first.
@@ -1151,18 +1205,9 @@ impl<C: MediaCatalog> MediaStore<C> {
                         report.staged_released += 1;
                         continue;
                     }
-                    // An owned staged row whose file is gone can never be
-                    // uploaded or promoted: mark it lost, like a ready one.
-                    match std::fs::symlink_metadata(self.path(id)) {
-                        Ok(_) => {}
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                            self.forget_reader(id);
-                            if self.inner.catalog.mark_lost(*id)? {
-                                report.lost_marked += 1;
-                            }
-                        }
-                        Err(error) => return Err(io_error(&error)),
-                    }
+                    // An owned staged row whose file is gone or invalid can
+                    // never be uploaded or promoted: mark it lost, like a ready one.
+                    self.check_swept_file_or_mark_lost(id, report)?;
                 }
             }
         }
@@ -1171,6 +1216,24 @@ impl<C: MediaCatalog> MediaStore<C> {
             cursor.row = None;
         }
         Ok(())
+    }
+
+    fn check_swept_file_or_mark_lost(
+        &self,
+        id: &FileId,
+        report: &mut SweepReport,
+    ) -> MediaResult<()> {
+        match std::fs::symlink_metadata(self.path(id)) {
+            Ok(metadata) if metadata.is_file() && is_valid_file_len(metadata.len()) => Ok(()),
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(io_error(&error)),
+            Ok(_) | Err(_) => {
+                self.forget_reader(id);
+                if self.inner.catalog.mark_lost(*id)? {
+                    report.lost_marked += 1;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Visits up to `limit` directory entries, resuming the open listing of
@@ -1223,7 +1286,7 @@ impl<C: MediaCatalog> MediaStore<C> {
                     // Bytes past the recorded length (a crash between append
                     // and record) are dropped, unless a writer holds the file.
                     let in_flight = lock(&self.inner.in_flight);
-                    if in_flight.contains(&id) {
+                    if in_flight.contains_key(&id) {
                         continue;
                     }
                     match self.inner.catalog.wire_partial_received(id)? {
@@ -1298,18 +1361,19 @@ struct WireFile<C> {
 
 impl<C> Drop for WireFile<C> {
     fn drop(&mut self) {
-        lock(&self.inner.in_flight).remove(&self.id);
+        release_in_flight(&self.inner.in_flight, &self.id);
     }
 }
 
 /// Cuts a wire file longer than `received` back to it. A missing or shorter
 /// file is left for the next open to discard.
 fn trim_wire(path: &Path, received: u64) -> io::Result<bool> {
-    let file = match std::fs::OpenOptions::new().write(true).open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
+    let file =
+        match fs_private::open_existing_regular_nofollow(path, OpenOptions::new().write(true)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
     if file.metadata()?.len() <= received {
         return Ok(false);
     }
@@ -1322,6 +1386,10 @@ impl<C: MediaCatalog> WireFile<C> {
     /// records the new length in the checkpoint row.
     fn append(&mut self, bytes: &[u8]) -> MediaResult<()> {
         self.inner.ensure_open()?;
+        let next_len = self
+            .len
+            .checked_add(bytes.len() as u64)
+            .ok_or(MediaError::InvalidBody("wire checkpoint length overflow"))?;
         // A short write: part of the chunk reaches the file, then the volume
         // refuses the rest.
         #[cfg(any(test, feature = "test-support"))]
@@ -1337,7 +1405,7 @@ impl<C: MediaCatalog> WireFile<C> {
             .and_then(|_| self.file.write_all(bytes))
             .map_err(|e| io_error(&e))?;
         sync_file(&self.file).map_err(|e| io_error(&e))?;
-        self.len += bytes.len() as u64;
+        self.len = next_len;
         Ok(())
     }
 
@@ -1408,7 +1476,7 @@ impl<C: MediaCatalog> CheckpointReader<C> {
         // Like the sweep: decide under the in-flight lock, so a handle that
         // opens this file meanwhile keeps it.
         let in_flight = lock(&inner.in_flight);
-        if !in_flight.contains(&id) && inner.catalog.wire_partial_received(id)?.is_none() {
+        if !in_flight.contains_key(&id) && inner.catalog.wire_partial_received(id)?.is_none() {
             remove_if_present(&wire_path(&inner.root, &id)).map_err(|e| io_error(&e))?;
         }
         Ok(())
