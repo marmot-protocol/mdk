@@ -847,6 +847,22 @@ class SyntheticRepoBisectAndMeltdownTests(unittest.TestCase):
             gh = supersede(before_freeze, [doomed, red])
             self.assertEqual((gh.cancelled, gh.dispatches), ([], 0))
 
+            # A run git cannot judge (not fetched yet, or no commit) is never cancelled: it may
+            # be a tree-fix merged after this poll's fetch.
+            unfetched = {"id": 14, "head_sha": "f" * 40, "status": "in_progress", "conclusion": None}
+            no_commit = {"id": 15, "head_sha": "", "status": "queued", "conclusion": None}
+            gh = supersede(fix, [unfetched, no_commit, {"id": 16, "head_sha": fix, "status": "queued", "conclusion": None}])
+            self.assertEqual((gh.cancelled, gh.dispatches), ([], 0))
+
+            # A cancelled run on master does not count as one: dispatch a replacement.
+            gh = supersede(fix, [{"id": 17, "head_sha": fix, "status": "completed", "conclusion": "cancelled"}, red])
+            self.assertEqual((gh.cancelled, gh.dispatches), ([], 1))
+
+            # Without a usable freeze time nothing can be told apart: do nothing.
+            incident.started_at = 0.0
+            gh = supersede(fix, [doomed, red])
+            self.assertEqual((gh.cancelled, gh.dispatches), ([], 0))
+
     def test_bisect_budget_enforcement_and_detached_dry_run_branch_safety(self):
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)

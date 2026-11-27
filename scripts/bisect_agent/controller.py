@@ -852,12 +852,15 @@ class BisectController:
             escalated = True
         return escalated
 
-    def _contains_fix_attempt(self, incident: IncidentRecord, sha: str) -> bool:
-        """Whether `sha` includes a commit merged after `incident` froze the tree.
+    def _contains_fix_attempt(self, incident: IncidentRecord, sha: str) -> bool | None:
+        """Whether `sha` includes a commit merged after `incident` froze the tree, or `None` if unknown.
 
         While frozen only `tree-fix` and `revert` PRs merge, so any such commit is a fix
-        attempt; squash merges carry their merge time as the committer date.
+        attempt; squash merges carry their merge time as the committer date. Unknown covers
+        a commit not fetched yet, a missing commit or freeze time, and git failures.
         """
+        if not sha or incident.started_at <= 0:
+            return None
         try:
             res = subprocess.run(
                 [
@@ -874,8 +877,10 @@ class BisectController:
                 timeout=60,
             )
         except (subprocess.TimeoutExpired, OSError):
-            return False
-        return res.returncode == 0 and res.stdout.strip() not in {"", "0"}
+            return None
+        if res.returncode != 0 or not res.stdout.strip().isdigit():
+            return None
+        return int(res.stdout) > 0
 
     def supersede_doomed_hosted_runs(self, master_ref: str = "origin/master") -> list[dict[str, Any]]:
         """While hosted Canary is frozen, cancel runs that cannot clear it and make sure `master` gets one.
@@ -886,7 +891,7 @@ class BisectController:
         """
         incident = self.state.active_incidents.get("hosted_canary")
         master_sha = resolve_commit(self.repo, master_ref)
-        if incident is None or not master_sha or not self._contains_fix_attempt(incident, master_sha):
+        if incident is None or not master_sha or self._contains_fix_attempt(incident, master_sha) is not True:
             return []
         runs = self.github.workflow_runs("canary.yml")
         if runs is None:
@@ -894,13 +899,16 @@ class BisectController:
         actions: list[dict[str, Any]] = []
         for run in runs:
             sha = str(run.get("head_sha") or "")
-            if run.get("status") == "completed" or sha == master_sha or self._contains_fix_attempt(incident, sha):
+            # Cancel only what git proves holds no fix: an unknown run may be a newer tree-fix.
+            if run.get("status") == "completed" or sha == master_sha or self._contains_fix_attempt(incident, sha) is not False:
                 continue
             cancelled = self.github.cancel_run(int(run.get("id") or 0))
             actions.append(
                 {"source": "canary.yml", "run_id": str(run.get("id")), "result": "cancelled" if cancelled else "cancel_failed"}
             )
-        if not any(str(run.get("head_sha") or "") == master_sha for run in runs):
+        if not any(
+            str(run.get("head_sha") or "") == master_sha and run.get("conclusion") != "cancelled" for run in runs
+        ):
             dispatched = self.github.dispatch_canary()
             actions.append({"source": "canary.yml", "sha": master_sha[:9], "result": "dispatched" if dispatched else "dispatch_failed"})
         return actions
