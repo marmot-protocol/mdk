@@ -1,8 +1,17 @@
 {
   "schema_version": 1,
-  "state": "green",
-  "updated_at": "2026-11-26T20:57:38Z",
-  "reason": "hosted_canary recovered green on fa7cfe824",
-  "run_url": "https://github.com/marmot-protocol/mdk/actions/runs/45885461493",
-  "incidents": {}
+  "state": "red",
+  "updated_at": "2026-11-27T06:54:12Z",
+  "reason": "2 consecutive red hosted_canary runs on unreproducible job `Full cross-platform CI (6 shards) / Relay runtime tests (1/2)` (step `Run relay runtime tests serially`)",
+  "run_url": "https://github.com/marmot-protocol/mdk/actions/runs/45951715443",
+  "incidents": {
+    "hosted_canary": {
+      "source": "hosted_canary",
+      "tip_sha": "93843488473dbf02ef2a88d43a1c2ff81c9c1385",
+      "started_at": 1795762451.627753,
+      "reason": "2 consecutive red hosted_canary runs on unreproducible job `Full cross-platform CI (6 shards) / Relay runtime tests (1/2)` (step `Run relay runtime tests serially`)",
+      "run_url": "https://github.com/marmot-protocol/mdk/actions/runs/45951715443",
+      "culprit_sha": null
+    }
+  }
 }
