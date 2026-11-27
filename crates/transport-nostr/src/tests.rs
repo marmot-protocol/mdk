@@ -8382,9 +8382,17 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
         "plane shutdown must shut down cached publish clients whose last Arc lived in the map"
     );
     assert!(
-        anon_b.client().is_shutdown(),
-        "plane shutdown must shut down remaining anonymous publish clients"
+        !anon_b.client().is_shutdown(),
+        "plane shutdown must leave a held adapter's anonymous publish client live"
     );
+    drop(adapter_b);
+    timeout(Duration::from_secs(5), async {
+        while !anon_b.client().is_shutdown() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping the last adapter clone after plane shutdown must shut down its anonymous publish client");
     drop(dave_pub_dyn);
 }
 
