@@ -148,6 +148,12 @@ if [ "$head_sha" != "$origin_master_sha" ]; then
     fi
 fi
 
+if [ "$dry_run" -eq 0 ]; then
+    bash crates/marmot-c/c-header.sh
+    python3 scripts/check_binding_docs.py --with-c
+    python3 scripts/classify_release_impact.py --c-abi check
+fi
+
 if [ "$push" -eq 1 ] && [ "$dry_run" -eq 0 ]; then
     gh auth status -h github.com >/dev/null || die "gh is not authenticated for github.com"
     # A building RC holds the shared macOS runners; let it finish first.

@@ -58,6 +58,24 @@ C_WORKSPACE_CRATES = {
     "transport-nostr-peeler",
 }
 
+C_PRECHECK_PATHS = {
+    ".cargo/config",
+    ".cargo/config.toml",
+    ".github/workflows/c-bindings.yml",
+    ".github/workflows/ci.yml",
+    "Cargo.lock",
+    "Cargo.toml",
+    "crates/marmot-c/API-GUIDE.md",
+    "crates/marmot-uniffi/API-GUIDE.md",
+    "rust-toolchain.toml",
+    "scripts/check_binding_docs.py",
+    "scripts/check_c_binding_parity.py",
+    "scripts/classify_ci_changes.py",
+    "scripts/classify_release_impact.py",
+    "scripts/install-odin.sh",
+}
+C_PRECHECK_CRATES = {"marmot-c", "marmot-uniffi", "marmot-uniffi-macros"}
+
 CONFORMANCE_WORKSPACE_CRATES = {
     "cgka-conformance-simulator",
     "cgka-engine",
@@ -182,7 +200,9 @@ def classify(paths: list[str], *, force_all: bool = False) -> dict[str, bool]:
         return dict.fromkeys(LANES, True)
 
     if all(_is_documentation(path) for path in normalized):
-        return dict.fromkeys(LANES, False)
+        result = dict.fromkeys(LANES, False)
+        result["run_c"] = "crates/marmot-c/API-GUIDE.md" in normalized
+        return result
 
     core_paths = [
         path for path in normalized
@@ -277,12 +297,20 @@ def classify(paths: list[str], *, force_all: bool = False) -> dict[str, bool]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--all", action="store_true", dest="force_all")
+    parser.add_argument("--c-precheck", action="store_true")
     parser.add_argument("--github-output", type=Path)
     args = parser.parse_args()
 
     raw = sys.stdin.buffer.read()
     paths = [item.decode("utf-8") for item in raw.split(b"\0") if item]
     result = classify(paths, force_all=args.force_all)
+    if args.c_precheck and not args.force_all:
+        result["run_c"] = any(
+            path in C_PRECHECK_PATHS
+            or path.startswith(".github/actions/setup-odin/")
+            or (_touches_crates(path, C_PRECHECK_CRATES) and not _is_documentation(path))
+            for path in paths
+        )
     output = "".join(f"{key}={str(value).lower()}\n" for key, value in result.items())
     if args.github_output is None:
         sys.stdout.write(output)

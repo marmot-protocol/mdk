@@ -14,7 +14,7 @@
 //!   [`marmot_last_error_message`].
 //!
 //! The C header `include/marmot.h` is generated with cbindgen (`just
-//! c-header`) and checked in; CI diff-gates it against this source.
+//! c-header`). CI builds and smoke-tests it against the native library.
 
 use std::ffi::c_char;
 use std::panic::AssertUnwindSafe;

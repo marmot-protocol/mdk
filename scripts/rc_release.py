@@ -520,6 +520,12 @@ class GitHub:
 # ---------------------------------------------------------------------------
 
 
+def meta_github_from_env(gh: GitHub) -> GitHub:
+    """The client that writes `rc-meta`: `META_GH_TOKEN` when set, else `gh`."""
+    token = os.environ.get("META_GH_TOKEN")
+    return GitHub(gh.repository, token, gh.api_url) if token else gh
+
+
 def github_from_env() -> GitHub:
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     repository = os.environ.get("GITHUB_REPOSITORY")
@@ -896,8 +902,14 @@ def publish_rc(
     signature_delta: dict[str, Any] | None = None,
     integration_notes: str | None = None,
     today: dt.date | None = None,
+    meta_gh: GitHub | None = None,
 ) -> str | None:
-    """Publish all three staged RC tracks atomically, then update `rc-meta`."""
+    """Publish all three staged RC tracks atomically, then update `rc-meta`.
+
+    `gh` (the release token) publishes the tracks; `meta_gh` (default `gh`) reads and writes
+    `rc-meta`, so its commits stay GitHub-signed by the workflow token.
+    """
+    meta_gh = meta_gh or gh
     tags = track_tags(version)
     titles = dict(TRACKS)
     staged = {prefix: gh.release_for_tag(tag) for prefix, tag in tags.items()}
@@ -928,11 +940,11 @@ def publish_rc(
             impact_report=impact_report,
             today=today,
         )
-        if gh.read_latest_rc() == document:
+        if meta_gh.read_latest_rc() == document:
             return None
         base = rc_base_version(version)
         rc_num = int(RC_VERSION.fullmatch(version).group(4))
-        counters = gh.read_rc_counters()
+        counters = meta_gh.read_rc_counters()
         counters[base] = max(counters.get(base, 0), rc_num)
         counters_doc = {"schema": 1, "highest_rc": counters}
         files: dict[str, str] = {
@@ -946,7 +958,7 @@ def publish_rc(
             files[RC_IMPACT_FILE] = json.dumps(impact_report, indent=2, sort_keys=True) + "\n"
         if integration_notes is not None:
             files[RC_NOTES_FILE] = integration_notes.rstrip() + "\n"
-        return write_meta_files(gh, files, f"RC {version} from {source_sha}")
+        return write_meta_files(meta_gh, files, f"RC {version} from {source_sha}")
     except ReleaseError as error:
         raise ReleaseError(
             f"{error}. Published so far: {', '.join(published) or 'none'}; {RC_LATEST_FILE} still names "
@@ -980,6 +992,7 @@ def command_publish(args: argparse.Namespace) -> int:
         impact_report=impact_report,
         signature_delta=signature_delta,
         integration_notes=integration_notes,
+        meta_gh=meta_github_from_env(gh),
     )
     write_summary("\n".join([
         f"## SemVer RC published (`{args.version}`)",

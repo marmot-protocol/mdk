@@ -8,6 +8,10 @@ on:
       - "!marmotc-v*-nightly.*"
       - "!marmotc-v*-rc.*"
   workflow_call:
+    secrets:
+      stage_token:
+        description: Token that stages the release draft (RC and Stable callers pass secrets.RELEASE_TOKEN; the workflow token is refused there). Named so no repo secret matches it, so tag-push and dispatch runs keep the workflow token
+        required: false
     inputs:
       source_sha:
         description: Full 40-character source SHA on master (or verified metadata-only release commit)
@@ -140,6 +144,11 @@ jobs:
       # published to a public GitHub Release, so they are built from a clean
       # target directory rather than from a restorable (poisonable) cache.
 
+      - name: Install cbindgen
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
+        with:
+          tool: cbindgen@0.29.4
+
       - name: Build C bindings
         shell: bash
         run: ./crates/marmot-c/c-bindings.sh
@@ -173,6 +182,44 @@ jobs:
 
           cp -R crates/marmot-c/output/. "$stage/"
           cp crates/marmot-c/README.md "$stage/"
+
+          # Keep links between bundle files relative. Link everything else to the source revision.
+          python3 - "$stage" <<'PY'
+          import os
+          import posixpath
+          import re
+          import sys
+          from pathlib import Path
+
+          stage = Path(sys.argv[1])
+          repo = f'https://github.com/{os.environ["GITHUB_REPOSITORY"]}'
+          sha = os.environ["SOURCE_SHA"]
+          readme = stage / "README.md"
+          sources = {readme: "crates/marmot-c"}
+          for reference in sorted((stage / "references").glob("*/API-REFERENCE.md")):
+              sources[reference] = f"crates/{reference.parent.name}"
+          readme_references = {
+              "API-GUIDE.md": "references/marmot-c/API-REFERENCE.md",
+              "../marmot-uniffi/API-GUIDE.md": "references/marmot-uniffi/API-REFERENCE.md",
+          }
+
+          for document, source_dir in sources.items():
+              def rebase(match):
+                  path, anchor = match[1], match[2] or ""
+                  if document == readme and path in readme_references:
+                      return f"]({readme_references[path]}{anchor})"
+                  if source_dir == "crates/marmot-c" and path == "README.md" and document != readme:
+                      return f"](../../README.md{anchor})"
+                  if path.startswith("/") or (document.parent / path).is_file():
+                      return match[0]
+                  source = posixpath.normpath(f"{source_dir}/{path}")
+                  kind = "tree" if path.endswith("/") else "blob"
+                  return f"]({repo}/{kind}/{sha}/{source}{anchor})"
+
+              text = document.read_text()
+              document.write_text(re.sub(r"\]\(([^)#:\s]+)(#[^)\s]*)?\)", rebase, text))
+          PY
+
           cat > "$stage/manifest.json" <<EOF
           {
             "artifact": "marmot-c",
@@ -186,6 +233,9 @@ jobs:
           EOF
 
           (cd "$stage_parent" && zip -r "../../$asset" "marmot-c-$version")
+          if [[ -f crates/marmot-c/API-GUIDE.md ]]; then
+            python3 scripts/check_binding_docs.py --c-bundle "$asset"
+          fi
           sha256sum "$asset" | awk -v name="$asset" '{print $1 "  " name}' > "$asset.sha256"
           cp "$asset" "$asset.sha256" dist/
 
@@ -231,7 +281,7 @@ jobs:
           Marmot C bindings generated from MDK commit \`$GITHUB_SHA\`.
 
           Assets:
-          - \`marmot-c-linux-x86_64-$version.zip\`: \`libmarmot_c.so\` + \`libmarmot_c.a\`, \`marmot.h\`, pkg-config file, README.
+          - \`marmot-c-linux-x86_64-$version.zip\`: \`libmarmot_c.so\` + \`libmarmot_c.a\`, \`marmot.h\`, pkg-config file, C and UniFFI API references, README.
 
           Verify downloads with the accompanying \`.sha256\` files.
           EOF
@@ -267,7 +317,7 @@ jobs:
         if: ${{ !!inputs.release_version }}
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.stage_token || secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.linux-bindings.outputs.release_tag }}
           RELEASE_VERSION: ${{ needs.linux-bindings.outputs.release_version }}
           SOURCE_SHA: ${{ needs.linux-bindings.outputs.source_sha }}
@@ -287,29 +337,26 @@ jobs:
               sys.exit(f"error: Marmot C manifest does not match release: {wrong}")
           '
           stage_notes="$RUNNER_TEMP/stage-notes.md"
+          : > "$stage_notes"
+          stage_args=(--stable)
           if [[ "$IS_RC" == "true" ]]; then
-            cat > "$stage_notes" <<EOF
-          SemVer Release Candidate for staging and integration testing. Pin a formal \`marmotc-v<version>\` release for production.
-
-          Marmot C bindings generated from exact MDK commit \`$SOURCE_SHA\`.
-
-          Assets:
-          - \`marmot-c-linux-x86_64-$version.zip\`: \`libmarmot_c.so\` + \`libmarmot_c.a\`, \`marmot.h\`, pkg-config file, README.
-
-          Verify downloads with the accompanying \`.sha256\` files.
-          EOF
+            printf '%s\n\n' 'SemVer Release Candidate for staging and integration testing. Pin a formal `marmotc-v<version>` release for production.' > "$stage_notes"
             stage_args=()
-          else
-            cat > "$stage_notes" <<EOF
+          fi
+          members="$(unzip -Z1 "$asset")"
+          references=""
+          if grep -Fxq "marmot-c-$version/references/marmot-c/API-REFERENCE.md" <<< "$members" &&
+             grep -Fxq "marmot-c-$version/references/marmot-uniffi/API-REFERENCE.md" <<< "$members"; then
+            references=', C and UniFFI API references'
+          fi
+          cat >> "$stage_notes" <<EOF
           Marmot C bindings generated from exact MDK commit \`$SOURCE_SHA\`.
 
           Assets:
-          - \`marmot-c-linux-x86_64-$version.zip\`: \`libmarmot_c.so\` + \`libmarmot_c.a\`, \`marmot.h\`, pkg-config file, README.
+          - \`marmot-c-linux-x86_64-$version.zip\`: \`libmarmot_c.so\` + \`libmarmot_c.a\`, \`marmot.h\`, pkg-config file, README$references.
 
           Verify downloads with the accompanying \`.sha256\` files.
           EOF
-            stage_args=(--stable)
-          fi
           python3 builder/scripts/rc_release.py stage-draft \
             --tag "$RELEASE_TAG" \
             --title "v$version - Marmot C" \

@@ -38,6 +38,10 @@ on:
       - "!wn-agent-v*-rc.*"
   workflow_dispatch:
   workflow_call:
+    secrets:
+      stage_token:
+        description: Token that stages the release draft (RC and Stable callers pass secrets.RELEASE_TOKEN; the workflow token is refused there). Named so no repo secret matches it, so tag-push and dispatch runs keep the workflow token
+        required: false
     inputs:
       source_sha:
         description: Full 40-character source SHA on master (or verified metadata-only release commit)
@@ -945,7 +949,7 @@ jobs:
       - name: Verify bundles and stage release draft
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.stage_token || secrets.GITHUB_TOKEN }}
           RELEASE_VERSION: ${{ inputs.release_version }}
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |

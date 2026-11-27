@@ -1,6 +1,7 @@
 # Generated/derived build artifacts. The xcframework.sh script writes into
 # these directories. The vendored copies in the app repos are what consumers
 # actually use; nothing in here is the source of truth.
+/API-REFERENCE.md
 /build/
 /generated/
 /output/

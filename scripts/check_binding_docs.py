@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Check or refresh binding-reference metadata while preserving authored guidance.
-
-Use --write to refresh signatures/source links and scaffold newly exported methods.
-New scaffolds deliberately fail validation until an author supplies integration prose.
-Removed and duplicate entries require editorial cleanup; they are never silently deleted.
-This source inventory does not validate semantic prose, DTOs, or generated-language ABI.
-"""
+"""Generate binding references from API guides and current Rust/C declarations."""
 from __future__ import annotations
 
 import argparse
@@ -13,11 +7,17 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import tomllib
+from zipfile import BadZipFile, ZipFile
 
 from check_c_binding_parity import REPO, UNIFFI_SRC, _braced_block, uniffi_exports
 
-ENTRY = re.compile(r"^### `([^`]+)`\n(.*?)(?=^### |^</details>|\Z)", re.MULTILINE | re.DOTALL)
-NEEDS_PROSE = "AUTHOR REQUIRED: explain purpose, API choice and integration constraints."
+ENTRY = re.compile(r"^### `([^`]+)`\n(.*?)(?=^#{2,3} |^</details>|\Z)", re.MULTILINE | re.DOTALL)
+GENERATED_LINK = re.compile(r"\[(?:Source|Header contract)\]\((?:src/|include/marmot\.h)[^)]*#L\d+\)")
+DECLARATION_FENCE = re.compile(r"(?m)^```(c|rust)[ \t]*\n([^\n]+)\n```[ \t]*$")
+DECLARATION = {
+    "c": re.compile(r"(?!return\b)[A-Za-z_][\w \t*]*[ \t*]marmot_\w+\s*\([^;{}]*\);"),
+    "rust": re.compile(r"(?:pub )?(?:async )?fn \w+\([^{}]*\)(?: -> [^{}]+)?;?"),
+}
 
 
 @dataclass(frozen=True)
@@ -97,78 +97,37 @@ def c_exports_in(header: str) -> dict[str, Export]:
     return result
 
 
-def source_pattern(language: str) -> str:
-    """Match the one mechanical source link, not other authored documentation links."""
-    label = "Source" if language == "rust" else "Header contract"
-    return rf"\[{label}\]\(([^)]+)\)"
-
-
-def scaffold(key: str, export: Export, language: str) -> str:
-    """Produce a new entry with a blocking marker for missing human-authored prose."""
-    label = "Source" if language == "rust" else "Header contract"
-    return (f"### `{key}`\n\n```{language}\n{export.signature}\n```\n\n"
-            f"{NEEDS_PROSE}\n\n[{label}]({export.source})\n\n")
-
-
-def refresh(text: str, language: str, expected: dict[str, Export]) -> str:
-    """Refresh metadata only; preserve prose and retain removed entries for review."""
+def render(text: str, language: str, expected: dict[str, Export]) -> str:
+    """Add signatures and links. Require exactly one authored entry per export."""
     seen: set[str] = set()
-    code_pattern = rf"```{language}\n.*?\n```"
-    link_pattern = source_pattern(language)
+    errors: list[str] = []
     label = "Source" if language == "rust" else "Header contract"
 
     def replace(match: re.Match) -> str:
         key, body = match[1], match[2]
         if key in seen:
-            raise ValueError(f"duplicate documented method: {key}; resolve before --write")
+            errors.append(f"duplicate documented method: {key}")
         seen.add(key)
         if key not in expected:
+            errors.append(f"removed/unknown method: {key}")
             return match[0]
-        export = expected[key]
-        code = f"```{language}\n{export.signature}\n```"
-        if re.search(code_pattern, body, re.DOTALL):
-            body = re.sub(code_pattern, lambda _: code, body, count=1, flags=re.DOTALL)
-        else:
-            body = "\n" + code + "\n" + body
-        link = f"[{label}]({export.source})"
-        if re.search(link_pattern, body):
-            body = re.sub(link_pattern, lambda _: link, body)
-        else:
-            body = body.rstrip() + "\n\n" + link + "\n\n"
-        return f"### `{key}`\n{body}"
-
-    refreshed = ENTRY.sub(replace, text)
-    missing = sorted(expected.keys() - seen)
-    if missing:
-        refreshed = refreshed.rstrip() + "\n\n<details>\n<summary>New exports — complete and organize before merging</summary>\n\n"
-        refreshed += "".join(scaffold(key, expected[key], language) for key in missing)
-        refreshed += "</details>\n"
-    return refreshed
-
-
-def check(text: str, language: str, expected: dict[str, Export]) -> list[str]:
-    """Report missing/stale/duplicate entries, signature/link drift and empty scaffolds."""
-    actual: dict[str, str] = {}
-    errors: list[str] = []
-    for match in ENTRY.finditer(text):
-        key, body = match[1], match[2]
-        if key in actual:
-            errors.append(f"duplicate documented method: {key}")
-        actual[key] = body
-    errors.extend(f"missing method: {key}; run --write to scaffold" for key in sorted(expected.keys() - actual.keys()))
-    errors.extend(f"removed/unknown method: {key}; review and remove explicitly" for key in sorted(actual.keys() - expected.keys()))
-    for key in sorted(expected.keys() & actual.keys()):
-        body, export = actual[key], expected[key]
-        codes = re.findall(rf"```{language}\n(.*?)\n```", body, re.DOTALL)
-        actual_signature = normalized(codes[0]) if len(codes) == 1 else "<missing or multiple signature blocks>"
-        if actual_signature != export.signature:
-            errors.append(f"changed signature: {key}\n  actual:   {actual_signature}\n  expected: {export.signature}\n  run --write to refresh")
-        links = re.findall(source_pattern(language), body)
-        if links != [export.source]:
-            errors.append(f"changed source link: {key}\n  actual:   {links}\n  expected: {export.source}\n  run --write to refresh")
-        if NEEDS_PROSE in body:
+        guidance = body.strip()
+        if not guidance:
             errors.append(f"missing authored guidance: {key}")
-    return errors
+        elif GENERATED_LINK.search(guidance) or any(
+            DECLARATION[kind].fullmatch(line.strip())
+            for kind, line in DECLARATION_FENCE.findall(guidance)
+        ):
+            errors.append(f"generated signature or source link in guide: {key}")
+        export = expected[key]
+        return (f"### `{key}`\n\n```{language}\n{export.signature}\n```\n\n"
+                f"[{label}]({export.source})\n{body}")
+
+    reference = ENTRY.sub(replace, text)
+    errors.extend(f"missing method: {key}" for key in sorted(expected.keys() - seen))
+    if errors:
+        raise ValueError("\n".join(errors))
+    return reference
 
 
 def release_problems(root: Path, version: str) -> list[str]:
@@ -196,37 +155,70 @@ def release_problems(root: Path, version: str) -> list[str]:
     return errors
 
 
+def _check_c_bundle(path: Path) -> None:
+    c = "references/marmot-c/API-REFERENCE.md"
+    uniffi = "references/marmot-uniffi/API-REFERENCE.md"
+    with ZipFile(path) as archive:
+        root = f"marmot-c-{path.stem.removeprefix('marmot-c-linux-x86_64-')}"
+        readme = archive.read(f"{root}/README.md").decode()
+        reference = archive.read(f"{root}/{c}").decode()
+        archive.getinfo(f"{root}/{uniffi}")
+        header = archive.read(f"{root}/include/marmot.h").decode()
+
+    for target in (c, uniffi):
+        if not re.search(rf"\]\({re.escape(target)}(?:#[^)]*)?\)", readme):
+            raise ValueError(f"bundled README does not link to {target}")
+    if "](../../README.md)" not in reference:
+        raise ValueError("bundled C reference does not link to the bundled README")
+
+    links = {
+        entry[1]: re.findall(r"\[Header contract\]\(([^)]+)\)", entry[2])
+        for entry in ENTRY.finditer(reference)
+    }
+    for key, export in c_exports_in(header).items():
+        if links.get(key) != [f"../../{export.source}"]:
+            raise ValueError(f"bundled C reference has an invalid header link for {key}")
+
+
 def main() -> int:
-    """Validate both references, optionally refreshing their mechanical metadata first."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--write", action="store_true", help="refresh signatures/links and scaffold new exports; preserve prose")
-    parser.add_argument("--release-version", help="also verify this workspace version has companion release documents")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--with-c", action="store_true", help="also generate the C reference from the generated header")
+    mode.add_argument("--c-bundle", type=Path, help="check links in a packaged C release ZIP")
+    mode.add_argument("--release-version", help="check release documents and UniFFI guide without writing references")
     args = parser.parse_args()
-    catalogs = [(REPO / "crates/marmot-uniffi/API-REFERENCE.md", "rust", uniffi_catalog()),
-                (REPO / "crates/marmot-c/API-REFERENCE.md", "c",
-                 c_exports_in((REPO / "crates/marmot-c/include/marmot.h").read_text()))]
-    errors: list[str] = []
-    for path, language, expected in catalogs:
-        text = path.read_text()
-        if args.write:
-            updated = refresh(text, language, expected)
-            if updated != text:
-                path.write_text(updated)
-            text = updated
-        problems = check(text, language, expected)
-        for problem in problems:
-            print(f"{path.relative_to(REPO)}: {problem}")
-        if not problems:
-            print(f"{path.relative_to(REPO)}: {len(expected)} callables; signatures and source links match")
-        errors += problems
+    if args.c_bundle:
+        try:
+            _check_c_bundle(args.c_bundle)
+        except (BadZipFile, KeyError, OSError, ValueError) as error:
+            parser.exit(1, f"{args.c_bundle}: {error}\n")
+        return 0
+
     if args.release_version:
         problems = release_problems(REPO, args.release_version)
-        for problem in problems:
-            print(problem)
-        if not problems:
-            print(f"release documentation preflight passed for {args.release_version}")
-        errors += problems
-    return bool(errors)
+        if problems:
+            parser.exit(1, "\n".join(problems) + "\n")
+
+    catalogs = [(REPO / "crates/marmot-uniffi", "rust", uniffi_catalog())]
+    if args.with_c:
+        crate = REPO / "crates/marmot-c"
+        catalogs.append((crate, "c", c_exports_in((crate / "include/marmot.h").read_text())))
+    for crate, language, exports in catalogs:
+        guide = crate / "API-GUIDE.md"
+        try:
+            reference = render(guide.read_text(), language, exports)
+        except ValueError as error:
+            parser.exit(1, f"{guide.relative_to(REPO)}:\n{error}\n")
+        if not args.release_version:
+            if args.with_c:
+                peer = "marmot-uniffi" if language == "c" else "marmot-c"
+                reference = reference.replace(f"../{peer}/API-GUIDE.md", f"../{peer}/API-REFERENCE.md")
+            output = crate / "API-REFERENCE.md"
+            output.write_text("<!-- Generated from API-GUIDE.md and declarations. Do not edit. -->\n\n" + reference)
+            print(f"{output.relative_to(REPO)}: {len(exports)} callables")
+    if args.release_version:
+        print(f"release documentation preflight passed for {args.release_version}")
+    return 0
 
 
 if __name__ == "__main__":

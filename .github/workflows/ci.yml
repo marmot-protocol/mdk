@@ -1,9 +1,10 @@
 name: CI
 
-# Team pull requests run a fast static gate (~1 minute, zero Rust compile):
+# Team pull requests run a fast static gate:
 # verified commit signatures, formatting, static/contract gates, cargo-audit,
 # and commit-trailer checks (advisory except the `just dependents-nextest`
-# record). External/fork pull requests, `ci:full`
+# record). Changes to binding inputs also generate the C header and references.
+# External/fork pull requests, `ci:full`
 # pull requests, `workflow_dispatch`, and `workflow_call` runs execute the full
 # CI matrix (`.github/CODEOWNERS` protects `.github/` so fork PRs cannot edit
 # this workflow without owner review). Post-merge verification runs
@@ -92,6 +93,8 @@ jobs:
     timeout-minutes: 5
     outputs:
       ci_mode: ${{ steps.mode.outputs.ci_mode }}
+      pr_base: ${{ steps.pr.outputs.base }}
+      c_abi_key: ${{ steps.pr.outputs.abi_key }}
       is_team_pr: ${{ steps.trust.outputs.is_team_pr }}
       rust_test_shards: ${{ steps.mode.outputs.rust_test_shards }}
       rust_test_partitions: ${{ steps.mode.outputs.rust_test_partitions }}
@@ -215,7 +218,8 @@ jobs:
           echo "is_team_pr=$is_team_pr" >> "$GITHUB_OUTPUT"
 
       # fast: team pull requests without `ci:full` run signatures, formatting,
-      # static gates, cargo-audit, and trailer checks (zero compile).
+      # static gates, cargo-audit, and trailer checks. Binding inputs also
+      # generate C declarations and references for review.
       # full: external/fork PRs, `ci:full` PRs, `workflow_call`, and manual runs
       # execute every CI job.
       # warm: master pushes run only the jobs that save a Rust cache.
@@ -269,10 +273,23 @@ jobs:
           echo "rust_test_shards=$shards" >> "$GITHUB_OUTPUT"
           echo "rust_test_partitions=$partitions" >> "$GITHUB_OUTPUT"
 
+      - name: Identify the tested PR base
+        if: github.event_name == 'pull_request'
+        id: pr
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          base="$(git rev-parse HEAD^1)"
+          target="$(printf '%s' "$BASE_REF" | sha256sum | cut -d ' ' -f 1)"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "abi_key=$PR_NUMBER-$target-$base" >> "$GITHUB_OUTPUT"
+
       - name: Classify changed paths
         id: classify
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ steps.pr.outputs.base }}
           CI_MODE: ${{ steps.mode.outputs.ci_mode }}
         run: |
           set -euo pipefail
@@ -286,8 +303,21 @@ jobs:
           else
             # Include removed paths and rename sources.
             git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" > "$paths"
+            flags=(--c-precheck)
           fi
           python3 scripts/classify_ci_changes.py "${flags[@]}" --github-output "$GITHUB_OUTPUT" < "$paths"
+
+      - name: Record a skipped C ABI comparison
+        if: github.event_name == 'pull_request' && steps.classify.outputs.run_c == 'false'
+        run: echo 'C bindings smoke was skipped for these paths.' > "$RUNNER_TEMP/c-abi.diff"
+
+      - name: Upload skipped C ABI result
+        if: github.event_name == 'pull_request' && steps.classify.outputs.run_c == 'false'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: c-abi-${{ steps.pr.outputs.abi_key }}-${{ github.run_attempt }}-skipped
+          path: ${{ runner.temp }}/c-abi.diff
+          if-no-files-found: error
 
       - name: PR commit trailers
         # Advisory, except on team PRs (fast mode, no compile here) a Rust crate
@@ -344,7 +374,7 @@ jobs:
       - name: C binding command-surface parity gate
         run: python3 scripts/check_c_binding_parity.py
 
-      - name: Complete binding documentation inventory
+      - name: Generate UniFFI method reference and test the generator
         run: |
           python3 scripts/check_binding_docs.py
           python3 scripts/test_check_binding_docs.py
@@ -651,7 +681,7 @@ jobs:
   c-smoke:
     name: C bindings smoke
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_c == 'true'
+    if: needs.changes.outputs.run_c == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -686,21 +716,97 @@ jobs:
         with:
           tool: cbindgen@0.29.4
 
-      - name: Header diff gate
+      - name: Generate C header and both API references
+        run: |
+          bash crates/marmot-c/c-header.sh
+          python3 scripts/check_binding_docs.py --with-c
+          python3 scripts/classify_release_impact.py --c-abi check
+
+      - name: Upload binding references and C header
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: binding-references-${{ github.run_attempt }}
+          path: |
+            crates/marmot-c/API-REFERENCE.md
+            crates/marmot-c/include/marmot.h
+            crates/marmot-uniffi/API-REFERENCE.md
+          if-no-files-found: error
+
+      - name: Check out exact PR base for C ABI comparison
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.changes.outputs.pr_base }}
+          path: abi-base
+          persist-credentials: false
+
+      - name: Select cbindgen for the PR base
+        if: github.event_name == 'pull_request'
+        id: base-cbindgen
         run: |
           set -euo pipefail
-          # Pin the exact version so a newer cbindgen can't reformat the
-          # checked-in header and fail the diff gate on unrelated PRs.
-          # RUSTC_BOOTSTRAP=1 lets cbindgen expand the mirror-generating
-          # macros on stable; it only affects header generation.
-          RUSTC_BOOTSTRAP=1 cbindgen --config crates/marmot-c/cbindgen.toml --crate marmot-c \
-            --output crates/marmot-c/include/marmot.h crates/marmot-c
-          git diff --exit-code crates/marmot-c/include/marmot.h
+          if [[ ! -s abi-base/crates/marmot-c/include/marmot.h ]]; then
+            version="$(bash abi-base/crates/marmot-c/c-header.sh --print-version)"
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            if [[ "$(cbindgen --version)" != "cbindgen $version" ]]; then
+              echo "tool=cbindgen@$version" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Install cbindgen for the PR base
+        if: steps.base-cbindgen.outputs.tool != ''
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
+        with:
+          tool: ${{ steps.base-cbindgen.outputs.tool }}
+
+      - name: Compare C declarations
+        if: github.event_name == 'pull_request'
+        id: c-abi
+        env:
+          BASE_SHA: ${{ needs.changes.outputs.pr_base }}
+        run: |
+          set -euo pipefail
+          header=crates/marmot-c/include/marmot.h
+          # Older bases ship a CI-checked header; later bases generate it on demand.
+          if [[ ! -s "abi-base/$header" ]]; then
+            bash abi-base/crates/marmot-c/c-header.sh
+          fi
+          [[ -s "abi-base/$header" && -s "$header" ]]
+
+          # Strip comments without expanding macros or choosing a C/C++ branch.
+          declarations() {
+            gcc -E -P -dD -fpreprocessed -Wno-pragma-once-outside-header -x c "$1" |
+              clang-format --assume-filename=marmot.h \
+                --style='{BasedOnStyle: LLVM, SortIncludes: Never, ColumnLimit: 100}'
+          }
+          declarations "abi-base/$header" > "$RUNNER_TEMP/base-declarations.h"
+          declarations "$header" > "$RUNNER_TEMP/merge-declarations.h"
+          patch="$RUNNER_TEMP/c-abi.diff"
+          state=unchanged
+          if diff -u --label "base/$BASE_SHA/marmot.h" "$RUNNER_TEMP/base-declarations.h" \
+            --label "merge/$GITHUB_SHA/marmot.h" "$RUNNER_TEMP/merge-declarations.h" > "$patch"; then
+            echo 'No C declaration changes.' > "$patch"
+          else
+            [[ $? -eq 1 ]]
+            state=changed
+            echo 'C ABI declarations changed. See the C ABI diff artifact.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Upload C ABI comparison
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: c-abi-${{ needs.changes.outputs.c_abi_key }}-${{ github.run_attempt }}-${{ steps.c-abi.outputs.state }}
+          path: ${{ runner.temp }}/c-abi.diff
+          if-no-files-found: error
 
       - name: Alloc-audit tests
+        if: needs.changes.outputs.ci_mode != 'fast'
         run: cargo test -p marmot-c --features alloc-audit --locked
 
       - name: Compile and run debug C smoke test (gcc)
+        if: needs.changes.outputs.ci_mode != 'fast'
         run: ./crates/marmot-c/c-smoke.sh --debug gcc
 
       - name: Upload runner diagnostics
@@ -2022,6 +2128,7 @@ jobs:
           CI_MODE: ${{ needs.changes.outputs.ci_mode }}
           IS_TEAM_PR: ${{ needs.changes.outputs.is_team_pr }}
           APPLE_OPT_IN: ${{ needs.changes.outputs.apple_opt_in }}
+          RUN_C: ${{ needs.changes.outputs.run_c }}
           TREE_STATE: ${{ needs.changes.outputs.tree_state }}
           TREE_STATE_REASON: ${{ needs.changes.outputs.tree_state_reason }}
           TREE_FIX_OPT_IN: ${{ needs.changes.outputs.tree_fix_opt_in }}
@@ -2041,11 +2148,12 @@ jobs:
               jq --exit-status 'all(.[]; .result == "success")' <<<"$NEEDS"
               ;;
             fast)
-              jq --exit-status --arg apple "$APPLE_OPT_IN" '
+              jq --exit-status --arg apple "$APPLE_OPT_IN" --arg c "${RUN_C:-false}" '
                 .signatures.result == "success"
                 and .changes.result == "success"
                 and .["rust-format"].result == "success"
                 and .["rust-audit"].result == "success"
+                and ($c != "true" or .["c-smoke"].result == "success")
                 and ($apple != "true" or (.["ios-account-clippy"].result == "success" and .["marmotkit-native-host"].result == "success"))
                 and all(.[]; .result | IN("success", "skipped"))
               ' <<<"$NEEDS"

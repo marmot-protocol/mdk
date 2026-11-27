@@ -57,7 +57,7 @@ This is the current integration entry point for Swift/iOS, Swift/macOS and Kotli
 
 | Document | Use it for |
 | --- | --- |
-| [Complete method reference](API-REFERENCE.md) | Every exported constructor, runtime method, object method, free function and host callback, with signatures, purpose, source and API-selection guidance. |
+| [Method guide](API-GUIDE.md) | Purpose and API-selection guidance for every exported constructor, runtime method, object method, free function, and host callback. |
 | [Release integration index](../../docs/integration/README.md) | Per-release upgrade guides: required changes, changed defaults, optional adoption, examples and acceptance checks. Read every intervening guide when skipping versions. |
 | [Changelog](CHANGELOG.md) | Binding-level changes per release. Unreleased work on `master` is in `changelog.d/`, one file per change. |
 | [Distribution](DISTRIBUTION.md) | Exact artifact layout, platform setup, checksums, Apple resources and source/binary pairing. |
@@ -136,8 +136,8 @@ of the founding state and Welcome; a reused or retried start keeps the existing 
 the start with `updateMessageRetention`, which would overwrite a reused chat's policy.
 If the start returns `IncompatibleKeyPackage`, ask the recipient to update their client and publish a compatible
 KeyPackage. An unusable recipient inbox route has its own `MissingMemberInboxRoute` result.
-See the [exact Rust signature and contract](API-REFERENCE.md#marmotstart_direct_conversation) and the
-[options variant](API-REFERENCE.md#marmotstart_direct_conversation_with_options).
+See the [method contract](API-GUIDE.md#marmotstart_direct_conversation) and the
+[options variant](API-GUIDE.md#marmotstart_direct_conversation_with_options).
 
 
 ### Direct-follow availability
@@ -162,7 +162,7 @@ operation. Cancelling keeps committed rows and does not change account scope.
 ### Feature map
 
 All methods, including less common management/diagnostic operations, are listed in the
-[complete reference](API-REFERENCE.md). These are the responsibilities of the main API families:
+[method guide](API-GUIDE.md). These are the responsibilities of the main API families:
 
 | Family | Integration boundary |
 | --- | --- |
@@ -258,10 +258,10 @@ In Swift, cancelling the task that awaits a throwing async call cancels its nati
 active per subscription, and cancel and await the old task before starting another. A call that
 completed before the cancel took effect returns its result or error instead; after
 `CancellationError`, refresh state a cancelled command may have changed. See the
-[Swift adapter signatures](API-REFERENCE.md#swift-cancellation-adapters).
+[Swift adapter signatures](API-GUIDE.md#swift-cancellation-adapters).
 
 ### Localization, privacy and diagnostics
-Native startup investigation can explicitly call `set_startup_diagnostics_enabled(true)` before the first account query, then read `startup_diagnostics_snapshot()` while a call remains unfinished. The snapshot uses independent bounded memory and fixed phases, including key lookup, database-open waiting and migration numbers; it contains no paths, account identifiers or error text. Keep normal builds disabled, bound host serialization separately, and revoke capture with `false` when it is no longer needed. Neither method changes upload consent or database state. See the [API reference](API-REFERENCE.md).
+Native startup investigation can explicitly call `set_startup_diagnostics_enabled(true)` before the first account query, then read `startup_diagnostics_snapshot()` while a call remains unfinished. The snapshot uses independent bounded memory and fixed phases, including key lookup, database-open waiting and migration numbers; it contains no paths, account identifiers or error text. Keep normal builds disabled, bound host serialization separately, and revoke capture with `false` when it is no longer needed. Neither method changes upload consent or database state. See the [method guide](API-GUIDE.md).
 
 
 `record_host_performance` accepts 28 shared host stages for runtime/UI initialization,
@@ -366,10 +366,10 @@ C record layouts are especially sensitive; C consumers rebuild against the match
 Database upgrades are separate from source-level API compatibility, and rolling back only the
 library can be unsupported.
 
-The reference's names, signatures and source-line links are checked against source with
-`just binding-docs-gate`; prose and runtime behavior are reviewed by hand. Every release from
-0.10.2 has concise release notes and a separate detailed integration guide; see
-[the release checklist](../../release.md#release-documentation).
+For exact signatures and source links, see the
+[generated references](../../README.md#build-an-app-on-mdk). Every release from
+0.10.2 has release notes and a separate integration guide. See the
+[release checklist](../../release.md#release-documentation).
 
 ## Runtime options and client label
 
@@ -498,7 +498,7 @@ MarmotKit runs MDK on a Tokio runtime it owns, not on the threads that call it.
   `logout()`. Cancelling a Swift `Task` awaiting any other throwing call
   does the same and throws `CancellationError`. Swift still waits for the result of those must-finish
   calls, even from a cancelled task, and of non-throwing methods: several subscription receives
-  (which have throwing [adapters](API-REFERENCE.md#swift-cancellation-adapters)), `relayHealth()`,
+  (which have throwing [adapters](API-GUIDE.md#swift-cancellation-adapters)), `relayHealth()`,
   `shutdown()` and `ConversationWindowSubscription.cancel()`.
 - **Subscription receives** (`next()`, `nextUpdate()`) are the exception: they wait on the calling
   thread, with the runtime entered, because a receive that ran ahead on the runtime could consume
@@ -1184,7 +1184,7 @@ only verified events that match the reference, keeps the newest `naddr`
 version, and turns an author's NIP-09 deletion into a `Deleted` row. Event JSON is the signed
 event; shape its content for display on the host. Author names and avatars
 come from `cachedIdentityProjections`. See
-[the method reference](API-REFERENCE.md#marmotcached_public_event_previews).
+[the method reference](API-GUIDE.md#marmotcached_public_event_previews).
 
 ## Selected chat-list presentation
 
@@ -1240,7 +1240,7 @@ list, count and selection agree.
   `InvalidChatListQuery { reason: ChatListQueryErrorFfi }` before any read; a malformed group ID fails with
   `InvalidHex`.
 
-See [`API-REFERENCE.md`](API-REFERENCE.md#marmotopen_chat_list_query_window) for the full matching rules.
+See [the API guide](API-GUIDE.md#marmotopen_chat_list_query_window) for the full matching rules.
 
 ## Prepared conversation windows
 
@@ -2270,7 +2270,7 @@ The stored copy becomes the sender's local attachment once the message is
 confirmed, with no retention budget. Preview limits and the legacy byte-array
 API bounds are not increased.
 
-See [the upload reference](API-REFERENCE.md#marmotupload_media_files) and
+See [the upload reference](API-GUIDE.md#marmotupload_media_files) and
 [local-send ownership](LOCAL-SENDS.md). C hosts use the
 [file-backed C inputs and control](../marmot-c/README.md#file-backed-media-upload).
 

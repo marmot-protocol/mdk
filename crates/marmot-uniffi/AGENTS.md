@@ -1,7 +1,7 @@
 # AGENTS.md - marmot-uniffi
 
 UniFFI bindings (MarmotKit) for the Marmot app runtime. For integration concepts, API selection and platform setup see
-`README.md`; for the exported method inventory see `API-REFERENCE.md`. Do not restate either here.
+`README.md`; for the exported method inventory see `API-GUIDE.md`. Do not restate either here.
 
 ## Code map
 
@@ -124,12 +124,10 @@ Expose `marmot-app` behavior through bindings, following [MDK's host boundary](.
 
 ## Documentation contract
 
-- Every exported constructor, runtime/object method, free function and foreign callback belongs in
-  `API-REFERENCE.md`, with its exact Rust signature, purpose and source link. Update it in the same PR
-  as API changes; use `just binding-docs-update` to regenerate mechanical signatures/source anchors
-  without replacing authored guidance. New scaffolds require prose before they pass; explicitly
-  review removed/duplicate entries. `just binding-docs-gate` checks metadata drift and runs its
-  companion tests. It does not validate prose, records/enums or generated-language ABI: review those manually.
+- Every exported constructor, runtime or object method, free function, and foreign callback needs an
+  authored entry in `API-GUIDE.md`. Update the guide in the same PR as API changes.
+  `just binding-docs-gate` checks guide coverage and generates `API-REFERENCE.md` with exact Rust signatures
+  and source links. Do not commit generated references. Review prose, records, enums, and binding ABI separately.
 - Keep the README's recommended/compatibility/lower-level selection table accurate. Do not describe
   a supported primitive as deprecated simply because a chat-screen projection exists. State a
   replacement and its scope for compatibility recommendations; claim formal deprecation only when

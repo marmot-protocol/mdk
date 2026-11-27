@@ -81,11 +81,16 @@ code pairing; ordinary chat data and credentials survive, while admission and me
 Apps embed MDK through the multi-account app runtime ([`marmot-app`](crates/marmot-app/README.md)), exposed as:
 
 - **MarmotKit** — UniFFI bindings for Swift (iOS, macOS) and Kotlin (Android). Start with the
-  [integration guide](crates/marmot-uniffi/README.md), then the [complete method reference](crates/marmot-uniffi/API-REFERENCE.md)
+  [integration guide](crates/marmot-uniffi/README.md), then the [method guide](crates/marmot-uniffi/API-GUIDE.md)
   and [distribution notes](crates/marmot-uniffi/DISTRIBUTION.md).
   Every constructor opens with [device groups](crates/marmot-uniffi/README.md#device-groups) on.
 - **Marmot C** — a C ABI over the same runtime, with ownership and blocking-call rules in the
-  [C guide](crates/marmot-c/README.md) and every symbol in its [reference](crates/marmot-c/API-REFERENCE.md).
+  [C guide](crates/marmot-c/README.md) and every symbol in its [API guide](crates/marmot-c/API-GUIDE.md).
+
+For unreleased signatures, download `binding-references-*` from the relevant
+[CI run](https://github.com/marmot-protocol/mdk/actions/workflows/ci.yml). Unpack it into `crates/`
+in a checkout of that run's commit so the source links work. Tagged C release bundles ship both
+references under `references/`. To generate both locally, install cbindgen 0.29.4 and run `just binding-docs-gate`.
 
 Each release ships a concise [release note](docs/release/) and a detailed [upgrade guide](docs/integration/README.md)
 with required changes, new defaults, and optional features. The latest is [0.18.0 → 0.19.0](docs/integration/0.19.0.md);

@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import io
 import json
 import os
 import subprocess
@@ -144,6 +146,37 @@ MarmotStatus marmot_list_accounts(void *client, MarmotAccountSummary **out);
 
 
 class ReleaseImpactClassifierTests(unittest.TestCase):
+    def test_generated_abi_cutover(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _init_synthetic_repo(repo)
+            header = repo / classifier.C_HEADER_PATH
+            original = header.read_text(encoding="utf-8")
+            header.write_text("/* Comment-only change. */\n" + original, encoding="utf-8")
+            args = ["--root", str(repo), "--c-abi"]
+            self.assertEqual(classifier.main([*args, "write"]), 0)
+            header.unlink()
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-m", "Replace tracked header with declarations")
+            cutover = _git(repo, "rev-parse", "HEAD")
+
+            _, delta = classifier.classify_range(repo, target_ref=cutover)
+            self.assertEqual(delta["c_abi"]["breaking"], [])
+            self.assertEqual(delta["c_abi"]["functions"]["added"], [])
+            _git(repo, "tag", "-a", "v0.19.1", "-m", "mdk v0.19.1", cutover)
+
+            header.write_text(original.replace("void *client", "unsigned client"), encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()) as error:
+                self.assertEqual(classifier.main([*args, "check"]), 1)
+            self.assertIn("differs from the generated header", error.getvalue())
+            self.assertEqual(classifier.main([*args, "write"]), 0)
+            header.unlink()
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-m", "Change C function signature")
+
+            _, delta = classifier.classify_range(repo, baseline_ref="v0.19.1", target_ref="HEAD")
+            self.assertEqual(delta["c_abi"]["breaking"], ["changed C signature `marmot_list_accounts`"])
+
     def test_additive_uniffi_and_c_exports_classify_as_patch(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -648,6 +681,38 @@ typedef void (*MarmotEventCallback)(const char *item, int flags, void *user_data
                 report, delta = classifier.classify_range(repo, target_ref="HEAD")
                 self.assertEqual(report["impact"], "minor")
                 self.assertIn(rel_path, delta["storage_migrations"])
+
+    def test_command_publish_writes_rc_meta_with_the_workflow_token(self):
+        # The release token publishes the tracks; rc-meta commits stay signed by the workflow token.
+        args = argparse.Namespace(
+            version="0.20.0-rc.3", source_sha="a" * 40,
+            impact_report=None, signature_delta=None, integration_notes=None,
+        )
+        env = {"GH_TOKEN": "release-pat", "META_GH_TOKEN": "workflow-token", "GITHUB_REPOSITORY": "o/r"}
+        with (
+            unittest.mock.patch.dict(os.environ, env),
+            unittest.mock.patch.object(rc_release, "publish_rc", return_value=None) as publish,
+        ):
+            self.assertEqual(rc_release.command_publish(args), 0)
+        self.assertEqual(publish.call_args.args[0].token, "release-pat")
+        self.assertEqual(publish.call_args.kwargs["meta_gh"].token, "workflow-token")
+
+    def test_publish_rc_publishes_with_the_release_client_and_writes_rc_meta_with_the_meta_client(self):
+        gh, meta_gh = unittest.mock.Mock(name="release"), unittest.mock.Mock(name="meta")
+        gh.release_for_tag.return_value = {"id": 1}
+        meta_gh.read_latest_rc.return_value = None
+        meta_gh.read_rc_counters.return_value = {}
+        with (
+            unittest.mock.patch.object(rc_release, "check_staged_release"),
+            unittest.mock.patch.object(rc_release, "publish_release", return_value={}) as publish,
+            unittest.mock.patch.object(rc_release, "latest_rc_document", return_value={"version": "0.20.0-rc.3"}),
+            unittest.mock.patch.object(rc_release, "write_meta_files", return_value="c" * 40) as write_meta,
+        ):
+            rc_release.publish_rc(gh, "0.20.0-rc.3", "a" * 40, "run", meta_gh=meta_gh)
+        self.assertEqual({call.args[0] for call in publish.call_args_list}, {gh})
+        self.assertIs(write_meta.call_args.args[0], meta_gh)
+        gh.read_latest_rc.assert_not_called()
+        gh.read_rc_counters.assert_not_called()
 
     def test_command_publish_rejects_missing_companion_files_before_publishing(self):
         args = argparse.Namespace(
