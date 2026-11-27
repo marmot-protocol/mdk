@@ -74,7 +74,8 @@ no merge queue. The shipping flow is:
 2. **Fast team PR gate (`Required CI`):** Open a short PR (`.agents/skills/gh-create-pr`). Team PRs (same-repo branch
    by an author with `write`, `maintain`, or `admin` permission) run a ~1-minute static gate with zero Rust compile:
    verified commit signatures, `cargo fmt --all --check`, all static/contract gates, `cargo --locked audit`, and
-   advisory commit-trailer checks. External/fork PRs, read-only org members, and `ci:full` PRs fail closed into the full
+   commit-trailer checks (advisory, except that a Rust crate change must record `just dependents-nextest` in
+   `Local-Checks:`). External/fork PRs, read-only org members, and `ci:full` PRs fail closed into the full
    `ci.yml` matrix on GitHub-hosted runners; `ci:apple` adds both macOS jobs (`ios-account-clippy`,
    `marmotkit-native-host`) to a team PR regardless of changed paths. When Meltdown Mode sets the `tree-state` branch
    (`state.json` = `"red"`), `Required CI` fails at check time unless labelled `tree-fix` or `revert` (PRs whose
@@ -169,7 +170,7 @@ Local verification proves your change before merge, and post-merge `Canary` runs
 the full suite. Keep local runs scoped to your change: several agents usually build on the same machine, so
 workspace-wide builds and suites run locally only when a rule below calls for one. On team pull requests, `Required CI`
 runs a ~1-minute static gate (verified commit signatures, `cargo fmt --check`, static/contract gates, `cargo audit`,
-and advisory commit-trailer checks) with zero Rust compile. External/fork pull requests and PRs labelled `ci:full` run
+and commit-trailer checks, advisory except the `just dependents-nextest` record) with zero Rust compile. External/fork pull requests and PRs labelled `ci:full` run
 the full `ci.yml` matrix on GitHub-hosted runners; `ci:apple` adds both macOS jobs on a team PR regardless of changed
 paths. Master pushes only refresh CI's Rust caches, and only when a dependency or toolchain input changes.
 
@@ -184,8 +185,9 @@ just dependents-nextest                                                        #
 
 - `just dependents-nextest` runs the full suites of every crate you changed and of every crate that depends on one,
   with the Canary's test features, so a change to a lower crate cannot break `marmot-session` or `marmot-app` unseen.
-  Run it once per push, one at a time per machine. Also run any feature-gated suite the nearest `AGENTS.md`
-  Verification section names.
+  When `wn-cli` is affected it also runs its CLI end-to-end suite. Run it once per push, one at a time per machine,
+  and record it in `Local-Checks:`: `Required CI` rejects a team PR that changes a crate without it. Also run any
+  feature-gated suite the nearest `AGENTS.md` Verification section names.
 - Stress every test you added or edited, alone and without retries: `just flake-stress <crate> 'test(=<name>)' 5`.
 - Run the `just` gates the nearest `AGENTS.md` names for the files you touched. Outside crates:
   `.github/workflows/` and CI scripts → `just ci-path-classifier-gate`; installers and install docs →

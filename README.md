@@ -222,7 +222,8 @@ just ci                      # full local parity with GitHub CI (slow)
 
 Team pull requests run a ~1-minute static gate (there is no merge queue):
 verified commit signatures, formatting, static/contract gates (the tracing audit
-among them), `cargo-audit`, and advisory commit-trailer checks. External/fork
+among them), `cargo-audit`, and commit-trailer checks (advisory, except that a
+Rust crate change must record `just dependents-nextest`). External/fork
 pull requests, read-only org members, and `ci:full` / manual runs execute the
 full `ci.yml` matrix on GitHub-hosted runners: workspace clippy, WASM build,
 Android arm64-v8a cross-check, every workspace test with the `ci` nextest

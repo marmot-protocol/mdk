@@ -2,7 +2,8 @@ name: CI
 
 # Team pull requests run a fast static gate (~1 minute, zero Rust compile):
 # verified commit signatures, formatting, static/contract gates, cargo-audit,
-# and advisory commit-trailer checks. External/fork pull requests, `ci:full`
+# and commit-trailer checks (advisory except the `just dependents-nextest`
+# record). External/fork pull requests, `ci:full`
 # pull requests, `workflow_dispatch`, and `workflow_call` runs execute the full
 # CI matrix (`.github/CODEOWNERS` protects `.github/` so fork PRs cannot edit
 # this workflow without owner review). Post-merge verification runs
@@ -214,7 +215,7 @@ jobs:
           echo "is_team_pr=$is_team_pr" >> "$GITHUB_OUTPUT"
 
       # fast: team pull requests without `ci:full` run signatures, formatting,
-      # static gates, cargo-audit, and advisory trailer checks (zero compile).
+      # static gates, cargo-audit, and trailer checks (zero compile).
       # full: external/fork PRs, `ci:full` PRs, `workflow_call`, and manual runs
       # execute every CI job.
       # warm: master pushes run only the jobs that save a Rust cache.
@@ -288,18 +289,23 @@ jobs:
           fi
           python3 scripts/classify_ci_changes.py "${flags[@]}" --github-output "$GITHUB_OUTPUT" < "$paths"
 
-      - name: PR commit trailers (advisory)
+      - name: PR commit trailers
+        # Advisory, except on team PRs (fast mode, no compile here) a Rust crate
+        # change must record `just dependents-nextest` in `Local-Checks:`.
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_MODE: ${{ steps.mode.outputs.ci_mode }}
         run: |
           set -euo pipefail
           if [[ "$EVENT_NAME" == "pull_request" && -n "$BASE_SHA" && -n "$HEAD_SHA" ]]; then
-            python3 scripts/check_pr_trailers.py --advisory \
-              --base "$BASE_SHA" \
-              --head "$HEAD_SHA" \
-              || echo "::warning title=PR trailers::advisory check failed unexpectedly"
+            # Never empty: bash 3.2 (macOS) rejects an empty "${array[@]}" under `set -u`.
+            args=(--advisory --base "$BASE_SHA" --head "$HEAD_SHA")
+            if [[ "$CI_MODE" == fast ]]; then
+              args+=(--enforce-dependents)
+            fi
+            python3 scripts/check_pr_trailers.py "${args[@]}"
           fi
 
   rust-format:
