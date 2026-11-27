@@ -207,7 +207,7 @@ int main(int argc, char **argv) {
     ok("NULL frees are no-ops");
 
     /* Prove the always-exported experimental constructor links through the
-       checked-in header in shared and static C consumers. Capability/auth
+       generated header in shared and static C consumers. Capability/auth
        behavior is owned by the real two-host secret_store_client test. */
     check(marmot_client_new_with_experimental_device_groups(NULL, NULL, 0, NULL, NULL, NULL) ==
               MARMOT_STATUS_NULL_POINTER,
@@ -243,8 +243,8 @@ int main(int argc, char **argv) {
     check(st == MARMOT_STATUS_OK, "runtime backup facts need no account worker");
     MarmotBackgroundBackupOutcome backup = MARMOT_BACKGROUND_BACKUP_OUTCOME_FINISHED_ATTEMPT;
     st = marmot_run_due_backup_pass(client, "no-account", &backup);
-    check(st == MARMOT_STATUS_OK && backup == MARMOT_BACKGROUND_BACKUP_OUTCOME_NOT_STARTED,
-          "disabled background backup returns its completion enum without a worker");
+    check(st == MARMOT_STATUS_UNKNOWN_ACCOUNT,
+          "background backup rejects an unknown account");
 
     st = marmot_record_host_performance(client,
         MARMOT_HOST_PERFORMANCE_OPERATION_CONVERSATION_COMPOSER_READY, 125,
