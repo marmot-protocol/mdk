@@ -130,11 +130,12 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         .storage()?;
 
     // Phase 1: Non-key columns (zero PK/UNIQUE collision possible).
+    // (`attachment_body_removals` runs after Phase 4 so any trigger-generated
+    // journal rows are also canonicalized.)
     for (table, column) in [
         ("account_compromise_warning_baseline", "device_group_id_hex"),
         ("app_pending_welcome_delivery", "group_id_hex"),
         ("app_prepared_group_image_upload", "group_id_hex"),
-        ("attachment_body_removals", "group_id_hex"),
         ("avatar_identity_demand", "group_id_hex"),
         ("device_heartbeat_sent", "group_id_hex"),
         ("history_deliveries_parked", "group_id_hex"),
@@ -455,6 +456,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             .storage()?;
         }
     }
+    canonicalize_non_key_column(tx, "attachment_body_removals", "group_id_hex")?;
 
     // Phase 5: Security/fence and standalone group-scoped tables.
     canonicalize_encrypted_media_watermarks(tx)?;
@@ -505,7 +507,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         "device_groups",
         "group_id_hex",
         &[],
-        "CASE WHEN trust = 'trusted' THEN 0 ELSE 1 END, recorded_at DESC",
+        "CASE WHEN trust IN ('created', 'linked') THEN 0 WHEN trust IN ('creating', 'awaiting_welcome') THEN 1 ELSE 2 END, recorded_at DESC",
         None,
     )?;
     canonicalize_device_group_joins(tx)?;
@@ -550,14 +552,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         "revision DESC, expires_at DESC",
         None,
     )?;
-    canonicalize_dedup_table(
-        tx,
-        "link_chat_report_pages",
-        "group_id",
-        &["page"],
-        "revision DESC, expires_at DESC",
-        None,
-    )?;
+    canonicalize_link_chat_report_pages(tx)?;
     canonicalize_dedup_table(
         tx,
         "small_state_items",
@@ -1197,16 +1192,21 @@ fn canonicalize_local_message_submissions(conn: &Connection) -> StorageResult<()
         let mut seen_tokens = BTreeSet::new();
         let mut seen_messages = BTreeSet::new();
         for (sequence, _spelling, client_token, message_id_hex) in rows {
-            let token_conflict = !seen_tokens.insert(client_token);
+            let token_conflict = seen_tokens.contains(&client_token);
             let message_conflict = message_id_hex
                 .as_ref()
-                .is_some_and(|message_id| !seen_messages.insert(message_id.clone()));
+                .is_some_and(|message_id| seen_messages.contains(message_id));
             if token_conflict || message_conflict {
                 conn.execute(
                     "DELETE FROM local_message_submissions WHERE sequence = ?1",
                     [sequence],
                 )
                 .storage()?;
+            } else {
+                seen_tokens.insert(client_token);
+                if let Some(message_id) = message_id_hex {
+                    seen_messages.insert(message_id);
+                }
             }
         }
         conn.execute(
@@ -1406,9 +1406,16 @@ fn canonicalize_attachment_acquisition(conn: &Connection) -> StorageResult<()> {
         let mut seen = BTreeSet::new();
         for (token, message_id_hex, attachment_index) in rows {
             if !seen.insert((message_id_hex, attachment_index)) {
-                // Explicitly remove FK-child rows while foreign_keys = OFF so
-                // `pragma_foreign_key_check` stays clean and the losing
-                // duplicate does not emit a spurious body-removal event.
+                // Move the losing duplicate out of completed state before
+                // deleting its body/row so `attachment_body_*` triggers do not
+                // emit spurious removal journal entries during consolidation.
+                conn.execute(
+                    "UPDATE attachment_acquisition
+                     SET state = 0, due = 0, attempt = NULL, body_completed = 0, cancelled = 1
+                     WHERE token = ?1",
+                    [&token],
+                )
+                .storage()?;
                 for child_table in [
                     "attachment_partial_chunk",
                     "attachment_partial",
@@ -1494,7 +1501,7 @@ fn canonicalize_encrypted_media_secrets(conn: &Connection) -> StorageResult<()> 
         spelling: String,
         component_id: i64,
         source_epoch: i64,
-        secret: Vec<u8>,
+        secret: zeroize::Zeroizing<Vec<u8>>,
         created_at: i64,
         retention_managed: i64,
     }
@@ -1516,7 +1523,7 @@ fn canonicalize_encrypted_media_secrets(conn: &Connection) -> StorageResult<()> 
                     spelling: row.get(0)?,
                     component_id: row.get(1)?,
                     source_epoch: row.get(2)?,
-                    secret: row.get(3)?,
+                    secret: zeroize::Zeroizing::new(row.get(3)?),
                     created_at: row.get(4)?,
                     retention_managed: row.get(5)?,
                 })
@@ -1564,7 +1571,7 @@ fn canonicalize_encrypted_media_secrets(conn: &Connection) -> StorageResult<()> 
                      SET secret = ?1, created_at_unix_seconds = ?2, retention_managed = ?3
                      WHERE group_id_hex = ?4 AND component_id = ?5 AND source_epoch = ?6",
                     params![
-                        &winner.secret,
+                        winner.secret.as_slice(),
                         winner.created_at,
                         retention_managed,
                         &lower_id,
@@ -1898,6 +1905,47 @@ fn canonicalize_device_removals(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+fn canonicalize_link_chat_report_pages(conn: &Connection) -> StorageResult<()> {
+    let targets = non_lowercase_targets(conn, "link_chat_report_pages", "group_id")?;
+    if targets.is_empty() {
+        return Ok(());
+    }
+    for lower_id in targets {
+        // Every page row for a group belongs to one `(link_ref, revision)`
+        // inventory; keep only the single winning spelling's pages so pages
+        // from distinct revisions are never mixed.
+        let winner: String = conn
+            .query_row(
+                "SELECT group_id
+                 FROM link_chat_report_pages
+                 WHERE lower(group_id) = ?1
+                 ORDER BY revision DESC, expires_at DESC,
+                          CASE WHEN group_id = ?1 THEN 0 ELSE 1 END,
+                          group_id ASC
+                 LIMIT 1",
+                [&lower_id],
+                |row| row.get(0),
+            )
+            .storage()?;
+        conn.execute(
+            "DELETE FROM link_chat_report_pages
+             WHERE lower(group_id) = ?1 AND group_id != ?2",
+            params![&lower_id, &winner],
+        )
+        .storage()?;
+        if winner != lower_id {
+            conn.execute(
+                "UPDATE link_chat_report_pages
+                 SET group_id = ?1
+                 WHERE group_id = ?2",
+                params![&lower_id, &winner],
+            )
+            .storage()?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::HANDLED_COLUMNS;
@@ -2162,6 +2210,8 @@ mod tests {
         let hash32 = vec![0x55u8; 32];
         let token_low = vec![0x01u8; 16];
         let token_hi = vec![0x02u8; 16];
+        let token_done_low = vec![0x03u8; 16];
+        let token_done_upper = vec![0x04u8; 16];
         let nonce_a = vec![0x0au8; 16];
         let nonce_b = vec![0x0bu8; 16];
 
@@ -2199,25 +2249,45 @@ mod tests {
                  sender, plaintext, kind, tags_json, recorded_at, received_at, source_epoch
              ) VALUES
                  ('aabb', 'm1', 'src-old', 'received', 'alice', 'old', 9, '[]', 10, 10, 4),
-                 ('AABB', 'm1', 'src-new', 'received', 'alice', 'new', 9, '[]', 20, 20, 4)",
+                 ('AABB', 'm1', 'src-new', 'received', 'alice', 'new', 9, '[]', 20, 20, 4),
+                 ('aabb', 'm2', 'src-m2-lo', 'received', 'alice', 'm2-lo', 9, '[]', 11, 11, 4),
+                 ('AABB', 'm2', 'src-m2-hi', 'received', 'alice', 'm2-hi', 9, '[]', 12, 12, 4)",
             [],
         )
         .unwrap();
-        // Colliding attachment_acquisition with token-keyed children: uppercase is completed (state=3).
+        // Colliding attachment_acquisition with token-keyed children:
+        // - m1: uppercase is completed (state=3) vs lowercase pending (state=0).
+        // - m2: BOTH lowercase and uppercase are completed (state=3) with retained
+        //   bytes; consolidating them must not emit spurious `attachment_body_removals` rows.
         conn.execute(
             "INSERT INTO attachment_acquisition (
                  token, group_id_hex, message_id_hex, attachment_index, source_message_id_hex,
                  source_epoch, slot_json, plaintext_digest, state, due, body_completed
              ) VALUES
-                 (?1, 'aabb', 'm1', 0, 'src-old', 4, '[]', ?3, 0, 0, 0),
-                 (?2, 'AABB', 'm1', 0, 'src-new', 4, '[]', ?3, 3, NULL, 1)",
-            rusqlite::params![&token_low, &token_hi, &digest],
+                 (?1, 'aabb', 'm1', 0, 'src-old', 4, '[]', ?5, 0, 0, 0),
+                 (?2, 'AABB', 'm1', 0, 'src-new', 4, '[]', ?5, 3, NULL, 1),
+                 (?3, 'aabb', 'm2', 0, 'src-m2-lo', 4, '[]', ?5, 3, NULL, 1),
+                 (?4, 'AABB', 'm2', 0, 'src-m2-hi', 4, '[]', ?5, 3, NULL, 1)",
+            rusqlite::params![
+                &token_low,
+                &token_hi,
+                &token_done_low,
+                &token_done_upper,
+                &digest
+            ],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO retained_attachment_bytes (token, bytes)
-             VALUES (?1, x'aa'), (?2, x'bbbb')",
-            rusqlite::params![&token_low, &token_hi],
+             VALUES (?1, x'aa'), (?2, x'bbbb'), (?3, x'cccc'), (?4, x'dddd')",
+            rusqlite::params![&token_low, &token_hi, &token_done_low, &token_done_upper],
+        )
+        .unwrap();
+        // Colliding device_groups: older trusted (`linked`) must beat newer `untrusted`.
+        conn.execute(
+            "INSERT INTO device_groups (group_id_hex, trust, key_package_ref_hex, recorded_at)
+             VALUES ('aabb', 'linked', 'kp-1', 100), ('AABB', 'untrusted', NULL, 200)",
+            [],
         )
         .unwrap();
         // Colliding attachment_removal_suppression: ByYou (0) under uppercase beats BySetting (1).
@@ -2356,7 +2426,55 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(retained_count, 1);
+        assert_eq!(retained_count, 2);
+
+        // Consolidating colliding completed attachment rows must not emit
+        // spurious `attachment_body_removals` entries.
+        let body_removals: i64 = conn
+            .query_row("SELECT count(*) FROM attachment_body_removals", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            body_removals, 0,
+            "duplicate attachment consolidation must not emit body-removal journal entries"
+        );
+
+        // Trusted (`linked`) device group must beat a newer `untrusted` duplicate.
+        let (dg_trust, dg_kp): (String, Option<String>) = conn
+            .query_row(
+                "SELECT trust, key_package_ref_hex FROM device_groups WHERE group_id_hex = 'aabb'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(dg_trust, "linked");
+        assert_eq!(dg_kp.as_deref(), Some("kp-1"));
+
+        // Rejected middle submission (`tok-1`, `msg-b`) must not cause the
+        // independent older submission (`tok-1`, `msg-a`) to be deleted.
+        let submissions: Vec<(String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT client_token, message_id_hex
+                     FROM local_message_submissions
+                     WHERE group_id_hex = 'aabb'
+                     ORDER BY client_token ASC",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            submissions,
+            vec![
+                ("tok-1".to_owned(), Some("msg-a".to_owned())),
+                ("tok-2".to_owned(), Some("msg-b".to_owned())),
+            ],
+            "discarded colliding submission must not reserve client_token and drop unrelated msg-a"
+        );
 
         // ByYou (0) beat BySetting (1).
         let suppression_reason: i64 = conn
@@ -2452,5 +2570,23 @@ mod tests {
             retention_intent["media_ciphertext_sha256"],
             serde_json::json!(["aa", "bb"])
         );
+
+        // Every handled TEXT group-id column across the schema must be
+        // strictly canonical lowercase after migration 0228.
+        for &(table, column) in HANDLED_COLUMNS {
+            let non_lower: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT count(*) FROM \"{table}\" WHERE \"{column}\" IS NOT NULL AND \"{column}\" != lower(\"{column}\")"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                non_lower, 0,
+                "{table}.{column} must contain no non-lowercase rows after migration 0228"
+            );
+        }
     }
 }
