@@ -44,7 +44,6 @@ use transport_nostr_peeler::NostrTransportEvent;
 
 mod delivery_spill;
 mod directory;
-mod directory_wire;
 mod known_limits;
 #[cfg(test)]
 pub(crate) mod publish_accounting_tests;
