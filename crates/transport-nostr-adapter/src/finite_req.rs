@@ -75,12 +75,14 @@ pub(crate) const ID_PREFIX: &str = "~f";
 const MAX_FRAME_BYTES: usize = 5 * 1024 * 1024;
 
 /// Global cap on queued bytes reserved concurrently across all active finite
-/// requests (byte budget plus one frame per request). Large enough for three
-/// concurrent 16 MiB+5 MiB directory relay fetches or ten 1 MiB+5 MiB history
-/// sweeps to overlap without serializing, while bounding worst-case memory
-/// under fan-out. A single request larger than this capacity still runs
-/// exclusively when nothing else is active so it never deadlocks.
-const DEFAULT_GLOBAL_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+/// requests (byte budget plus one frame per unshared request, or one shared
+/// group budget plus one frame per active relay under [`FiniteRequests::sharing`]).
+/// Large enough for four concurrent 5-relay directory reads (`4 × (16 + 5×5) =
+/// 164 MiB`) plus concurrent history sweeps without serializing, while bounding
+/// worst-case queued frame memory under fan-out. A single request larger than
+/// this capacity still runs exclusively when nothing else is active so it never
+/// deadlocks.
+const DEFAULT_GLOBAL_QUEUE_BYTES: usize = 192 * 1024 * 1024;
 
 /// Bounded wait for tracked `send_msg(req)` and `CLOSE` cleanup tasks during
 /// [`FiniteRequests::shutdown`].
@@ -132,6 +134,9 @@ pub enum FiniteEnd {
     InvalidMessage,
     /// The REQ could not be queued.
     SetupFailed,
+    /// Local finite-request queue capacity stayed full until the request's
+    /// deadline before any REQ went out; the relay was never asked.
+    Busy,
 }
 
 /// What one request read.
@@ -220,12 +225,17 @@ impl FiniteReply {
 /// transport. Build it with the client, and install [`Self::transport`]
 /// under the SDK's transport.
 #[derive(Clone)]
-pub struct FiniteRequests(Arc<Registry>, Option<Arc<AtomicUsize>>);
+pub struct FiniteRequests(Arc<Registry>, Option<Arc<SharedBudget>>);
 
 impl fmt::Debug for FiniteRequests {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FiniteRequests").finish_non_exhaustive()
     }
+}
+
+struct ActiveRequest {
+    slot: Arc<Slot>,
+    relay: Option<Relay>,
 }
 
 struct Registry {
@@ -246,19 +256,168 @@ struct Registry {
     queue_budget: Arc<QueueBudget>,
     next_id: AtomicU64,
     next_connection: AtomicU64,
-    requests: Mutex<HashMap<String, Arc<Slot>>>,
+    requests: Mutex<HashMap<String, ActiveRequest>>,
     verified: Mutex<Verified>,
-    /// Synchronizes `shutting_down` with tracked `send_msg(req)` and
+    /// Synchronizes `shutdown.cancel()` with tracked `send_msg(req)` and
     /// `Registered::drop` `CLOSE` tasks so no cleanup task can be spawned
     /// after [`FiniteRequests::begin_shutdown`] or missed by `join_shutdown`.
-    cleanup: Mutex<CleanupState>,
+    cleanup: Mutex<Vec<JoinHandle<()>>>,
     shutdown: CancellationToken,
 }
 
+/// Shared kept-event and queued-frame budget for one [`FiniteRequests::sharing`]
+/// fan-out group.
+///
+/// The group reserves its `max_kept_event_bytes` once from [`QueueBudget`]
+/// while at least one request in the group is active; each active relay in the
+/// group reserves only one private [`MAX_FRAME_BYTES`] frame buffer. Bytes
+/// buffered beyond a slot's private frame draw from `queue_used` (capped at
+/// `max_kept_event_bytes`), so worst-case queued RAM matches the global
+/// reservation exactly without multiplying the shared budget across every relay.
+struct SharedBudget {
+    max_kept_event_bytes: usize,
+    kept_left: AtomicUsize,
+    queue_used: AtomicUsize,
+    permit_state: Mutex<SharedPermitState>,
+    init_lock: tokio::sync::Mutex<()>,
+}
+
 #[derive(Default)]
-struct CleanupState {
-    shutting_down: bool,
-    tasks: Vec<JoinHandle<()>>,
+struct SharedPermitState {
+    active: usize,
+    permit: Option<QueuePermit>,
+}
+
+struct SharedGroupGuard {
+    shared: Arc<SharedBudget>,
+}
+
+impl Drop for SharedGroupGuard {
+    fn drop(&mut self) {
+        let released = {
+            let mut state = self
+                .shared
+                .permit_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            state.active = state.active.saturating_sub(1);
+            if state.active == 0 {
+                state.permit.take()
+            } else {
+                None
+            }
+        };
+        drop(released);
+    }
+}
+
+struct RequestPermit {
+    _relay_permit: QueuePermit,
+    _group_guard: Option<SharedGroupGuard>,
+}
+
+impl SharedBudget {
+    fn new(max_kept_event_bytes: usize) -> Self {
+        Self {
+            max_kept_event_bytes,
+            kept_left: AtomicUsize::new(max_kept_event_bytes),
+            queue_used: AtomicUsize::new(0),
+            permit_state: Mutex::default(),
+            init_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    fn try_reserve_queue_bytes(&self, delta: usize) -> bool {
+        self.queue_used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                let next = used.checked_add(delta)?;
+                (next <= self.max_kept_event_bytes).then_some(next)
+            })
+            .is_ok()
+    }
+
+    fn release_queue_bytes(&self, delta: usize) {
+        self.queue_used.fetch_sub(delta, Ordering::Relaxed);
+    }
+
+    async fn admit(
+        self: &Arc<Self>,
+        budget: &Arc<QueueBudget>,
+        deadline: Instant,
+        cancel: &CancellationToken,
+        registry: &Registry,
+    ) -> Result<RequestPermit, FiniteEnd> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(FiniteEnd::Cancelled);
+            }
+            if registry.is_shutting_down() {
+                return Err(FiniteEnd::Disconnected);
+            }
+            let has_group_permit = self
+                .permit_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .permit
+                .is_some();
+            if has_group_permit {
+                // Never hold `active` while waiting in the FIFO queue: if the
+                // group's last active request exits before we are admitted, it
+                // must release `group_permit` rather than deadlocking against a
+                // larger waiter ahead of us in FIFO.
+                let relay_permit = budget
+                    .admit(MAX_FRAME_BYTES, deadline, cancel, registry)
+                    .await?;
+                let mut state = self.permit_state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.permit.is_some() {
+                    state.active += 1;
+                    drop(state);
+                    return Ok(RequestPermit {
+                        _relay_permit: relay_permit,
+                        _group_guard: Some(SharedGroupGuard {
+                            shared: self.clone(),
+                        }),
+                    });
+                }
+                drop(state);
+                // The group permit dropped while we waited; release our frame
+                // permit and loop to acquire group + frame atomically.
+                drop(relay_permit);
+                continue;
+            }
+            let mut deadline_sleep = std::pin::pin!(tokio::time::sleep_until(deadline));
+            let _init = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(FiniteEnd::Cancelled),
+                () = registry.shutdown.cancelled() => return Err(FiniteEnd::Disconnected),
+                () = &mut deadline_sleep => return Err(FiniteEnd::Busy),
+                guard = self.init_lock.lock() => guard,
+            };
+            if self
+                .permit_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .permit
+                .is_some()
+            {
+                continue;
+            }
+            let total = self.max_kept_event_bytes.saturating_add(MAX_FRAME_BYTES);
+            let combined = budget.admit(total, deadline, cancel, registry).await?;
+            let relay_bytes = MAX_FRAME_BYTES.min(combined.reserved);
+            let (relay_permit, group_permit) = combined.split(relay_bytes);
+            let mut state = self.permit_state.lock().unwrap_or_else(|e| e.into_inner());
+            state.permit = Some(group_permit);
+            state.active = 1;
+            drop(state);
+            return Ok(RequestPermit {
+                _relay_permit: relay_permit,
+                _group_guard: Some(SharedGroupGuard {
+                    shared: self.clone(),
+                }),
+            });
+        }
+    }
 }
 
 /// FIFO reservation budget bounding total queued bytes reserved across active
@@ -281,6 +440,19 @@ struct QueueBudgetState {
 struct QueuePermit {
     budget: Arc<QueueBudget>,
     reserved: usize,
+}
+
+impl QueuePermit {
+    fn split(mut self, first: usize) -> (Self, Self) {
+        let first = first.min(self.reserved);
+        let second = self.reserved - first;
+        self.reserved = first;
+        let other = Self {
+            budget: self.budget.clone(),
+            reserved: second,
+        };
+        (self, other)
+    }
 }
 
 impl Drop for QueuePermit {
@@ -389,8 +561,8 @@ impl QueueBudget {
                 biased;
                 () = cancel.cancelled() => return Err(FiniteEnd::Cancelled),
                 // Failing to obtain local queue-budget capacity before any REQ
-                // is sent is a local setup failure, never a relay timeout.
-                () = &mut admit_sleep => return Err(FiniteEnd::SetupFailed),
+                // is sent is local backpressure (`Busy`), never a relay timeout.
+                () = &mut admit_sleep => return Err(FiniteEnd::Busy),
                 () = registry.shutdown.cancelled() => return Err(FiniteEnd::Disconnected),
                 () = budget_notified => {}
             }
@@ -428,6 +600,9 @@ struct Slot {
     max_items: usize,
     max_frame: usize,
     queue_bytes: usize,
+    /// Bytes this slot may buffer privately before drawing from `shared_queue`.
+    private_queue_bytes: usize,
+    shared_queue: Option<Arc<SharedBudget>>,
     state: Mutex<SlotState>,
     ready: Notify,
 }
@@ -437,6 +612,8 @@ struct SlotState {
     binding: Binding,
     frames: VecDeque<String>,
     queued_bytes: usize,
+    /// Bytes currently borrowed from `Slot::shared_queue`.
+    shared_queued_bytes: usize,
     /// EVENT frames queued, at most one past the item budget.
     event_frames: usize,
     /// EVENT frames dropped at the wrapper, unread.
@@ -485,15 +662,43 @@ impl Slot {
         } else if state.queued_bytes + bytes > self.queue_bytes {
             state.end = Some(FiniteEnd::ByteLimit);
         } else {
-            state.event_frames += usize::from(event);
-            state.queued_bytes += bytes;
-            state.frames.push_back(text);
+            let next_queued = state.queued_bytes + bytes;
+            let mut next_shared = state.shared_queued_bytes;
+            let mut shared_overflow = false;
+            if let Some(shared) = &self.shared_queue {
+                let needed_shared = next_queued.saturating_sub(self.private_queue_bytes);
+                let delta = needed_shared.saturating_sub(state.shared_queued_bytes);
+                if delta > 0 {
+                    if shared.try_reserve_queue_bytes(delta) {
+                        next_shared = needed_shared;
+                    } else {
+                        shared_overflow = true;
+                    }
+                }
+            }
+            if shared_overflow {
+                state.end = Some(FiniteEnd::ByteLimit);
+            } else {
+                state.event_frames += usize::from(event);
+                state.queued_bytes = next_queued;
+                state.shared_queued_bytes = next_shared;
+                state.frames.push_back(text);
+            }
         }
         if state.end.is_some() && event {
             state.dropped_event_bytes += bytes as u64;
         }
         drop(state);
         self.ready.notify_one();
+    }
+
+    fn release_shared_bytes(&self, state: &mut SlotState) {
+        if state.shared_queued_bytes > 0 {
+            if let Some(shared) = &self.shared_queue {
+                shared.release_queue_bytes(state.shared_queued_bytes);
+            }
+            state.shared_queued_bytes = 0;
+        }
     }
 
     fn end_from_wire(&self, connection: u64, end: FiniteEnd) {
@@ -505,13 +710,19 @@ impl Slot {
         }
     }
 
-    fn end_for_shutdown(&self) {
+    /// Retire this slot during shutdown: suppress any unsent REQ, drop queued
+    /// frames, release shared queue bytes, and return whether its REQ had
+    /// already gone out on a connection.
+    fn retire_for_shutdown(&self) -> bool {
         let mut state = self.lock();
-        if state.end.is_none() {
-            state.end = Some(FiniteEnd::Disconnected);
-            drop(state);
-            self.ready.notify_one();
-        }
+        let was_sent = matches!(state.binding, Binding::Sent(_));
+        state.binding = Binding::Retired;
+        state.frames.clear();
+        state.queued_bytes = 0;
+        self.release_shared_bytes(&mut state);
+        drop(state);
+        self.ready.notify_one();
+        was_sent
     }
 
     /// The frames queued so far, or the wrapper's end once none are left.
@@ -521,6 +732,7 @@ impl Slot {
             return Err(state.end.clone());
         }
         state.queued_bytes = 0;
+        self.release_shared_bytes(&mut state);
         Ok(std::mem::take(&mut state.frames))
     }
 }
@@ -541,7 +753,7 @@ impl FiniteRequests {
     pub fn sharing(&self, max_kept_event_bytes: usize) -> Self {
         Self(
             self.0.clone(),
-            Some(Arc::new(AtomicUsize::new(max_kept_event_bytes))),
+            Some(Arc::new(SharedBudget::new(max_kept_event_bytes))),
         )
     }
 
@@ -576,17 +788,29 @@ impl FiniteRequests {
     }
 
     /// Reject new finite requests, wake any request waiting on the global
-    /// queued-byte budget or NIP-42 authentication, and end active slots as
-    /// [`FiniteEnd::Disconnected`].
-    pub(crate) fn begin_shutdown(&self) {
-        {
-            let mut cleanup = self.0.cleanup.lock().unwrap_or_else(|e| e.into_inner());
-            cleanup.shutting_down = true;
+    /// queued-byte budget or NIP-42 authentication, retire all active slots
+    /// (suppressing any unsent REQs), and return `(id, relay)` pairs whose REQs
+    /// had already gone out on a live connection.
+    pub(crate) fn begin_shutdown(&self) -> Vec<(String, Relay)> {
+        let active = {
+            // Strict lock order: `cleanup` -> `requests` (matching
+            // `Registered::drop`), so no task can be spawned after shutdown
+            // begins and no in-flight `Drop` can hide a `Sent` slot between
+            // `requests` and `cleanup`.
+            let _cleanup = self.0.cleanup.lock().unwrap_or_else(|e| e.into_inner());
+            self.0.shutdown.cancel();
+            let mut requests = self.0.requests.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *requests)
+        };
+        let mut to_close = Vec::new();
+        for (id, entry) in active {
+            if entry.slot.retire_for_shutdown()
+                && let Some(relay) = entry.relay
+            {
+                to_close.push((id, relay));
+            }
         }
-        self.0.shutdown.cancel();
-        for slot in self.0.slots() {
-            slot.end_for_shutdown();
-        }
+        to_close
     }
 
     /// Join every tracked `send_msg(req)` and `CLOSE` cleanup task spawned
@@ -596,7 +820,7 @@ impl FiniteRequests {
         let deadline = Instant::now() + FINITE_SHUTDOWN_WAIT;
         let tasks = {
             let mut cleanup = self.0.cleanup.lock().unwrap_or_else(|e| e.into_inner());
-            std::mem::take(&mut cleanup.tasks)
+            std::mem::take(&mut *cleanup)
         };
         if tasks.is_empty() {
             return;
@@ -621,10 +845,21 @@ impl FiniteRequests {
     }
 
     /// Stop admitting new requests, end active/waiting requests as
-    /// [`FiniteEnd::Disconnected`], and join tracked `send_msg(req)` and
-    /// `CLOSE` cleanup tasks.
+    /// [`FiniteEnd::Disconnected`], send `CLOSE` for every already-sent active
+    /// request (for callers keeping the SDK `Client` connected), and join
+    /// tracked `send_msg(req)` and `CLOSE` cleanup tasks.
     pub async fn shutdown(&self) {
-        self.begin_shutdown();
+        let to_close = self.begin_shutdown();
+        if !to_close.is_empty() {
+            let _ = tokio::time::timeout(
+                FINITE_SHUTDOWN_WAIT,
+                futures::future::join_all(to_close.into_iter().map(|(id, relay)| async move {
+                    let close = ClientMessage::close(SubscriptionId::new(&id));
+                    let _ = relay.send_msg(close).await;
+                })),
+            )
+            .await;
+        }
         self.join_shutdown().await;
     }
 
@@ -733,37 +968,55 @@ impl FiniteRequests {
                 existing_deadline,
             );
         }
-        let admit_deadline = existing_deadline.unwrap_or_else(|| Instant::now() + limits.timeout);
-        let queue_bytes = limits.max_event_bytes.saturating_add(MAX_FRAME_BYTES);
-        let permit = match self
-            .0
-            .queue_budget
-            .admit(queue_bytes, admit_deadline, cancel, &self.0)
-            .await
-        {
-            Ok(permit) => permit,
-            Err(end) => return (FiniteReply::ended(end), existing_deadline),
+        // One total deadline covers both local queue admission and wire
+        // execution so callers' inspection/sweep budgets never double. Expiry
+        // before admission reports `FiniteEnd::Busy` (never a relay timeout);
+        // expiry after admission reports `FiniteEnd::TimedOut`.
+        let request_deadline = existing_deadline.unwrap_or_else(|| Instant::now() + limits.timeout);
+        let permit = match &self.1 {
+            Some(shared) => {
+                match shared
+                    .admit(&self.0.queue_budget, request_deadline, cancel, &self.0)
+                    .await
+                {
+                    Ok(permit) => permit,
+                    Err(end) => return (FiniteReply::ended(end), Some(request_deadline)),
+                }
+            }
+            None => {
+                let queue_bytes = limits.max_event_bytes.saturating_add(MAX_FRAME_BYTES);
+                match self
+                    .0
+                    .queue_budget
+                    .admit(queue_bytes, request_deadline, cancel, &self.0)
+                    .await
+                {
+                    Ok(relay_permit) => RequestPermit {
+                        _relay_permit: relay_permit,
+                        _group_guard: None,
+                    },
+                    Err(end) => return (FiniteReply::ended(end), Some(request_deadline)),
+                }
+            }
         };
-        // Start the relay timeout only once local queue admission succeeds so
-        // waiting behind other local requests never marks a healthy relay as
-        // timed out.
-        let relay_deadline = existing_deadline.unwrap_or_else(|| Instant::now() + limits.timeout);
-        let mut deadline = std::pin::pin!(tokio::time::sleep_until(relay_deadline));
+        let mut deadline = std::pin::pin!(tokio::time::sleep_until(request_deadline));
         let id = format!(
             "{ID_PREFIX}{:x}",
             self.0.next_id.fetch_add(1, Ordering::Relaxed)
         );
-        let slot = self
-            .0
-            .new_slot(<&Url>::from(relay.url()).as_str().to_owned(), limits);
-        let registered = Registered::new(&self.0, id.clone(), slot.clone(), relay.clone(), permit);
-        if self.0.is_shutting_down() {
-            let _ = registered.retire().await;
+        let slot = self.0.new_slot(
+            <&Url>::from(relay.url()).as_str().to_owned(),
+            limits,
+            self.1.clone(),
+        );
+        let Some(registered) =
+            Registered::new(&self.0, id.clone(), slot.clone(), relay.clone(), permit)
+        else {
             return (
                 FiniteReply::ended(FiniteEnd::Disconnected),
-                Some(relay_deadline),
+                Some(request_deadline),
             );
-        }
+        };
         let subscription_id = SubscriptionId::new(&id);
         let req = ClientMessage::req(subscription_id.clone(), filters.to_vec());
         let mut collector = Collector::new(filters, limits, self, relay.url(), &subscription_id);
@@ -842,7 +1095,7 @@ impl FiniteRequests {
             collector.charge_unread(unread.frames);
             collector.fetched_bytes += unread.dropped_event_bytes;
         }
-        (collector.reply(end), Some(relay_deadline))
+        (collector.reply(end), Some(request_deadline))
     }
 }
 
@@ -942,7 +1195,7 @@ struct Registered {
     retired: bool,
     // Held until `unregister()` clears queued frames so budget bytes are
     // returned only after the slot can no longer accept frames.
-    _permit: QueuePermit,
+    _permit: RequestPermit,
 }
 
 /// What a request left unread when it retired.
@@ -957,30 +1210,37 @@ impl Registered {
         id: String,
         slot: Arc<Slot>,
         relay: Relay,
-        permit: QueuePermit,
-    ) -> Self {
-        registry
-            .requests
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.clone(), slot.clone());
-        Self {
+        permit: RequestPermit,
+    ) -> Option<Self> {
+        let mut requests = registry.requests.lock().unwrap_or_else(|e| e.into_inner());
+        if registry.is_shutting_down() {
+            return None;
+        }
+        requests.insert(
+            id.clone(),
+            ActiveRequest {
+                slot: slot.clone(),
+                relay: Some(relay.clone()),
+            },
+        );
+        drop(requests);
+        Some(Self {
             registry: registry.clone(),
             id,
             slot,
             relay,
             retired: false,
             _permit: permit,
-        }
+        })
     }
 
     /// Stop taking frames for the request, and close it on the relay if its
     /// REQ went out. Whatever it had not read yet is returned.
     async fn retire(mut self) -> Unread {
         let (sent, unread) = self.unregister();
-        if sent && !self.registry.is_shutting_down() {
+        if sent {
             let close = ClientMessage::close(SubscriptionId::new(&self.id));
-            let _ = self.relay.send_msg(close).await;
+            let _ = tokio::time::timeout(FINITE_SHUTDOWN_WAIT, self.relay.send_msg(close)).await;
         }
         unread
     }
@@ -995,6 +1255,8 @@ impl Registered {
         let mut state = self.slot.lock();
         let sent = matches!(state.binding, Binding::Sent(_));
         state.binding = Binding::Retired;
+        state.queued_bytes = 0;
+        self.slot.release_shared_bytes(&mut state);
         let unread = Unread {
             frames: std::mem::take(&mut state.frames),
             dropped_event_bytes: state.dropped_event_bytes,
@@ -1008,13 +1270,22 @@ impl Drop for Registered {
         if self.retired {
             return;
         }
+        // Hold `cleanup` across `unregister` + spawn (matching `begin_shutdown`'s
+        // `cleanup` -> `requests` lock order) so a concurrent shutdown cannot
+        // miss a `Sent` slot removed here before its `CLOSE` task is registered.
+        let registry = self.registry.clone();
+        let mut cleanup = registry.cleanup.lock().unwrap_or_else(|e| e.into_inner());
         let (sent, _) = self.unregister();
-        if sent && let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        if sent
+            && !registry.is_shutting_down()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
             let close = ClientMessage::close(SubscriptionId::new(&self.id));
             let relay = self.relay.clone();
-            let _ = self.registry.spawn_cleanup(&runtime, async move {
+            cleanup.retain(|existing| !existing.is_finished());
+            cleanup.push(runtime.spawn(async move {
                 let _ = relay.send_msg(close).await;
-            });
+            }));
         }
     }
 }
@@ -1052,7 +1323,7 @@ impl<'a> Collector<'a> {
             filters,
             limits,
             registry: &finite.0,
-            kept_left: finite.1.as_deref(),
+            kept_left: finite.1.as_deref().map(|shared| &shared.kept_left),
             relay,
             subscription_id,
             seen: HashSet::new(),
@@ -1254,21 +1525,34 @@ impl Registry {
         task: impl Future<Output = ()> + Send + 'static,
     ) -> bool {
         let mut cleanup = self.cleanup.lock().unwrap_or_else(|e| e.into_inner());
-        if cleanup.shutting_down {
+        if self.is_shutting_down() {
             return false;
         }
-        cleanup.tasks.retain(|existing| !existing.is_finished());
-        cleanup.tasks.push(runtime.spawn(task));
+        cleanup.retain(|existing| !existing.is_finished());
+        cleanup.push(runtime.spawn(task));
         true
     }
 
     /// A new request's slot for `relay`, within `limits`.
-    fn new_slot(&self, relay: String, limits: FiniteLimits) -> Arc<Slot> {
+    fn new_slot(
+        &self,
+        relay: String,
+        limits: FiniteLimits,
+        shared_queue: Option<Arc<SharedBudget>>,
+    ) -> Arc<Slot> {
+        let queue_bytes = limits.max_event_bytes.saturating_add(MAX_FRAME_BYTES);
+        let private_queue_bytes = if shared_queue.is_some() {
+            MAX_FRAME_BYTES
+        } else {
+            queue_bytes
+        };
         Arc::new(Slot {
             relay,
             max_items: limits.max_items,
             max_frame: self.max_frame,
-            queue_bytes: limits.max_event_bytes.saturating_add(MAX_FRAME_BYTES),
+            queue_bytes,
+            private_queue_bytes,
+            shared_queue,
             state: Mutex::default(),
             ready: Notify::new(),
         })
@@ -1279,7 +1563,7 @@ impl Registry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
-            .cloned()
+            .map(|entry| entry.slot.clone())
     }
 
     fn slots(&self) -> Vec<Arc<Slot>> {
@@ -1287,7 +1571,7 @@ impl Registry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .cloned()
+            .map(|entry| entry.slot.clone())
             .collect()
     }
 
@@ -1787,12 +2071,14 @@ mod tests {
     /// A request registered under `id` for [`RELAY`], as `fetch` registers
     /// one before queuing its REQ.
     fn register(registry: &Registry, id: &str, limits: FiniteLimits) -> Arc<Slot> {
-        let slot = registry.new_slot(RELAY.to_owned(), limits);
-        registry
-            .requests
-            .lock()
-            .unwrap()
-            .insert(id.to_owned(), slot.clone());
+        let slot = registry.new_slot(RELAY.to_owned(), limits, None);
+        registry.requests.lock().unwrap().insert(
+            id.to_owned(),
+            ActiveRequest {
+                slot: slot.clone(),
+                relay: None,
+            },
+        );
         slot
     }
 
@@ -2754,8 +3040,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             timed_out_reply.end,
-            FiniteEnd::SetupFailed,
-            "local queue-budget wait expiry must not classify a healthy relay as TimedOut"
+            FiniteEnd::Busy,
+            "local queue-budget wait expiry must report FiniteEnd::Busy, never TimedOut"
         );
         assert!(!third_task.is_finished());
 
@@ -3072,7 +3358,7 @@ mod tests {
             }
         }
         assert!(
-            !finite.0.cleanup.lock().unwrap().tasks.is_empty(),
+            !finite.0.cleanup.lock().unwrap().is_empty(),
             "dropping a live fetch must track its background CLOSE task"
         );
 
@@ -3127,7 +3413,7 @@ mod tests {
         assert_eq!(active_reply.end, FiniteEnd::Disconnected);
         assert_eq!(waiting_reply.end, FiniteEnd::Disconnected);
         assert!(
-            finite.0.cleanup.lock().unwrap().tasks.is_empty(),
+            finite.0.cleanup.lock().unwrap().is_empty(),
             "joined shutdown must drain and join all tracked cleanup tasks"
         );
         assert_eq!(budget.state.lock().unwrap().reserved, 0);
@@ -3161,12 +3447,12 @@ mod tests {
         ));
         assert!(futures::poll!(pending_fetch.as_mut()).is_pending());
         assert_eq!(
-            finite.0.cleanup.lock().unwrap().tasks.len(),
+            finite.0.cleanup.lock().unwrap().len(),
             1,
             "send_msg(req) task must be tracked immediately at spawn time"
         );
         assert!(
-            !finite.0.cleanup.lock().unwrap().tasks[0].is_finished(),
+            !finite.0.cleanup.lock().unwrap()[0].is_finished(),
             "send_msg(req) has not yet executed on the single-threaded runtime"
         );
 
@@ -3174,12 +3460,12 @@ mod tests {
         // join the pending `send_msg(req)` task, and dropping `pending_fetch`
         // afterwards must not spawn any post-shutdown cleanup task.
         finite.shutdown().await;
-        assert!(finite.0.cleanup.lock().unwrap().tasks.is_empty());
+        assert!(finite.0.cleanup.lock().unwrap().is_empty());
 
         let reply = pending_fetch.await;
         assert_eq!(reply.end, FiniteEnd::Disconnected);
         assert!(
-            finite.0.cleanup.lock().unwrap().tasks.is_empty(),
+            finite.0.cleanup.lock().unwrap().is_empty(),
             "no cleanup task may be spawned after shutdown"
         );
         client.shutdown().await;
@@ -3271,6 +3557,264 @@ mod tests {
             .unwrap();
         assert_eq!(reply.end, FiniteEnd::Disconnected);
         assert!(started.elapsed() < Duration::from_secs(5));
+
+        client.shutdown().await;
+        server.abort();
+    }
+
+    /// Under `FiniteRequests::sharing(16 MiB)`, a 4-relay directory fan-out
+    /// reserves the shared 16 MiB budget once plus 1 private frame per active
+    /// relay (`16 + 4×5 = 36 MiB`), rather than multiplying `16 + 5 = 21 MiB`
+    /// per relay (`84 MiB`). With a 64 MiB global budget and one stalled relay,
+    /// all three healthy relays still complete and return their records while
+    /// the stalled relay times out (`TimedOut`), and all reserved bytes release.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sharing_group_reserves_shared_budget_once_so_stalled_relay_does_not_starve_peers() {
+        use tokio_tungstenite::tungstenite::Message as Ws;
+
+        // Relay 0 accepts a REQ and never replies (stalled relay).
+        let stalled_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_url =
+            RelayUrl::parse(&format!("ws://{}", stalled_listener.local_addr().unwrap())).unwrap();
+        let stalled_req_seen = Arc::new(Notify::new());
+        let stalled_server = tokio::spawn({
+            let stalled_req_seen = stalled_req_seen.clone();
+            async move {
+                let (stream, _) = stalled_listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    let Ws::Text(text) = message else {
+                        continue;
+                    };
+                    if head_verb(&text).as_deref() == Some("REQ") {
+                        stalled_req_seen.notify_one();
+                    }
+                }
+            }
+        });
+
+        // Relays 1..=3 are healthy LocalRelays, each holding a distinct note.
+        let keys = Keys::generate();
+        let mut healthy_relays = Vec::new();
+        let mut healthy_urls = Vec::new();
+        let mut expected_events = Vec::new();
+        for idx in 1..=3 {
+            let relay = LocalRelay::builder().build();
+            relay.run().await.unwrap();
+            let ev = note(&keys, &format!("healthy-relay-{idx}"));
+            relay.add_event(ev.clone()).await.unwrap();
+            healthy_urls.push(relay.url().await);
+            expected_events.push(ev);
+            healthy_relays.push(relay);
+        }
+
+        // 64 MiB cap: per-relay 21 MiB × 4 = 84 MiB would have serialized relay 3
+        // behind the stalled relay; shared-group reservation is 16 + 4×5 = 36 MiB.
+        const SHARED_BUDGET: usize = 16 * 1024 * 1024;
+        let budget = Arc::new(QueueBudget::new(64 * 1024 * 1024));
+        let builder = crate::network_proxy::nostr_builder(Ok(None));
+        let finite = FiniteRequests::for_builder_with_budget(&builder, budget.clone());
+        let transport = finite.transport(builder.websocket_transport.clone());
+        let client = builder.websocket_transport(transport).build();
+        let mut all_urls = vec![stalled_url.clone()];
+        all_urls.extend(healthy_urls.clone());
+        for url in &all_urls {
+            client.add_relay(url).await.unwrap();
+            client
+                .try_connect_relay(url)
+                .timeout(Duration::from_secs(5))
+                .await
+                .unwrap();
+        }
+
+        let sharing = finite.sharing(SHARED_BUDGET);
+        let cancel = CancellationToken::new();
+        let filter = Filter::new().kind(Kind::TextNote);
+        let req_limits = FiniteLimits {
+            max_items: usize::MAX,
+            max_event_bytes: SHARED_BUDGET,
+            timeout: Duration::from_secs(5),
+        };
+
+        // Start stalled relay first so it claims the sharing group's shared
+        // 16 MiB permit and stays active on the wire.
+        let stalled_sdk_relay = client.relay(&stalled_url).await.unwrap().unwrap();
+        let stalled_cancel = CancellationToken::new();
+        let stalled_task = tokio::spawn({
+            let sharing = sharing.clone();
+            let filter = filter.clone();
+            let stalled_cancel = stalled_cancel.clone();
+            async move {
+                sharing
+                    .fetch(
+                        &stalled_sdk_relay,
+                        vec![filter],
+                        req_limits,
+                        &stalled_cancel,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), stalled_req_seen.notified())
+            .await
+            .expect("stalled relay must receive REQ");
+        assert_eq!(
+            budget.state.lock().unwrap().reserved,
+            SHARED_BUDGET + MAX_FRAME_BYTES,
+            "first relay in a sharing group reserves group budget + 1 frame"
+        );
+
+        // Fetch all 3 healthy relays concurrently in the same sharing group
+        // while the stalled relay remains active.
+        let mut healthy_replies = Vec::new();
+        let fetches = healthy_urls.iter().map(|url| {
+            let client = client.clone();
+            let sharing = sharing.clone();
+            let filter = filter.clone();
+            let cancel = cancel.clone();
+            let url = url.clone();
+            async move {
+                let relay = client.relay(&url).await.unwrap().unwrap();
+                sharing
+                    .fetch(&relay, vec![filter], req_limits, &cancel)
+                    .await
+            }
+        });
+        for reply in tokio::time::timeout(
+            Duration::from_secs(5),
+            futures::future::join_all(fetches),
+        )
+        .await
+        .expect(
+            "healthy peers in sharing group must complete without starving behind stalled relay",
+        ) {
+            healthy_replies.push(reply);
+        }
+        for (reply, expected) in healthy_replies.into_iter().zip(expected_events) {
+            assert_eq!(reply.end, FiniteEnd::Eose);
+            assert_eq!(reply.events, vec![expected]);
+        }
+
+        // Cancel the stalled relay and verify full budget & shared queue release.
+        stalled_cancel.cancel();
+        let stalled_reply = stalled_task.await.unwrap();
+        assert_eq!(stalled_reply.end, FiniteEnd::Cancelled);
+        assert_eq!(budget.state.lock().unwrap().reserved, 0);
+        assert_eq!(
+            sharing
+                .1
+                .as_ref()
+                .unwrap()
+                .queue_used
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        finite.shutdown().await;
+        client.shutdown().await;
+        stalled_server.abort();
+        drop(healthy_relays);
+    }
+
+    /// Standalone `FiniteRequests::shutdown()` on a still-connected SDK `Client`
+    /// sends `CLOSE` for every already-sent active request and suppresses any
+    /// still-unsent REQ so it never reaches the relay wire (#2895/#2897).
+    #[tokio::test]
+    async fn standalone_shutdown_on_live_client_sends_close_for_active_and_suppresses_unsent_req() {
+        use tokio_tungstenite::tungstenite::Message as Ws;
+
+        let req_seen = Arc::new(Notify::new());
+        let close_seen = Arc::new(Notify::new());
+        let seen_reqs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_closes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = RelayUrl::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn({
+            let req_seen = req_seen.clone();
+            let close_seen = close_seen.clone();
+            let seen_reqs = seen_reqs.clone();
+            let seen_closes = seen_closes.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    let Ws::Text(text) = message else {
+                        continue;
+                    };
+                    let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    match (frame[0].as_str(), frame[1].as_str()) {
+                        (Some("REQ"), Some(id)) => {
+                            seen_reqs.lock().unwrap().push(id.to_owned());
+                            req_seen.notify_one();
+                        }
+                        (Some("CLOSE"), Some(id)) => {
+                            seen_closes.lock().unwrap().push(id.to_owned());
+                            close_seen.notify_one();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        let (finite, client) = client_on(None, &url).await;
+        let sdk_relay = client.relay(&url).await.unwrap().unwrap();
+        let filter = Filter::new().kind(Kind::TextNote);
+        let cancel = CancellationToken::new();
+
+        // 1. Start a live request whose REQ goes out on the wire and stays open
+        // (relay never sends EOSE).
+        let active_task = tokio::spawn({
+            let finite = finite.clone();
+            let sdk_relay = sdk_relay.clone();
+            let filter = filter.clone();
+            let cancel = cancel.clone();
+            async move {
+                finite
+                    .fetch(&sdk_relay, vec![filter], limits(10, 1 << 20), &cancel)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), req_seen.notified())
+            .await
+            .expect("first request's REQ must reach the relay");
+        let sent_id = seen_reqs.lock().unwrap()[0].clone();
+
+        // 2. Poll a second request once on this single-threaded runtime so it
+        // registers `Binding::Unsent` and spawns `send_msg(req)`, without yet
+        // delivering its REQ onto the wire.
+        let mut unsent_fetch =
+            std::pin::pin!(finite.fetch(&sdk_relay, vec![filter], limits(10, 1 << 20), &cancel,));
+        assert!(futures::poll!(unsent_fetch.as_mut()).is_pending());
+
+        // 3. Call standalone `finite.shutdown().await` while keeping `client`
+        // connected: the already-sent request must receive `CLOSE`, and the
+        // unsent request must be suppressed and never reach the relay.
+        finite.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(5), close_seen.notified())
+            .await
+            .expect("standalone shutdown must send CLOSE for active Sent requests");
+
+        let active_reply = tokio::time::timeout(Duration::from_secs(5), active_task)
+            .await
+            .expect("active request must end promptly")
+            .unwrap();
+        let unsent_reply = unsent_fetch.await;
+        assert_eq!(active_reply.end, FiniteEnd::Disconnected);
+        assert_eq!(unsent_reply.end, FiniteEnd::Disconnected);
+
+        // Give the live socket a turn to flush any leaked frame before checking.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            *seen_reqs.lock().unwrap(),
+            vec![sent_id.clone()],
+            "unsent REQ must be suppressed by shutdown and never reach the relay"
+        );
+        assert_eq!(
+            *seen_closes.lock().unwrap(),
+            vec![sent_id],
+            "standalone shutdown must send CLOSE for the already-sent request"
+        );
 
         client.shutdown().await;
         server.abort();

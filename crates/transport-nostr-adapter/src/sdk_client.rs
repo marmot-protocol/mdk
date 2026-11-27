@@ -178,7 +178,7 @@ fn project_acquisition(
         FiniteEnd::TimedOut => NostrAcquisitionEnd::Deadline,
         FiniteEnd::Disconnected => NostrAcquisitionEnd::Disconnected,
         FiniteEnd::InvalidMessage => NostrAcquisitionEnd::InvalidMessage,
-        FiniteEnd::SetupFailed => NostrAcquisitionEnd::SetupFailed,
+        FiniteEnd::SetupFailed | FiniteEnd::Busy => NostrAcquisitionEnd::SetupFailed,
         // Still refused after the one retry, or no authenticator to retry with.
         FiniteEnd::Closed(reason) if is_auth_required(reason) => {
             NostrAcquisitionEnd::AuthenticationFailed

@@ -81,6 +81,9 @@ pub enum IdsReply {
     Answered(Vec<Event>),
     Closed(ClosedReason),
     Unreachable(UnreachableKind),
+    /// Local finite-request queue capacity stayed full before any REQ went out;
+    /// the relay was never asked.
+    Busy,
 }
 
 /// One relay, as a comparison sees it. Implementations keep their connections
@@ -200,6 +203,9 @@ pub enum CompareEnd {
     /// The relay does not speak NIP-77.
     Unsupported,
     Unreachable(UnreachableKind),
+    /// Local finite-request queue capacity stayed full before a REQ could be
+    /// admitted; neither the relay's nor the route's fault.
+    LocalBusy,
     SinkFailed,
 }
 
@@ -216,6 +222,7 @@ impl CompareEnd {
             Self::Refused(_) => "refused",
             Self::Unsupported => "unsupported",
             Self::Unreachable(_) => "unreachable",
+            Self::LocalBusy => "local_busy",
             Self::SinkFailed => "sink_failed",
         }
     }
@@ -522,6 +529,10 @@ where
                     self.read_bytes(0);
                     let end = CompareEnd::Unreachable(kind);
                     return Some(self.stop(window, events, end).await);
+                }
+                IdsReply::Busy => {
+                    self.read_bytes(0);
+                    return Some(self.stop(window, events, CompareEnd::LocalBusy).await);
                 }
             };
             self.answered();

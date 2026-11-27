@@ -2918,7 +2918,7 @@ fn retryable_inspection_error(error: &transport_nostr::DirectoryInspectionError)
     use transport_nostr::DirectoryInspectionError::*;
     match error {
         Partial { cause, .. } => retryable_inspection_error(cause),
-        RateLimited | Incomplete | Unreachable | TimedOut => true,
+        RateLimited | Incomplete | LocalBusy | Unreachable | TimedOut => true,
         AuthenticationRequired
         | AuthenticationTimedOut
         | AuthenticationSignerFailed
@@ -3285,7 +3285,9 @@ impl AccountSetup<'_> {
                         }
                         Unreachable => OnboardingIssue::Unreachable,
                         InvalidRequest => OnboardingIssue::InvalidRelay,
-                        Incomplete | Partial { .. } => OnboardingIssue::DiscoveryIncomplete,
+                        Incomplete | LocalBusy | Partial { .. } => {
+                            OnboardingIssue::DiscoveryIncomplete
+                        }
                     };
                     failures.push(OnboardingFinding {
                         endpoint: Some(endpoint),

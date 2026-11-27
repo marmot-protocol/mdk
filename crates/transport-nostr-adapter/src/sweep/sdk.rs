@@ -192,6 +192,9 @@ fn failed_end(end: FiniteEnd) -> Result<(), FailedEnd> {
         // More than one reply may hold: a cut, never a proof.
         FiniteEnd::ItemLimit | FiniteEnd::ByteLimit => Err(FailedEnd::Cut),
         FiniteEnd::TimedOut => Err(FailedEnd::Unreachable(UnreachableKind::TimedOut)),
+        // Local finite-request queue capacity stayed full before any REQ went
+        // out: never classify a healthy relay as unreachable or timed out.
+        FiniteEnd::Busy => Err(FailedEnd::Busy),
         // The reply was lost on its way in, or never started: nothing of it is
         // trusted, and the relay is retried like a dropped connection.
         FiniteEnd::Disconnected
@@ -205,6 +208,7 @@ enum FailedEnd {
     Closed(ClosedReason),
     Cut,
     Unreachable(UnreachableKind),
+    Busy,
 }
 
 #[async_trait]
@@ -261,6 +265,7 @@ impl SweepRelay for SdkSweepRelay {
             },
             Err(FailedEnd::Closed(reason)) => SliceReply::Closed(reason),
             Err(FailedEnd::Unreachable(kind)) => SliceReply::Unreachable(kind),
+            Err(FailedEnd::Busy) => SliceReply::Busy,
         }
     }
 
@@ -322,6 +327,7 @@ impl SweepRelay for SdkSweepRelay {
                 Ok(()) => {}
                 Err(FailedEnd::Closed(reason)) => return self.second_refused(reason),
                 Err(FailedEnd::Unreachable(kind)) => return SecondReply::Unreachable(kind),
+                Err(FailedEnd::Busy) => return SecondReply::Busy,
                 // Large events can outgrow the byte budget: split the chunk
                 // and ask again.
                 Err(FailedEnd::Cut) if chunk.len() > 1 => {
@@ -427,6 +433,7 @@ impl CompareRelay for SdkSweepRelay {
                 Ok(()) => events.extend(reply.events),
                 Err(FailedEnd::Closed(reason)) => return IdsReply::Closed(reason),
                 Err(FailedEnd::Unreachable(kind)) => return IdsReply::Unreachable(kind),
+                Err(FailedEnd::Busy) => return IdsReply::Busy,
                 // Large events can outgrow the byte budget: split the chunk
                 // and ask again. One id that still does not fit is left out,
                 // and the caller reads it as withheld.
@@ -480,6 +487,7 @@ mod tests {
             Closed(Option<Category>),
             Cut,
             Unreachable(UnreachableKind),
+            Busy,
         }
         for (input, expected) in [
             (FiniteEnd::Eose, End::Complete),
@@ -501,6 +509,7 @@ mod tests {
                 FiniteEnd::TimedOut,
                 End::Unreachable(UnreachableKind::TimedOut),
             ),
+            (FiniteEnd::Busy, End::Busy),
             (
                 FiniteEnd::Disconnected,
                 End::Unreachable(UnreachableKind::Disconnected),
@@ -523,9 +532,22 @@ mod tests {
                 Err(FailedEnd::Closed(reason)) => End::Closed(reason.0),
                 Err(FailedEnd::Cut) => End::Cut,
                 Err(FailedEnd::Unreachable(kind)) => End::Unreachable(kind),
+                Err(FailedEnd::Busy) => End::Busy,
             };
             assert_eq!(actual, expected);
         }
+        // `SweepEnd::LocalBusy` preserves partial progress as `Advanced` and
+        // otherwise settles as `Unanswered` (never `RelayUnreachable`).
+        let no_progress = super::super::SweepReport {
+            covered: Vec::new(),
+            end: super::super::SweepEnd::LocalBusy,
+            cursor: None,
+            stats: super::super::SweepStats::default(),
+        };
+        assert_eq!(
+            no_progress.outcome(),
+            super::super::SweepOutcomeKind::Unanswered
+        );
     }
 
     #[tokio::test]

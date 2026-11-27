@@ -261,9 +261,14 @@ for reconnect/backoff and relay status mechanics.
   character included), or any binary frame, passes on and ends that connection's requests `InvalidMessage`, so no
   EVENT the SDK would drop can shorten a page unseen. Each request's queue holds its byte budget plus one frame, which covers an ordinary
   page's envelopes however slow the caller; only rejected events or more than a frame of padding can fill it, and
-  that ends the request as a cut. Active finite requests admit against a shared global queued-byte budget (FIFO
-  reservation per request, clamping an individual oversized request to the global capacity so it runs exclusively
-  without deadlocking, and respecting cancellation, deadline, and shutdown while waiting). The collector applies the builder's relay limits (frame, event size, tags; a frame
+  that ends the request as a cut. Active finite requests admit against a shared global queued-byte budget (192 MiB
+  default, FIFO reservation per unshared request, or one shared group budget plus one private 5 MiB frame per active
+  relay under `FiniteRequests::sharing` so peer relays in a directory fan-out never multiply the shared budget; an
+  individual oversized request clamps to global capacity so it runs exclusively without deadlocking). One total
+  deadline covers admission and wire execution: expiry during local admission ends `FiniteEnd::Busy` (never a relay
+  timeout), which callers map to local backpressure (`SweepEnd::LocalBusy` / `CompareEnd::LocalBusy` /
+  `DirectoryInspectionError::LocalBusy` / plain-lookup error) rather than blaming a healthy relay as `Unreachable` or
+  reading records as absent. The collector applies the builder's relay limits (frame, event size, tags; a frame
   never past the queue's 5 MiB ceiling; a relay's own `add_relay(..).limits(..)` override is not applied, since the
   SDK cannot read it back, so do not set one), expiry, the filter,
   the event id and signature of the supplied bytes, the client database's deletion check and the builder's admission
@@ -277,8 +282,9 @@ for reconnect/backoff and relay status mechanics.
   one-shot clients get finite requests through `FiniteRequests::install`; keep that surface to `install`, `fetch`,
   `fetch_watching` with `watch_auth` (an authentication watch started before the dial, with opt-in
   `AuthWatch::with_challenge_wait(AUTH_CHALLENGE_WAIT)` for one-shot directory inspection only so history sweeps keep
-  their full timeout contract), `sharing` (one byte budget
-  for a read's relays, charged per kept event), `shutdown` (ending active/waiting requests and joining tracked
+  their full timeout contract), `sharing` (one kept-event and shared queue-budget reservation
+  for a read's relays), `shutdown` (retiring active slots to suppress unsent REQs, sending `CLOSE` for already-sent
+  active requests on live clients, ending active/waiting requests as `Disconnected`, and joining tracked
   `send_msg(req)` / `CLOSE` cleanup tasks) and their types.
 - The client's wire tap (`src/sweep/hint_tap.rs`) counts, per REQ, the EVENT frames its relay sends before that
   REQ's EOSE, valid or not, on the connection the REQ went out on (`ReplyCounts`). `dispatch_sdk_notification` asks
