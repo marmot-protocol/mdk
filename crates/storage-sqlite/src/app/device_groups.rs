@@ -3,7 +3,7 @@
 
 use crate::app::backup_recovery_key::forget_kept_recovery_key;
 use crate::app::compromise_warning::{FirstTrustedRoster, record_first_trusted_roster};
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, params};
@@ -74,11 +74,12 @@ const CLAIMING: &str = "trust IN ('creating', 'created', 'awaiting_welcome', 'li
 
 impl SqliteAppStorage {
     pub fn device_group(&self, group_id_hex: &str) -> StorageResult<Option<DeviceGroupRecord>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .query_row_cached(
                 "SELECT group_id_hex, trust, key_package_ref_hex, recorded_at
                  FROM device_groups WHERE group_id_hex = ?1",
-                params![group_id_hex],
+                params![group_id_hex.as_ref()],
                 device_group_row,
             )
             .optional()
@@ -110,6 +111,7 @@ impl SqliteAppStorage {
     pub fn insert_device_group(&self, record: &DeviceGroupRecord) -> StorageResult<bool> {
         check_untrusted_target(record.trust)?;
         check_ref(record.trust, record.key_package_ref_hex.as_deref())?;
+        let group_id_hex = canonical_group_id_hex(&record.group_id_hex);
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
         let taken: bool = tx
@@ -118,7 +120,7 @@ impl SqliteAppStorage {
                     "SELECT EXISTS(SELECT 1 FROM device_groups WHERE group_id_hex = ?1)
                          OR (?2 AND EXISTS(SELECT 1 FROM device_groups WHERE {CLAIMING}))"
                 ),
-                params![record.group_id_hex, record.trust.claims_account()],
+                params![group_id_hex.as_ref(), record.trust.claims_account()],
                 |row| row.get(0),
             )
             .storage()?;
@@ -129,7 +131,7 @@ impl SqliteAppStorage {
             "INSERT INTO device_groups (group_id_hex, trust, key_package_ref_hex, recorded_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![
-                record.group_id_hex,
+                group_id_hex.as_ref(),
                 record.trust.as_str(),
                 record.key_package_ref_hex,
                 u64_to_i64(record.recorded_at)?
@@ -189,11 +191,12 @@ impl SqliteAppStorage {
                 "trust_device_group moves only into a trusted state".into(),
             ));
         }
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
         if !move_trust(
             &tx,
-            group_id_hex,
+            group_id_hex.as_ref(),
             from,
             to,
             key_package_ref_hex,
@@ -201,7 +204,7 @@ impl SqliteAppStorage {
         )? {
             return Ok(None);
         }
-        let changed = record_first_trusted_roster(&tx, group_id_hex, first)?;
+        let changed = record_first_trusted_roster(&tx, group_id_hex.as_ref(), first)?;
         forget_kept_recovery_key(&tx)?;
         tx.commit().storage()?;
         Ok(Some(changed))
@@ -213,11 +216,12 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         trust: DeviceGroupTrust,
     ) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let changed = self
             .lock()?
             .execute_cached(
                 "DELETE FROM device_groups WHERE group_id_hex = ?1 AND trust = ?2",
-                params![group_id_hex, trust.as_str()],
+                params![group_id_hex.as_ref(), trust.as_str()],
             )
             .storage()?;
         Ok(changed != 0)
@@ -251,6 +255,8 @@ fn move_trust(
     key_package_ref_hex: Option<&str>,
     recorded_at: u64,
 ) -> StorageResult<bool> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
+    let group_id_hex = group_id_hex.as_ref();
     let current: Option<Option<String>> = tx
         .query_row_cached(
             "SELECT key_package_ref_hex FROM device_groups

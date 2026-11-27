@@ -13,7 +13,7 @@
 
 use crate::SqliteResultExt;
 use crate::base::connection::{
-    OpenedAccount, SqliteStorageOptions, apply_cipher_pragmas, ensure_private_db_files,
+    OpenedAccount, SqliteStorageOptions, apply_pre_key_pragmas, ensure_private_db_files,
     finish_account_open, open_account_in_memory,
 };
 use crate::base::migrations::RENEWED_PER_DATABASE;
@@ -146,7 +146,7 @@ fn copy(template: &Path, options: &SqliteStorageOptions) -> StorageResult<Connec
     )
     .storage()?;
     let mut connection = Connection::open_in_memory().storage()?;
-    apply_cipher_pragmas(&connection, options)?;
+    apply_pre_key_pragmas(&connection, options)?;
     Backup::new(&source, &mut connection)
         .storage()?
         .run_to_completion(c_int::MAX, Duration::ZERO, None)

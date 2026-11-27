@@ -55,15 +55,17 @@ pub(super) fn presentation_page_tx(
             "conversation page limit exceeded".into(),
         ));
     }
-    if let Some(first) = page.messages.first()
-        && page
+    if let Some(first) = page.messages.first() {
+        let first_group = canonical_group_id_hex(&first.group_id_hex);
+        if page
             .messages
             .iter()
-            .any(|m| m.group_id_hex != first.group_id_hex)
-    {
-        return Err(StorageError::Serialization(
-            "conversation page group mismatch".into(),
-        ));
+            .any(|m| canonical_group_id_hex(&m.group_id_hex) != first_group)
+        {
+            return Err(StorageError::Serialization(
+                "conversation page group mismatch".into(),
+            ));
+        }
     }
     let mut system_rows = vec![false; page.messages.len()];
     let store_epoch = conn
@@ -109,7 +111,9 @@ pub(super) fn presentation_page_tx(
             WHERE {authenticated_source}
               AND a.plaintext = requested.plaintext AND a.source_epoch IS requested.epoch"
         );
-        let mut parameters: Vec<&dyn rusqlite::ToSql> = vec![&first.group_id_hex];
+        let canonical_group = canonical_group_id_hex(&first.group_id_hex);
+        let canonical_group = canonical_group.as_ref();
+        let mut parameters: Vec<&dyn rusqlite::ToSql> = vec![&canonical_group];
         for (_, message, epoch) in &eligible {
             parameters.extend([
                 &message.message_id_hex as &dyn rusqlite::ToSql,

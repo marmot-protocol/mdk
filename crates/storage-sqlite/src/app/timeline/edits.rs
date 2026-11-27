@@ -291,6 +291,8 @@ impl SqliteAppStorage {
         before: Option<(u64, String)>,
         limit: usize,
     ) -> StorageResult<TimelineEditHistoryPage> {
+        let group = canonical_group_id_hex(group);
+        let group = group.as_ref();
         if !(1..=100).contains(&limit) {
             return Err(StorageError::Serialization(
                 "edit history limit must be 1..=100".into(),

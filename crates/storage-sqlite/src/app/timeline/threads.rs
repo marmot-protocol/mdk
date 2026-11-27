@@ -7,7 +7,7 @@
 
 use super::TimelineThreadRef;
 use crate::SqliteResultExt;
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::storage::StorageResult;
 use cgka_traits::{
@@ -123,6 +123,8 @@ fn legacy_root(
     start: &str,
     cache: &mut ThreadRootCache,
 ) -> StorageResult<String> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
+    let group_id_hex = group_id_hex.as_ref();
     let key = (group_id_hex.to_owned(), start.to_owned());
     if let Some(root) = cache.get(&key) {
         return Ok(root.clone());
@@ -155,6 +157,8 @@ pub(super) fn named_root_hint(
     start: &str,
     root: &str,
 ) -> StorageResult<Option<(u64, String)>> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
+    let group_id_hex = group_id_hex.as_ref();
     let mut current = start.to_owned();
     let mut visited = HashSet::new();
     // `start` is the parent itself, one row below where the read walk that
@@ -190,10 +194,11 @@ fn stored_row(
     group_id_hex: &str,
     message_id_hex: &str,
 ) -> StorageResult<Option<StoredRow>> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
     conn.query_row_cached(
         "SELECT kind, tags_json, reply_to_message_id_hex FROM message_timeline
          WHERE group_id_hex = ?1 AND message_id_hex = ?2",
-        params![group_id_hex, message_id_hex],
+        params![group_id_hex.as_ref(), message_id_hex],
         |row| {
             let kind = u64::try_from(row.get::<_, i64>(0)?).unwrap_or_default();
             // Scrubbed or damaged tags read as none: the walk then follows

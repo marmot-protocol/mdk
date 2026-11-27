@@ -82,6 +82,7 @@ pub(super) fn suppress_past_window(
     index: u32,
     now: u64,
 ) -> StorageResult<bool> {
+    let group = canonical_group_id_hex(group);
     let Some(cutoff) = keep_media_in(conn)?.cutoff(now) else {
         return Ok(false);
     };
@@ -97,7 +98,7 @@ pub(super) fn suppress_past_window(
                    WHERE q.group_id_hex=h.group_id_hex AND q.message_id_hex=h.message_id_hex
                      AND q.attachment_index=h.attachment_index)
              ON CONFLICT DO NOTHING",
-            params![group, message, index, cutoff, RemovalReason::BySetting as i64],
+            params![group.as_ref(), message, index, cutoff, RemovalReason::BySetting as i64],
         )
         .storage()?
         == 1)

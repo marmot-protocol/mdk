@@ -18,7 +18,7 @@
 use cgka_traits::storage::StorageResult;
 use rusqlite::{OptionalExtension, params};
 
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 
 /// What this device knows of one sibling's activity.
@@ -299,14 +299,17 @@ impl SqliteAppStorage {
     ) -> StorageResult<()> {
         let conn = self.lock()?;
         match sent {
-            Some(sent) => conn.execute_cached(
-                "INSERT INTO device_heartbeat_sent (singleton, group_id_hex, sent_at)
-                 VALUES (1, ?1, ?2)
-                 ON CONFLICT(singleton) DO UPDATE SET
-                    group_id_hex = excluded.group_id_hex,
-                    sent_at = excluded.sent_at",
-                params![sent.group_id_hex, u64_to_i64(sent.sent_at)?],
-            ),
+            Some(sent) => {
+                let group_id_hex = canonical_group_id_hex(&sent.group_id_hex);
+                conn.execute_cached(
+                    "INSERT INTO device_heartbeat_sent (singleton, group_id_hex, sent_at)
+                     VALUES (1, ?1, ?2)
+                     ON CONFLICT(singleton) DO UPDATE SET
+                        group_id_hex = excluded.group_id_hex,
+                        sent_at = excluded.sent_at",
+                    params![group_id_hex.as_ref(), u64_to_i64(sent.sent_at)?],
+                )
+            }
             None => conn.execute_cached("DELETE FROM device_heartbeat_sent", []),
         }
         .storage()?;

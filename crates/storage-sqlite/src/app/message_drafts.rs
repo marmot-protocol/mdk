@@ -11,7 +11,7 @@ pub use revisioned::{
 
 #[cfg(test)]
 use crate::SqliteAccountStorage;
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -215,13 +215,14 @@ impl SqliteAppStorage {
         &self,
         group_id_hex: &str,
     ) -> Result<Option<StoredMessageDraft>, MessageDraftRevisionError> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
         let file_backed: bool = tx
             .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM message_draft_attachments
                  WHERE group_id_hex = ?1 AND file_id IS NOT NULL)",
-                params![group_id_hex],
+                params![group_id_hex.as_ref()],
                 |row| row.get(0),
             )
             .storage()?;
@@ -230,7 +231,7 @@ impl SqliteAppStorage {
                 "the draft holds a file-backed attachment",
             ));
         }
-        let draft = load_message_draft(&tx, group_id_hex)?;
+        let draft = load_message_draft(&tx, &group_id_hex)?;
         tx.commit().storage()?;
         Ok(draft)
     }
@@ -244,6 +245,7 @@ impl SqliteAppStorage {
         reply_to_message_id_hex: Option<&str>,
         media_attachments: &[StoredMessageDraftAttachment],
     ) -> StorageResult<StoredMessageDraft> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         validate_waveform_samples(media_attachments)?;
         let media_attachments = media_attachments
             .iter()
@@ -251,13 +253,13 @@ impl SqliteAppStorage {
             .collect::<Vec<_>>();
         self.connection.with_transaction(|| {
             self.write_message_draft(
-                group_id_hex,
+                &group_id_hex,
                 content,
                 reply_to_message_id_hex,
                 &media_attachments,
             )?;
             let conn = self.lock()?;
-            load_message_draft(&conn, group_id_hex)?.ok_or_else(|| {
+            load_message_draft(&conn, &group_id_hex)?.ok_or_else(|| {
                 StorageError::Backend("saved message draft could not be reloaded".to_owned())
             })
         })
@@ -273,6 +275,7 @@ impl SqliteAppStorage {
         reply_to_message_id_hex: Option<&str>,
         media_attachments: &[DraftAttachmentInput<'_>],
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let now_ms = unix_now_ms();
         self.connection.with_transaction(|| {
             let mut conn = self.lock()?;
@@ -280,7 +283,7 @@ impl SqliteAppStorage {
             let group_exists = tx
                 .query_row_cached(
                     "SELECT EXISTS(SELECT 1 FROM account_groups WHERE group_id_hex = ?1)",
-                    params![group_id_hex],
+                    params![group_id_hex.as_ref()],
                     |row| row.get::<_, bool>(0),
                 )
                 .storage()?;
@@ -296,10 +299,15 @@ impl SqliteAppStorage {
                     content = excluded.content,
                     reply_to_message_id_hex = excluded.reply_to_message_id_hex,
                     updated_at_ms = excluded.updated_at_ms",
-                params![group_id_hex, content, reply_to_message_id_hex, now_ms],
+                params![
+                    group_id_hex.as_ref(),
+                    content,
+                    reply_to_message_id_hex,
+                    now_ms
+                ],
             )
             .storage()?;
-            sync_message_draft_attachments(&tx, group_id_hex, media_attachments)?;
+            sync_message_draft_attachments(&tx, &group_id_hex, media_attachments)?;
             tx.commit().storage()?;
             Ok(())
         })
@@ -340,9 +348,10 @@ fn load_message_draft_attachment_summaries(
     conn: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<Vec<StoredMessageDraftAttachmentSummary>> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
     let mut statement = conn.prepare_cached(ATTACHMENT_SUMMARIES_SQL).storage()?;
     let rows = statement
-        .query_map(params![group_id_hex], |row| {
+        .query_map(params![group_id_hex.as_ref()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -372,6 +381,7 @@ pub(crate) fn draft_attachment_ids_tx(
     conn: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<Vec<String>> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
     let mut statement = conn
         .prepare_cached(
             "SELECT attachment_id FROM message_draft_attachments
@@ -379,7 +389,7 @@ pub(crate) fn draft_attachment_ids_tx(
         )
         .storage()?;
     let ids = statement
-        .query_map(params![group_id_hex], |row| row.get(0))
+        .query_map(params![group_id_hex.as_ref()], |row| row.get(0))
         .storage()?
         .collect::<Result<_, _>>()
         .storage()?;
@@ -664,12 +674,13 @@ fn load_message_draft(
     conn: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<Option<StoredMessageDraft>> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
     let draft = conn
         .query_row_cached(
             "SELECT content, reply_to_message_id_hex, created_at_ms, updated_at_ms
                  FROM message_drafts
                  WHERE group_id_hex = ?1",
-            params![group_id_hex],
+            params![group_id_hex.as_ref()],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -685,10 +696,10 @@ fn load_message_draft(
         return Ok(None);
     };
 
-    let media_attachments = load_message_draft_attachments(conn, group_id_hex)?;
+    let media_attachments = load_message_draft_attachments(conn, &group_id_hex)?;
 
     Ok(Some(StoredMessageDraft {
-        group_id_hex: group_id_hex.to_owned(),
+        group_id_hex: group_id_hex.into_owned(),
         content,
         reply_to_message_id_hex,
         media_attachments,

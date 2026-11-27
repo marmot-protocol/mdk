@@ -227,6 +227,8 @@ impl SqliteAppStorage {
         events: &[ImportedAppEvent],
         now: u64,
     ) -> StorageResult<AppEventImport> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
+        let group_id_hex = group_id_hex.as_ref();
         let (slot, recovery_key, backup_id, head, written_at) = match source {
             HistoryImportProvenance::Device(slot) => {
                 (Some(slot.as_slice()), None, None, None, None)
@@ -404,6 +406,8 @@ impl SqliteAppStorage {
         now: u64,
         limit: usize,
     ) -> StorageResult<Vec<HistoryExportRow>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
+        let group_id_hex = group_id_hex.as_ref();
         let (after_epoch, after_at, after_id) = match after {
             Some((epoch, at, id)) => (Some(u64_to_i64(epoch)?), Some(u64_to_i64(at)?), Some(id)),
             None => (None, None, None),
@@ -601,12 +605,13 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         message_id_hex: &str,
     ) -> StorageResult<Option<DeviceSlotId>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let slot = self
             .lock()?
             .query_row_cached(
                 "SELECT source_slot FROM app_event_imports
                  WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND source_slot IS NOT NULL",
-                params![group_id_hex, message_id_hex],
+                params![group_id_hex.as_ref(), message_id_hex],
                 |row| row.get::<_, Vec<u8>>(0),
             )
             .optional()
@@ -626,13 +631,14 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         message_id_hex: &str,
     ) -> StorageResult<Option<HistoryImportProvenance>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .query_row_cached(
                 &format!(
                     "SELECT {TIMELINE_IMPORT_PROVENANCE_SQL} FROM app_event_imports AS imported
              WHERE imported.group_id_hex=?1 AND imported.message_id_hex=?2"
                 ),
-                params![group_id_hex, message_id_hex],
+                params![group_id_hex.as_ref(), message_id_hex],
                 history_import_provenance_from_row,
             )
             .optional()
@@ -649,12 +655,13 @@ impl SqliteAppStorage {
         message_id_hex: &str,
         ciphertext_sha256: &str,
     ) -> StorageResult<Option<Zeroizing<[u8; 32]>>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let key = self
             .lock()?
             .query_row_cached(
                 "SELECT file_key FROM imported_media_file_keys
                  WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND ciphertext_sha256 = ?3",
-                params![group_id_hex, message_id_hex, ciphertext_sha256],
+                params![group_id_hex.as_ref(), message_id_hex, ciphertext_sha256],
                 |row| row.get::<_, Vec<u8>>(0).map(Zeroizing::new),
             )
             .optional()
@@ -671,13 +678,14 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         ciphertext_sha256: &str,
     ) -> StorageResult<Option<Zeroizing<[u8; 32]>>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let key = self
             .lock()?
             .query_row_cached(
                 "SELECT file_key FROM imported_media_file_keys
                  WHERE group_id_hex = ?1 AND ciphertext_sha256 = ?2
                  LIMIT 1",
-                params![group_id_hex, ciphertext_sha256],
+                params![group_id_hex.as_ref(), ciphertext_sha256],
                 |row| row.get::<_, Vec<u8>>(0).map(Zeroizing::new),
             )
             .optional()
@@ -692,6 +700,7 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         message_id_hex: &str,
     ) -> StorageResult<Vec<ImportedFileKey>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let conn = self.lock()?;
         let mut statement = conn
             .prepare_cached(
@@ -701,7 +710,7 @@ impl SqliteAppStorage {
             )
             .storage()?;
         let rows = statement
-            .query_map(params![group_id_hex, message_id_hex], |row| {
+            .query_map(params![group_id_hex.as_ref(), message_id_hex], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     Zeroizing::new(row.get::<_, Vec<u8>>(1)?),
@@ -721,10 +730,11 @@ impl SqliteAppStorage {
     }
 
     fn holds_app_event(&self, group_id_hex: &str, message_id_hex: &str) -> StorageResult<bool> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM app_events WHERE group_id_hex = ?1 AND message_id_hex = ?2)",
-                params![group_id_hex, message_id_hex],
+                params![group_id_hex.as_ref(), message_id_hex],
                 |row| row.get::<_, bool>(0),
             )
             .storage()

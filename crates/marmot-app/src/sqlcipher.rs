@@ -691,9 +691,9 @@ fn rekey_legacy_sqlcipher_database(
 ) -> Result<(), AppError> {
     fs_private::ensure_private_db_files(db_path)?;
     let conn = Connection::open(db_path)?;
-    // Pin cipher_compatibility and enable cipher_memory_security before keying,
-    // matching storage-sqlite, so the rekey open does not depend on SQLCipher
-    // defaults and key material is wiped from the heap.
+    // Enable cipher_memory_security before keying and pin cipher_compatibility
+    // after keying, matching storage-sqlite, so the rekey open does not depend
+    // on SQLCipher defaults and key material is wiped from the heap.
     open_hardened_sqlcipher(&conn, legacy_key, SqlCipherHardening::cipher_only())?;
     rekey_sqlcipher_connection(db_path, &conn, new_key)
 }
