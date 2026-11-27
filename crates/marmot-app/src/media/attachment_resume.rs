@@ -74,6 +74,10 @@ pub(crate) struct AttachmentResume {
     /// Wakes transfer observers after each progress or phase write: byte
     /// progress as progress, a body restart or a new phase as a state change.
     pub updates: Option<crate::runtime::attachment_controls::AttachmentUpdates>,
+    /// Tracks blocking checkpoint, progress, capacity, and verification tasks
+    /// so worker teardown drains every descendant before cache eviction
+    /// (mdk#3801).
+    pub tasks: crate::runtime::account_worker::WorkerTaskScope,
 }
 fn retry(message: &str) -> AttachmentDownloadFailure {
     AttachmentDownloadFailure::Retry(AppError::BlobStore(message.into()))
@@ -186,18 +190,20 @@ impl AttachmentResume {
             return true;
         }
         let this = self.clone();
-        let promoted = tokio::task::spawn_blocking(move || {
-            Ok::<_, cgka_traits::StorageError>(
-                this.storage
-                    .app_storage()
-                    .attachment_request_is_explicit(&this.job.reference)?
-                    && this
-                        .storage
+        let promoted = self
+            .tasks
+            .spawn_blocking(move || {
+                Ok::<_, cgka_traits::StorageError>(
+                    this.storage
                         .app_storage()
-                        .attachment_transfer_is_active(&this.job, crate::unix_now_seconds())?,
-            )
-        })
-        .await;
+                        .attachment_request_is_explicit(&this.job.reference)?
+                        && this
+                            .storage
+                            .app_storage()
+                            .attachment_transfer_is_active(&this.job, crate::unix_now_seconds())?,
+                )
+            })
+            .await;
         if matches!(promoted, Ok(Ok(true))) {
             self.explicit_permission.store(true, Ordering::Release);
             return true;
@@ -245,14 +251,16 @@ impl AttachmentResume {
             return Err(retry("automatic attachment permission revoked"));
         }
         let this = self.clone();
-        let allowed = tokio::task::spawn_blocking(move || {
-            this.storage
-                .app_storage()
-                .begin_attachment_network_attempt(&this.job, crate::unix_now_seconds())
-        })
-        .await
-        .map_err(|_| stop("attachment admission task failed"))?
-        .map_err(|_| stop("attachment admission failed"))?;
+        let allowed = self
+            .tasks
+            .spawn_blocking(move || {
+                this.storage
+                    .app_storage()
+                    .begin_attachment_network_attempt(&this.job, crate::unix_now_seconds())
+            })
+            .await
+            .map_err(|_| stop("attachment admission task failed"))?
+            .map_err(|_| stop("attachment admission failed"))?;
         if !allowed {
             return Err(stop("attachment network attempt not admitted"));
         }
@@ -298,18 +306,20 @@ impl AttachmentResume {
     ) -> Result<(), AttachmentDownloadFailure> {
         self.finishing.store(true, Ordering::Release);
         let this = self.clone();
-        let recorded = tokio::task::spawn_blocking(move || {
-            // Park on disk pressure before recording a completed receipt, so a
-            // blocked job never becomes an opted-in body with no retention.
-            // Stable retention quota failures after this boundary remain terminal.
-            this.check_capacity(needed, held)?;
-            this.storage
-                .app_storage()
-                .mark_attachment_body_completed(&this.job, crate::unix_now_seconds())
-                .map_err(|_| stop("attachment receipt failed"))
-        })
-        .await
-        .map_err(|_| stop("attachment receipt task failed"))??;
+        let recorded = self
+            .tasks
+            .spawn_blocking(move || {
+                // Park on disk pressure before recording a completed receipt, so a
+                // blocked job never becomes an opted-in body with no retention.
+                // Stable retention quota failures after this boundary remain terminal.
+                this.check_capacity(needed, held)?;
+                this.storage
+                    .app_storage()
+                    .mark_attachment_body_completed(&this.job, crate::unix_now_seconds())
+                    .map_err(|_| stop("attachment receipt failed"))
+            })
+            .await
+            .map_err(|_| stop("attachment receipt task failed"))??;
         if !recorded {
             return Err(stop("attachment receipt superseded"));
         }
@@ -380,7 +390,8 @@ impl AttachmentResume {
         held: u64,
     ) -> Result<(), AttachmentDownloadFailure> {
         let this = Arc::clone(self);
-        tokio::task::spawn_blocking(move || this.check_download_capacity(bytes, on_disk, held))
+        self.tasks
+            .spawn_blocking(move || this.check_download_capacity(bytes, on_disk, held))
             .await
             .map_err(|_| retry("attachment capacity task failed"))?
     }
@@ -422,17 +433,19 @@ impl AttachmentResume {
         restart: bool,
     ) -> Result<(), AttachmentDownloadFailure> {
         let this = self.clone();
-        let updated = tokio::task::spawn_blocking(move || {
-            this.storage.app_storage().update_attachment_progress(
-                &this.job,
-                crate::unix_now_seconds(),
-                1,
-                received,
-                total,
-                restart,
-            )
-        })
-        .await;
+        let updated = self
+            .tasks
+            .spawn_blocking(move || {
+                this.storage.app_storage().update_attachment_progress(
+                    &this.job,
+                    crate::unix_now_seconds(),
+                    1,
+                    received,
+                    total,
+                    restart,
+                )
+            })
+            .await;
         // Observation failures must not mask a cryptographic terminal outcome.
         // The worker cancellation monitor and publication gate still fence bytes.
         if matches!(updated, Ok(Ok(false))) {
@@ -455,14 +468,16 @@ impl AttachmentResume {
     /// with a state change, since the row enters that transfer state.
     pub(crate) async fn phase(&self, phase: u8) -> Result<(), AttachmentDownloadFailure> {
         let this = self.clone();
-        let updated = tokio::task::spawn_blocking(move || {
-            this.storage.app_storage().update_attachment_phase(
-                &this.job,
-                crate::unix_now_seconds(),
-                phase,
-            )
-        })
-        .await;
+        let updated = self
+            .tasks
+            .spawn_blocking(move || {
+                this.storage.app_storage().update_attachment_phase(
+                    &this.job,
+                    crate::unix_now_seconds(),
+                    phase,
+                )
+            })
+            .await;
         // Observation failures must not mask a cryptographic terminal outcome.
         // The worker cancellation monitor and publication gate still fence bytes.
         if matches!(updated, Ok(Ok(false))) {
@@ -480,16 +495,17 @@ impl AttachmentResume {
     ) -> Result<Option<u64>, AttachmentDownloadFailure> {
         let this = self.clone();
         let locator_digest = Sha256::digest(url.as_str().as_bytes()).into();
-        tokio::task::spawn_blocking(move || {
-            this.storage.app_storage().attachment_partial_total(
-                &this.job,
-                crate::unix_now_seconds(),
-                (&this.ciphertext_digest, &locator_digest),
-            )
-        })
-        .await
-        .map_err(|_| retry("partial checkpoint task failed"))?
-        .map_err(|_| retry("partial checkpoint metadata unavailable"))
+        self.tasks
+            .spawn_blocking(move || {
+                this.storage.app_storage().attachment_partial_total(
+                    &this.job,
+                    crate::unix_now_seconds(),
+                    (&this.ciphertext_digest, &locator_digest),
+                )
+            })
+            .await
+            .map_err(|_| retry("partial checkpoint task failed"))?
+            .map_err(|_| retry("partial checkpoint metadata unavailable"))
     }
 
     pub(super) async fn load(
@@ -499,19 +515,20 @@ impl AttachmentResume {
     ) -> Result<Option<RestoredPartial>, AttachmentDownloadFailure> {
         let this = self.clone();
         let locator_digest = Sha256::digest(url.as_str().as_bytes()).into();
-        tokio::task::spawn_blocking(move || {
-            read_checkpoint(
-                &this.storage,
-                &this.media,
-                &this.job,
-                crate::unix_now_seconds(),
-                max,
-                Some((&this.ciphertext_digest, &locator_digest)),
-            )
-        })
-        .await
-        .map_err(|_| retry("partial checkpoint task failed"))?
-        .map_err(|_| retry("partial checkpoint read failed"))
+        self.tasks
+            .spawn_blocking(move || {
+                read_checkpoint(
+                    &this.storage,
+                    &this.media,
+                    &this.job,
+                    crate::unix_now_seconds(),
+                    max,
+                    Some((&this.ciphertext_digest, &locator_digest)),
+                )
+            })
+            .await
+            .map_err(|_| retry("partial checkpoint task failed"))?
+            .map_err(|_| retry("partial checkpoint read failed"))
     }
     pub(crate) async fn clear(
         &self,
@@ -524,12 +541,13 @@ impl AttachmentResume {
                 <[u8; 32]>::from(Sha256::digest(url.as_str().as_bytes())),
             )
         });
-        tokio::task::spawn_blocking(move || {
-            clear_checkpoint(&this.storage, &this.media, &this.job, identity)
-        })
-        .await
-        .map_err(|_| retry("partial checkpoint task failed"))?
-        .map_err(|_| retry("partial checkpoint cleanup failed"))?;
+        self.tasks
+            .spawn_blocking(move || {
+                clear_checkpoint(&this.storage, &this.media, &this.job, identity)
+            })
+            .await
+            .map_err(|_| retry("partial checkpoint task failed"))?
+            .map_err(|_| retry("partial checkpoint cleanup failed"))?;
         Ok(())
     }
     pub(super) async fn save(
@@ -539,40 +557,42 @@ impl AttachmentResume {
         bytes: Vec<u8>,
     ) -> Result<(), AttachmentDownloadFailure> {
         let this = self.clone();
-        let saved = tokio::task::spawn_blocking(move || {
-            // A checkpoint write keeps the reserve free, like every other
-            // write on the account's volume. A shortage parks the job with
-            // what its next attempt needs: the rest of the body beyond the
-            // saved `offset`, and its store file. Space that cannot be
-            // measured is a transient failure, not a full disk.
-            let disk = this.disk_policy()?;
-            let free = available_space(&this.directory)
-                .map_err(|_| retry("free disk space unavailable"))?;
-            let body = identity
-                .total
-                .saturating_sub(super::file_transfer::MEDIA_AEAD_TAG_BYTES);
-            let need = DiskPolicy::download_need(body, offset as u64);
-            if disk.admit(free, bytes.len() as u64) != Admission::Admitted {
-                return Err(storage_blocked(need));
-            }
-            // The volume or the database can still fill between the
-            // measurement and the write: the store reports that as
-            // `Capacity`, and it parks the same way.
-            write_checkpoint(
-                &this.storage.app_storage(),
-                &this.media,
-                &this.job,
-                &identity,
-                offset as u64,
-                &bytes,
-            )
-            .map_err(|error| match error {
-                media_store::MediaError::Capacity => storage_blocked(need),
-                _ => retry("partial checkpoint write failed"),
+        let saved = self
+            .tasks
+            .spawn_blocking(move || {
+                // A checkpoint write keeps the reserve free, like every other
+                // write on the account's volume. A shortage parks the job with
+                // what its next attempt needs: the rest of the body beyond the
+                // saved `offset`, and its store file. Space that cannot be
+                // measured is a transient failure, not a full disk.
+                let disk = this.disk_policy()?;
+                let free = available_space(&this.directory)
+                    .map_err(|_| retry("free disk space unavailable"))?;
+                let body = identity
+                    .total
+                    .saturating_sub(super::file_transfer::MEDIA_AEAD_TAG_BYTES);
+                let need = DiskPolicy::download_need(body, offset as u64);
+                if disk.admit(free, bytes.len() as u64) != Admission::Admitted {
+                    return Err(storage_blocked(need));
+                }
+                // The volume or the database can still fill between the
+                // measurement and the write: the store reports that as
+                // `Capacity`, and it parks the same way.
+                write_checkpoint(
+                    &this.storage.app_storage(),
+                    &this.media,
+                    &this.job,
+                    &identity,
+                    offset as u64,
+                    &bytes,
+                )
+                .map_err(|error| match error {
+                    media_store::MediaError::Capacity => storage_blocked(need),
+                    _ => retry("partial checkpoint write failed"),
+                })
             })
-        })
-        .await
-        .map_err(|_| retry("partial checkpoint task failed"))??;
+            .await
+            .map_err(|_| retry("partial checkpoint task failed"))??;
         if !saved {
             return Err(retry("partial checkpoint no longer admitted"));
         }
@@ -590,38 +610,44 @@ impl AttachmentResume {
     ) -> Result<Option<WirePrefix>, AttachmentDownloadFailure> {
         let this = self.clone();
         let locator_digest: [u8; 32] = Sha256::digest(url.as_str().as_bytes()).into();
-        tokio::task::spawn_blocking(move || {
-            let expected = (&this.ciphertext_digest, &locator_digest);
-            let Some(part) = this
-                .storage
-                .app_storage()
-                .load_attachment_partial(&this.job, crate::unix_now_seconds(), max, Some(expected))
-                .map_err(|_| retry("partial file checkpoint unavailable"))?
-            else {
-                return Ok(None);
-            };
-            let target = this.storage.app_storage().attachment_checkpoint(
-                &this.job,
-                part.identity.clone(),
-                crate::unix_now_seconds,
-            );
-            let mut sink = HashingSink {
-                hash: Sha256::new(),
-                control: &control,
-            };
-            let restored = this.media.checkpoint_restore(&target, &mut sink);
-            control.check()?;
-            match restored.map_err(|_| retry("partial file checkpoint unavailable"))? {
-                Some(received) if received == part.received => Ok(Some(WirePrefix {
-                    identity: part.identity,
-                    received,
-                    hash: sink.hash,
-                })),
-                _ => Ok(None),
-            }
-        })
-        .await
-        .map_err(|_| retry("partial file checkpoint task failed"))?
+        self.tasks
+            .spawn_blocking(move || {
+                let expected = (&this.ciphertext_digest, &locator_digest);
+                let Some(part) = this
+                    .storage
+                    .app_storage()
+                    .load_attachment_partial(
+                        &this.job,
+                        crate::unix_now_seconds(),
+                        max,
+                        Some(expected),
+                    )
+                    .map_err(|_| retry("partial file checkpoint unavailable"))?
+                else {
+                    return Ok(None);
+                };
+                let target = this.storage.app_storage().attachment_checkpoint(
+                    &this.job,
+                    part.identity.clone(),
+                    crate::unix_now_seconds,
+                );
+                let mut sink = HashingSink {
+                    hash: Sha256::new(),
+                    control: &control,
+                };
+                let restored = this.media.checkpoint_restore(&target, &mut sink);
+                control.check()?;
+                match restored.map_err(|_| retry("partial file checkpoint unavailable"))? {
+                    Some(received) if received == part.received => Ok(Some(WirePrefix {
+                        identity: part.identity,
+                        received,
+                        hash: sink.hash,
+                    })),
+                    _ => Ok(None),
+                }
+            })
+            .await
+            .map_err(|_| retry("partial file checkpoint task failed"))?
     }
 
     /// Opens this attempt's finished `len`-byte checkpoint for `url`, to
@@ -637,20 +663,21 @@ impl AttachmentResume {
     > {
         let this = self.clone();
         let locator_digest: [u8; 32] = Sha256::digest(url.as_str().as_bytes()).into();
-        tokio::task::spawn_blocking(move || {
-            let target = this.storage.app_storage().attachment_checkpoint_matching(
-                &this.job,
-                Some((this.ciphertext_digest, locator_digest)),
-                crate::unix_now_seconds,
-            );
-            this.media
-                .checkpoint_reader(&target)
-                .map_err(|_| retry("file checkpoint unavailable"))?
-                .filter(|reader| reader.len() == len)
-                .ok_or_else(|| retry("file checkpoint incomplete"))
-        })
-        .await
-        .map_err(|_| retry("file checkpoint task failed"))?
+        self.tasks
+            .spawn_blocking(move || {
+                let target = this.storage.app_storage().attachment_checkpoint_matching(
+                    &this.job,
+                    Some((this.ciphertext_digest, locator_digest)),
+                    crate::unix_now_seconds,
+                );
+                this.media
+                    .checkpoint_reader(&target)
+                    .map_err(|_| retry("file checkpoint unavailable"))?
+                    .filter(|reader| reader.len() == len)
+                    .ok_or_else(|| retry("file checkpoint incomplete"))
+            })
+            .await
+            .map_err(|_| retry("file checkpoint task failed"))?
     }
 }
 

@@ -261,12 +261,23 @@ pub(crate) struct EncryptedMediaUploadHttp {
     allowed_locator_kinds: Vec<String>,
     allow_loopback_http: bool,
     transport: BlossomHttpTransport,
-    retention_app: MarmotApp,
-    retention_account: String,
+    storage: storage_sqlite::SqliteAccountStorage,
+    media: crate::AccountMediaStore,
+    account_dir: std::path::PathBuf,
+    fallback_policy: storage_sqlite::AttachmentDownloadPolicy,
+    tasks: crate::runtime::account_worker::WorkerTaskScope,
     retention_group: GroupId,
 }
 
 impl EncryptedMediaUploadHttp {
+    pub(crate) fn with_tasks(
+        mut self,
+        tasks: crate::runtime::account_worker::WorkerTaskScope,
+    ) -> Self {
+        self.tasks = tasks;
+        self
+    }
+
     /// Stages every body in the media store, uploads, then binds the uploads
     /// to their descriptors. A body the disk cannot hold refuses the send
     /// with the storage-full error; any failure releases what was staged.
@@ -275,12 +286,17 @@ impl EncryptedMediaUploadHttp {
     pub(crate) async fn run(
         self,
     ) -> Result<(MediaUploadResult, crate::media::outgoing::OutgoingUploads), AppError> {
-        let mut uploads = crate::media::outgoing::OutgoingUploads::new(
-            self.retention_app.clone(),
-            self.retention_account.clone(),
+        let tasks = self.tasks.clone();
+        let cancel = tasks.token();
+        let mut uploads = crate::media::outgoing::OutgoingUploads::with_handles(
+            self.storage.clone(),
+            self.media.clone(),
+            tasks.clone(),
         );
-        let app = self.retention_app.clone();
-        let account = self.retention_account.clone();
+        let storage = self.storage.clone();
+        let media = self.media.clone();
+        let account_dir = self.account_dir.clone();
+        let fallback_policy = self.fallback_policy.clone();
         let group = self.retention_group.clone();
         let source_epoch = self.source_epoch;
         let control = match &self.request {
@@ -289,11 +305,32 @@ impl EncryptedMediaUploadHttp {
             }
             crate::media::file_transfer::MediaUploadPayload::Bytes(_) => None,
         };
-        let staging = tokio::task::spawn_blocking(move || {
-            crate::media::outgoing::SendStaging::open(&app, &account, &group, source_epoch)
-        })
-        .await
-        .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
+        struct CancelOnDrop(Option<Arc<crate::MediaFileTransferControl>>);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                if let Some(control) = self.0.take() {
+                    control.cancel();
+                }
+            }
+        }
+        let mut cancel_on_drop = CancelOnDrop(control.clone());
+        let staging_cancel = cancel.clone();
+        let staging = tasks
+            .spawn_blocking(move || {
+                if staging_cancel.is_cancelled() {
+                    return Err(AppError::TransportClosed);
+                }
+                crate::media::outgoing::SendStaging::open_with_handles(
+                    storage,
+                    media,
+                    account_dir,
+                    &fallback_policy,
+                    &group,
+                    source_epoch,
+                )
+            })
+            .await
+            .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
         let result = match staging {
             Ok(staging) => self.upload(Arc::new(staging), &mut uploads).await,
             Err(error) => Err(error),
@@ -308,6 +345,7 @@ impl EncryptedMediaUploadHttp {
                 return Err(error);
             }
         };
+        cancel_on_drop.0 = None;
         Ok((result, uploads))
     }
 
@@ -316,6 +354,8 @@ impl EncryptedMediaUploadHttp {
         staging: Arc<crate::media::outgoing::SendStaging>,
         uploads: &mut crate::media::outgoing::OutgoingUploads,
     ) -> Result<MediaUploadResult, AppError> {
+        let tasks = self.tasks.clone();
+        let cancel = tasks.token();
         let policy = MediaOperationPolicy {
             version: self.version,
             default_endpoints: &self.default_endpoints,
@@ -325,37 +365,45 @@ impl EncryptedMediaUploadHttp {
         let mut result = match self.request {
             crate::media::file_transfer::MediaUploadPayload::Files(sources, control) => {
                 let servers = crate::media::upload_servers(sources.server().clone(), policy)?;
-                let (stage, stage_control, version) =
-                    (staging.clone(), control.clone(), self.version);
+                let (stage, stage_control, version, stage_cancel) = (
+                    staging.clone(),
+                    control.clone(),
+                    self.version,
+                    cancel.clone(),
+                );
                 // The blocking task owns the reservations it makes until this
                 // await hands them back; if this future is dropped first, the
                 // task's result drops and releases them.
                 let mut staged = uploads.handoff();
-                let (staged, sources) = tokio::task::spawn_blocking(move || {
-                    let sources = match sources {
-                        crate::media::file_transfer::FileUploadSources::Host(request) => {
-                            stage_file_sources(
-                                &stage,
-                                staged.tokens_mut(),
-                                request.attachments,
-                                version,
-                                stage_control,
-                            )
+                let (staged, sources) = tasks
+                    .spawn_blocking(move || {
+                        if stage_cancel.is_cancelled() {
+                            return (staged, Err(AppError::TransportClosed));
                         }
-                        crate::media::file_transfer::FileUploadSources::Draft(request) => {
-                            crate::media::outgoing::stage_draft_sources(
-                                &stage,
-                                staged.tokens_mut(),
-                                request,
-                                version,
-                                &stage_control,
-                            )
-                        }
-                    };
-                    (staged, sources)
-                })
-                .await
-                .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
+                        let sources = match sources {
+                            crate::media::file_transfer::FileUploadSources::Host(request) => {
+                                stage_file_sources(
+                                    &stage,
+                                    staged.tokens_mut(),
+                                    request.attachments,
+                                    version,
+                                    stage_control,
+                                )
+                            }
+                            crate::media::file_transfer::FileUploadSources::Draft(request) => {
+                                crate::media::outgoing::stage_draft_sources(
+                                    &stage,
+                                    staged.tokens_mut(),
+                                    request,
+                                    version,
+                                    &stage_control,
+                                )
+                            }
+                        };
+                        (staged, sources)
+                    })
+                    .await
+                    .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
                 uploads.absorb(staged);
                 crate::media::outgoing::upload_staged(
                     staging.media(),
@@ -367,32 +415,37 @@ impl EncryptedMediaUploadHttp {
                     policy,
                     &self.transport,
                     control,
+                    &tasks,
                 )
                 .await?
             }
             crate::media::file_transfer::MediaUploadPayload::Bytes(request) => {
                 crate::media::validate_media_upload_batch(&request.attachments)?;
-                let stage = staging.clone();
+                let (stage, stage_cancel) = (staging.clone(), cancel.clone());
                 let mut reserved = uploads.handoff();
-                let (request, reserved, staged) = tokio::task::spawn_blocking(move || {
-                    let staged = request.attachments.iter().try_for_each(|attachment| {
-                        let len = attachment.plaintext.len() as u64;
-                        stage
-                            .stage(reserved.tokens_mut(), len, |media, target| {
-                                crate::media::outgoing::stage_body(
-                                    media,
-                                    target,
-                                    &mut std::io::Cursor::new(&attachment.plaintext),
-                                    len,
-                                    &|| false,
-                                )
-                            })
-                            .map(|_| ())
-                    });
-                    (request, reserved, staged)
-                })
-                .await
-                .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
+                let (request, reserved, staged) = tasks
+                    .spawn_blocking(move || {
+                        if stage_cancel.is_cancelled() {
+                            return (request, reserved, Err(AppError::TransportClosed));
+                        }
+                        let staged = request.attachments.iter().try_for_each(|attachment| {
+                            let len = attachment.plaintext.len() as u64;
+                            stage
+                                .stage(reserved.tokens_mut(), len, |media, target| {
+                                    crate::media::outgoing::stage_body(
+                                        media,
+                                        target,
+                                        &mut std::io::Cursor::new(&attachment.plaintext),
+                                        len,
+                                        &|| stage_cancel.is_cancelled(),
+                                    )
+                                })
+                                .map(|_| ())
+                        });
+                        (request, reserved, staged)
+                    })
+                    .await
+                    .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
                 uploads.absorb(reserved);
                 staged?;
                 upload_encrypted_media(
@@ -415,7 +468,13 @@ impl EncryptedMediaUploadHttp {
         // expired. The message itself has not been sent yet.
         let tokens = uploads.tokens().to_vec();
         let descriptors = result.clone();
-        tokio::task::spawn_blocking(move || staging.bind(&tokens, &descriptors))
+        tasks
+            .spawn_blocking(move || {
+                if cancel.is_cancelled() {
+                    return Err(AppError::TransportClosed);
+                }
+                staging.bind(&tokens, &descriptors)
+            })
             .await
             .map_err(|_| AppError::BlockingTask("media staging failed".into()))??;
         Ok(result)
@@ -6131,6 +6190,10 @@ impl AppClient {
             }
             crate::media::file_transfer::MediaUploadPayload::Bytes(_) => None,
         };
+        let storage = self.app.account_storage(&self.state.label)?;
+        let media = self.app.account_media_store(&self.state.label, &storage)?;
+        let account_dir = self.app.account_dir(&self.state.label);
+        let fallback_policy = crate::runtime::attachment_controls::default_policy(&self.app.config);
         Ok((
             EncryptedMediaUploadHttp {
                 request,
@@ -6143,8 +6206,11 @@ impl AppClient {
                 allowed_locator_kinds: policy.allowed_locator_kinds,
                 allow_loopback_http: allow_loopback,
                 transport: self.blossom_http_transport.clone(),
-                retention_app: self.app.clone(),
-                retention_account: self.state.label.clone(),
+                storage,
+                media,
+                account_dir,
+                fallback_policy,
+                tasks: crate::runtime::account_worker::WorkerTaskScope::new(),
                 retention_group: group_id.clone(),
             },
             EncryptedMediaUploadFinish {

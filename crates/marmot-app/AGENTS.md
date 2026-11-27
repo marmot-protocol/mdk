@@ -291,11 +291,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   check share. A sign-in nudge that arrives during a read waits for its continuation and then brings the next check
   forward, since the read may have started before what nudged it. A waiting host check keeps its place: each later
   command that names no existing group (`waits_behind_sign_in_check`) parks in order, up to `PARKED_LIMIT`, after
-  which the worker pauses only account-wide host admissions (`WorkerInbox` splits host commands into sequence-ordered
-  group-scoped and account-wide channels); group-scoped commands, the worker's own work, and its timers' retries still
-  go ahead. Long-running units that defer commands (startup hydration, startup sync, catch-up, and
-  `defer_commands_until`) likewise pause host intake at `DEFERRED_COMMAND_LIMIT` while worker-owned retries continue
-  (mdk#3801). The read task keeps these:
+  which the worker pauses only account-wide host admissions (`WorkerInbox` sequences and routes group-scoped and
+  account-wide host commands atomically under one mutex so cross-lane FIFO cannot reverse); group-scoped commands, the
+  worker's own work, and its timers' retries still go ahead. Long-running units that defer commands (startup hydration,
+  startup sync, catch-up, and `defer_commands_until`) likewise pause host intake at `DEFERRED_COMMAND_LIMIT` (while
+  `defer_commands_until` continues honoring `PARKED_LIMIT` for account-wide commands whenever a host sign-in check holds
+  its place) while worker-owned retries continue (mdk#3801). The read task keeps these:
   - T1: it holds the directory's handle, the relay plane for its endpoint filter, the account id, this device's slot
     and its telemetry step, and nothing of the client.
   - T2: it reaches the directory only through its public API: the cached relay-list read, the discovery fetch, which

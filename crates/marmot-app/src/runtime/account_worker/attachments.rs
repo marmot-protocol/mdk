@@ -1512,6 +1512,7 @@ pub(super) fn schedule(
             permission: permission.clone(),
             finishing: Default::default(),
             updates: Some(shared.attachment_updates.clone()),
+            tasks: http.tasks.clone(),
         };
         let tasks = http.tasks.clone();
         let cancel = cancelled(

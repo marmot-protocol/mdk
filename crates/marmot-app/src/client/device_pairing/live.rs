@@ -2000,6 +2000,10 @@ impl AppClient {
             return Ok(None);
         }
         let Some(group_id) = self.app.removed_device_group(&self.state.label)? else {
+            self.app.note_no_stored_device_group_removal(
+                &hex::encode(self.adapter.account_id().as_slice()),
+                &self.state.label,
+            );
             return Ok(None);
         };
         // A classification that fails counts as an unlink: stopping is the

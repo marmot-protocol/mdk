@@ -1793,6 +1793,7 @@ async fn run_app_runtime_account_worker(
                         scheduled_convergence: &mut scheduled_convergence,
                         recovery_runner: recovery_runner.as_mut(),
                         unit: &unit,
+                        sign_in_held: sign_in_reads.holds_place(),
                     },
                 )
                 .await;
@@ -2561,6 +2562,7 @@ async fn run_app_runtime_account_worker(
                                         scheduled_convergence: &mut scheduled_convergence,
                                         recovery_runner: recovery_runner.as_mut(),
                                         unit: &unit,
+                                        sign_in_held: sign_in_reads.holds_place(),
                                     },
                                 )
                                 .await;
@@ -2752,6 +2754,7 @@ async fn run_app_runtime_account_worker(
                     &mut commands,
                     &mut pending,
                     Some(send_waiting),
+                    sign_in_reads.holds_place(),
                 ))
                 .await;
                 // Durable work can arrive after a direct send ended the relay
@@ -3637,6 +3640,11 @@ async fn run_app_runtime_account_worker(
     // account caches or removes the account directory (mdk#3801).
     scheduled_push_retry.end().await;
     scheduled_runtime_group_subscription_refresh.end().await;
+    media_http.tasks.end().await;
+    // Drop any unread media completions (for example `OutgoingUploads`) before
+    // returning, then drain any release-on-drop blocking tasks they spawned.
+    media_http_rx.close();
+    while media_http_rx.try_recv().is_ok() {}
     media_http.tasks.end().await;
     // Each exit that still held the client stopped the runner on it; any
     // other exit's drop aborts the task and refunds the attempts it left
@@ -5197,7 +5205,7 @@ impl WorkerTaskScope {
         Self::default()
     }
 
-    pub(super) fn token(&self) -> tokio_util::sync::CancellationToken {
+    pub(crate) fn token(&self) -> tokio_util::sync::CancellationToken {
         self.cancel.clone()
     }
 
@@ -5213,7 +5221,7 @@ impl WorkerTaskScope {
         self.tasks.spawn(future)
     }
 
-    pub(super) fn spawn_blocking<F, R>(&self, func: F) -> JoinHandle<R>
+    pub(crate) fn spawn_blocking<F, R>(&self, func: F) -> JoinHandle<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
@@ -5952,18 +5960,29 @@ fn publish_before_unit(
     client.subscribe_read_state()
 }
 
+fn count_waiting_behind_sign_in(queue: &VecDeque<QueuedCommand>) -> usize {
+    queue
+        .iter()
+        .filter(|queued| queued.command().waits_behind_sign_in_check())
+        .count()
+}
+
 /// Hold the worker's commands while `work` exclusively borrows the live
 /// client. Group reads answer from A meanwhile; mutations and the reads
 /// still on the worker stay queued FIFO behind `work`. Worker-owned catch-up
 /// runs afterward because create/invite spawn it immediately after the
 /// caller-visible reply. Keep later deferred commands behind that catch-up
-/// in their arrival order.
+/// in their arrival order. When `sign_in_held` is true, preserve
+/// `sign_in_reads::PARKED_LIMIT` for account-wide commands so group-scoped
+/// units (such as invite Welcome fanout) never reopen account admission past
+/// the parking bound (mdk#3801).
 async fn defer_commands_until<Fut>(
     published: Option<watch::Receiver<Arc<crate::client::read_state::ReadState>>>,
     work: Fut,
     commands: &mut WorkerInbox,
     pending: &mut VecDeque<QueuedCommand>,
     mut send_waiting: Option<oneshot::Sender<()>>,
+    sign_in_held: bool,
 ) -> Fut::Output
 where
     Fut: Future,
@@ -5974,14 +5993,20 @@ where
     let mut commands_open = true;
     let mut work = std::pin::pin!(work);
     let output = loop {
-        let admit_host = deferred.len() + follow_up.len() < DEFERRED_COMMAND_LIMIT;
+        let admit_group = deferred.len() + follow_up.len() < DEFERRED_COMMAND_LIMIT;
+        let admit_account = admit_group
+            && (!sign_in_held
+                || count_waiting_behind_sign_in(&deferred)
+                    + count_waiting_behind_sign_in(&follow_up)
+                    + count_waiting_behind_sign_in(pending)
+                    < sign_in_reads::PARKED_LIMIT);
         let command = if let Some(command) = pending.pop_front() {
             Some(command)
         } else {
             tokio::select! {
                 biased;
                 result = &mut work => break result,
-                command = commands.recv_admitting(admit_host, admit_host), if commands_open => {
+                command = commands.recv_admitting(admit_group, admit_account), if commands_open => {
                     if command.is_none() {
                         commands_open = false;
                     }
@@ -6107,6 +6132,10 @@ struct AccountWorkerCommandContext<'a> {
     /// it waits on it.
     recovery_runner: Option<&'a mut SpawnedRunner>,
     unit: &'a WorkerUnitGauge,
+    /// Whether a host sign-in check currently holds its place in the worker,
+    /// so `defer_commands_until` preserves the `PARKED_LIMIT` (64) cap on
+    /// account-wide commands instead of admitting up to `DEFERRED_COMMAND_LIMIT`.
+    sign_in_held: bool,
 }
 
 /// Publish what a sign-in check changed, and answer the host check it
@@ -6209,6 +6238,7 @@ fn account_worker_command_future<'a>(
         scheduled_convergence,
         recovery_runner,
         unit,
+        sign_in_held,
     } = context;
     let storage_permit = shared.observer.product().permit();
     match command {
@@ -6385,6 +6415,7 @@ fn account_worker_command_future<'a>(
                 commands,
                 pending,
                 None,
+                sign_in_held,
             ))
             .await;
             let result = match repaired {
@@ -6599,6 +6630,7 @@ fn account_worker_command_future<'a>(
                     commands,
                     pending,
                     None,
+                    sign_in_held,
                 ))
                 .await;
             }
@@ -7099,6 +7131,7 @@ fn account_worker_command_future<'a>(
                     commands,
                     pending,
                     None,
+                    sign_in_held,
                 ))
                 .await;
             }
@@ -8008,16 +8041,17 @@ fn account_worker_command_future<'a>(
                 .prepare_encrypted_media_upload_payload(&group_id, request)
                 .await
             {
-                Ok((http, finish)) => {
-                    spawn_media_http(media_http, permit, http.run(), move |result| {
-                        MediaHttpCompletion::Upload {
-                            finish,
-                            result: result.map(|(result, uploads)| (result, Box::new(uploads))),
-                            respond,
-                            started_at,
-                        }
-                    })
-                }
+                Ok((http, finish)) => spawn_media_http(
+                    media_http,
+                    permit,
+                    http.with_tasks(media_http.tasks.clone()).run(),
+                    move |result| MediaHttpCompletion::Upload {
+                        finish,
+                        result: result.map(|(result, uploads)| (result, Box::new(uploads))),
+                        respond,
+                        started_at,
+                    },
+                ),
                 Err(err) => {
                     shared.observer.performance().record(
                         AppPerformanceOperation::MediaUpload,
@@ -10455,7 +10489,8 @@ mod tests {
                 .unwrap();
             let (release, work) = oneshot::channel::<()>();
             let mut pending = VecDeque::new();
-            let serve = defer_commands_until(published, work, &mut receiver, &mut pending, None);
+            let serve =
+                defer_commands_until(published, work, &mut receiver, &mut pending, None, false);
             let check = async {
                 assert!(matches!(
                     timeout(Duration::from_secs(1), response)
@@ -10510,7 +10545,7 @@ mod tests {
             .unwrap();
         let (release, work) = oneshot::channel::<()>();
         let mut pending = VecDeque::new();
-        let serve = defer_commands_until(published, work, &mut receiver, &mut pending, None);
+        let serve = defer_commands_until(published, work, &mut receiver, &mut pending, None, false);
         let check = async {
             let ack = timeout(Duration::from_secs(1), ack)
                 .await
@@ -10594,7 +10629,7 @@ mod tests {
             .unwrap();
         let (release, work) = oneshot::channel::<()>();
         let mut pending = VecDeque::new();
-        let serve = defer_commands_until(published, work, &mut receiver, &mut pending, None);
+        let serve = defer_commands_until(published, work, &mut receiver, &mut pending, None, false);
         let check = async {
             timeout(Duration::from_secs(10), async {
                 while commands.capacity() < commands.max_capacity() {
@@ -10673,7 +10708,7 @@ mod tests {
             })
             .unwrap();
         let (release, work) = oneshot::channel::<()>();
-        let serve = defer_commands_until(published, work, &mut receiver, &mut pending, None);
+        let serve = defer_commands_until(published, work, &mut receiver, &mut pending, None, false);
         let check = async {
             assert!(
                 timeout(Duration::from_secs(1), read)
@@ -10741,7 +10776,7 @@ mod tests {
         let mut receiver = WorkerInbox::from(receiver);
         let mut pending = VecDeque::new();
         let (release, work) = oneshot::channel::<()>();
-        let serve = defer_commands_until(published, work, &mut receiver, &mut pending, None);
+        let serve = defer_commands_until(published, work, &mut receiver, &mut pending, None, false);
         let probe = async {
             // Enqueue past DEFERRED_COMMAND_LIMIT + channel buffer (8).
             let mut responses = Vec::new();
@@ -10787,6 +10822,96 @@ mod tests {
             pending.len(),
             DEFERRED_COMMAND_LIMIT,
             "deferred queue must stop at DEFERRED_COMMAND_LIMIT"
+        );
+    }
+
+    /// While a host sign-in check holds `PARKED_LIMIT` (64) account-wide
+    /// commands in `pending`, `defer_commands_until` (such as during invite
+    /// Welcome fanout) must keep account-wide admission paused at 64 instead of
+    /// draining extra account commands up to `DEFERRED_COMMAND_LIMIT` (256),
+    /// while still admitting group-scoped commands (mdk#3801).
+    #[tokio::test(flavor = "current_thread")]
+    async fn defer_commands_until_preserves_sign_in_parked_limit_for_account_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let client = publishing_client(&app).await;
+        let published = publish_before_unit(&client);
+        let (commands, host_rx) = WorkerCommands::host_channel(8, Arc::default());
+        let (mut inbox, _own) = WorkerInbox::new_host(host_rx);
+        let mut pending = VecDeque::new();
+        let mut parked_receivers = Vec::new();
+        for _ in 0..sign_in_reads::PARKED_LIMIT {
+            let (respond, rx) = ReadReply::unobserved();
+            parked_receivers.push(rx);
+            commands
+                .try_send(AccountWorkerCommand::PendingWelcomeDeliveries { respond })
+                .unwrap();
+            pending.push_back(inbox.try_recv().unwrap());
+        }
+
+        let (release, work) = oneshot::channel::<()>();
+        let serve = defer_commands_until(published, work, &mut inbox, &mut pending, None, true);
+        let probe = async {
+            let mut extra_account_rx = Vec::new();
+            let mut account_sent = 0usize;
+            for _ in 0..32 {
+                let (respond, rx) = ReadReply::unobserved();
+                let mut cmd = Some(AccountWorkerCommand::PendingWelcomeDeliveries { respond });
+                for _ in 0..16 {
+                    match commands.try_send(cmd.take().unwrap()) {
+                        Ok(()) => {
+                            extra_account_rx.push(rx);
+                            account_sent += 1;
+                            break;
+                        }
+                        Err(mpsc::error::TrySendError::Full(returned)) => {
+                            cmd = Some(returned);
+                            tokio::task::yield_now().await;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            panic!("channel closed unexpectedly");
+                        }
+                    }
+                }
+                if cmd.is_some() {
+                    break;
+                }
+            }
+            // Group-scoped command must still be admitted while account lane is paused at 64.
+            let (group_respond, _group_rx) = oneshot::channel();
+            commands
+                .try_send(AccountWorkerCommand::SendMessage {
+                    enqueued_at: Instant::now(),
+                    queued: None,
+                    group_id: GroupId::new(vec![0x22; 16]),
+                    payload: Vec::new(),
+                    respond: group_respond,
+                })
+                .expect("group-scoped command must still be admitted");
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            release.send(()).unwrap();
+            (account_sent, extra_account_rx)
+        };
+        let (result, (account_sent, _extra_account_rx)) = tokio::join!(serve, probe);
+        result.unwrap();
+        assert_eq!(
+            account_sent, 8,
+            "account channel must stay paused at PARKED_LIMIT (only 8 buffered, 0 drained)"
+        );
+        let parked_account = pending
+            .iter()
+            .filter(|q| q.command().waits_behind_sign_in_check())
+            .count();
+        assert_eq!(
+            parked_account,
+            sign_in_reads::PARKED_LIMIT,
+            "defer_commands_until must not admit account commands beyond PARKED_LIMIT"
         );
     }
 

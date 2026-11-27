@@ -7701,7 +7701,11 @@ impl AccountManager {
         .await
     }
 
-    fn validate_incomplete_account_setup_reset(
+    /// Pure metadata/keychain preflight that never opens `account_storage`, so
+    /// a concurrent `remove_account` that already evicted caches cannot have
+    /// its stale database connection repopulated before the directory rename
+    /// (mdk#3801).
+    fn validate_incomplete_account_setup_reset_preflight(
         &self,
         account_id: &str,
         account: &AccountSummary,
@@ -7731,10 +7735,21 @@ impl AccountManager {
         {
             return Err(AppError::AccountSetupResetNotApplicable);
         }
+        if self.app.key_package_record_path(&account.label).exists() {
+            return Err(AppError::AccountSetupKeyPackageRecoveryAvailable);
+        }
+        Ok(())
+    }
+
+    /// Storage-backed reset validation, called strictly under
+    /// `AccountLifecycleFences` and `worker_transactions` (mdk#3801).
+    fn validate_incomplete_account_setup_reset_storage(
+        &self,
+        account: &AccountSummary,
+    ) -> Result<(), AppError> {
         let storage = self.app.account_storage(&account.label)?;
         if storage.key_package_lifecycle()?.is_some()
             || !storage.stored_key_package_bundles()?.is_empty()
-            || self.app.key_package_record_path(&account.label).exists()
         {
             return Err(AppError::AccountSetupKeyPackageRecoveryAvailable);
         }
@@ -7760,9 +7775,10 @@ impl AccountManager {
         }
         let account_id = AccountHome::account_id_for_secret(nsec)?;
         let expected = self.app.account_home().account(&account_id)?;
-        // Validate read-only preconditions before fencing generated setup or
-        // report admission so rejected calls never disturb a live account.
-        self.validate_incomplete_account_setup_reset(&account_id, &expected)?;
+        // Validate read-only non-DB preconditions before fencing generated
+        // setup or report admission so rejected calls never disturb a live
+        // account and never repopulate evicted storage caches.
+        self.validate_incomplete_account_setup_reset_preflight(&account_id, &expected)?;
         self.finish_nip46_account(&expected).await;
         let _fences = AccountLifecycleFences::acquire_for_reset(self, &expected).await?;
         let lock_wait = self
@@ -7774,7 +7790,8 @@ impl AccountManager {
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve_original(&expected)?;
-        self.validate_incomplete_account_setup_reset(&account_id, &account)?;
+        self.validate_incomplete_account_setup_reset_preflight(&account_id, &account)?;
+        self.validate_incomplete_account_setup_reset_storage(&account)?;
 
         self.ensure_worker_reaped(&account.account_id_hex).await?;
 

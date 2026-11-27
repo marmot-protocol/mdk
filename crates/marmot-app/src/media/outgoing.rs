@@ -432,9 +432,10 @@ fn stream_staged<C: MediaCatalog + 'static>(
     len: u64,
     wire: WireKey,
     digest: [u8; 32],
+    tasks: crate::runtime::account_worker::WorkerTaskScope,
 ) -> FileUploadStream {
     let (sender, receiver) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(4);
-    tokio::task::spawn_blocking(move || {
+    tasks.spawn_blocking(move || {
         let result = (|| -> std::io::Result<()> {
             let reader = media
                 .open_staged_reader(&file)
@@ -504,6 +505,7 @@ pub(crate) async fn upload_staged<C: MediaCatalog + 'static>(
     policy: MediaOperationPolicy<'_>,
     transport: &BlossomHttpTransport,
     control: Arc<MediaFileTransferControl>,
+    tasks: &crate::runtime::account_worker::WorkerTaskScope,
 ) -> Result<MediaUploadResult, AppError> {
     use rand::RngCore;
     let mut attachments = Vec::with_capacity(sources.len());
@@ -528,15 +530,17 @@ pub(crate) async fn upload_staged<C: MediaCatalog + 'static>(
             ),
         };
         let (pass_media, pass_wire, pass_control) = (media.clone(), wire.clone(), control.clone());
-        let (source, digest) = tokio::task::spawn_blocking(move || {
-            let digest = ciphertext_digest(&pass_media, &source, &pass_wire, &pass_control);
-            (source, digest)
-        })
-        .await
-        .map_err(|_| AppError::BlockingTask("media file preparation failed".into()))?;
+        let (source, digest) = tasks
+            .spawn_blocking(move || {
+                let digest = ciphertext_digest(&pass_media, &source, &pass_wire, &pass_control);
+                (source, digest)
+            })
+            .await
+            .map_err(|_| AppError::BlockingTask("media file preparation failed".into()))?;
         let digest = digest?;
         let len = source.len + MEDIA_AEAD_TAG_BYTES;
-        let (stream_media, file, plaintext_len) = (media.clone(), source.file, source.len);
+        let (stream_media, file, plaintext_len, stream_tasks) =
+            (media.clone(), source.file, source.len, tasks.clone());
         let body = FileUploadBody {
             len,
             digest,
@@ -547,6 +551,7 @@ pub(crate) async fn upload_staged<C: MediaCatalog + 'static>(
                     plaintext_len,
                     wire.clone(),
                     digest,
+                    stream_tasks.clone(),
                 ))
             }),
         };
@@ -628,20 +633,40 @@ pub(crate) async fn upload_staged<C: MediaCatalog + 'static>(
 }
 
 /// The uploads of one send until message admission takes them over. Dropping
-/// it unfinished (a cancelled job) releases them on the blocking pool; error
-/// paths call [`Self::release`] to finish that before they return. The
-/// upload TTL and the media sweep reclaim anything a release misses.
+/// it unfinished (a cancelled job) releases them on the blocking pool under
+/// the worker's task scope using the already-open storage/media handles (never
+/// reopening storage by label after cache eviction, mdk#3801); error paths
+/// call [`Self::release`] to finish that before they return. The upload TTL
+/// and the media sweep reclaim anything a release misses.
 pub(crate) struct OutgoingUploads {
-    app: MarmotApp,
-    account: String,
+    handles: Option<(SqliteAccountStorage, AccountMediaStore)>,
+    tasks: crate::runtime::account_worker::WorkerTaskScope,
     tokens: Vec<Vec<u8>>,
 }
 
 impl OutgoingUploads {
-    pub(crate) fn new(app: MarmotApp, account: String) -> Self {
+    pub(crate) fn with_handles(
+        storage: SqliteAccountStorage,
+        media: AccountMediaStore,
+        tasks: crate::runtime::account_worker::WorkerTaskScope,
+    ) -> Self {
         Self {
-            app,
-            account,
+            handles: Some((storage, media)),
+            tasks,
+            tokens: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(app: MarmotApp, account: String) -> Self {
+        let handles = app.account_storage(&account).ok().and_then(|storage| {
+            app.account_media_store(&account, &storage)
+                .ok()
+                .map(|media| (storage, media))
+        });
+        Self {
+            handles,
+            tasks: crate::runtime::account_worker::WorkerTaskScope::new(),
             tokens: Vec::new(),
         }
     }
@@ -650,7 +675,11 @@ impl OutgoingUploads {
     /// reserves uploads. If its result is never awaited, dropping it releases
     /// what it reserved.
     pub(crate) fn handoff(&self) -> Self {
-        Self::new(self.app.clone(), self.account.clone())
+        Self {
+            handles: self.handles.clone(),
+            tasks: self.tasks.clone(),
+            tokens: Vec::new(),
+        }
     }
 
     /// Takes over the uploads `other` reserved.
@@ -674,7 +703,10 @@ impl OutgoingUploads {
     /// Releases every upload not owned by an admitted message.
     pub(crate) async fn release(mut self) {
         let tokens = std::mem::take(&mut self.tokens);
-        release_outgoing_uploads(self.app.clone(), self.account.clone(), tokens).await;
+        let Some((storage, media)) = self.handles.take() else {
+            return;
+        };
+        release_outgoing_uploads(storage, media, &self.tasks, tokens).await;
     }
 }
 
@@ -691,10 +723,13 @@ impl Drop for OutgoingUploads {
         if self.tokens.is_empty() {
             return;
         }
-        let (app, account) = (self.app.clone(), self.account.clone());
+        let Some((storage, media)) = self.handles.take() else {
+            return;
+        };
         let tokens = std::mem::take(&mut self.tokens);
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn_blocking(move || release_uploads_blocking(&app, &account, &tokens));
+        if tokio::runtime::Handle::try_current().is_ok() {
+            self.tasks
+                .spawn_blocking(move || release_uploads_blocking(&storage, &media, &tokens));
         }
     }
 }
@@ -703,21 +738,25 @@ impl Drop for OutgoingUploads {
 /// their staged files. Failures are logged; the TTL prune and media sweep
 /// retry them.
 pub(crate) async fn release_outgoing_uploads(
-    app: MarmotApp,
-    account: String,
+    storage: SqliteAccountStorage,
+    media: AccountMediaStore,
+    tasks: &crate::runtime::account_worker::WorkerTaskScope,
     tokens: Vec<Vec<u8>>,
 ) {
     if tokens.is_empty() {
         return;
     }
-    let _ = tokio::task::spawn_blocking(move || release_uploads_blocking(&app, &account, &tokens))
+    let _ = tasks
+        .spawn_blocking(move || release_uploads_blocking(&storage, &media, &tokens))
         .await;
 }
 
-fn release_uploads_blocking(app: &MarmotApp, account: &str, tokens: &[Vec<u8>]) {
+fn release_uploads_blocking(
+    storage: &SqliteAccountStorage,
+    media: &AccountMediaStore,
+    tokens: &[Vec<u8>],
+) {
     let released = (|| -> Result<(), AppError> {
-        let storage = app.account_storage(account)?;
-        let media = app.account_media_store(account, &storage)?;
         let files = tokens
             .iter()
             .filter_map(|token| {
@@ -741,8 +780,7 @@ fn release_uploads_blocking(app: &MarmotApp, account: &str, tokens: &[Vec<u8>]) 
 /// One send's staging context: the account's database and media store, the
 /// free-disk rule, and where its uploads are recorded.
 pub(crate) struct SendStaging {
-    app: MarmotApp,
-    account: String,
+    directory: std::path::PathBuf,
     storage: SqliteAccountStorage,
     media: AccountMediaStore,
     disk: DiskPolicy,
@@ -752,15 +790,16 @@ pub(crate) struct SendStaging {
 
 impl SendStaging {
     /// Blocking. Prunes expired uploads first, so the row cap counts live
-    /// ones only.
-    pub(crate) fn open(
-        app: &MarmotApp,
-        account: &str,
+    /// ones only. Uses already-open storage/media handles so background
+    /// staging never reopens storage by label after cache eviction (mdk#3801).
+    pub(crate) fn open_with_handles(
+        storage: SqliteAccountStorage,
+        media: AccountMediaStore,
+        directory: std::path::PathBuf,
+        fallback_policy: &storage_sqlite::AttachmentDownloadPolicy,
         group: &cgka_traits::GroupId,
         source_epoch: u64,
     ) -> Result<Self, AppError> {
-        let storage = app.account_storage(account)?;
-        let media = app.account_media_store(account, &storage)?;
         if storage
             .app_storage()
             .prune_attachment_uploads(crate::unix_now_seconds(), 64)
@@ -769,10 +808,10 @@ impl SendStaging {
             tracing::warn!(target: "marmot_app::media", method = "outgoing_upload_prune",
                 "outgoing upload cleanup deferred");
         }
+        let disk = send_disk_policy_with_fallback(&storage, fallback_policy)?;
         Ok(Self {
-            app: app.clone(),
-            account: account.to_owned(),
-            disk: send_disk_policy(app, &storage)?,
+            directory,
+            disk,
             storage,
             media,
             group: hex::encode(group.as_slice()),
@@ -780,12 +819,33 @@ impl SendStaging {
         })
     }
 
+    /// Blocking. Convenience constructor for unit tests.
+    #[cfg(test)]
+    pub(crate) fn open(
+        app: &MarmotApp,
+        account: &str,
+        group: &cgka_traits::GroupId,
+        source_epoch: u64,
+    ) -> Result<Self, AppError> {
+        let storage = app.account_storage(account)?;
+        let media = app.account_media_store(account, &storage)?;
+        let fallback_policy = crate::runtime::attachment_controls::default_policy(&app.config);
+        Self::open_with_handles(
+            storage,
+            media,
+            app.account_dir(account),
+            &fallback_policy,
+            group,
+            source_epoch,
+        )
+    }
+
     pub(crate) fn media(&self) -> &AccountMediaStore {
         &self.media
     }
 
     fn admit(&self, len: u64) -> Result<(), AppError> {
-        admit_send_body(&self.app, &self.account, self.disk, len)
+        admit_send_body_at(&self.directory, self.disk, len)
     }
 
     /// Admits, reserves and stages one body, recording its upload in
@@ -843,9 +903,15 @@ pub(crate) fn send_disk_policy(
     app: &MarmotApp,
     storage: &SqliteAccountStorage,
 ) -> Result<DiskPolicy, AppError> {
-    let policy = storage.app_storage().attachment_download_policy(
-        &crate::runtime::attachment_controls::default_policy(&app.config),
-    )?;
+    let fallback = crate::runtime::attachment_controls::default_policy(&app.config);
+    send_disk_policy_with_fallback(storage, &fallback)
+}
+
+fn send_disk_policy_with_fallback(
+    storage: &SqliteAccountStorage,
+    fallback: &storage_sqlite::AttachmentDownloadPolicy,
+) -> Result<DiskPolicy, AppError> {
+    let policy = storage.app_storage().attachment_download_policy(fallback)?;
     Ok(DiskPolicy {
         reserve_bytes: policy.disk_reserve,
     })
@@ -859,7 +925,15 @@ pub(crate) fn admit_send_body(
     disk: DiskPolicy,
     len: u64,
 ) -> Result<(), AppError> {
-    let Ok(free) = super::attachment_resume::available_space(&app.account_dir(account)) else {
+    admit_send_body_at(&app.account_dir(account), disk, len)
+}
+
+fn admit_send_body_at(
+    directory: &std::path::Path,
+    disk: DiskPolicy,
+    len: u64,
+) -> Result<(), AppError> {
+    let Ok(free) = super::attachment_resume::available_space(directory) else {
         return Ok(());
     };
     match disk.admit(free, DiskPolicy::send_need(len)) {

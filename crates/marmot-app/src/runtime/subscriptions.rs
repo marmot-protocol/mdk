@@ -1170,23 +1170,43 @@ impl MarmotAppRuntime {
         };
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
+            enum TimelineWake {
+                Event(Box<Result<MarmotAppEvent, broadcast::error::RecvError>>),
+                BlockListChanged(Result<(), watch::error::RecvError>),
+            }
             loop {
-                let event = tokio::select! {
+                let wake = tokio::select! {
                     biased;
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
                     _ = updates_tx.closed() => return,
-                    event = events.recv() => event,
-                    changed = block_changes.changed() => {
+                    wake = async {
+                        tokio::select! {
+                            event = events.recv() => TimelineWake::Event(Box::new(event)),
+                            changed = block_changes.changed() => TimelineWake::BlockListChanged(changed),
+                        }
+                    } => wake,
+                };
+                let event = match wake {
+                    TimelineWake::Event(event) => *event,
+                    TimelineWake::BlockListChanged(changed) => {
                         if changed.is_err() {
                             return;
                         }
                         let storage = policy_storage.clone();
-                        let Ok(revision) = blocking_app_task(move || Ok(storage.app_storage().block_list_revision()?)).await else {
+                        let Ok(revision) = blocking_app_task(move || {
+                            Ok(storage.app_storage().block_list_revision()?)
+                        })
+                        .await
+                        else {
                             return;
                         };
                         if revision != policy_revision {
                             policy_revision = revision;
-                            if updates_tx.send(TimelineSubscriptionSignal::PolicyRefresh).await.is_err() {
+                            if updates_tx
+                                .send(TimelineSubscriptionSignal::PolicyRefresh)
+                                .await
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -1270,7 +1290,13 @@ impl MarmotAppRuntime {
                     _ = updates_tx.closed() => return,
                     event = async { tokio::select! {
                         event = events.recv() => event,
-                        _ = block_changes.changed() => Err(broadcast::error::RecvError::Lagged(0)),
+                        changed = block_changes.changed() => {
+                            if changed.is_err() {
+                                Err(broadcast::error::RecvError::Closed)
+                            } else {
+                                Err(broadcast::error::RecvError::Lagged(0))
+                            }
+                        }
                     }} => match event {
                         Ok(event) => event,
                         Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1433,9 +1459,19 @@ impl MarmotAppRuntime {
                     biased;
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
                     _ = updates_tx.closed() => return,
-                    event = events.recv() => Some(event),
-                    _ = block_changes.changed() => Some(Err(broadcast::error::RecvError::Lagged(0))),
-                    _ = expiry_wait => None,
+                    event = async {
+                        tokio::select! {
+                            event = events.recv() => Some(event),
+                            changed = block_changes.changed() => {
+                                if changed.is_err() {
+                                    Some(Err(broadcast::error::RecvError::Closed))
+                                } else {
+                                    Some(Err(broadcast::error::RecvError::Lagged(0)))
+                                }
+                            }
+                            _ = expiry_wait => None,
+                        }
+                    } => event,
                 };
                 let Some(event) = event else {
                     let now_ms = notifications::unix_now_ms();

@@ -78,6 +78,7 @@ fn resume_context(
         permission: None,
         finishing: Default::default(),
         updates: None,
+        tasks: Default::default(),
         storage: store.clone(),
         job: job.clone(),
         ciphertext_digest: hex::decode(&reference.ciphertext_sha256)

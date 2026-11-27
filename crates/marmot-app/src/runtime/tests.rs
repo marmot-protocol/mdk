@@ -6514,3 +6514,243 @@ async fn reset_incomplete_account_setup_acquires_teardown_fences() {
     ));
     runtime.shutdown_and_close().await.unwrap();
 }
+
+/// `reset_incomplete_account_setup` must not call `account_storage` before
+/// acquiring the worker transaction, so a concurrent removal that has already
+/// evicted caches cannot have its stale database handle repopulated before the
+/// account directory is renamed (mdk#3801).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_incomplete_account_setup_does_not_repopulate_evicted_cache_during_removal() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(directory.path());
+    let keys = nostr::prelude::Keys::generate();
+    let secret = keys.secret_key().to_secret_hex();
+    let account = home.import_nostr_account(&secret).unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+
+    crate::tests::account_database_from_an_older_build(&app, &account.label);
+    app.ensure_strict_cutover_replacement_intent_before_session_open(&account.label)
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    // Simulate `remove_account` holding `worker_transactions` right after
+    // `drop_account_caches` and before `account_home().remove_account`.
+    let tx_guard = runtime.accounts.worker_transactions.lock().await;
+    app.drop_account_caches(&account.label);
+    assert!(
+        !app.account_storages
+            .lock()
+            .unwrap()
+            .contains_key(&account.label)
+    );
+
+    let reset = tokio::spawn({
+        let runtime = runtime.clone();
+        let secret = secret.clone();
+        async move { runtime.reset_incomplete_account_setup(&secret, true).await }
+    });
+    // Wait until `reset` has completed its preflight, acquired the lifecycle
+    // fences, and is parked on `worker_transactions`.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runtime
+            .setup
+            .generated_setup_fenced_for_test(&account.account_id_hex)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reset reaches lifecycle fences and waits on worker_transactions");
+    assert!(
+        !app.account_storages
+            .lock()
+            .unwrap()
+            .contains_key(&account.label),
+        "reset preflight must not reopen account_storage before acquiring worker_transactions"
+    );
+
+    // Finish the simulated removal and release the transaction.
+    home.remove_account(&account.label).unwrap();
+    drop(tx_guard);
+    let err = tokio::time::timeout(Duration::from_secs(5), reset)
+        .await
+        .expect("reset finishes after removal releases worker_transactions")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AppError::AccountHome(AccountHomeError::UnknownAccount(_))
+        ),
+        "expected UnknownAccount after concurrent removal, got {err:?}"
+    );
+    assert!(
+        !app.account_storages
+            .lock()
+            .unwrap()
+            .contains_key(&account.label),
+        "account storage cache must remain empty after removal"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Continuous broadcast traffic must not starve block-list refreshes on
+/// `subscribe_timeline_messages` or chat mute expiry on
+/// `subscribe_chat_list` (mdk#3801).
+#[tokio::test(flavor = "current_thread")]
+async fn broadcast_traffic_does_not_starve_block_list_refresh_or_mute_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let group_id = runtime
+        .create_group("alice", "unbiased select", &[], None)
+        .await
+        .unwrap()
+        .operation
+        .expect("group created");
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    // Mute the chat with a short expiry so `subscribe_chat_list` arms its
+    // mute-expiry timer on startup.
+    let mute_until = crate::notifications::unix_now_ms() + 20;
+    app.set_chat_muted("alice", &group_id_hex, Some(mute_until))
+        .unwrap();
+
+    let mut timeline = runtime
+        .subscribe_timeline_messages("alice", TimelineMessageQuery::default())
+        .await
+        .unwrap();
+    let mut chat_list = runtime.subscribe_chat_list("alice", false).await.unwrap();
+    assert!(
+        chat_list
+            .snapshot
+            .iter()
+            .any(|row| row.group_id_hex == group_id_hex && row.muted),
+        "chat list snapshot must start muted"
+    );
+
+    // Wait on the wall clock until the mute deadline has passed so
+    // `expiry_wait` is immediately ready alongside buffered broadcast events.
+    while crate::notifications::unix_now_ms() <= mute_until {
+        std::thread::yield_now();
+    }
+
+    // Trigger a block-list change SYNCHRONOUSLY (no `.await` yield before the
+    // broadcast burst!) so `block_changes.changed()`, `expiry_wait`, and all
+    // 64 broadcast events are simultaneously ready on the very next poll of
+    // both subscription loops. Under a biased select that prioritizes
+    // `events.recv()`, all 64 projections drain ahead of `PolicyRefresh` and
+    // `MuteChanged`; under an unbiased work select, both fire well before 64
+    // projections (failure probability <= (2/3)^64 < 1e-11).
+    let blocked_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
+    let adopted = app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .adopt_block_list(
+            &storage_sqlite::StoredBlockList {
+                event_id: "aa".repeat(32),
+                event_created_at: crate::unix_now_seconds().max(1),
+                public_tags: Vec::new(),
+                private_tags: vec![vec!["p".into(), blocked_pubkey.clone()]],
+            },
+            &[(blocked_pubkey, true)],
+            crate::notifications::unix_now_ms(),
+            &alice.account_id_hex,
+            &MarmotApp::chat_list_mention_classifier(&alice.account_id_hex),
+        )
+        .unwrap();
+    assert!(adopted, "block list update must be adopted");
+    app.block_list_updates.send_modify(|revision| {
+        *revision = revision.wrapping_add(1);
+    });
+
+    let base_row = chat_list
+        .snapshot
+        .iter()
+        .find(|row| row.group_id_hex == group_id_hex)
+        .unwrap()
+        .clone();
+    const BURST: usize = 64;
+    for i in 0..BURST {
+        let mut row = base_row.clone();
+        row.pinned_position = Some(i as u32);
+        row.muted = true;
+        row.muted_until_ms = Some(mute_until);
+        let _ = runtime.events.send(MarmotAppEvent::ProjectionUpdated(
+            crate::RuntimeProjectionUpdate {
+                account_id_hex: alice.account_id_hex.clone(),
+                account_label: "alice".into(),
+                update: crate::AppProjectionUpdate {
+                    group_id_hex: group_id_hex.clone(),
+                    chat_list_trigger: ChatListUpdateTrigger::NewLastMessage,
+                    chat_list_row: Some(row),
+                    timeline_messages: Vec::new(),
+                    timeline_changes: vec![storage_sqlite::TimelineMessageChange::Remove {
+                        message_id_hex: format!("{i:064x}"),
+                        reason: storage_sqlite::TimelineRemoveReason::Invalidated,
+                    }],
+                },
+            },
+        ));
+    }
+
+    // 1. `subscribe_timeline_messages` must not drain all 64 projections before
+    // noticing `block_changes.changed()`.
+    let mut timeline_saw_policy_before_burst_end = false;
+    for _ in 0..BURST {
+        let signal = tokio::time::timeout(Duration::from_secs(5), timeline.updates.recv())
+            .await
+            .expect("timeline subscription delivers signal")
+            .expect("timeline subscription stays open");
+        if matches!(
+            signal,
+            crate::runtime::subscriptions::TimelineSubscriptionSignal::PolicyRefresh
+        ) {
+            timeline_saw_policy_before_burst_end = true;
+            break;
+        }
+    }
+    assert!(
+        timeline_saw_policy_before_burst_end,
+        "biased broadcast select starved timeline block-list PolicyRefresh behind all {BURST} ready broadcast events"
+    );
+
+    // 2. `subscribe_chat_list` must not drain all 64 projections before
+    // noticing the ready mute expiry or block-list refresh.
+    let mut chat_list_saw_non_broadcast_before_burst_end = false;
+    for _ in 0..BURST {
+        let update = tokio::time::timeout(Duration::from_secs(5), chat_list.recv())
+            .await
+            .expect("chat list subscription delivers update")
+            .expect("chat list subscription stays open");
+        let is_non_broadcast = matches!(
+            update,
+            RuntimeChatListUpdate::Row {
+                trigger: ChatListUpdateTrigger::MuteChanged
+                    | ChatListUpdateTrigger::SnapshotRefresh,
+                ..
+            } | RuntimeChatListUpdate::Snapshot {
+                trigger: ChatListUpdateTrigger::SnapshotRefresh,
+                ..
+            }
+        );
+        if is_non_broadcast {
+            chat_list_saw_non_broadcast_before_burst_end = true;
+            break;
+        }
+    }
+    assert!(
+        chat_list_saw_non_broadcast_before_burst_end,
+        "biased broadcast select starved chat list mute expiry / block-list refresh behind all {BURST} ready broadcast events"
+    );
+
+    drop(timeline);
+    drop(chat_list);
+    runtime.shutdown_and_close().await.unwrap();
+}

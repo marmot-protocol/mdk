@@ -8432,7 +8432,9 @@ impl MarmotApp {
         account_id_hex: &str,
         signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     ) -> Arc<dyn NostrRelayClient> {
-        let stop = self.account_publish_stop(account_id_hex);
+        let entry = self.account_publish_stop_entry_resolved(account_id_hex);
+        let app = self.clone();
+        let account_id_owned = account_id_hex.to_owned();
         // The publisher sends nothing once the account is unlinked, and no
         // event over a relay's known limit (mdk#2334).
         let guard = |client: Arc<dyn NostrRelayClient>| -> Arc<dyn NostrRelayClient> {
@@ -8440,8 +8442,11 @@ impl MarmotApp {
                 client,
                 self.relay_event_limits(),
             ));
-            Arc::new(unlinked_publish_gate::UnlinkedPublishGate::new(
-                client, stop,
+            Arc::new(unlinked_publish_gate::UnlinkedPublishGate::for_account(
+                client,
+                app,
+                account_id_owned,
+                entry,
             ))
         };
         #[cfg(test)]
