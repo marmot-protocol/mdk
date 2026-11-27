@@ -954,11 +954,13 @@ struct RuntimeLifecycleInner {
     /// from here (mdk#3466 L3).
     shutdown_began: std::sync::OnceLock<tokio::time::Instant>,
     active_account_opens: AtomicUsize,
+    active_account_opens_by_id: StdMutex<HashMap<String, usize>>,
     account_opens_drained: Notify,
 }
 
 pub(crate) struct RuntimeAccountOpenPermit {
     lifecycle: RuntimeLifecycle,
+    account_id_hex: String,
     started_at: Instant,
 }
 
@@ -972,6 +974,7 @@ impl RuntimeLifecycle {
                 stop_tx,
                 shutdown_began: std::sync::OnceLock::new(),
                 active_account_opens: AtomicUsize::new(0),
+                active_account_opens_by_id: StdMutex::new(HashMap::new()),
                 account_opens_drained: Notify::new(),
             }),
         }
@@ -1026,19 +1029,57 @@ impl RuntimeLifecycle {
         self.inner.stop_tx.subscribe()
     }
 
-    pub(crate) fn begin_account_open(&self) -> Result<RuntimeAccountOpenPermit, AppError> {
+    pub(crate) fn begin_account_open(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<RuntimeAccountOpenPermit, AppError> {
         self.ensure_running()?;
+        {
+            let mut by_id = self
+                .inner
+                .active_account_opens_by_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *by_id.entry(account_id_hex.to_owned()).or_insert(0) += 1;
+        }
         self.inner
             .active_account_opens
             .fetch_add(1, Ordering::AcqRel);
         if self.is_stopping() {
-            self.finish_account_open(Instant::now());
+            self.finish_account_open(account_id_hex, Instant::now());
             return Err(AppError::RuntimeStopping);
         }
         Ok(RuntimeAccountOpenPermit {
             lifecycle: self.clone(),
+            account_id_hex: account_id_hex.to_owned(),
             started_at: Instant::now(),
         })
+    }
+
+    pub(crate) async fn wait_for_account_opens_for_account_to_drain(
+        &self,
+        account_id_hex: &str,
+        wait: Duration,
+    ) -> bool {
+        if self.active_account_opens_for_account(account_id_hex) == 0 {
+            return true;
+        }
+        if wait.is_zero() {
+            return false;
+        }
+        timeout(wait, async {
+            loop {
+                let notified = self.inner.account_opens_drained.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.active_account_opens_for_account(account_id_hex) == 0 {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_ok()
     }
 
     pub(crate) async fn wait_for_account_opens_to_drain(&self, wait: Duration) -> bool {
@@ -1096,13 +1137,41 @@ impl RuntimeLifecycle {
         self.inner.active_account_opens.load(Ordering::Acquire)
     }
 
-    fn finish_account_open(&self, started_at: Instant) {
+    fn active_account_opens_for_account(&self, account_id_hex: &str) -> usize {
+        self.inner
+            .active_account_opens_by_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(account_id_hex)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn finish_account_open(&self, account_id_hex: &str, started_at: Instant) {
+        let account_remaining = {
+            let mut by_id = self
+                .inner
+                .active_account_opens_by_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let remaining = by_id
+                .get_mut(account_id_hex)
+                .map(|count| {
+                    *count = count.saturating_sub(1);
+                    *count
+                })
+                .unwrap_or(0);
+            if remaining == 0 {
+                by_id.remove(account_id_hex);
+            }
+            remaining
+        };
         let previous = self
             .inner
             .active_account_opens
             .fetch_sub(1, Ordering::AcqRel);
         let remaining = previous.saturating_sub(1);
-        if remaining == 0 {
+        if remaining == 0 || account_remaining == 0 {
             self.inner.account_opens_drained.notify_waiters();
         }
         tracing::debug!(
@@ -1117,7 +1186,8 @@ impl RuntimeLifecycle {
 
 impl Drop for RuntimeAccountOpenPermit {
     fn drop(&mut self) {
-        self.lifecycle.finish_account_open(self.started_at);
+        self.lifecycle
+            .finish_account_open(&self.account_id_hex, self.started_at);
     }
 }
 
@@ -7493,6 +7563,27 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Wait until every blocking `runtime_local_client` open for `account_id`
+    /// has finished and dropped any uncollected `OpenedAccount` before
+    /// teardown evicts caches or removes on-disk state (mdk#3801).
+    async fn ensure_account_opens_drained(&self, account_id: &str) -> Result<(), AppError> {
+        if self
+            .shared
+            .lifecycle()
+            .wait_for_account_opens_for_account_to_drain(
+                account_id,
+                APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
+            )
+            .await
+        {
+            Ok(())
+        } else {
+            Err(AppError::BlockingTask(
+                "account open still in progress".into(),
+            ))
+        }
+    }
+
     async fn finish_worker_reapers_unbounded(&self) {
         loop {
             let reaper = self
@@ -7645,6 +7736,8 @@ impl AccountManager {
                 self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
                 self.ensure_worker_reaped(&account.account_id_hex).await?;
             }
+            self.ensure_account_opens_drained(&account.account_id_hex)
+                .await?;
             // Evict every in-memory handle and warm flag for this label BEFORE
             // the account directory is deleted. Otherwise the cached account
             // storage connection (and directory cache) keeps pointing at the
@@ -7801,6 +7894,8 @@ impl AccountManager {
                 self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
                 self.ensure_worker_reaped(&account.account_id_hex).await?;
             }
+            self.ensure_account_opens_drained(&account.account_id_hex)
+                .await?;
             {
                 let gate = self.shared.local_submission_gate(&account.account_id_hex);
                 let _admission = gate.lock().await;
@@ -7936,6 +8031,8 @@ impl AccountManager {
                 self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
                 self.ensure_worker_reaped(&account.account_id_hex).await?;
             }
+            self.ensure_account_opens_drained(&account.account_id_hex)
+                .await?;
             let home = self.app.account_home();
             if unlinked {
                 self.app

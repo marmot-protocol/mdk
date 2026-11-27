@@ -3680,3 +3680,111 @@ fn upload_staging_and_release_drain_without_reopening_storage() {
         );
     });
 }
+
+/// Cancelling a media upload *after* blocking staging has already reserved an
+/// `outgoing_attachment_uploads` row must release that reservation
+/// synchronously inside the tracked blocking closure BEFORE
+/// `WorkerTaskScope::end()` returns, without spawning post-drain cleanup or
+/// reopening evicted storage caches (mdk#3801).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_staging_cancellation_after_reservation_releases_before_scope_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let relay = Arc::new(crate::tests::ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_blob_endpoints(true),
+    )
+    .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group = client
+        .create_group("staging-cancel-after-reserve", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("group created");
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let path = source_dir.path().join("large.bin");
+    let len = 64 * 1024 * 1024u64;
+    std::fs::File::create(&path).unwrap().set_len(len).unwrap();
+    let control = Arc::new(crate::MediaFileTransferControl::default());
+    let request = crate::MediaFileUploadRequest {
+        attachments: vec![crate::MediaFileUploadAttachmentRequest {
+            source_path: path.to_string_lossy().into_owned(),
+            expected_size: Some(len),
+            file_name: "large.bin".into(),
+            media_type: "application/octet-stream".into(),
+            dim: None,
+            thumbhash: None,
+        }],
+        caption: None,
+        send: false,
+        blossom_server: Some("http://127.0.0.1:9".into()),
+        message_tags: Vec::new(),
+    };
+    let (upload_http, finish) = client
+        .prepare_encrypted_media_upload_payload(
+            &group,
+            crate::media::file_transfer::MediaUploadPayload::Files(
+                crate::media::file_transfer::FileUploadSources::Host(request),
+                control.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    // Hold a pre-opened handle for post-drain verification so we can verify
+    // `app.account_storages` stayed evicted without repopulating it.
+    let verify_storage = app.account_storage("alice").unwrap();
+
+    let (http, _completions) = context();
+    let tasks = http.tasks.clone();
+    let permit = http.permits.clone().acquire_owned().await.unwrap();
+    let (respond, _rx) = oneshot::channel();
+    spawn_media_http(
+        &http,
+        permit,
+        upload_http.with_tasks(http.tasks.clone()).run(),
+        move |result| MediaHttpCompletion::Upload {
+            finish,
+            result: result.map(|(r, u)| (r, Box::new(u))),
+            respond,
+            started_at: std::time::Instant::now(),
+        },
+    );
+
+    // Wait until staging has created the reservation row and started copying bytes.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while control.processed_bytes() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("staging reserves and begins processing bytes");
+
+    app.drop_account_caches("alice");
+    assert!(!app.account_storages.lock().unwrap().contains_key("alice"));
+
+    // End the scope while blocking staging holds an active reservation.
+    tokio::time::timeout(Duration::from_secs(10), tasks.end())
+        .await
+        .expect("WorkerTaskScope::end drains staging and its synchronous release");
+
+    // Immediately on return from `tasks.end()` — with zero sleep or extra
+    // blocking fence — the reservation must already be released and caches
+    // must remain evicted.
+    assert!(
+        !app.account_storages.lock().unwrap().contains_key("alice"),
+        "post-cancellation upload release must not reopen evicted account storage"
+    );
+    let remaining_uploads = verify_storage
+        .app_storage()
+        .prune_attachment_uploads(u64::MAX, 64)
+        .unwrap();
+    assert_eq!(
+        remaining_uploads, 0,
+        "reserved upload must be released BEFORE WorkerTaskScope::end returns"
+    );
+}

@@ -1449,7 +1449,7 @@ impl MarmotAppRuntime {
                         pending::<()>().await;
                         return;
                     };
-                    let delay_ms = until_ms.saturating_sub(notifications::unix_now_ms());
+                    let delay_ms = until_ms.saturating_sub(app.chat_list_now_ms());
                     tokio::time::sleep(Duration::from_millis(
                         u64::try_from(delay_ms).unwrap_or_default(),
                     ))
@@ -1474,7 +1474,7 @@ impl MarmotAppRuntime {
                     } => event,
                 };
                 let Some(event) = event else {
-                    let now_ms = notifications::unix_now_ms();
+                    let now_ms = app.chat_list_now_ms();
                     let expired = mute_expiries
                         .iter()
                         .filter(|(_, until_ms)| **until_ms <= now_ms)

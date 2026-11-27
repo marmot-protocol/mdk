@@ -3184,7 +3184,7 @@ fn lifecycle_refuses_account_open_after_shutdown_begins() {
     lifecycle.begin_shutdown();
 
     assert!(matches!(
-        lifecycle.begin_account_open(),
+        lifecycle.begin_account_open("alice"),
         Err(AppError::RuntimeStopping)
     ));
 }
@@ -3213,7 +3213,7 @@ async fn member_key_package_prewarm_refuses_work_after_shutdown_begins() {
 async fn lifecycle_waits_for_account_opens_to_drain() {
     let lifecycle = RuntimeLifecycle::new();
     let permit = lifecycle
-        .begin_account_open()
+        .begin_account_open("alice")
         .expect("account open should start before shutdown");
 
     let waiter = {
@@ -3589,9 +3589,15 @@ async fn open_runtime_local_test_client(
     account_ref: &str,
 ) -> crate::AppClient {
     let shared = runtime.shared_services();
-    app.runtime_local_client(account_ref, shared.relay_plane(), shared.lifecycle(), None)
-        .await
-        .expect("open local test client")
+    app.runtime_local_client(
+        account_ref,
+        shared.relay_plane(),
+        shared.lifecycle(),
+        None,
+        None,
+    )
+    .await
+    .expect("open local test client")
 }
 
 /// Running sessions follow the stored audit-log switch, whatever order the
@@ -6597,14 +6603,19 @@ async fn reset_incomplete_account_setup_does_not_repopulate_evicted_cache_during
 /// Continuous broadcast traffic must not starve block-list refreshes on
 /// `subscribe_timeline_messages` or chat mute expiry on
 /// `subscribe_chat_list` (mdk#3801).
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn broadcast_traffic_does_not_starve_block_list_refresh_or_mute_expiry() {
     let dir = tempfile::tempdir().unwrap();
     let home = marmot_account::AccountHome::open(dir.path());
     let alice = home.create_account("alice").unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app =
-        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    // Anchor virtual chat-list time to the current wall clock so SQLite reads
+    // and the virtual clock agree while keeping a 60-second mute deadline
+    // immune to runner load.
+    let base_ms = crate::notifications::unix_now_ms();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay)
+        .with_virtual_chat_list_clock(base_ms);
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
     let group_id = runtime
@@ -6615,9 +6626,7 @@ async fn broadcast_traffic_does_not_starve_block_list_refresh_or_mute_expiry() {
         .expect("group created");
     let group_id_hex = hex::encode(group_id.as_slice());
 
-    // Mute the chat with a short expiry so `subscribe_chat_list` arms its
-    // mute-expiry timer on startup.
-    let mute_until = crate::notifications::unix_now_ms() + 20;
+    let mute_until = base_ms + 60_000;
     app.set_chat_muted("alice", &group_id_hex, Some(mute_until))
         .unwrap();
 
@@ -6634,19 +6643,68 @@ async fn broadcast_traffic_does_not_starve_block_list_refresh_or_mute_expiry() {
         "chat list snapshot must start muted"
     );
 
-    // Wait on the wall clock until the mute deadline has passed so
-    // `expiry_wait` is immediately ready alongside buffered broadcast events.
-    while crate::notifications::unix_now_ms() <= mute_until {
-        std::thread::yield_now();
+    let base_row = chat_list
+        .snapshot
+        .iter()
+        .find(|row| row.group_id_hex == group_id_hex)
+        .unwrap()
+        .clone();
+    const BURST: usize = 64;
+
+    // 1. Mark the mute expired in storage and deliver an initial projection
+    // setting `mute_expiries` to `base_ms` (already due at virtual t=0),
+    // followed synchronously by `BURST` ready broadcast events. Under a biased
+    // select prioritizing `events.recv()`, all 64 projections drain ahead of
+    // `MuteChanged`; under an unbiased work select, `MuteChanged` fires well
+    // before all 64 drain (failure probability <= (1/2)^64).
+    app.set_chat_muted("alice", &group_id_hex, Some(base_ms - 1))
+        .unwrap();
+    for i in 0..=BURST {
+        let mut row = base_row.clone();
+        row.pinned_position = Some(i as u32);
+        row.muted = true;
+        row.muted_until_ms = Some(base_ms);
+        let _ = runtime.events.send(MarmotAppEvent::ProjectionUpdated(
+            crate::RuntimeProjectionUpdate {
+                account_id_hex: alice.account_id_hex.clone(),
+                account_label: "alice".into(),
+                update: crate::AppProjectionUpdate {
+                    group_id_hex: group_id_hex.clone(),
+                    chat_list_trigger: ChatListUpdateTrigger::NewLastMessage,
+                    chat_list_row: Some(row),
+                    timeline_messages: Vec::new(),
+                    timeline_changes: Vec::new(),
+                },
+            },
+        ));
     }
 
-    // Trigger a block-list change SYNCHRONOUSLY (no `.await` yield before the
-    // broadcast burst!) so `block_changes.changed()`, `expiry_wait`, and all
-    // 64 broadcast events are simultaneously ready on the very next poll of
-    // both subscription loops. Under a biased select that prioritizes
-    // `events.recv()`, all 64 projections drain ahead of `PolicyRefresh` and
-    // `MuteChanged`; under an unbiased work select, both fire well before 64
-    // projections (failure probability <= (2/3)^64 < 1e-11).
+    let mut chat_list_saw_mute_expiry_before_burst_end = false;
+    // Allow 1 extra slot for the initial projection that arms `mute_expiries = base_ms`.
+    for _ in 0..=BURST {
+        let update = tokio::time::timeout(Duration::from_secs(5), chat_list.recv())
+            .await
+            .expect("chat list subscription delivers update")
+            .expect("chat list subscription stays open");
+        if matches!(
+            update,
+            RuntimeChatListUpdate::Row {
+                trigger: ChatListUpdateTrigger::MuteChanged,
+                ..
+            }
+        ) {
+            chat_list_saw_mute_expiry_before_burst_end = true;
+            break;
+        }
+    }
+    assert!(
+        chat_list_saw_mute_expiry_before_burst_end,
+        "biased broadcast select starved chat list MuteChanged behind all {BURST} ready broadcast events"
+    );
+
+    // 2. Trigger a block-list change SYNCHRONOUSLY alongside `BURST` matching
+    // timeline projections so `block_changes.changed()` and all 64 broadcast
+    // events are simultaneously ready on `subscribe_timeline_messages`.
     let blocked_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
     let adopted = app
         .account_storage("alice")
@@ -6669,19 +6727,7 @@ async fn broadcast_traffic_does_not_starve_block_list_refresh_or_mute_expiry() {
     app.block_list_updates.send_modify(|revision| {
         *revision = revision.wrapping_add(1);
     });
-
-    let base_row = chat_list
-        .snapshot
-        .iter()
-        .find(|row| row.group_id_hex == group_id_hex)
-        .unwrap()
-        .clone();
-    const BURST: usize = 64;
     for i in 0..BURST {
-        let mut row = base_row.clone();
-        row.pinned_position = Some(i as u32);
-        row.muted = true;
-        row.muted_until_ms = Some(mute_until);
         let _ = runtime.events.send(MarmotAppEvent::ProjectionUpdated(
             crate::RuntimeProjectionUpdate {
                 account_id_hex: alice.account_id_hex.clone(),
@@ -6689,7 +6735,7 @@ async fn broadcast_traffic_does_not_starve_block_list_refresh_or_mute_expiry() {
                 update: crate::AppProjectionUpdate {
                     group_id_hex: group_id_hex.clone(),
                     chat_list_trigger: ChatListUpdateTrigger::NewLastMessage,
-                    chat_list_row: Some(row),
+                    chat_list_row: None,
                     timeline_messages: Vec::new(),
                     timeline_changes: vec![storage_sqlite::TimelineMessageChange::Remove {
                         message_id_hex: format!("{i:064x}"),
@@ -6700,8 +6746,6 @@ async fn broadcast_traffic_does_not_starve_block_list_refresh_or_mute_expiry() {
         ));
     }
 
-    // 1. `subscribe_timeline_messages` must not drain all 64 projections before
-    // noticing `block_changes.changed()`.
     let mut timeline_saw_policy_before_burst_end = false;
     for _ in 0..BURST {
         let signal = tokio::time::timeout(Duration::from_secs(5), timeline.updates.recv())
@@ -6721,36 +6765,90 @@ async fn broadcast_traffic_does_not_starve_block_list_refresh_or_mute_expiry() {
         "biased broadcast select starved timeline block-list PolicyRefresh behind all {BURST} ready broadcast events"
     );
 
-    // 2. `subscribe_chat_list` must not drain all 64 projections before
-    // noticing the ready mute expiry or block-list refresh.
-    let mut chat_list_saw_non_broadcast_before_burst_end = false;
-    for _ in 0..BURST {
-        let update = tokio::time::timeout(Duration::from_secs(5), chat_list.recv())
-            .await
-            .expect("chat list subscription delivers update")
-            .expect("chat list subscription stays open");
-        let is_non_broadcast = matches!(
-            update,
-            RuntimeChatListUpdate::Row {
-                trigger: ChatListUpdateTrigger::MuteChanged
-                    | ChatListUpdateTrigger::SnapshotRefresh,
-                ..
-            } | RuntimeChatListUpdate::Snapshot {
-                trigger: ChatListUpdateTrigger::SnapshotRefresh,
-                ..
-            }
-        );
-        if is_non_broadcast {
-            chat_list_saw_non_broadcast_before_burst_end = true;
-            break;
-        }
-    }
-    assert!(
-        chat_list_saw_non_broadcast_before_burst_end,
-        "biased broadcast select starved chat list mute expiry / block-list refresh behind all {BURST} ready broadcast events"
-    );
-
     drop(timeline);
     drop(chat_list);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Teardown (`deactivate_account`) must wait for an in-flight worker reconnect
+/// blocking open to drain (and drop any rejected `OpenedAccount`) before
+/// evicting caches, so the abandoned reconnect open cannot repopulate
+/// `account_storages` after teardown returns (mdk#3801).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teardown_waits_for_in_flight_reconnect_open_before_evicting_caches() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+
+    // Hold the reconnect's blocking `open_account` at `SessionOpen`.
+    let (reached, proceed) = install_local_open_gate(&app, "alice");
+    let mut events = runtime.subscribe();
+    let commands = runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .get(&alice.account_id_hex)
+        .expect("alice worker running")
+        .commands
+        .clone();
+
+    runtime
+        .shared_services()
+        .relay_plane()
+        .simulate_notification_consumer_exit_for_test();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(MarmotAppEvent::AccountError(error))
+                    if error.message.starts_with("runtime receive failed") =>
+                {
+                    break;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("runtime events closed before receive failure");
+                }
+            }
+        }
+    })
+    .await
+    .expect("consumer exit triggers reconnect loop");
+
+    // Interrupt the reconnect backoff sleep immediately so the worker enters
+    // its blocking reconnect open without waiting for wall-clock backoff.
+    let (respond, _rx) = oneshot::channel();
+    let _ = commands.try_send(AccountWorkerCommand::ConnectivityRestored { respond });
+    wait_for_test_signal(reached, "reconnect SessionOpen gate").await;
+
+    let deactivate = tokio::spawn({
+        let accounts = runtime.accounts();
+        async move { accounts.deactivate_account("alice").await }
+    });
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    let finished_while_reconnect_held = deactivate.is_finished();
+    proceed.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), deactivate)
+        .await
+        .expect("deactivate finishes once reconnect open drains")
+        .unwrap()
+        .unwrap();
+    assert!(
+        !finished_while_reconnect_held,
+        "teardown returned while a blocking reconnect open was still in flight"
+    );
+    // Fence behind the blocking pool to verify no late reopen repopulates caches.
+    tokio::task::spawn_blocking(|| ()).await.unwrap();
+    assert!(
+        !app.account_storages.lock().unwrap().contains_key("alice"),
+        "abandoned reconnect open must not repopulate evicted account storage cache"
+    );
     runtime.shutdown_and_close().await.unwrap();
 }

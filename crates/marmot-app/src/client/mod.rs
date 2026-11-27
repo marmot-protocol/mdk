@@ -371,37 +371,43 @@ impl EncryptedMediaUploadHttp {
                     self.version,
                     cancel.clone(),
                 );
-                // The blocking task owns the reservations it makes until this
-                // await hands them back; if this future is dropped first, the
-                // task's result drops and releases them.
+                // The blocking task owns the reservations it makes until the
+                // oneshot hands them back; if this future is dropped first, the
+                // failed send releases them synchronously inside the tracked
+                // closure BEFORE TaskTracker drops its token (mdk#3801).
+                let (result_tx, result_rx) = tokio::sync::oneshot::channel();
                 let mut staged = uploads.handoff();
-                let (staged, sources) = tasks
-                    .spawn_blocking(move || {
-                        if stage_cancel.is_cancelled() {
-                            return (staged, Err(AppError::TransportClosed));
+                tasks.spawn_blocking(move || {
+                    if stage_cancel.is_cancelled() {
+                        staged.release_blocking();
+                        let _ = result_tx.send((staged, Err(AppError::TransportClosed)));
+                        return;
+                    }
+                    let sources = match sources {
+                        crate::media::file_transfer::FileUploadSources::Host(request) => {
+                            stage_file_sources(
+                                &stage,
+                                staged.tokens_mut(),
+                                request.attachments,
+                                version,
+                                stage_control,
+                            )
                         }
-                        let sources = match sources {
-                            crate::media::file_transfer::FileUploadSources::Host(request) => {
-                                stage_file_sources(
-                                    &stage,
-                                    staged.tokens_mut(),
-                                    request.attachments,
-                                    version,
-                                    stage_control,
-                                )
-                            }
-                            crate::media::file_transfer::FileUploadSources::Draft(request) => {
-                                crate::media::outgoing::stage_draft_sources(
-                                    &stage,
-                                    staged.tokens_mut(),
-                                    request,
-                                    version,
-                                    &stage_control,
-                                )
-                            }
-                        };
-                        (staged, sources)
-                    })
+                        crate::media::file_transfer::FileUploadSources::Draft(request) => {
+                            crate::media::outgoing::stage_draft_sources(
+                                &stage,
+                                staged.tokens_mut(),
+                                request,
+                                version,
+                                &stage_control,
+                            )
+                        }
+                    };
+                    if let Err((mut rejected, _)) = result_tx.send((staged, sources)) {
+                        rejected.release_blocking();
+                    }
+                });
+                let (staged, sources) = result_rx
                     .await
                     .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
                 uploads.absorb(staged);
@@ -422,28 +428,33 @@ impl EncryptedMediaUploadHttp {
             crate::media::file_transfer::MediaUploadPayload::Bytes(request) => {
                 crate::media::validate_media_upload_batch(&request.attachments)?;
                 let (stage, stage_cancel) = (staging.clone(), cancel.clone());
+                let (result_tx, result_rx) = tokio::sync::oneshot::channel();
                 let mut reserved = uploads.handoff();
-                let (request, reserved, staged) = tasks
-                    .spawn_blocking(move || {
-                        if stage_cancel.is_cancelled() {
-                            return (request, reserved, Err(AppError::TransportClosed));
-                        }
-                        let staged = request.attachments.iter().try_for_each(|attachment| {
-                            let len = attachment.plaintext.len() as u64;
-                            stage
-                                .stage(reserved.tokens_mut(), len, |media, target| {
-                                    crate::media::outgoing::stage_body(
-                                        media,
-                                        target,
-                                        &mut std::io::Cursor::new(&attachment.plaintext),
-                                        len,
-                                        &|| stage_cancel.is_cancelled(),
-                                    )
-                                })
-                                .map(|_| ())
-                        });
-                        (request, reserved, staged)
-                    })
+                tasks.spawn_blocking(move || {
+                    if stage_cancel.is_cancelled() {
+                        reserved.release_blocking();
+                        let _ = result_tx.send((request, reserved, Err(AppError::TransportClosed)));
+                        return;
+                    }
+                    let staged = request.attachments.iter().try_for_each(|attachment| {
+                        let len = attachment.plaintext.len() as u64;
+                        stage
+                            .stage(reserved.tokens_mut(), len, |media, target| {
+                                crate::media::outgoing::stage_body(
+                                    media,
+                                    target,
+                                    &mut std::io::Cursor::new(&attachment.plaintext),
+                                    len,
+                                    &|| stage_cancel.is_cancelled(),
+                                )
+                            })
+                            .map(|_| ())
+                    });
+                    if let Err((_, mut rejected, _)) = result_tx.send((request, reserved, staged)) {
+                        rejected.release_blocking();
+                    }
+                });
+                let (request, reserved, staged) = result_rx
                     .await
                     .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
                 uploads.absorb(reserved);

@@ -1236,6 +1236,7 @@ async fn run_app_runtime_account_worker(
         &relay_plane,
         lifecycle.clone(),
         Some(&startup_progress),
+        None,
     ));
     let startup = shared
         .observer
@@ -3062,7 +3063,14 @@ async fn run_app_runtime_account_worker(
                                     // The reopened session registers a new signer,
                                     // so retire the previous session's SDK context.
                                     relay_plane.retire_account_session_transport(&transport_account).await;
-                                    app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone(), None).await
+                                    app.runtime_local_client(
+                                        &account_label,
+                                        &relay_plane,
+                                        lifecycle.clone(),
+                                        None,
+                                        Some(&media_http.tasks),
+                                    )
+                                    .await
                                 } => result,
                             };
                             reopen.finish_app(&reopened_result);

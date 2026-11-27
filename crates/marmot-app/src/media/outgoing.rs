@@ -708,6 +708,21 @@ impl OutgoingUploads {
         };
         release_outgoing_uploads(storage, media, &self.tasks, tokens).await;
     }
+
+    /// Releases every upload synchronously on the current blocking thread and
+    /// clears `tokens` so a subsequent `Drop` does not spawn a detached task
+    /// after a tracked blocking closure has already released its tracker token
+    /// (mdk#3801).
+    pub(crate) fn release_blocking(&mut self) {
+        if self.tokens.is_empty() {
+            return;
+        }
+        let Some((storage, media)) = self.handles.take() else {
+            return;
+        };
+        let tokens = std::mem::take(&mut self.tokens);
+        release_uploads_blocking(&storage, &media, &tokens);
+    }
 }
 
 impl std::fmt::Debug for OutgoingUploads {
