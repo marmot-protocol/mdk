@@ -587,7 +587,7 @@ async fn ready_welcome_before_parked_signer() {
         .try_into()
         .ok()
         .unwrap();
-    assert_eq!(wave.message_ids(), [ready.id.clone()]);
+    assert_eq!(wave.message_ids(), std::slice::from_ref(&ready.id));
     runtime
         .finish_welcome_publish_task(wave.run().await)
         .await
@@ -598,7 +598,7 @@ async fn ready_welcome_before_parked_signer() {
     }
     assert_eq!(
         staged_welcome_publishes(&adapter).as_slice(),
-        [ready.clone()]
+        std::slice::from_ref(ready)
     );
     assert_eq!(runtime.session().unsealed_owed_welcomes().unwrap().len(), 1);
 }
@@ -1068,7 +1068,10 @@ async fn a_route_less_welcome_owes_one_lookup_per_paced_attempt() {
     };
     invite.route_carol(false);
     invite.confirm_commit().await;
-    assert!(take(&invite).is_empty(), "no attempt has found no route yet");
+    assert!(
+        take(&invite).is_empty(),
+        "no attempt has found no route yet"
+    );
 
     invite.runtime.run_due_maintenance().await.unwrap();
     assert_eq!(

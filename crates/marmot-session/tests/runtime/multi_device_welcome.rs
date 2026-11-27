@@ -36,23 +36,29 @@ fn nostr_device_session_with_sealer(
     account: &[u8],
     sealer: Arc<dyn InboxSealer>,
 ) -> AccountDeviceSession {
+    AccountDeviceSession::open(nostr_device_config(path, key, account, sealer)).unwrap()
+}
+
+fn nostr_device_config(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    account: &[u8],
+    sealer: Arc<dyn InboxSealer>,
+) -> SessionConfig {
     use cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID;
     let keys = deterministic_nostr_keys(account);
     let mut components = default_group_components();
     components.insert(NOSTR_ROUTING_COMPONENT_ID);
-    AccountDeviceSession::open(
-        SessionConfig::new(
-            path,
-            SqlCipherKey::new(key.as_secret_str()).unwrap(),
-            pad32(account),
-            Box::new(transport_nostr_peeler::NostrMlsPeeler::default()),
-            sealer,
-        )
-        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
-        .protocol_profile(ProtocolProfile::Current)
-        .supported_app_components(components),
+    SessionConfig::new(
+        path,
+        SqlCipherKey::new(key.as_secret_str()).unwrap(),
+        pad32(account),
+        Box::new(transport_nostr_peeler::NostrMlsPeeler::default()),
+        sealer,
     )
-    .unwrap()
+    .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
+    .protocol_profile(ProtocolProfile::Current)
+    .supported_app_components(components)
 }
 
 fn nostr_routing() -> AppComponentData {
@@ -884,17 +890,25 @@ impl InboxSealer for RejoinRecordingSealer {
 async fn automatic_rejoin_unseals_only_the_first_successful_offer_for_a_group() {
     let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("automatic rejoin offers").unwrap();
+    let clock = Arc::new(cgka_engine::convergence_clock::ManualConvergenceClock::new(
+        0,
+        unix_now() * 1_000,
+    ));
     let sealer = Arc::new(RejoinRecordingSealer {
         inner: nostr_sealer(b"alice"),
         unseals: Mutex::default(),
     });
     let mut phone = Device::with_session(
-        nostr_device_session_with_sealer(
-            dir.path().join("alice.sqlite"),
-            &key,
-            b"alice",
-            sealer.clone(),
-        ),
+        AccountDeviceSession::open(
+            nostr_device_config(
+                dir.path().join("alice.sqlite"),
+                &key,
+                b"alice",
+                sealer.clone(),
+            )
+            .convergence_clock_for_test(clock.clone()),
+        )
+        .unwrap(),
         cgka_traits::engine::KeyPackage::new(Vec::new()),
     );
     phone.publish().await;
@@ -963,7 +977,7 @@ async fn automatic_rejoin_unseals_only_the_first_successful_offer_for_a_group() 
         .prepare_convergence_cutoff_delay_ms(&group_id)
         .unwrap()
     {
-        tokio::time::sleep(Duration::from_millis(delay.saturating_add(1))).await;
+        clock.advance_ms(delay.saturating_add(1));
         session.advance_convergence(&group_id).await.unwrap();
     }
     assert!(session.group_record(&group_id).unwrap().removed);

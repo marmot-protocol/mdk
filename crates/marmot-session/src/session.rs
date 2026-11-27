@@ -151,6 +151,8 @@ pub struct SessionConfig {
     allow_legacy_compatibility_profile: bool,
     storage_options: SqliteStorageOptions,
     convergence_policy: CanonicalizationPolicy,
+    #[cfg(feature = "test-support")]
+    convergence_clock: Option<Arc<dyn cgka_engine::convergence_clock::ConvergenceClock>>,
     recorder: Option<Box<dyn ForensicRecorder>>,
     maintenance_sources: Option<(Arc<dyn WallClock>, Arc<dyn EntropySource>)>,
     defer_group_hydration: bool,
@@ -229,6 +231,8 @@ impl SessionConfig {
             allow_legacy_compatibility_profile: false,
             storage_options: SqliteStorageOptions::default(),
             convergence_policy: CanonicalizationPolicy::default(),
+            #[cfg(feature = "test-support")]
+            convergence_clock: None,
             recorder: None,
             maintenance_sources: None,
             defer_group_hydration: false,
@@ -308,6 +312,16 @@ impl SessionConfig {
     /// are accepted only by explicit `test-policy-overrides` harness builds.
     pub fn convergence_policy(mut self, policy: CanonicalizationPolicy) -> Self {
         self.convergence_policy = policy;
+        self
+    }
+
+    /// Control the engine clock without changing the pinned policy.
+    #[cfg(feature = "test-support")]
+    pub fn convergence_clock_for_test(
+        mut self,
+        clock: Arc<dyn cgka_engine::convergence_clock::ConvergenceClock>,
+    ) -> Self {
+        self.convergence_clock = Some(clock);
         self
     }
 
@@ -561,6 +575,10 @@ impl AccountDeviceSession {
         if let Some((wall_clock, entropy)) = config.maintenance_sources {
             founding_welcome_clock = wall_clock.clone();
             builder = builder.maintenance_sources(wall_clock, entropy);
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(clock) = config.convergence_clock {
+            builder = builder.convergence_clock(clock);
         }
         let audit = config
             .recorder
