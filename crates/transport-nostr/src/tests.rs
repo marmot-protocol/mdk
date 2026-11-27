@@ -2560,7 +2560,6 @@ async fn directory_fetch_owner_cancellation_does_not_orphan_waiters() {
             .await
     });
     directory_fetcher.started.notified().await;
-    first.abort();
 
     let second_plane = relay_plane.clone();
     let second = tokio::spawn(async move {
@@ -2569,6 +2568,8 @@ async fn directory_fetch_owner_cancellation_does_not_orphan_waiters() {
             .await
     });
     wait_for_directory_waiter(&relay_plane).await;
+    first.abort();
+    let _ = first.await;
     directory_fetcher.release.notify_one();
 
     assert_eq!(second.await.unwrap().unwrap(), vec![event]);
@@ -2577,6 +2578,295 @@ async fn directory_fetch_owner_cancellation_does_not_orphan_waiters() {
         relay_plane.relay_health().await.directory_coalesced_waiters,
         1
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn directory_fetch_cancels_when_final_waiter_leaves() {
+    use tokio::sync::watch;
+
+    struct CancellableDirectoryFetcher {
+        fetch_count: AtomicUsize,
+        active_fetches: Arc<AtomicUsize>,
+        dropped_tx: watch::Sender<usize>,
+        started: Notify,
+        release: Notify,
+    }
+
+    struct ActiveDropGuard {
+        active: Arc<AtomicUsize>,
+        dropped_tx: watch::Sender<usize>,
+    }
+
+    impl Drop for ActiveDropGuard {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            self.dropped_tx.send_modify(|count| *count += 1);
+        }
+    }
+
+    #[async_trait]
+    impl DirectoryRelayFetcher for CancellableDirectoryFetcher {
+        async fn fetch_directory_events(
+            &self,
+            _request: DirectoryFetchRequest,
+        ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            self.active_fetches.fetch_add(1, Ordering::SeqCst);
+            let _guard = ActiveDropGuard {
+                active: self.active_fetches.clone(),
+                dropped_tx: self.dropped_tx.clone(),
+            };
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(Vec::new())
+        }
+    }
+
+    for with_completion in [false, true] {
+        let (dropped_tx, mut dropped_rx) = watch::channel(0usize);
+        let fetcher = Arc::new(CancellableDirectoryFetcher {
+            fetch_count: AtomicUsize::new(0),
+            active_fetches: Arc::new(AtomicUsize::new(0)),
+            dropped_tx,
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let plane = relay_plane_with_directory_fetcher(
+            Arc::new(RecordingRelayClient::default()),
+            fetcher.clone(),
+        );
+        let endpoints = vec![TransportEndpoint("wss://relay.example".into())];
+        let queries = vec![DirectoryEventQuery::new(0, vec!["11".repeat(32)], 12)];
+
+        let spawn_fetch = |plane: MarmotRelayPlane,
+                           endpoints: Vec<TransportEndpoint>,
+                           queries: Vec<DirectoryEventQuery>| {
+            tokio::spawn(async move {
+                if with_completion {
+                    plane
+                        .fetch_directory_events_with_completion(endpoints, queries)
+                        .await
+                        .map(|outcome| outcome.records)
+                } else {
+                    plane.fetch_directory_events(endpoints, queries).await
+                }
+            })
+        };
+
+        let first = spawn_fetch(plane.clone(), endpoints.clone(), queries.clone());
+        fetcher.started.notified().await;
+        let second = spawn_fetch(plane.clone(), endpoints.clone(), queries.clone());
+        wait_for_directory_waiter(&plane).await;
+
+        // Dropping one waiter leaves the second waiter attached: the shared
+        // fetch must remain active.
+        first.abort();
+        let _ = first.await;
+        tokio::task::yield_now().await;
+        assert_eq!(fetcher.active_fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(plane.relay_health().await.directory_inflight_fetches, 1);
+
+        // Dropping the final waiter immediately removes the key and cancels
+        // the underlying fetch task.
+        second.abort();
+        let _ = second.await;
+        assert_eq!(plane.relay_health().await.directory_inflight_fetches, 0);
+        timeout(
+            Duration::from_secs(2),
+            dropped_rx.wait_for(|count| *count >= 1),
+        )
+        .await
+        .expect("final waiter drop must cancel the shared directory fetch")
+        .unwrap();
+        assert_eq!(fetcher.active_fetches.load(Ordering::SeqCst), 0);
+
+        // A subsequent request for the same key starts fresh.
+        let third = spawn_fetch(plane.clone(), endpoints, queries);
+        fetcher.started.notified().await;
+        fetcher.release.notify_one();
+        assert!(third.await.unwrap().is_ok());
+        assert_eq!(fetcher.fetch_count.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_plane_shutdown_cancels_and_joins_active_directory_fetches() {
+    use tokio::sync::watch;
+
+    struct ShutdownObservingFetcher {
+        fetch_count: AtomicUsize,
+        active_fetches: Arc<AtomicUsize>,
+        started_tx: watch::Sender<usize>,
+    }
+
+    struct ActiveCounter(Arc<AtomicUsize>);
+    impl Drop for ActiveCounter {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl DirectoryRelayFetcher for ShutdownObservingFetcher {
+        async fn fetch_directory_events(
+            &self,
+            _request: DirectoryFetchRequest,
+        ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            self.active_fetches.fetch_add(1, Ordering::SeqCst);
+            let _active = ActiveCounter(self.active_fetches.clone());
+            self.started_tx.send_modify(|count| *count += 1);
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    let (started_tx, mut started_rx) = watch::channel(0usize);
+    let fetcher = Arc::new(ShutdownObservingFetcher {
+        fetch_count: AtomicUsize::new(0),
+        active_fetches: Arc::new(AtomicUsize::new(0)),
+        started_tx,
+    });
+    let plane = relay_plane_with_directory_fetcher(
+        Arc::new(RecordingRelayClient::default()),
+        fetcher.clone(),
+    );
+    let endpoints = vec![TransportEndpoint("wss://relay.example".into())];
+    let query = vec![DirectoryEventQuery::new(0, vec!["11".repeat(32)], 12)];
+
+    let plain_waiter = tokio::spawn({
+        let plane = plane.clone();
+        let endpoints = endpoints.clone();
+        let query = query.clone();
+        async move { plane.fetch_directory_events(endpoints, query).await }
+    });
+    let strict_waiter = tokio::spawn({
+        let plane = plane.clone();
+        let endpoints = endpoints.clone();
+        let query = query.clone();
+        async move {
+            plane
+                .fetch_directory_events_with_completion(endpoints, query)
+                .await
+        }
+    });
+    timeout(
+        Duration::from_secs(2),
+        started_rx.wait_for(|count| *count >= 2),
+    )
+    .await
+    .expect("both coalesced directory fetches started")
+    .unwrap();
+    assert_eq!(plane.relay_health().await.directory_inflight_fetches, 2);
+
+    plane.shutdown().await;
+
+    assert_eq!(
+        fetcher.active_fetches.load(Ordering::SeqCst),
+        0,
+        "shutdown must cancel and join active coalesced directory fetches before returning"
+    );
+    assert_eq!(plane.relay_health().await.directory_inflight_fetches, 0);
+    assert!(
+        plain_waiter
+            .await
+            .unwrap()
+            .expect_err("plain waiter receives shutdown error")
+            .contains("shutting down")
+    );
+    assert!(
+        strict_waiter
+            .await
+            .unwrap()
+            .expect_err("strict waiter receives shutdown error")
+            .contains("shutting down")
+    );
+
+    let after_shutdown = plane
+        .fetch_directory_events(endpoints, query)
+        .await
+        .expect_err("post-shutdown directory fetch must fail immediately");
+    assert!(after_shutdown.contains("shutting down"));
+    assert_eq!(fetcher.fetch_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn directory_fetch_final_waiter_cancellation_tears_down_real_relay_connection() {
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    for with_completion in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let req_seen = Arc::new(Notify::new());
+        let closed_or_disconnected = Arc::new(Notify::new());
+        let req_seen_server = req_seen.clone();
+        let closed_server = closed_or_disconnected.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            while let Some(item) = socket.next().await {
+                match item {
+                    Ok(Message::Text(text)) => {
+                        let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        if frame[0] == "REQ" {
+                            req_seen_server.notify_one();
+                        } else if frame[0] == "CLOSE" {
+                            closed_server.notify_one();
+                            return;
+                        }
+                    }
+                    Ok(Message::Ping(payload)) => {
+                        let _ = socket.send(Message::Pong(payload)).await;
+                    }
+                    Ok(Message::Close(_)) | Err(_) => {
+                        closed_server.notify_one();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            closed_server.notify_one();
+        });
+
+        let plane = relay_plane_with_directory_fetcher(
+            Arc::new(RecordingRelayClient::default()),
+            Arc::new(NostrSdkDirectoryRelayFetcher::standalone()),
+        );
+        let query = vec![DirectoryEventQuery::new(0, vec!["11".repeat(32)], 4)];
+        let waiter = tokio::spawn({
+            let plane = plane.clone();
+            let endpoint = endpoint.clone();
+            let query = query.clone();
+            async move {
+                if with_completion {
+                    let _ = plane
+                        .fetch_directory_events_with_completion(vec![endpoint], query)
+                        .await;
+                } else {
+                    let _ = plane.fetch_directory_events(vec![endpoint], query).await;
+                }
+            }
+        });
+
+        timeout(Duration::from_secs(5), req_seen.notified())
+            .await
+            .expect("relay received REQ");
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(plane.relay_health().await.directory_inflight_fetches, 0);
+
+        // Must tear down well before DIRECTORY_RELAY_FETCH_WAIT (3s).
+        timeout(
+            Duration::from_millis(1500),
+            closed_or_disconnected.notified(),
+        )
+        .await
+        .expect("final waiter cancellation must close the underlying relay connection");
+        server.abort();
+        let _ = server.await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
