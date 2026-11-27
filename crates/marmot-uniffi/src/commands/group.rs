@@ -69,6 +69,10 @@ pub struct CreateGroupOptionsFfi {
     /// Zero preserves the compatibility behavior: disappearing messages are
     /// disabled and retention is not a founding capability requirement.
     pub disappearing_message_secs: u64,
+    /// Founding member references to grant admin rights in the initial Welcome.
+    /// The creator is always an admin.
+    #[uniffi(default = [])]
+    pub initial_admins: Vec<String>,
 }
 
 /// Founding options for a new direct conversation. They never change a
@@ -107,6 +111,7 @@ impl From<CreateGroupOptionsFfi> for marmot_app::AppCreateGroupOptions {
             description: options.description.unwrap_or_default(),
             initial_image: options.initial_image.map(Into::into),
             disappearing_message_secs: options.disappearing_message_secs,
+            initial_admins: options.initial_admins,
             ..Default::default()
         }
     }

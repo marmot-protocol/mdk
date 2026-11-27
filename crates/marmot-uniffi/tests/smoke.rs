@@ -12,8 +12,8 @@ use std::sync::{Arc, Once};
 
 use marmot_account::AccountHome;
 use marmot_uniffi::{
-    AuditLogSettingsFfi, AuditLogSourceFfi, CursorPersistenceFfi, Marmot, MarmotKitError,
-    MediaAttachmentReferenceFfi, MediaLocatorFfi, MediaUploadAttachmentRequestFfi,
+    AuditLogSettingsFfi, AuditLogSourceFfi, CreateGroupOptionsFfi, CursorPersistenceFfi, Marmot,
+    MarmotKitError, MediaAttachmentReferenceFfi, MediaLocatorFfi, MediaUploadAttachmentRequestFfi,
     MediaUploadRequestFfi, MessageDraftAttachmentFfi, MessageTagFfi, NotificationWakeSourceFfi,
     PushPlatformFfi, RelayEndpointPolicyFfi, RelayTelemetrySettingsFfi, TimelineMessageQueryFfi,
     parse_media_imeta_tag,
@@ -420,7 +420,7 @@ fn normalize_member_ref_accepts_profile_and_nostr_forms() {
 }
 
 #[tokio::test]
-async fn create_group_rejects_malformed_member_as_invalid_identity() {
+async fn create_group_rejects_invalid_membership_inputs() {
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");
     let account = AccountHome::open_with_keychain(
@@ -440,7 +440,7 @@ async fn create_group_rejects_malformed_member_as_invalid_identity() {
 
     let error = kit
         .create_group(
-            account.label,
+            account.label.clone(),
             "invalid member".into(),
             vec!["not-a-member-ref".into()],
             None,
@@ -452,6 +452,42 @@ async fn create_group_rejects_malformed_member_as_invalid_identity() {
         matches!(error, MarmotKitError::InvalidIdentity { .. }),
         "malformed member reference must remain invalid input, got {error:?}"
     );
+    assert_ne!(account.account_id_hex, ACCOUNT_ID);
+    let error = kit
+        .create_group_with_options(
+            account.label.clone(),
+            "invalid founding admin".into(),
+            Vec::new(),
+            CreateGroupOptionsFfi {
+                description: None,
+                initial_image: None,
+                disappearing_message_secs: 0,
+                initial_admins: vec![ACCOUNT_ID.to_owned()],
+            },
+        )
+        .await
+        .expect_err("a founding admin must be a member");
+
+    assert!(matches!(
+        error,
+        MarmotKitError::Runtime { details }
+            if details == marmot_app::AppError::GroupCreateAdminNotMember.to_string()
+    ));
+    let group = kit
+        .create_group_with_options(
+            account.label,
+            "explicit creator admin".into(),
+            Vec::new(),
+            CreateGroupOptionsFfi {
+                description: None,
+                initial_image: None,
+                disappearing_message_secs: 0,
+                initial_admins: vec![account.account_id_hex],
+            },
+        )
+        .await
+        .expect("the creator may appear in initial admins");
+    assert!(group.group_id_hex.is_some());
     kit.shutdown().await;
 }
 

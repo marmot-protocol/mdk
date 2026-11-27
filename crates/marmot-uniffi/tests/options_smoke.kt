@@ -1,14 +1,30 @@
 package dev.ipf.marmotkit
 
 import java.nio.file.Files
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.runBlocking
 
 private class OptionsStore : SecretStore {
-    override fun hasSecretForLabel(label: String): Boolean = label == "probe"
-    override fun hasSecretForAccountId(accountIdHex: String): Boolean = false
-    override fun writeSecret(label: String, accountIdHex: String, secretKeyHex: String) {}
-    override fun loadSecret(label: String, accountIdHex: String): String = "callback-probe"
-    override fun removeSecret(label: String, accountIdHex: String) {}
+    private data class Credential(val label: String, val key: String)
+
+    private val secrets = ConcurrentHashMap<String, Credential>()
+
+    override fun hasSecretForLabel(label: String): Boolean =
+        label == "probe" || secrets.values.any { it.label == label }
+
+    override fun hasSecretForAccountId(accountIdHex: String): Boolean = secrets.containsKey(accountIdHex)
+
+    override fun writeSecret(label: String, accountIdHex: String, secretKeyHex: String) {
+        secrets[accountIdHex] = Credential(label, secretKeyHex)
+    }
+
+    override fun loadSecret(label: String, accountIdHex: String): String =
+        secrets[accountIdHex]?.takeIf { it.label == label }?.key
+            ?: throw MarmotKitException.SecretNotFound("Missing smoke credential")
+
+    override fun removeSecret(label: String, accountIdHex: String) {
+        secrets.remove(accountIdHex)
+    }
 }
 
 fun main(args: Array<String>) = runBlocking {
@@ -77,6 +93,28 @@ fun main(args: Array<String>) = runBlocking {
                 listOf("ws://127.0.0.1:1"), copy).use { experimental ->
                 check(experimental.listAccounts().isEmpty())
             }
+
+            val relay = "ws://127.0.0.1:1"
+            kit.start()
+            val account = kit.createIdentityWithProfile(listOf(relay), listOf(relay)).account
+            val groupOptions = CreateGroupOptionsFfi(
+                description = null, initialImage = null, disappearingMessageSecs = 0uL,
+            )
+            val creation = kit.createGroupWithOptions(account.label, "Founding admins smoke", emptyList(), groupOptions)
+            val group = checkNotNull(creation.groupIdHex)
+            val creator = kit.groupDetails(account.label, group).members.single()
+            check(creator.isSelf && creator.isAdmin)
+
+            val invalidOptions = groupOptions.copy(
+                initialAdmins = listOf("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"),
+            )
+            try {
+                kit.createGroupWithOptions(account.label, "Invalid admin smoke", emptyList(), invalidOptions)
+                error("native group creation accepted a nonmember admin")
+            } catch (error: MarmotKitException.Runtime) {
+                check(error.details == "initial admins must be founding members")
+            }
+            kit.shutdownAndClose()
         }
     } finally {
         root.deleteRecursively()
