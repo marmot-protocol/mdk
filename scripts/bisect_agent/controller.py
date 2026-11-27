@@ -420,7 +420,11 @@ def default_worktree_runner(
                 # `env_reset` does not drop `CARGO_TARGET_DIR`, `ODIN`, or `ANDROID_NDK_HOME`.
                 os.chmod(sandbox, 0o777)
                 env_pairs = [f"{k}={v}" for k, v in sorted(env.items())]
-                argv = [*runner_prefix, "env", "-i", *env_pairs, *command]
+                # A private TMPDIR the runner creates and removes itself: gates write fixed
+                # paths under TMPDIR that the bot's own Canary runs also use, and the bot
+                # cannot delete files the runner writes.
+                private_tmp = ("sh", "-c", 'TMPDIR="$(mktemp -d)" && export TMPDIR && trap \'rm -rf "$TMPDIR"\' EXIT && "$@"', "sh")
+                argv = [*runner_prefix, "env", "-i", *env_pairs, *private_tmp, *command]
             else:
                 argv = list(command)
             try:

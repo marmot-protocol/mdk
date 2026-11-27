@@ -686,6 +686,28 @@ class ClassifierTests(unittest.TestCase):
             verdict, _ = default_worktree_runner(git_trusts_this_worktree)(wt)
             self.assertEqual(verdict, RunVerdict.PASS)
 
+    def test_isolated_predicate_gets_a_private_tmpdir_it_removes(self):
+        # Gates write fixed paths under TMPDIR (`/tmp/android-elf-tests/...`). Shared with
+        # the bot's own Canary runs, the `mdk-runner` replay hit directories `mdk-bot`
+        # owned and failed `binding-build-gate` on a green commit.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            wt = tmp / "wt"
+            wt.mkdir()
+            record = tmp / "tmpdir.txt"
+            write_under_tmpdir = (
+                "python3",
+                "-c",
+                "import os, pathlib, sys; d = pathlib.Path(os.environ['TMPDIR']); "
+                "(d / 'android-elf-tests').mkdir(); pathlib.Path(sys.argv[1]).write_text(str(d))",
+                str(record),
+            )
+            verdict, _ = default_worktree_runner(write_under_tmpdir, runner_prefix=("env",))(wt)
+            self.assertEqual(verdict, RunVerdict.PASS)
+            private = Path(record.read_text())
+            self.assertNotEqual(private, Path(os.environ.get("TMPDIR", "/tmp")))
+            self.assertFalse(private.exists())
+
     def test_predicate_nextest_store_lands_in_the_sandbox_target_dir(self):
         # nextest keeps its store at `<workspace>/target/nextest` whatever `CARGO_TARGET_DIR`
         # says. The `mdk-runner` sandbox cannot write the bot-owned worktree, so every live
