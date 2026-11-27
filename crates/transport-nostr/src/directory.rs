@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
+use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -272,9 +273,6 @@ impl CoalescedMap for CompletionFetchMap {
     }
 }
 
-type RemoveWaiterFn =
-    fn(&mut DirectoryRelayPlaneState, &DirectoryFetchKey, u64, u64) -> Option<CancellationToken>;
-
 #[derive(Default)]
 struct DirectoryRelayPlaneState {
     next_id: u64,
@@ -304,22 +302,22 @@ impl DirectoryRelayPlaneState {
 /// Drops a waiter from its coalesced entry synchronously if the caller future
 /// is cancelled mid-await. Losing the final waiter removes the key and cancels
 /// the shared fetch immediately; remaining waiters keep the fetch running.
-struct CoalescedWaiterGuard {
+struct CoalescedWaiterGuard<M: CoalescedMap> {
     state: Arc<Mutex<DirectoryRelayPlaneState>>,
-    remove_waiter: RemoveWaiterFn,
     key: DirectoryFetchKey,
     entry_id: u64,
     waiter_id: u64,
     armed: bool,
+    _map: PhantomData<M>,
 }
 
-impl CoalescedWaiterGuard {
+impl<M: CoalescedMap> CoalescedWaiterGuard<M> {
     fn disarm(&mut self) {
         self.armed = false;
     }
 }
 
-impl Drop for CoalescedWaiterGuard {
+impl<M: CoalescedMap> Drop for CoalescedWaiterGuard<M> {
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -328,32 +326,24 @@ impl Drop for CoalescedWaiterGuard {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let cancel = (self.remove_waiter)(&mut state, &self.key, self.entry_id, self.waiter_id);
+        let map = M::map(&mut state);
+        let cancel = {
+            let empty = map.get_mut(&self.key).is_some_and(|entry| {
+                if entry.id != self.entry_id {
+                    return false;
+                }
+                entry.waiters.retain(|(id, _)| *id != self.waiter_id);
+                entry.waiters.is_empty()
+            });
+            empty
+                .then(|| map.remove(&self.key).map(|entry| entry.cancel))
+                .flatten()
+        };
         drop(state);
         if let Some(cancel) = cancel {
             cancel.cancel();
         }
     }
-}
-
-fn remove_waiter_for<M: CoalescedMap>(
-    state: &mut DirectoryRelayPlaneState,
-    key: &DirectoryFetchKey,
-    entry_id: u64,
-    waiter_id: u64,
-) -> Option<CancellationToken> {
-    let map = M::map(state);
-    let empty = {
-        let entry = map.get_mut(key)?;
-        if entry.id != entry_id {
-            return None;
-        }
-        entry.waiters.retain(|(id, _)| *id != waiter_id);
-        entry.waiters.is_empty()
-    };
-    empty
-        .then(|| map.remove(key).map(|entry| entry.cancel))
-        .flatten()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -486,11 +476,13 @@ impl ScopedDirectoryClient {
     }
 
     async fn shutdown(mut self) {
-        self.shut_down = true;
+        let deadline = Instant::now() + RELAY_PLANE_SHUTDOWN_WAIT;
+        let _ = timeout_at(deadline, self.finite.shutdown()).await;
         for relay in &self.relays {
             relay.shutdown();
         }
-        let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, self.client.shutdown()).await;
+        let _ = timeout_at(deadline, self.client.shutdown()).await;
+        self.shut_down = true;
     }
 }
 
@@ -502,10 +494,13 @@ impl Drop for ScopedDirectoryClient {
         for relay in &self.relays {
             relay.shutdown();
         }
+        let finite = self.finite.clone();
         let client = self.client.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, client.shutdown()).await;
+                let deadline = Instant::now() + RELAY_PLANE_SHUTDOWN_WAIT;
+                let _ = timeout_at(deadline, finite.shutdown()).await;
+                let _ = timeout_at(deadline, client.shutdown()).await;
             });
         }
     }
@@ -852,13 +847,13 @@ impl DirectoryRelayPlane {
             }
         };
 
-        let mut guard = CoalescedWaiterGuard {
+        let mut guard = CoalescedWaiterGuard::<M> {
             state: self.state.clone(),
-            remove_waiter: remove_waiter_for::<M>,
             key,
             entry_id,
             waiter_id,
             armed: true,
+            _map: PhantomData,
         };
         let result = rx
             .await

@@ -104,9 +104,9 @@ drop: storage imports loss by count, so a token's count must cover every drop un
   `deactivate_account_context` runs (which also tears down that account's cached and retired signer-bound publish
   clients). Unfinished `loss_marker_tasks` are never aborted on
   timeout; bounded shutdown still cannot guarantee marker persistence if storage stays `Retryable` until the host
-  closes SQLite (write-ahead cursor fencing for that case is tracked in `#3813`). Directory fetch tasks are not yet
-  joined here (tracked for coalesced fetch cancellation). The plane registers nothing in the app's close registry
-  (`#2341`).
+  closes SQLite (write-ahead cursor fencing for that case is tracked in `#3813`). Active coalesced directory fetch
+  tasks are cancelled and joined within `RELAY_PLANE_SHUTDOWN_WAIT` (`DirectoryRelayPlane::shutdown`). The plane
+  registers nothing in the app's close registry (`#2341`).
 - Dropping the last plane handle without shutdown aborts the same router and forwarder tasks
   (`Drop for MarmotRelayPlaneInner`). They hold the transport, so without it every short-lived plane (one per `wnd`
   Execute request) stayed alive with its SDK clients. Never give those tasks a `MarmotRelayPlane` clone, or the
