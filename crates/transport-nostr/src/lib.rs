@@ -209,9 +209,10 @@ struct MarmotRelayPlaneInner {
     publish_clients: std::sync::Mutex<PublishClientRegistry>,
     /// Each account's anonymous group-publish / read-back clients (current and
     /// any retained earlier adapter clones), tracked weakly per account so
-    /// adapter clones keep working while held and drop tears them down, while
-    /// account deactivation and plane shutdown tear down every live pool for
-    /// that account right away.
+    /// adapter clones keep working while held (including across receive-plane
+    /// `shutdown()`), dropping the last clone tears the pool down, and explicit
+    /// account deactivation tears down every live pool for that account right
+    /// away.
     anonymous_publish_clients:
         std::sync::Mutex<HashMap<MemberId, Vec<Weak<ManagedSdkPublishClient>>>>,
     /// Each account's read-back REQs to each relay in the last hour, shared
@@ -334,8 +335,10 @@ impl RelayPlaneTransport {
 /// `MarmotRelayPlane` drops only the plane's `Arc`, so an in-flight publish or
 /// running account worker keeps its working pool until it releases its `Arc`,
 /// at which point `Drop` schedules `NostrSdkRelayClient::shutdown()`. Explicit
-/// account deactivation and plane shutdown still tear down live clients
-/// immediately via weak handles.
+/// account deactivation tears down all live publish clients for that account
+/// immediately via weak handles; `MarmotRelayPlane::shutdown()` tears down
+/// cached and retired signer-bound publish clients while leaving adapter-owned
+/// anonymous publish pools live until their adapter drops or deactivates.
 struct ManagedSdkPublishClient {
     account_id: MemberId,
     inner: NostrSdkRelayClient,
@@ -2054,9 +2057,10 @@ impl MarmotRelayPlane {
         }
         drop(routes);
         // Never share a socket with the authenticated receive pool or Welcome
-        // publisher. Adapter clones retain this account's anonymous WRITE pool;
-        // dropping the last clone tears it down, and deactivation or plane
-        // shutdown tears down every live pool for this account immediately.
+        // publisher. Adapter clones own this account's anonymous WRITE pool so
+        // it stays usable across receive-plane `shutdown()` while held;
+        // dropping the last clone tears it down, and explicit account
+        // deactivation tears down every live pool for this account immediately.
         let anonymous_publish_client = self.inner.transport.sdk_relay_client.as_ref().map(|_| {
             let client = ManagedSdkPublishClient::new(
                 account_id.clone(),
@@ -2864,34 +2868,28 @@ impl MarmotRelayPlane {
             let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, directory_client.shutdown()).await;
         }
         let managed_clients = {
-            let mut managed = {
-                let mut registry = self
-                    .inner
-                    .publish_clients
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let mut clients = registry
-                    .account
+            // Anonymous publish clients belong to their live account adapters
+            // (which may still publish group messages or push triggers after
+            // receive-plane shutdown, tearing down on account deactivation or
+            // when the last adapter clone drops). Only signer-bound cached and
+            // retired publish clients are torn down directly by plane shutdown.
+            let mut registry = self
+                .inner
+                .publish_clients
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut clients = registry
+                .account
+                .drain()
+                .map(|(_, client)| client)
+                .collect::<Vec<_>>();
+            clients.extend(
+                registry
+                    .retired
                     .drain()
-                    .map(|(_, client)| client)
-                    .collect::<Vec<_>>();
-                clients.extend(
-                    registry
-                        .retired
-                        .drain()
-                        .flat_map(|(_, entries)| entries.into_iter().filter_map(|w| w.upgrade())),
-                );
-                clients
-            };
-            managed.extend(
-                self.inner
-                    .anonymous_publish_clients
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .drain()
-                    .flat_map(|(_, entries)| entries.into_iter().filter_map(|weak| weak.upgrade())),
+                    .flat_map(|(_, entries)| entries.into_iter().filter_map(|w| w.upgrade())),
             );
-            managed
+            clients
         };
         let pending_clients = {
             self.inner
