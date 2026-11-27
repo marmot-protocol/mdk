@@ -674,6 +674,18 @@ class ClassifierTests(unittest.TestCase):
             rc = cli_main(["poll", "--live", "--repo-dir", str(tmp), "--no-fetch"])
             self.assertEqual(rc, 2)
 
+    def test_predicate_git_trusts_only_its_own_worktree(self):
+        # The `mdk-runner` sandbox runs git in a worktree `mdk-bot` owns, and git refuses it
+        # ("detected dubious ownership"). Every `just fast-ci` replay failed in
+        # `changelog-gate`, on green commits too, so a fast-ci break read as a baseline break
+        # and was never bisected. Git must trust exactly the replay's worktree.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            wt = Path(tmp_str) / "wt"
+            wt.mkdir()
+            git_trusts_this_worktree = ("sh", "-c", 'test "$(git config --get-all safe.directory)" = "$PWD"')
+            verdict, _ = default_worktree_runner(git_trusts_this_worktree)(wt)
+            self.assertEqual(verdict, RunVerdict.PASS)
+
     def test_predicate_nextest_store_lands_in_the_sandbox_target_dir(self):
         # nextest keeps its store at `<workspace>/target/nextest` whatever `CARGO_TARGET_DIR`
         # says. The `mdk-runner` sandbox cannot write the bot-owned worktree, so every live
