@@ -517,21 +517,24 @@ pub struct NostrAdapterMetrics {
     /// These are not relay failures and may still have reached a relay.
     #[serde(default)]
     pub publish_cancellations: usize,
-    /// Route-level NIP-77 passes attempted after ordinary subscription rebuilds.
+    /// Retained for snapshot schema stability after the legacy
+    /// `reconcile_subscription` stack was retired (#2897 / #3789); remains
+    /// zero under the unified recovery runner (#2660).
     #[serde(default)]
     pub reconciliation_attempts: usize,
+    /// Retained for snapshot schema stability after `#3789`; remains zero.
     #[serde(default)]
     pub reconciliation_relays_succeeded: usize,
+    /// Retained for snapshot schema stability after `#3789`; remains zero.
     #[serde(default)]
     pub reconciliation_relays_failed: usize,
-    /// Event ids the relays reported absent from the durable local route sets.
+    /// Retained for snapshot schema stability after `#3789`; remains zero.
     #[serde(default)]
     pub reconciliation_remote_items: usize,
-    /// Missing events successfully downloaded by reconciliation.
+    /// Retained for snapshot schema stability after `#3789`; remains zero.
     #[serde(default)]
     pub reconciliation_received_items: usize,
-    /// Group passes that returned nothing because no time order covered the
-    /// history they were missing.
+    /// Retained for snapshot schema stability after `#3789`; remains zero.
     #[serde(default)]
     pub reconciliation_order_unproven_passes: usize,
     /// Account activations whose every REQ reached every relay.

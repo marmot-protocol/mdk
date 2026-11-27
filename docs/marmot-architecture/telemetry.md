@@ -62,10 +62,10 @@ runtime. It complements the policy docs:
 | `publish_successes` | Calls whose accepted-endpoint count is at least `max(required_acks, 1)`, the same rule as `TransportPublishReport::met_required_acks`. Partial acceptance at or above that threshold succeeds. | Aggregate count. |
 | `publish_failures` | Client errors and `Ok` outcomes below that threshold, including empty acceptance when `required_acks == 0`. | Aggregate count. |
 | `publish_cancellations` | Started calls whose caller dropped them before the relay client returned. Not a relay failure; the event may still have reached a relay. | Aggregate count. |
-| `reconciliation_attempts` | NIP-77 reconciliation passes recorded by the relay plane, inbox and group routes alike, including passes that errored. | Aggregate count. |
-| `reconciliation_relays_succeeded` / `reconciliation_relays_failed` | Endpoint results summed over those passes. | Aggregate count. |
-| `reconciliation_remote_items` / `reconciliation_received_items` | Event ids relays reported missing locally, and missing events downloaded. | Aggregate count. |
-| `reconciliation_order_unproven_passes` | Group passes that returned nothing because no time order covered the history they were missing: no relay answered the window probes, the delivery boundary was unknown or excluded everything fetched, or more history was set aside than the relays' comparisons name. A pass waiting one round for an unfinished window search does not count. Repeated, these are the passes that end in a "history may be incomplete" notice. | Aggregate count. |
+| `reconciliation_attempts` | Retired (`#3789` / `#2897`): formerly NIP-77 reconciliation passes recorded by the relay plane; retained as always-zero for snapshot schema stability. | Aggregate count. |
+| `reconciliation_relays_succeeded` / `reconciliation_relays_failed` | Retired (`#3789` / `#2897`): retained as always-zero for snapshot schema stability. | Aggregate count. |
+| `reconciliation_remote_items` / `reconciliation_received_items` | Retired (`#3789` / `#2897`): retained as always-zero for snapshot schema stability. | Aggregate count. |
+| `reconciliation_order_unproven_passes` | Retired (`#3789` / `#2897`): formerly group passes held back without a proven order; retained as always-zero for snapshot schema stability. | Aggregate count. |
 | `activations_full` / `activations_degraded` / `activations_failed` | Account activations by outcome: every REQ reached every relay; the activation succeeded while some relay owed a REQ (it was unreachable, so the relay client re-sends the REQ on its next connection) or refused one (it was connected and rejected the REQ while another relay took it; a refusal is not re-sent); or the activation failed and rolled back, because no relay took or owes one of its REQs or the relay client returned an error. | Aggregate count. |
 | `read_back_requests` / `read_back_found` | Read-back REQs sent for a pending commit, one per relay asked, and the relays that returned its exact event. A read past the hourly cap, or of a relay the host-safety rule refuses, sends nothing and counts nothing. | Aggregate count. |
 | `group_syncs_full` / `group_syncs_degraded` / `group_syncs_failed` | Group syncs that issued REQs, by the same outcomes. A failed sync is one whose REQ no relay took or owes, or that hit a relay-client error; it leaves the routes it already committed in place. Syncs that issue no REQs do not count. | Aggregate count. |
@@ -514,8 +514,8 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `relay_publish_successes` | none | Counter | Adapter `publish_successes` (acceptance threshold met) |
 | `relay_publish_failures` | none | Counter | Adapter `publish_failures` (error or below threshold) |
 | `relay_publish_cancellations` | none | Counter | Adapter `publish_cancellations` (caller dropped the call in flight) |
-| `relay_reconciliation_attempts` | none | Counter | Adapter `reconciliation_attempts` (inbox and group NIP-77 passes) |
-| `relay_reconciliation_order_unproven_passes` | none | Counter | Adapter `reconciliation_order_unproven_passes` (group passes held back without a proven order) |
+| `relay_reconciliation_attempts` | none | Counter | Adapter `reconciliation_attempts` (retired in `#3789`; retained as always-zero for schema stability) |
+| `relay_reconciliation_order_unproven_passes` | none | Counter | Adapter `reconciliation_order_unproven_passes` (retired in `#3789`; retained as always-zero for schema stability) |
 | `relay_account_activations_full` / `relay_account_activations_degraded` / `relay_account_activations_failed` | none | Counter | Adapter `activations_full` / `activations_degraded` / `activations_failed` |
 | `relay_group_syncs_full` / `relay_group_syncs_degraded` / `relay_group_syncs_failed` | none | Counter | Adapter `group_syncs_full` / `group_syncs_degraded` / `group_syncs_failed` |
 | `relay_read_back_requests` / `relay_read_back_found` | none | Counter | Adapter `read_back_requests` / `read_back_found` (pending-commit read-backs sent, and relays that returned the event) |

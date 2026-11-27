@@ -52,6 +52,11 @@ Written to be readable in 5 minutes each, shareable as a package.
 - **Doc:** [`overview/nostr-bounded-acquisition-interface.md`](./overview/nostr-bounded-acquisition-interface.md)
   - **What it covers:** Optional owned acquisition and notification-loss evidence at the existing relay-client boundary.
 
+- **Doc:** [`overview/nostr-consumer-inventory.md`](./overview/nostr-consumer-inventory.md)
+  - **What it covers:** Complete Nostr consumer map (live 445, inbox 1059, live/ordinary/strict directory, inspections,
+    previews/stickers, KeyPackage recovery, history recovery, pairing, NIP-46, publishing), shared vs domain-specific
+    guarantees, retired implementations, and release-build resource verification (`#2897`).
+
 - **Doc:** [`overview/transport-agnosticism.md`](./overview/transport-agnosticism.md)
   - **What it covers:** Working note on where transport pluggability stops today: leak inventory from the FIPS spike and
     PRs #1513/#1521/#1514, the five seams (directory, peeler injection, endpoint type, blob store, composition-root

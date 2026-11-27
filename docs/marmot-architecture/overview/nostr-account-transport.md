@@ -23,7 +23,9 @@ Nostr has three separate roles in Marmot:
 3. Transport. Nostr relays are the first transport for MLS ciphertext, welcomes, KeyPackages, relay lists, and related
    account state.
 
-The identity role is not expected to change. The transport role should remain replaceable.
+The identity role is not expected to change. The transport role should remain replaceable. For the current
+end-to-end map of every Nostr consumer, its authentication/factory context, validation, and shutdown owner, see
+[nostr-consumer-inventory.md](./nostr-consumer-inventory.md).
 
 ## Account Transport Subsystems
 
