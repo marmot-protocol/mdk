@@ -6306,8 +6306,7 @@ typedef struct MarmotTimelineMessageRecord {
   /**
    * True for an agent item whose first event this device does not
    * hold, such as one that began before this member joined: the row
-   * is the first edit of it this device received, showing the latest
-   * version.
+   * is the first edit this device received, with the latest version.
    */
   bool agent_item_first_event_missing;
   struct MarmotTimelineReactionSummary reactions;
