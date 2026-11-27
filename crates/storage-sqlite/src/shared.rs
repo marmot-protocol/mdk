@@ -655,39 +655,40 @@ impl SqliteSharedStorage {
         const PROJECTION: &str =
             "SELECT account_id_hex, npub, profile_json,
                     CASE WHEN profile_json IS NULL THEN NULL
+                         WHEN NOT json_valid(profile_json)
+                           OR json_type(profile_json) != 'object' THEN 'invalid'
                          ELSE COALESCE(profile_json -> '$.created_at', '0')
                     END,
                     min(
-                        marmot_search_rank(json_extract(profile_json, '$.name'), ?1) * 6,
-                        marmot_search_rank(json_extract(profile_json, '$.nip05'), ?1) * 6 + 1,
-                        marmot_search_rank(json_extract(profile_json, '$.display_name'), ?1) * 6 + 2,
-                        marmot_search_rank(json_extract(profile_json, '$.about'), ?1) * 6 + 3,
+                        marmot_search_rank(CASE WHEN json_valid(profile_json) THEN json_extract(profile_json, '$.name') END, ?1) * 6,
+                        marmot_search_rank(CASE WHEN json_valid(profile_json) THEN json_extract(profile_json, '$.nip05') END, ?1) * 6 + 1,
+                        marmot_search_rank(CASE WHEN json_valid(profile_json) THEN json_extract(profile_json, '$.display_name') END, ?1) * 6 + 2,
+                        marmot_search_rank(CASE WHEN json_valid(profile_json) THEN json_extract(profile_json, '$.about') END, ?1) * 6 + 3,
                         marmot_search_rank(npub, ?1) * 6 + 4,
                         marmot_search_rank(account_id_hex, ?1) * 6 + 5
                     ) AS search_rank
              FROM directory_users";
         let conn = self.lock()?;
-        let read_row = |row: &rusqlite::Row<'_>| {
-            Ok((
+        let read_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Option<SearchProfile>> {
+            let created_at = match row.get::<_, Option<String>>(3)? {
+                None => None,
+                Some(value) => match value.parse::<u64>() {
+                    Ok(timestamp) => Some(timestamp),
+                    Err(_) => return Ok(None),
+                },
+            };
+            Ok(Some((
                 PublicDirectoryProfileRecord {
                     account_id_hex: row.get(0)?,
                     npub: row.get(1)?,
                     profile_json: row.get(2)?,
                 },
-                row.get::<_, Option<String>>(3)?
-                    .map(|value| {
-                        value.parse::<u64>().map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                3,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })
-                    })
-                    .transpose()?,
+                created_at,
                 row.get(4)?,
-            ))
+            )))
         };
+        let mut profiles = Vec::new();
+        let mut skipped_malformed = 0usize;
         if account_ids.is_empty() {
             let mut statement = conn
                 .prepare_cached(&format!(
@@ -695,31 +696,46 @@ impl SqliteSharedStorage {
                      ORDER BY account_id_hex LIMIT {PUBLIC_DIRECTORY_USERS_MAX}"
                 ))
                 .storage()?;
-            return statement
-                .query_map([query], read_row)
-                .storage()?
-                .map(|row| row.storage())
-                .collect();
-        }
-        let mut profiles = Vec::new();
-        for ids in account_ids.chunks(crate::SQLITE_BIND_PARAMETER_CHUNK - 1) {
-            let placeholders = std::iter::repeat_n("?", ids.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let mut statement = conn
-                .prepare_cached(&format!(
-                    "{PROJECTION} WHERE account_id_hex IN ({placeholders})"
-                ))
-                .storage()?;
-            let rows = statement
-                .query_map(
-                    params_from_iter(std::iter::once(query).chain(ids.iter().map(String::as_str))),
-                    read_row,
-                )
-                .storage()?;
+            let rows = statement.query_map([query], read_row).storage()?;
             for row in rows {
-                profiles.push(row.storage()?);
+                match row.storage()? {
+                    Some(profile) => profiles.push(profile),
+                    None => skipped_malformed += 1,
+                }
             }
+        } else {
+            for ids in account_ids.chunks(crate::SQLITE_BIND_PARAMETER_CHUNK - 1) {
+                let placeholders = std::iter::repeat_n("?", ids.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut statement = conn
+                    .prepare_cached(&format!(
+                        "{PROJECTION} WHERE account_id_hex IN ({placeholders})"
+                    ))
+                    .storage()?;
+                let rows = statement
+                    .query_map(
+                        params_from_iter(
+                            std::iter::once(query).chain(ids.iter().map(String::as_str)),
+                        ),
+                        read_row,
+                    )
+                    .storage()?;
+                for row in rows {
+                    match row.storage()? {
+                        Some(profile) => profiles.push(profile),
+                        None => skipped_malformed += 1,
+                    }
+                }
+            }
+        }
+        if skipped_malformed > 0 {
+            tracing::warn!(
+                target: "storage_sqlite::shared",
+                method = "public_directory_profiles",
+                skipped_malformed,
+                "skipped directory profile rows with malformed JSON or created_at"
+            );
         }
         Ok(profiles)
     }
@@ -1269,7 +1285,12 @@ fn prune_key_package_barriers(tx: &Transaction<'_>, now: i64) -> StorageResult<(
             ORDER BY evicted_at DESC, event_created_at DESC, event_id_hex, account_id_hex
             LIMIT -1 OFFSET 1000
          )
-         ORDER BY event_created_at DESC, event_id_hex, evicted_at DESC
+         ORDER BY
+            CASE WHEN kind = 'exact_deletion' THEN 0 ELSE 1 END,
+            event_created_at DESC,
+            CASE WHEN kind = 'deletion' THEN 0 ELSE 1 END,
+            event_id_hex,
+            evicted_at DESC
          LIMIT 1
          ON CONFLICT(id) DO UPDATE SET
             event_id_hex = excluded.event_id_hex,
@@ -1719,6 +1740,102 @@ mod tests {
         );
     }
 
+    /// Regression for #3798: malformed `created_at` values or invalid JSON in
+    /// one row's `profile_json` must not abort `public_directory_profiles`.
+    #[test]
+    fn public_directory_profiles_skips_rows_with_malformed_created_at_or_json() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        let valid_id = "11".repeat(32);
+        let null_profile_id = "12".repeat(32);
+        let negative_id = "21".repeat(32);
+        let string_id = "22".repeat(32);
+        let null_ts_id = "23".repeat(32);
+        let float_id = "24".repeat(32);
+        let broken_json_id = "25".repeat(32);
+
+        let put = |account_id_hex: &str, npub: &str, profile_json: Option<&str>| {
+            storage
+                .put_public_directory_user(&PublicDirectoryUserRecord {
+                    account_id_hex: account_id_hex.to_owned(),
+                    npub: npub.to_owned(),
+                    profile_json: profile_json.map(str::to_owned),
+                    relay_lists_json: "{}".into(),
+                    key_package_json: None,
+                    event_id_hex: None,
+                    event_kind: None,
+                    event_created_at: None,
+                    follows: Vec::new(),
+                    follows_created_at: 0,
+                })
+                .unwrap();
+        };
+
+        put(
+            &valid_id,
+            "npub1valid",
+            Some(r#"{"name":"Alice","created_at":42}"#),
+        );
+        put(&null_profile_id, "npub1alice", None);
+        put(
+            &negative_id,
+            "npub1neg",
+            Some(r#"{"name":"Alice Neg","created_at":-1}"#),
+        );
+        put(
+            &string_id,
+            "npub1str",
+            Some(r#"{"name":"Alice Str","created_at":"bad"}"#),
+        );
+        put(
+            &null_ts_id,
+            "npub1null",
+            Some(r#"{"name":"Alice Null","created_at":null}"#),
+        );
+        put(
+            &float_id,
+            "npub1flt",
+            Some(r#"{"name":"Alice Flt","created_at":1.5}"#),
+        );
+        put(&broken_json_id, "npub1alicebroken", Some("{not valid json"));
+
+        let scanned = storage.public_directory_profiles("alice", &[]).unwrap();
+        assert_eq!(
+            scanned,
+            vec![
+                (
+                    PublicDirectoryProfileRecord {
+                        account_id_hex: valid_id.clone(),
+                        npub: "npub1valid".into(),
+                        profile_json: Some(r#"{"name":"Alice","created_at":42}"#.into()),
+                    },
+                    Some(42),
+                    0
+                ),
+                (
+                    PublicDirectoryProfileRecord {
+                        account_id_hex: null_profile_id.clone(),
+                        npub: "npub1alice".into(),
+                        profile_json: None,
+                    },
+                    None,
+                    16
+                ),
+            ]
+        );
+
+        let ids = vec![
+            valid_id.clone(),
+            null_profile_id.clone(),
+            negative_id,
+            string_id,
+            null_ts_id,
+            float_id,
+            broken_json_id,
+        ];
+        let by_ids = storage.public_directory_profiles("alice", &ids).unwrap();
+        assert_eq!(by_ids, scanned);
+    }
+
     // #761: the batched listing is defensively bounded. The uncapped path still
     // returns every user; the cap bounds the materialized set to the
     // lowest-ordered users and attaches only their (subquery-scoped) follows,
@@ -2000,6 +2117,119 @@ mod tests {
                 assert_eq!(watermark.kind, PublicKeyPackageBarrierKind::ExactDeletion);
                 assert_eq!(watermark.deleted_event_id, None);
             }
+        }
+    }
+
+    /// Regression for #3798: batch watermark eviction into the global fallback
+    /// must follow the `exact_deletion` > `deletion` > `replacement` dominance
+    /// lattice instead of dropping a stronger deletion barrier behind a newer
+    /// or lower-id replacement evicted in the same prune.
+    #[test]
+    fn key_package_watermark_fallback_preserves_dominant_barrier_in_batch_eviction() {
+        // Case 1: `exact_deletion` dominates a higher-timestamp `replacement`
+        // evicted in the same prune batch.
+        {
+            let storage = SqliteSharedStorage::in_memory().unwrap();
+            let now = unix_now_seconds_i64();
+            {
+                let conn = storage.lock().unwrap();
+                for index in 0..1_000_i64 {
+                    conn.execute(
+                        "INSERT INTO public_key_package_eviction_watermarks (
+                            account_id_hex, key_package_id, event_id_hex, deleted_event_id,
+                            event_created_at, evicted_at, kind
+                         ) VALUES (?1, 'slot', ?2, NULL, ?3, ?4, 'replacement')",
+                        params![
+                            format!("{:064x}", index + 10),
+                            format!("{:064x}", index + 10),
+                            now - 10,
+                            now,
+                        ],
+                    )
+                    .unwrap();
+                }
+                // Evicted exact_deletion with older created_at and larger event_id.
+                conn.execute(
+                    "INSERT INTO public_key_package_eviction_watermarks (
+                        account_id_hex, key_package_id, event_id_hex, deleted_event_id,
+                        event_created_at, evicted_at, kind
+                     ) VALUES (?1, 'slot', ?2, NULL, ?3, ?4, 'exact_deletion')",
+                    params!["01".repeat(32), "ff".repeat(32), now - 500, now - 100],
+                )
+                .unwrap();
+                // Evicted replacement in the same batch with newer created_at and smaller event_id.
+                conn.execute(
+                    "INSERT INTO public_key_package_eviction_watermarks (
+                        account_id_hex, key_package_id, event_id_hex, deleted_event_id,
+                        event_created_at, evicted_at, kind
+                     ) VALUES (?1, 'slot', ?2, NULL, ?3, ?4, 'replacement')",
+                    params!["02".repeat(32), "00".repeat(32), now - 50, now - 200],
+                )
+                .unwrap();
+            }
+            // Trigger `prune_key_package_barriers`.
+            storage
+                .put_public_key_package_barrier(&key_package_barrier(&"aa".repeat(32), 0))
+                .unwrap();
+
+            let fallback = storage
+                .key_package_global_eviction()
+                .unwrap()
+                .expect("global fallback watermark must survive batch eviction");
+            assert_eq!(fallback.kind, PublicKeyPackageBarrierKind::ExactDeletion);
+            assert_eq!(fallback.observed_at, (now - 100) as u64);
+        }
+
+        // Case 2: at equal `event_created_at`, `deletion` dominates a
+        // `replacement` even when the replacement has a smaller `event_id_hex`.
+        {
+            let storage = SqliteSharedStorage::in_memory().unwrap();
+            let now = unix_now_seconds_i64();
+            {
+                let conn = storage.lock().unwrap();
+                for index in 0..1_000_i64 {
+                    conn.execute(
+                        "INSERT INTO public_key_package_eviction_watermarks (
+                            account_id_hex, key_package_id, event_id_hex, deleted_event_id,
+                            event_created_at, evicted_at, kind
+                         ) VALUES (?1, 'slot', ?2, NULL, ?3, ?4, 'replacement')",
+                        params![
+                            format!("{:064x}", index + 10),
+                            format!("{:064x}", index + 10),
+                            now - 10,
+                            now,
+                        ],
+                    )
+                    .unwrap();
+                }
+                conn.execute(
+                    "INSERT INTO public_key_package_eviction_watermarks (
+                        account_id_hex, key_package_id, event_id_hex, deleted_event_id,
+                        event_created_at, evicted_at, kind
+                     ) VALUES (?1, 'slot', ?2, NULL, ?3, ?4, 'deletion')",
+                    params!["01".repeat(32), "ff".repeat(32), now - 200, now - 150],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO public_key_package_eviction_watermarks (
+                        account_id_hex, key_package_id, event_id_hex, deleted_event_id,
+                        event_created_at, evicted_at, kind
+                     ) VALUES (?1, 'slot', ?2, NULL, ?3, ?4, 'replacement')",
+                    params!["02".repeat(32), "00".repeat(32), now - 200, now - 100],
+                )
+                .unwrap();
+            }
+            storage
+                .put_public_key_package_barrier(&key_package_barrier(&"aa".repeat(32), 0))
+                .unwrap();
+
+            let fallback = storage
+                .key_package_global_eviction()
+                .unwrap()
+                .expect("global fallback watermark must survive batch eviction");
+            assert_eq!(fallback.kind, PublicKeyPackageBarrierKind::Deletion);
+            assert_eq!(fallback.event_created_at, (now - 200) as u64);
+            assert_eq!(fallback.observed_at, (now - 100) as u64);
         }
     }
 
