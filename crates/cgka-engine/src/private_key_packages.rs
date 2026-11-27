@@ -21,7 +21,9 @@ use crate::engine::Engine;
 use crate::key_package::{
     KeyPackageMetadata, key_package_device_tag_claim, key_package_metadata, key_package_ref,
 };
-use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceTagClaim};
+use cgka_traits::app_components::{
+    DeviceRosterV1, DeviceSlotId, DeviceTagClaim, NOSTR_ROUTING_MAX_RELAYS,
+};
 use cgka_traits::engine::{ForwardedInvitation, KeyPackage};
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
@@ -285,9 +287,9 @@ impl SiblingWelcome {
     /// 1, 2 (with its fixed inherited generation) or 3 (with something
     /// forwarded, a presence byte of 0 or 1 before each optional field, and
     /// no confirmation beside a generation), a ref of 1 to 64 bytes,
-    /// one `mls_welcome` MLSMessage, relay URLs of
-    /// 1 to 512 bytes of UTF-8, and nothing left over. The Welcome itself is
-    /// not processed here.
+    /// one `mls_welcome` MLSMessage, at most [`NOSTR_ROUTING_MAX_RELAYS`] relay
+    /// URLs of 1 to 512 bytes of UTF-8, and nothing left over. The Welcome
+    /// itself is not processed here.
     pub fn decode(bytes: &[u8]) -> Result<Self, EngineError> {
         let invalid = || EngineError::Serialize("invalid sibling Welcome".into());
         let (&version, mut rest) = bytes.split_first().ok_or_else(invalid)?;
@@ -338,6 +340,9 @@ impl SiblingWelcome {
         let mut remaining = list.as_slice();
         let mut relays = Vec::new();
         while !remaining.is_empty() {
+            if relays.len() >= NOSTR_ROUTING_MAX_RELAYS {
+                return Err(invalid());
+            }
             let relay = VLBytes::tls_deserialize(&mut remaining).map_err(|_| invalid())?;
             if !(1..=MAX_SIBLING_WELCOME_RELAY_LEN).contains(&relay.as_slice().len()) {
                 return Err(invalid());

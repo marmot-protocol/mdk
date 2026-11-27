@@ -467,12 +467,39 @@ fn encode_optional_bytes(bytes: Option<&[u8]>, out: &mut Vec<u8>) {
 
 // ── Decoding ────────────────────────────────────────────────────────────────
 
+/// Maximum encoded byte length of one `(slot, DeviceEntryV1)` pair in
+/// `devices<V>` (QUIC varint length prefixes take 2 bytes for 64..=16383).
+const DEVICE_ROSTER_MAX_ENCODED_DEVICE_ENTRY_LEN: usize = 32 // slot
+    + (2 + DEVICE_ROSTER_TEXT_MAX_LEN) // label
+    + (1 + 16) // rename_id
+    + (2 + DEVICE_ROSTER_TEXT_MAX_LEN) // client
+    + (2 + DEVICE_ROSTER_TEXT_MAX_LEN) // platform
+    + 8 // linked_at
+    + (1 + 32) // linked_by
+    + 1 // settings
+    + 1 // status
+    + (1 + 2 + DEVICE_ROSTER_KEY_PACKAGE_REF_MAX_LEN) // announced_key_package
+    + (1 + 2 + DEVICE_ROSTER_TAG_SIGNATURE_KEY_MAX_LEN) // tag_signature_key
+    + (1 + 2 + DEVICE_ROSTER_RESERVED_KEY_MAX_LEN); // history_key
+
+/// Maximum encoded byte length of the `devices<V>` vector, derived from
+/// `device-roster-v1.md`'s [`MAX_LEAVES_PER_ACCOUNT`] (20) device ceiling.
+const DEVICE_ROSTER_DEVICES_VECTOR_MAX_LEN: usize =
+    MAX_LEAVES_PER_ACCOUNT * DEVICE_ROSTER_MAX_ENCODED_DEVICE_ENTRY_LEN;
+
 /// Decode canonical roster state bytes. Entries must be sorted and unique,
 /// and the state must satisfy [`DeviceRosterV1::validate`].
 pub fn decode_device_roster_v1(bytes: &[u8]) -> Result<DeviceRosterV1, String> {
     let mut cursor = bytes;
     let leaf_tag_key = decode_slot(&mut cursor, "leaf tag key")?;
-    let devices_bytes = decode_vector(&mut cursor, "devices")?;
+    let devices_bytes = decode_var_bytes(
+        &mut cursor,
+        DEVICE_ROSTER_DEVICES_VECTOR_MAX_LEN,
+        "device roster devices",
+    )?;
+    // `device-roster-v1.md` defines no count cap on `rejected_slots`;
+    // `decode_var_bytes` already verifies `cursor.len() >= len` before copying,
+    // so allocation stays bounded by the caller's slice.
     let rejected_slots_bytes = decode_vector(&mut cursor, "rejected slots")?;
     let account = decode_account(&mut cursor)?;
     if !cursor.is_empty() {
@@ -504,6 +531,8 @@ pub fn decode_device_roster_v1(bytes: &[u8]) -> Result<DeviceRosterV1, String> {
 /// entry.
 pub fn decode_device_roster_update_v1(bytes: &[u8]) -> Result<DeviceRosterUpdateV1, String> {
     let mut cursor = bytes;
+    // `device-roster-v1.md` defines no operation count cap beyond unique keys;
+    // `decode_var_bytes` bounds allocation by the caller's slice.
     let operations_bytes = decode_vector(&mut cursor, "operations")?;
     if !cursor.is_empty() {
         return Err("device roster update has trailing bytes".into());
@@ -1178,5 +1207,49 @@ mod tests {
             let update = DeviceRosterUpdateV1::new(vec![invalid.clone()]).unwrap();
             assert!(prior.apply(&update).is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn devices_vector_bound_matches_max_leaves_per_account() {
+        let maximal_entry = |n: u8| DeviceEntryV1 {
+            label: "a".repeat(DEVICE_ROSTER_TEXT_MAX_LEN),
+            rename_id: Some([n; 16]),
+            client: "b".repeat(DEVICE_ROSTER_TEXT_MAX_LEN),
+            platform: "c".repeat(DEVICE_ROSTER_TEXT_MAX_LEN),
+            linked_at: u64::MAX,
+            linked_by: Some(slot(0xff)),
+            settings: DeviceSettingsV1 {
+                add_to_all_chats: true,
+                bring_history: true,
+                keep_while_inactive: true,
+            },
+            status: DeviceStatusV1::Active,
+            announced_key_package: Some(vec![0xaa; DEVICE_ROSTER_KEY_PACKAGE_REF_MAX_LEN]),
+            tag_signature_key: Some(vec![n; DEVICE_ROSTER_TAG_SIGNATURE_KEY_MAX_LEN]),
+            history_key: Some(vec![0xbb; DEVICE_ROSTER_RESERVED_KEY_MAX_LEN]),
+        };
+        let maximal = DeviceRosterV1 {
+            leaf_tag_key: [0x33; 32],
+            devices: (0..MAX_LEAVES_PER_ACCOUNT as u8)
+                .map(|n| (slot(n), maximal_entry(n)))
+                .collect(),
+            ..DeviceRosterV1::default()
+        };
+        let encoded = encode_device_roster_v1(&maximal).unwrap();
+        assert_eq!(decode_device_roster_v1(&encoded).unwrap(), maximal);
+
+        // Extract the encoded `devices<V>` byte length and verify a length one
+        // byte larger is rejected immediately as exceeding the maximum length
+        // (before entry parsing).
+        let (devices_len, _) = super::super::codec::decode_quic_varint(&encoded[32..]).unwrap();
+        let over_limit = usize::try_from(devices_len).unwrap() + 1;
+        let mut oversized = vec![0x33; 32];
+        super::super::codec::encode_quic_varint(over_limit as u64, &mut oversized);
+        oversized.resize(oversized.len() + over_limit + 3, 0);
+        let error = decode_device_roster_v1(&oversized).unwrap_err();
+        assert!(
+            error.contains("device roster devices exceeds maximum length"),
+            "expected vector-bound rejection, got: {error}"
+        );
     }
 }

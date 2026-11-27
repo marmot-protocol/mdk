@@ -5656,3 +5656,198 @@ async fn an_owed_welcome_marked_expired_stays_expired_and_a_staged_one_is_not_ma
     }
     assert!(alice.outstanding_sent_welcomes().unwrap().is_empty());
 }
+
+/// Group creation must reject caller-supplied `GROUP_LIFECYCLE_COMPONENT_ID`
+/// in both required (`CreateGroupRequest.app_components`) and optional
+/// (`optional_app_components`) inputs so a newly created group cannot install
+/// `Disbanded` without a disband commit or tombstone (mdk#2456).
+#[tokio::test]
+async fn create_group_rejects_lifecycle_override_in_required_and_optional_inputs() {
+    use cgka_traits::app_components::encode_group_lifecycle_v1;
+    for state in [GroupLifecycleV1::Disbanded, GroupLifecycleV1::Active] {
+        let lifecycle_override = AppComponentData {
+            component_id: GROUP_LIFECYCLE_COMPONENT_ID,
+            data: encode_group_lifecycle_v1(state),
+        };
+
+        let mut alice = build_current_client(b"alice-create-lifecycle-req");
+        let req_err = alice
+            .create_group(CreateGroupRequest {
+                name: "override-required".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![lifecycle_override.clone()],
+                initial_admins: vec![],
+            })
+            .await
+            .expect_err("required initial app_components must reject lifecycle override");
+        assert!(
+            matches!(req_err, EngineError::Other(ref msg) if msg == "group creation request cannot override engine-owned app components"),
+            "{state:?}: unexpected required-vector error: {req_err:?}"
+        );
+        assert!(alice.live_group_ids().unwrap().is_empty());
+
+        let opt_err = alice
+            .create_group_with_optional_app_components(
+                CreateGroupRequest {
+                    name: "override-optional".into(),
+                    description: String::new(),
+                    members: vec![],
+                    required_features: vec![],
+                    app_components: vec![],
+                    initial_admins: vec![],
+                },
+                vec![lifecycle_override],
+            )
+            .await
+            .expect_err("optional initial app_components must reject lifecycle override");
+        assert!(
+            matches!(opt_err, EngineError::Other(ref msg) if msg == "group creation request cannot override engine-owned app components"),
+            "{state:?}: unexpected optional-vector error: {opt_err:?}"
+        );
+        assert!(alice.live_group_ids().unwrap().is_empty());
+    }
+}
+
+/// Joining a Welcome whose `0x800c` (`GROUP_LIFECYCLE`) is already `Disbanded`
+/// must be rejected with `EngineError::InvalidWelcome` in both Current and
+/// Legacy profiles, leaving no group state and preserving the invitee's
+/// KeyPackage, while an identical Welcome with `Active` joins cleanly (mdk#3795).
+#[tokio::test]
+async fn join_welcome_rejects_disbanded_lifecycle_in_current_and_legacy_profiles() {
+    use cgka_engine::provider::EngineOpenMlsProvider;
+    use cgka_traits::app_components::encode_group_lifecycle_v1;
+    use cgka_traits::storage::AccountDeviceSignerStorage as _;
+    use openmls::component::ComponentData;
+    use openmls::group::MlsGroup;
+    use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
+    use openmls_traits::OpenMlsProvider as _;
+    use tls_codec::Deserialize as _;
+
+    for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
+        for lifecycle in [GroupLifecycleV1::Disbanded, GroupLifecycleV1::Active] {
+            let alice_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+            let mut alice = build_profile_client_on_storage(
+                b"alice-disbanded-welcome",
+                alice_storage.clone(),
+                profile,
+            );
+            let bob_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+            let mut bob = build_profile_client_on_storage(
+                b"bob-disbanded-welcome",
+                bob_storage.clone(),
+                profile,
+            );
+            let bob_kp = bob.fresh_key_package().await.unwrap();
+            let (gid, created) = alice
+                .create_group(CreateGroupRequest {
+                    name: "welcome-lifecycle".into(),
+                    description: String::new(),
+                    members: vec![],
+                    required_features: vec![],
+                    app_components: vec![],
+                    initial_admins: vec![],
+                })
+                .await
+                .unwrap();
+            if let SendResult::GroupCreated { pending, .. } = created {
+                alice.confirm_published(pending).await.unwrap();
+            }
+
+            let crypto = openmls_rust_crypto::RustCrypto::default();
+            let provider = EngineOpenMlsProvider::<SqliteAccountStorage>::new(
+                &crypto,
+                alice_storage.mls_storage(),
+            );
+            let mls_gid = openmls::group::GroupId::from_slice(gid.as_slice());
+            let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+                .unwrap()
+                .unwrap();
+            let binding = alice_storage
+                .account_device_signer(&alice.self_id())
+                .unwrap()
+                .unwrap();
+            let signer = SignatureKeyPair::read(
+                alice_storage.mls_storage(),
+                &binding.mls_signature_public_key,
+                Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519.signature_algorithm(),
+            )
+            .unwrap();
+            let parsed_kp = {
+                let msg =
+                    openmls::prelude::MlsMessageIn::tls_deserialize_exact(bob_kp.bytes()).unwrap();
+                let openmls::prelude::MlsMessageBodyIn::KeyPackage(kp) = msg.extract() else {
+                    panic!("expected KeyPackage");
+                };
+                kp.validate(provider.crypto(), openmls::prelude::ProtocolVersion::Mls10)
+                    .unwrap()
+            };
+            let lifecycle_bytes = encode_group_lifecycle_v1(lifecycle);
+            let mut builder = mls_group
+                .commit_builder()
+                .propose_adds(vec![parsed_kp])
+                .add_proposals(vec![Proposal::AppDataUpdate(Box::new(
+                    AppDataUpdateProposal::update(
+                        GROUP_LIFECYCLE_COMPONENT_ID,
+                        lifecycle_bytes.clone(),
+                    ),
+                ))])
+                .load_psks(provider.storage())
+                .unwrap();
+            let mut app_data = builder.app_data_dictionary_updater();
+            app_data.set(ComponentData::from_parts(
+                GROUP_LIFECYCLE_COMPONENT_ID,
+                lifecycle_bytes.into(),
+            ));
+            builder.with_app_data_dictionary_updates(app_data.changes());
+            let bundle = builder
+                .build(provider.rand(), provider.crypto(), &signer, |_| true)
+                .unwrap()
+                .stage_commit(&provider)
+                .unwrap();
+            let welcome_bytes = bundle
+                .to_welcome_msg()
+                .unwrap()
+                .tls_serialize_detached()
+                .unwrap();
+            let wrapped = MockPeeler::default()
+                .wrap_welcome(
+                    &EncryptedPayload {
+                        ciphertext: welcome_bytes,
+                        aad: vec![],
+                    },
+                    &bob.self_id(),
+                )
+                .await
+                .unwrap();
+
+            let result = bob.join_welcome(wrapped).await;
+            if lifecycle == GroupLifecycleV1::Disbanded {
+                assert!(
+                    matches!(result, Err(EngineError::InvalidWelcome)),
+                    "{profile:?}: Disbanded Welcome must be rejected with InvalidWelcome, got {result:?}"
+                );
+                assert!(bob.live_group_ids().unwrap().is_empty());
+                assert!(
+                    matches!(
+                        bob_storage.get_group(&gid),
+                        Err(cgka_traits::storage::StorageError::NotFound)
+                    ),
+                    "{profile:?}: rejected Disbanded Welcome must persist no group"
+                );
+                assert_eq!(
+                    bob_storage.stored_key_package_bundles().unwrap().len(),
+                    1,
+                    "{profile:?}: rejected Disbanded Welcome must preserve invitee KeyPackage"
+                );
+            } else {
+                assert_eq!(
+                    result.expect("Active Welcome control must join"),
+                    gid,
+                    "{profile:?}: Active control failed"
+                );
+            }
+        }
+    }
+}

@@ -1185,6 +1185,19 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
+        // Caller UpdateAppComponents must not mutate the engine-owned lifecycle
+        // component (0x800c); refuse before queueing as well as on direct send.
+        if let SendIntent::UpdateAppComponents { updates, .. } = intent
+            && updates.iter().any(|update| {
+                update.component_id == cgka_traits::app_components::GROUP_LIFECYCLE_COMPONENT_ID
+            })
+        {
+            return Err(EngineError::Other(
+                "group lifecycle component cannot be updated through UpdateAppComponents; \
+                 use EnableDisbanding or Disband"
+                    .into(),
+            ));
+        }
         // Disband has its own durable acceptance gates and intentionally
         // remains available while the ordinary send lifecycle is paused.
         if matches!(intent, SendIntent::Disband { .. }) {
