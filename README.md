@@ -275,6 +275,7 @@ just android-check                                                  # compile-ch
 just tamarin                                                        # formal models
 just flake-report                                                   # rank tests that failed an attempt in recent CI runs
 just flake-stress <package> '<filter>' [count]                      # rerun a filter with no retries to prove a flake fix
+just dependents-nextest [base]                                      # test changed crates and every crate depending on them
 just test-timing-ratchet                                            # fail when test files gain sleeps or sub-second timeouts
 just pr-trailers-check                                              # validate Local-Checks, Local-Review, and Release-Impact trailers
 just bisect-agent-contract                                          # run unit and synthetic-repo tests for the revert-only Bisect Agent

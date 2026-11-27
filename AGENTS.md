@@ -177,13 +177,16 @@ While iterating, run only the test you are working on. Before each push, run onc
 
 ```sh
 cargo fmt --all
-cargo clippy -p <crate> --all-targets --all-features --locked -- -D warnings   # each crate you changed
-cargo nextest run -p <crate> -E 'test(<area>)'                                 # tests covering the change
+cargo clippy -p <crate> --all-targets --locked -- -D warnings                  # each crate you changed, default features
+cargo clippy -p <crate> --all-targets --all-features --locked -- -D warnings   # each crate you changed, all features
+just dependents-nextest                                                        # changed crates and every crate depending on one
 ```
 
-- Take test scope and required features from the nearest `AGENTS.md` Verification section. Run the tests you added
-  or edited plus the test binary or module covering the code you changed; run a whole crate's suite only when the
-  change is crate-wide.
+- `just dependents-nextest` runs the full suites of every crate you changed and of every crate that depends on one,
+  with the Canary's test features, so a change to a lower crate cannot break `marmot-session` or `marmot-app` unseen.
+  Run it once per push, one at a time per machine. Also run any feature-gated suite the nearest `AGENTS.md`
+  Verification section names.
+- Stress every test you added or edited, alone and without retries: `just flake-stress <crate> 'test(=<name>)' 5`.
 - Run the `just` gates the nearest `AGENTS.md` names for the files you touched. Outside crates:
   `.github/workflows/` and CI scripts → `just ci-path-classifier-gate`; installers and install docs →
   `just agent-install-docs-gate` and `just install-example-sha256-gate`; new or renamed paths → `just naming-gate`.
@@ -194,8 +197,7 @@ Widen only for these changes:
 
 - A `pub` item other crates use (type, field, enum variant, trait, signature, feature): run CI's lint once,
   `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`. It compiles every dependent and the
-  feature-gated test targets (`test-crash-hooks`, `test-policy-overrides`) that default builds skip. Test only the
-  dependents whose behavior you changed.
+  feature-gated test targets (`test-crash-hooks`, `test-policy-overrides`) that default builds skip.
 - Shared build inputs (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `Justfile`, `vendor/`) or
   `.github/workflows/`: `just fast-ci` once.
 - Convergence, delivery, branch-selection, or multi-client behavior: `just simulator-smoke` (the Canary smoke

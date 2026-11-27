@@ -113,6 +113,10 @@ flake-report-contract:
 flake-stress package filter count="40" *args:
     cargo nextest run -p {{quote(package)}} -E {{quote(filter)}} --stress-count {{quote(count)}} --retries 0 --no-fail-fast --test-threads "${FLAKE_STRESS_THREADS:-num-cpus}" {{args}}
 
+# Test every crate changed since `base` and every crate depending on one, with the Canary's test features.
+dependents-nextest base="origin/master":
+    python3 scripts/dependents_nextest.py --base {{quote(base)}} --features {{test-features}}
+
 # Fail when a test file gains real-time waits (sleeps, or timeouts of a second
 # or less) over scripts/test_timing_baseline.json. After removing waits, run
 # it with `--update` to lock the lower counts in.
@@ -343,6 +347,7 @@ cargo-audit-policy-gate:
 ci-path-classifier-gate:
     python3 scripts/test_classify_ci_changes.py
     python3 scripts/test_ci_workflow_policy.py
+    python3 scripts/test_dependents_nextest.py
 
 openclaw-dev-smoke root="":
     #!/usr/bin/env bash
