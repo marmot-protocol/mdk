@@ -27,13 +27,24 @@ use transport_nostr_adapter::{
 };
 use transport_nostr_peeler::NostrTransportEvent;
 
+#[derive(Default)]
+struct PublishStopState {
+    /// Whether this process has resolved the account's on-disk unlinked flag
+    /// and any stored device-group removal cleanly.
+    checked: bool,
+    /// Whether an explicit stop (in-process unlink, on-disk `unlinked`, stored
+    /// device-group removal, or sign-out removal hold) is currently active.
+    explicit_stop: bool,
+}
+
 /// One account's publish stop while this app is open.
 #[derive(Clone, Default)]
 pub(crate) struct AccountPublishStop {
     stop: Arc<AtomicBool>,
-    /// Whether this process has looked for a removal the engine stored and
-    /// the app never noted. Held while looking, so one look runs at a time.
-    checked: Arc<Mutex<bool>>,
+    /// Held while looking for an on-disk unlink or stored removal and across
+    /// explicit stop/lift transitions, so one look runs at a time and cannot
+    /// race an explicit stop or lift.
+    state: Arc<Mutex<PublishStopState>>,
     #[cfg(test)]
     checks: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -42,24 +53,71 @@ impl crate::MarmotApp {
     /// The stop every publisher of this account checks: set once its device
     /// group unlinked this device (D67), or, until a client open tells it
     /// apart, once a removal the engine stored is found here.
+    ///
+    /// Always returns the account's shared `entry.stop` handle, even on
+    /// transient lookup errors (failing closed while uncertain without
+    /// permanently bricking handed-out handles once the error clears or a
+    /// failed-link undo lifts the stop). Once resolved cleanly for an open
+    /// account, subsequent calls reuse the cached handle without rescanning
+    /// `account.json` from disk (mdk#3801).
     pub(crate) fn account_publish_stop(&self, account_id_hex: &str) -> Arc<AtomicBool> {
-        // A label is not an account id, so find the record among them all.
+        let entry = self.account_publish_stop_entry(account_id_hex);
+        let mut state = entry
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.checked {
+            return entry.stop;
+        }
+        // A label is not an account id, so find the record among them all once
+        // until resolved cleanly.
         let Ok(accounts) = self.account_home().accounts() else {
-            return Arc::new(AtomicBool::new(true));
+            entry.stop.store(true, Ordering::Release);
+            return entry.stop;
         };
         let Some(account) = accounts
             .into_iter()
             .find(|account| account.account_id_hex == account_id_hex)
         else {
-            return self.account_publish_stop_entry(account_id_hex).stop;
+            entry.stop.store(state.explicit_stop, Ordering::Release);
+            return entry.stop;
         };
-        // An account unlinked before this app opened has no stop set here.
+        // An account unlinked before this app opened has no stop set here yet.
         if account.unlinked {
-            return Arc::new(AtomicBool::new(true));
+            state.explicit_stop = true;
+            state.checked = true;
+            entry.stop.store(true, Ordering::Release);
+            return entry.stop;
         }
-        let entry = self.account_publish_stop_entry(account_id_hex);
-        if !self.check_stored_device_group_removal(&account.label, &entry) {
-            return Arc::new(AtomicBool::new(true));
+        if !self.device_groups_enabled() {
+            state.checked = true;
+            entry.stop.store(state.explicit_stop, Ordering::Release);
+            return entry.stop;
+        }
+        #[cfg(test)]
+        entry.checks.fetch_add(1, Ordering::Relaxed);
+        match self.removed_device_group(&account.label) {
+            Ok(Some(_)) => {
+                state.explicit_stop = true;
+                state.checked = true;
+                entry.stop.store(true, Ordering::Release);
+            }
+            Ok(None) => {
+                state.checked = true;
+                entry.stop.store(state.explicit_stop, Ordering::Release);
+            }
+            Err(error) => {
+                // Fail closed on the shared stop and leave `checked = false`
+                // so a later lookup or `lift_failed_link_publish_stop` can
+                // recover every existing handle.
+                entry.stop.store(true, Ordering::Release);
+                tracing::warn!(
+                    target: "marmot_app::unlinked_publish_gate",
+                    method = "check_stored_device_group_removal",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not look for this device's removal; refusing to publish"
+                );
+            }
         }
         entry.stop
     }
@@ -79,45 +137,6 @@ impl crate::MarmotApp {
             .entry(account_id_hex.to_owned())
             .or_default()
             .clone()
-    }
-
-    /// Look, once per account per process, for this device's removal from
-    /// its device group that the engine stored and the app never noted, and
-    /// stop the account's publishing if there is one. Only a client can tell
-    /// an unlink from a failed link's undo (D40), so its open decides and
-    /// lifts the stop for a failed link. False when the look failed: the
-    /// caller refuses, and the next publisher looks again.
-    fn check_stored_device_group_removal(&self, label: &str, entry: &AccountPublishStop) -> bool {
-        if !self.device_groups_enabled() {
-            return true;
-        }
-        let mut checked = entry
-            .checked
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *checked {
-            return true;
-        }
-        #[cfg(test)]
-        entry.checks.fetch_add(1, Ordering::Relaxed);
-        match self.removed_device_group(label) {
-            Ok(removed) => {
-                if removed.is_some() {
-                    entry.stop.store(true, Ordering::Release);
-                }
-                *checked = true;
-                true
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "marmot_app::unlinked_publish_gate",
-                    method = "check_stored_device_group_removal",
-                    error_kind = error.privacy_safe_kind(),
-                    "could not look for this device's removal; refusing to publish"
-                );
-                false
-            }
-        }
     }
 
     /// This account's trusted device group, when its stored copy records
@@ -155,17 +174,27 @@ impl crate::MarmotApp {
     /// Refuse every publish of this account on this device from now on: its
     /// device group unlinked this device (mdk#2628 D67).
     pub(crate) fn stop_unlinked_account_publishing(&self, account_id_hex: &str) {
-        self.account_publish_stop_entry(account_id_hex)
-            .stop
-            .store(true, Ordering::Release);
+        let entry = self.account_publish_stop_entry(account_id_hex);
+        let mut state = entry
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.explicit_stop = true;
+        state.checked = true;
+        entry.stop.store(true, Ordering::Release);
     }
 
     /// Lift the stop a stored removal set: a client found that the removal
     /// undid a failed link (D40), which stops nothing.
     pub(crate) fn lift_failed_link_publish_stop(&self, account_id_hex: &str) {
-        self.account_publish_stop_entry(account_id_hex)
-            .stop
-            .store(false, Ordering::Release);
+        let entry = self.account_publish_stop_entry(account_id_hex);
+        let mut state = entry
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.explicit_stop = false;
+        state.checked = true;
+        entry.stop.store(false, Ordering::Release);
     }
 
     /// Forget a removed account's publish stop. Publishers already handed
@@ -484,5 +513,98 @@ mod tests {
         done.store(true, Ordering::Relaxed);
         toggler.join().unwrap();
         assert!(refused > 0, "some batches were decided while stopped");
+    }
+
+    /// A handle handed out during a transient storage/filesystem lookup failure
+    /// must share `entry.stop` so publishing recovers once the error clears or
+    /// `lift_failed_link_publish_stop` runs, and subsequent lookups reuse the
+    /// cached per-account entry without rescanning `account.json` from disk.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_gate_recovers_after_transient_error_and_caches_resolved_state() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = crate::MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            crate::MarmotAppConfig::white_noise()
+                .with_allow_loopback_relay_endpoints(true)
+                .with_device_groups(true),
+        )
+        .with_test_relay_client(relay.clone());
+        let alice = app.account_home().create_account("alice").unwrap();
+        let bob = app.account_home().create_account("bob").unwrap();
+        let sample_event = NostrTransportEvent::new_unsigned(
+            "00".repeat(32),
+            1,
+            Vec::new(),
+            String::new(),
+            &cgka_traits::SystemWallClock,
+        );
+        let endpoints = vec![TransportEndpoint("wss://relay.example".to_owned())];
+
+        // 1. Transient failure on alice: symlink loop makes DB existence check fail.
+        let alice_db = app.account_storage_path(&alice.label);
+        std::os::unix::fs::symlink(&alice_db, &alice_db).unwrap();
+        let alice_stop = app.account_publish_stop(&alice.account_id_hex);
+        let alice_gate = UnlinkedPublishGate::new(relay.clone(), alice_stop.clone());
+        let err = alice_gate
+            .publish_event(&endpoints, &sample_event, 1)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unlinked"),
+            "transient error must fail closed: {err}"
+        );
+
+        // Once the transient error clears, rechecking updates the shared stop so
+        // the ALREADY-HANDED-OUT gate recovers without being permanently bricked.
+        std::fs::remove_file(&alice_db).unwrap();
+        assert!(
+            !app.account_publishing_stopped(&alice.account_id_hex),
+            "recheck after transient error clears must succeed"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &alice_stop,
+                &app.account_publish_stop(&alice.account_id_hex)
+            ),
+            "transient failure must return the shared entry.stop"
+        );
+        alice_gate
+            .publish_event(&endpoints, &sample_event, 1)
+            .await
+            .expect("existing gate handle must recover once transient error clears");
+
+        // 2. Cached resolution avoids rescanning `account.json` from disk.
+        let account_json = app.account_dir(&alice.label).join("account.json");
+        let original_mode = std::fs::metadata(&account_json).unwrap().permissions();
+        std::fs::set_permissions(&account_json, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let cached_stopped = app.account_publishing_stopped(&alice.account_id_hex);
+        std::fs::set_permissions(&account_json, original_mode).unwrap();
+        assert!(
+            !cached_stopped,
+            "resolved publish stop must be served from cache without rereading account.json"
+        );
+
+        // 3. `lift_failed_link_publish_stop` also unblocks a handle handed out during a transient error.
+        let bob_db = app.account_storage_path(&bob.label);
+        std::os::unix::fs::symlink(&bob_db, &bob_db).unwrap();
+        let bob_stop = app.account_publish_stop(&bob.account_id_hex);
+        let bob_gate = UnlinkedPublishGate::new(relay.clone(), bob_stop);
+        assert!(
+            bob_gate
+                .publish_event(&endpoints, &sample_event, 1)
+                .await
+                .is_err()
+        );
+        app.lift_failed_link_publish_stop(&bob.account_id_hex);
+        bob_gate
+            .publish_event(&endpoints, &sample_event, 1)
+            .await
+            .expect("lift_failed_link_publish_stop must unblock an existing handle");
+        std::fs::remove_file(&bob_db).unwrap();
     }
 }

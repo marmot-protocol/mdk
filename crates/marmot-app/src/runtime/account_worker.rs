@@ -12,8 +12,8 @@ mod welcome_runs;
 
 use read_queue::run_as_account_worker;
 pub(crate) use read_queue::{
-    QueuedCommand, ReadClass, ReadReply, UnitKind, WorkerCommands, WorkerInbox, WorkerLane,
-    WorkerReply, WorkerUnit, WorkerUnitGauge, observe_on_account_worker,
+    HostCommandReceivers, QueuedCommand, ReadClass, ReadReply, UnitKind, WorkerCommands,
+    WorkerInbox, WorkerLane, WorkerReply, WorkerUnit, WorkerUnitGauge, observe_on_account_worker,
 };
 #[cfg(test)]
 pub(crate) use read_queue::{TestWorkerReceiver, test_worker_channel, test_worker_queue};
@@ -1165,7 +1165,7 @@ fn install_storage_telemetry(
 
 pub(crate) fn spawn_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
-    commands: mpsc::Receiver<QueuedCommand>,
+    commands: HostCommandReceivers,
     ready: oneshot::Sender<Result<(), AppError>>,
     startup_progress: AccountStartupProgress,
     shutdown: oneshot::Receiver<()>,
@@ -1194,14 +1194,14 @@ fn stop_recovery_runner<'a>(
 
 async fn run_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
-    host_commands: mpsc::Receiver<QueuedCommand>,
+    host_commands: HostCommandReceivers,
     ready: oneshot::Sender<Result<(), AppError>>,
     startup_progress: AccountStartupProgress,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     // The worker's own timers send on a channel of their own, so its
     // retries run even while it takes no host command (mdk#3466).
-    let (mut commands, command_tx) = WorkerInbox::new(host_commands);
+    let (mut commands, command_tx) = WorkerInbox::new_host(host_commands);
     let worker_started_at = Instant::now();
     let mut ready = Some(ready);
     let AccountWorkerRuntime {
@@ -1506,6 +1506,7 @@ async fn run_app_runtime_account_worker(
             Ok::<_, ClassifiedSyncFailure>(summary)
         });
         loop {
+            let admit_host = deferred.len() < DEFERRED_COMMAND_LIMIT;
             tokio::select! {
                 _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
                     startup_explicit_shutdown = runtime_shutdown_requested(&lifecycle_shutdown);
@@ -1516,7 +1517,7 @@ async fn run_app_runtime_account_worker(
                     break None;
                 }
                 result = &mut initial_sync => break Some(result),
-                command = commands.recv() => {
+                command = commands.recv_admitting(admit_host, admit_host) => {
                     match command {
                         None => break None,
                         Some(command) => handle_startup_sync_command(
@@ -1664,7 +1665,7 @@ async fn run_app_runtime_account_worker(
     // later commands can land while a deferred create/invite still owns
     // Welcome fanout.
     let (media_http_tx, mut media_http_rx) = mpsc::unbounded_channel();
-    let (media_http_worker_lifetime, _) = watch::channel(());
+    let worker_tasks = WorkerTaskScope::new();
     let media_http = MediaHttpContext {
         product: shared.observer.product().clone(),
         tx: media_http_tx,
@@ -1672,7 +1673,7 @@ async fn run_app_runtime_account_worker(
         prepared_group_image_uploads,
         history_blobs: HistoryBlobFlights::default(),
         backup_background_conditions: shared.backup_background_conditions.clone(),
-        worker_lifetime: media_http_worker_lifetime,
+        tasks: worker_tasks.clone(),
     };
     let mut backup_condition_updates = client
         .app
@@ -1826,7 +1827,7 @@ async fn run_app_runtime_account_worker(
     let mut presentation_due = true;
     let mut avatar_due = true;
     let mut attachment_due = true;
-    let mut attachment_admission = attachments::Admission::default();
+    let mut attachment_admission = attachments::Admission::with_tasks(worker_tasks);
     // Recovery and post-join work run on their own wakes and deadlines;
     // the tick only checks that none was missed (mdk#2923 step B).
     let mut schedule = schedule::Schedule::opened();
@@ -2105,8 +2106,9 @@ async fn run_app_runtime_account_worker(
         let ready_command = ready_command_index(&pending, &media_http, sign_in_reads.holds_place());
         // Commands parked behind a waiting host check are not waiting
         // commands: group commands and the worker's own work go ahead of them.
-        // At the parked bound the worker takes no more host commands until
-        // the host check is answered; its own sends still come in.
+        // At the parked bound the worker pauses only account-wide host
+        // admissions until the host check is answered; group-scoped commands
+        // and the worker's own sends still come in (mdk#3801).
         let parked = if sign_in_reads.holds_place() {
             pending
                 .iter()
@@ -2115,7 +2117,7 @@ async fn run_app_runtime_account_worker(
         } else {
             0
         };
-        let admit_host_commands = parked < sign_in_reads::PARKED_LIMIT;
+        let admit_account_commands = parked < sign_in_reads::PARKED_LIMIT;
         // Spaced, so a burst of deliveries reads it once, not once each.
         let due_read_ready =
             maintenance_due_read_at.is_none_or(|at| at.elapsed() >= MAINTENANCE_DUE_READ_SPACING);
@@ -2435,7 +2437,7 @@ async fn run_app_runtime_account_worker(
             command = async {
                 match ready_command.and_then(|index| pending.remove(index)) {
                     Some(command) => Some(command),
-                    None => commands.recv_admitting(admit_host_commands).await,
+                    None => commands.recv_admitting(true, admit_account_commands).await,
                 }
             }, if !yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = true;
@@ -2581,11 +2583,11 @@ async fn run_app_runtime_account_worker(
             _ = tokio::time::sleep_until(local_submission_retry_at),
                 if local_submission_service_owed && local_submission_due
                     && pending.len() == parked
-                    && commands.is_empty_admitting(admit_host_commands)
+                    && commands.is_empty_admitting(true, admit_account_commands)
                     && !lifecycle.is_stopping() => {
                 // Recheck after polling the deadline: a buffered command may
                 // have arrived while the normal command arm was fairness-gated.
-                if pending.len() > parked || !commands.is_empty_admitting(admit_host_commands) {
+                if pending.len() > parked || !commands.is_empty_admitting(true, admit_account_commands) {
                     continue 'worker;
                 }
                 let retry = publish_next_local_submission(
@@ -3065,8 +3067,21 @@ async fn run_app_runtime_account_worker(
                                     // reads that answer from A must not
                                     // either: A moves to the reopened client
                                     // only once it is drained.
-                                    if let Err(err) = drain_deferred_hydration(&mut reopened).await
-                                    {
+                                    let hydration_result = tokio::select! {
+                                        biased;
+                                        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                                            reopened.finish_audit_recording();
+                                            break 'worker;
+                                        }
+                                        stop = &mut shutdown => {
+                                            if stop.is_ok() {
+                                                reopened.finish_audit_recording();
+                                            }
+                                            break 'worker;
+                                        }
+                                        result = drain_deferred_hydration(&mut reopened) => result,
+                                    };
+                                    if let Err(err) = hydration_result {
                                         publish_app_runtime_account_error(
                                             Emit::Unpublished(Unpublished::ReopenNotDrained),
                                             &events,
@@ -3246,7 +3261,7 @@ async fn run_app_runtime_account_worker(
             _ = tokio::time::sleep_until(local_submission_retry_at),
                 if local_submission_due && (!local_submission_service_owed
                     || (pending.len() == parked
-                        && commands.is_empty_admitting(admit_host_commands))) => {
+                        && commands.is_empty_admitting(true, admit_account_commands))) => {
                 let retry = publish_next_local_submission(
                     &mut client, &app, &shared, &unit, &events,
                     &account_id_hex, &account_label,
@@ -3607,6 +3622,12 @@ async fn run_app_runtime_account_worker(
     welcome_route_lookups.end().await;
     // No inbox check outlives the worker either.
     relay_checks.end().await;
+    // Cancel and drain all worker-spawned media HTTP, storage completion,
+    // attachment housekeeping, and retry timer tasks before teardown evicts
+    // account caches or removes the account directory (mdk#3801).
+    scheduled_push_retry.end().await;
+    scheduled_runtime_group_subscription_refresh.end().await;
+    media_http.tasks.end().await;
     // Each exit that still held the client stopped the runner on it; any
     // other exit's drop aborts the task and refunds the attempts it left
     // open. What a quantum staged stays durable.
@@ -4337,13 +4358,14 @@ async fn handle_account_worker_catch_up(
                 .await
         });
         loop {
+            let admit_host = deferred.len() < DEFERRED_COMMAND_LIMIT;
             let command = if let Some(command) = pending.pop_front() {
                 Some(command)
             } else {
                 tokio::select! {
                     biased;
                     result = &mut sync => break result,
-                    command = commands.recv(), if commands_open => {
+                    command = commands.recv_admitting(admit_host, admit_host), if commands_open => {
                         if command.is_none() {
                             commands_open = false;
                         }
@@ -4692,6 +4714,7 @@ async fn run_startup_hydration_pipeline(
         if !batch_delay.is_zero() {
             let hold_until = TokioInstant::now() + batch_delay;
             loop {
+                let admit_host = deferred.len() < DEFERRED_COMMAND_LIMIT;
                 tokio::select! {
                     _ = tokio::time::sleep_until(hold_until) => break,
                     _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
@@ -4702,7 +4725,7 @@ async fn run_startup_hydration_pipeline(
                     stop = &mut *shutdown => {
                         return StartupHydrationOutcome::Shutdown { explicit: stop.is_ok() };
                     }
-                    command = commands.recv() => match command {
+                    command = commands.recv_admitting(admit_host, admit_host) => match command {
                         Some(command) => {
                             handle_startup_hydration_command(
                                 client,
@@ -4723,7 +4746,8 @@ async fn run_startup_hydration_pipeline(
         }
         let mut commands_served = 0usize;
         while commands_served < STARTUP_HYDRATION_COMMAND_BUDGET {
-            match commands.try_recv() {
+            let admit_host = deferred.len() < DEFERRED_COMMAND_LIMIT;
+            match commands.try_recv_admitting(admit_host, admit_host) {
                 Ok(command) => {
                     commands_served += 1;
                     handle_startup_hydration_command(
@@ -5143,6 +5167,57 @@ async fn handle_startup_hydration_command(
 /// background admission keeps free for foreground work.
 pub(crate) const MEDIA_HTTP_IN_FLIGHT_LIMIT: usize = super::ATTACHMENT_TRANSFER_LIMIT + 1;
 
+/// Maximum host commands buffered in memory while a long unit (startup
+/// hydration, startup sync, catch-up, or `defer_commands_until`) holds the
+/// worker. Once reached, host channel admissions pause so callers experience
+/// bounded backpressure while worker-owned retries continue (mdk#3801).
+const DEFERRED_COMMAND_LIMIT: usize = 256;
+
+/// Tracks detached async and blocking tasks owned by one account worker so
+/// teardown cancels and drains every task before worker exit and cache
+/// eviction (mdk#3801).
+#[derive(Clone, Default)]
+pub(super) struct WorkerTaskScope {
+    tasks: tokio_util::task::TaskTracker,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl WorkerTaskScope {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn token(&self) -> tokio_util::sync::CancellationToken {
+        self.cancel.clone()
+    }
+
+    pub(super) fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    pub(super) fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.tasks.spawn(future)
+    }
+
+    pub(super) fn spawn_blocking<F, R>(&self, func: F) -> JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.tasks.spawn_blocking(func)
+    }
+
+    pub(super) async fn end(&self) {
+        self.cancel.cancel();
+        self.tasks.close();
+        self.tasks.wait().await;
+    }
+}
+
 struct MediaHttpContext {
     product: marmot_observability::ProductRecorder,
     tx: mpsc::UnboundedSender<MediaHttpDone>,
@@ -5155,9 +5230,15 @@ struct MediaHttpContext {
     history_blobs: HistoryBlobFlights,
     /// Shared latest platform facts; the worker owns no independent copy.
     backup_background_conditions: watch::Sender<super::BackupBackgroundConditions>,
-    /// Never sends a value. Dropping the worker-owned sender closes every
-    /// receiver and cancels active HTTP futures on every worker exit path.
-    worker_lifetime: watch::Sender<()>,
+    /// Tracks every detached async/blocking task for this worker and cancels
+    /// them on drop (abort/panic) or graceful `end().await` (mdk#3801).
+    tasks: WorkerTaskScope,
+}
+
+impl Drop for MediaHttpContext {
+    fn drop(&mut self) {
+        self.tasks.cancel.cancel();
+    }
 }
 
 /// Whether a history upload and a history fetch (mdk#2628 4.2c) are running.
@@ -5321,10 +5402,13 @@ struct MediaHttpDone {
 
 /// Stores a fetched avatar image as a cache file and settles its attempt.
 /// A disk too full for it, or any failure, retries the fetch later; the
-/// previous image stays. Blocking: runs on the blocking pool.
+/// previous image stays. Blocking: runs on the blocking pool using handles
+/// already opened on the worker.
 fn store_acquired_avatar(
-    app: &crate::MarmotApp,
-    label: &str,
+    account: &storage_sqlite::SqliteAccountStorage,
+    media: &crate::AccountMediaStore,
+    fallback_policy: &storage_sqlite::AttachmentDownloadPolicy,
+    directory: &std::path::Path,
     job: &storage_sqlite::AvatarAcquisition,
     image: &storage_sqlite::AvatarImage,
 ) {
@@ -5334,19 +5418,14 @@ fn store_acquired_avatar(
         storage_sqlite::SelectedAvatar::RemoteImage { .. }
     )
     .then(|| now.saturating_add(24 * 60 * 60));
-    let Ok(account) = app.account_storage(label) else {
-        return;
-    };
     let storage = account.app_storage();
     let stored = (|| {
-        let media = app.account_media_store(label, &account)?;
         let reserve = storage
-            .attachment_download_policy(&super::attachment_controls::default_policy(&app.config))?
+            .attachment_download_policy(fallback_policy)?
             .disk_reserve;
-        let directory = app.account_dir(label);
-        let free = || crate::media::attachment_resume::available_space(&directory);
+        let free = || crate::media::attachment_resume::available_space(directory);
         crate::media::avatar_files::store_acquired(
-            &storage, &media, reserve, &free, job, image, refresh,
+            &storage, media, reserve, &free, job, image, refresh,
         )
     })();
     match stored {
@@ -5500,11 +5579,11 @@ fn spawn_media_http<T>(
         crate::ProductUnit::Attempt,
     );
     let tx = media_http.tx.clone();
-    let mut worker_lifetime = media_http.worker_lifetime.subscribe();
-    tokio::spawn(async move {
+    let cancel = media_http.tasks.token();
+    media_http.tasks.spawn(async move {
         let output = tokio::select! {
             biased;
-            _ = worker_lifetime.changed() => return,
+            _ = cancel.cancelled() => return,
             output = work => output,
         };
         let _ = tx.send(MediaHttpDone {
@@ -5657,11 +5736,11 @@ async fn complete_media_http(
                 let fallback = super::attachment_controls::default_policy(&client.app.config);
                 let directory = client.app.account_dir(&client.state.label);
                 let tx = media_http.tx.clone();
-                let lifetime = media_http.worker_lifetime.subscribe();
+                let cancel = media_http.tasks.token();
                 let lifecycle = shared.lifecycle();
                 // Keep both permits until storage completion, but return to the
                 // worker immediately. Shutdown is checked between stream chunks.
-                tokio::task::spawn_blocking(move || {
+                media_http.tasks.spawn_blocking(move || {
                     let result = handles.and_then(|(storage, media)| {
                         attachments::complete_acquired_stored(
                             &storage,
@@ -5670,7 +5749,7 @@ async fn complete_media_http(
                             &directory,
                             &job,
                             result,
-                            &|| lifecycle.is_stopping() || lifetime.has_changed().is_err(),
+                            &|| lifecycle.is_stopping() || cancel.is_cancelled(),
                         )
                     });
                     let _ = tx.send(MediaHttpDone {
@@ -5709,11 +5788,23 @@ async fn complete_media_http(
                 // The image becomes a cache file on the blocking pool (file
                 // I/O, hashing, AEAD); the permit is held until it is stored.
                 Ok(image) => {
-                    let app = client.app.clone();
-                    let label = client.state.label.clone();
+                    let label = &client.state.label;
+                    let handles = client.app.account_storage(label).and_then(|storage| {
+                        let media = client.app.account_media_store(label, &storage)?;
+                        Ok((storage, media))
+                    });
+                    let fallback = super::attachment_controls::default_policy(&client.app.config);
+                    let directory = client.app.account_dir(label);
                     let tx = media_http.tx.clone();
-                    tokio::task::spawn_blocking(move || {
-                        store_acquired_avatar(&app, &label, &job, &image);
+                    let cancel = media_http.tasks.token();
+                    media_http.tasks.spawn_blocking(move || {
+                        if !cancel.is_cancelled()
+                            && let Ok((account, media)) = handles
+                        {
+                            store_acquired_avatar(
+                                &account, &media, &fallback, &directory, &job, &image,
+                            );
+                        }
                         let _ = tx.send(MediaHttpDone {
                             permit,
                             completion: MediaHttpCompletion::AvatarStored,
@@ -5873,13 +5964,14 @@ where
     let mut commands_open = true;
     let mut work = std::pin::pin!(work);
     let output = loop {
+        let admit_host = deferred.len() + follow_up.len() < DEFERRED_COMMAND_LIMIT;
         let command = if let Some(command) = pending.pop_front() {
             Some(command)
         } else {
             tokio::select! {
                 biased;
                 result = &mut work => break result,
-                command = commands.recv(), if commands_open => {
+                command = commands.recv_admitting(admit_host, admit_host), if commands_open => {
                     if command.is_none() {
                         commands_open = false;
                     }
@@ -8685,6 +8777,13 @@ impl ScheduledPushRegistrationRetry {
             task.abort();
         }
     }
+
+    async fn end(&mut self) {
+        if let Some(task) = self.timer_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
 }
 
 impl Drop for ScheduledPushRegistrationRetry {
@@ -8772,6 +8871,13 @@ impl ScheduledRuntimeGroupSubscriptionRefresh {
     fn disarm(&mut self) {
         if let Some(task) = self.timer_task.take() {
             task.abort();
+        }
+    }
+
+    async fn end(&mut self) {
+        if let Some(task) = self.timer_task.take() {
+            task.abort();
+            let _ = task.await;
         }
     }
 }
@@ -10607,6 +10713,67 @@ mod tests {
         assert!(pending.is_empty());
     }
 
+    /// While a held unit defers host commands, the in-memory `deferred` /
+    /// `follow_up` buffer must stop growing past its bound and apply channel
+    /// backpressure instead of draining unbounded host commands (mdk#3801).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn defer_commands_until_bounds_deferred_queue_with_backpressure() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let client = publishing_client(&app).await;
+        let published = publish_before_unit(&client);
+        let (commands, receiver) = test_worker_queue(8);
+        let mut receiver = WorkerInbox::from(receiver);
+        let mut pending = VecDeque::new();
+        let (release, work) = oneshot::channel::<()>();
+        let serve = defer_commands_until(published, work, &mut receiver, &mut pending, None);
+        let probe = async {
+            // Attempt to enqueue well beyond the deferred bound + channel buffer.
+            let mut responses = Vec::new();
+            let mut backpressured = false;
+            for _ in 0..300 {
+                let (respond, response) = oneshot::channel();
+                let mut cmd = Some(AccountWorkerCommand::ConnectivityRestored { respond });
+                for _ in 0..16 {
+                    match commands.try_send(cmd.take().unwrap()) {
+                        Ok(()) => {
+                            responses.push(response);
+                            break;
+                        }
+                        Err(mpsc::error::TrySendError::Full(returned)) => {
+                            cmd = Some(returned);
+                            tokio::task::yield_now().await;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            panic!("channel closed unexpectedly");
+                        }
+                    }
+                }
+                if cmd.is_some() {
+                    backpressured = true;
+                    break;
+                }
+            }
+            release.send(()).unwrap();
+            (backpressured, responses.len())
+        };
+        let (result, (backpressured, sent)) = tokio::join!(serve, probe);
+        result.unwrap();
+        assert!(
+            backpressured,
+            "defer_commands_until drained all {sent} commands without backpressure"
+        );
+        assert!(
+            pending.len() <= 256,
+            "deferred queue grew to {}, exceeding bound",
+            pending.len()
+        );
+    }
+
     // Pauses the clock, which needs the current-thread runtime.
     #[tokio::test(flavor = "current_thread")]
     #[cfg(feature = "test-policy-overrides")]
@@ -11110,7 +11277,6 @@ mod tests {
         limit: usize,
     ) -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let (worker_lifetime, _) = watch::channel(());
         (
             MediaHttpContext {
                 product: Default::default(),
@@ -11122,7 +11288,7 @@ mod tests {
                     crate::runtime::BackupBackgroundConditions::default(),
                 )
                 .0,
-                worker_lifetime,
+                tasks: WorkerTaskScope::new(),
             },
             rx,
         )
@@ -11345,7 +11511,7 @@ mod tests {
         drop(client);
 
         // Fill the startup channel before spawning the real worker.
-        let (commands, receiver) = test_worker_queue(8);
+        let (commands, receiver) = WorkerCommands::host_channel(8, Arc::default());
         let mut transfers = Vec::new();
         for _ in 0..MEDIA_HTTP_IN_FLIGHT_LIMIT {
             let (started, start) = oneshot::channel();

@@ -2337,7 +2337,7 @@ pub(crate) fn observe_event(
             // frozen V1's message-fatal rule. V2 rejection is attachment-local,
             // and locator-kind policy gates fetchability at download time rather
             // than delivery.
-            let Some(mut message) = decode_received_event(
+            let mut message = decode_received_event(
                 payload,
                 &sender_hex,
                 sender_display_name,
@@ -2348,10 +2348,7 @@ pub(crate) fn observe_event(
                 source_received_at,
                 outer_transport_at,
                 allow_loopback_http,
-            ) else {
-                summary.events.push(host_group_event(event));
-                return None;
-            };
+            )?;
             message.authority = *authority;
             // A device-group kind is read only in the device group this
             // account trusts, whose events never reach a chat's projection.
@@ -2364,7 +2361,6 @@ pub(crate) fn observe_event(
                     kind = message.kind,
                     "ignoring a device-group kind outside the device group",
                 );
-                summary.events.push(host_group_event(event));
                 return None;
             }
             // Gossip remains available to native ingestion, but must never enter
@@ -3283,5 +3279,94 @@ mod group_roster_api_tests {
             assert_eq!(record.presentation_member_ids_hex, None, "{roster:?}");
             assert_eq!(record.direct_member_ids_hex, None, "{roster:?}");
         }
+    }
+
+    #[test]
+    fn observe_event_omits_rejected_and_device_group_messages_from_summary_events() {
+        let group_id = GroupId::new(vec![0x42; 16]);
+        let sender = MemberId::new(vec![0x11; 32]);
+        let sender_hex = hex::encode(sender.as_slice());
+        let mut state = AccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: Vec::new(),
+        };
+        let display_names = HashMap::new();
+
+        // 1. Payload that fails `decode_received_event` (invalid inner JSON).
+        let mut summary = SyncSummary::default();
+        let malformed = GroupEvent::MessageReceived {
+            group_id: group_id.clone(),
+            message_id: cgka_traits::MessageId::new(vec![0xaa; 32]),
+            sender: sender.clone(),
+            sender_leaf_index: Some(1),
+            epoch: cgka_traits::EpochId(1),
+            payload: b"{}".to_vec(),
+            retention: None,
+            authority: None,
+            encrypted_media_secret: None,
+        };
+        let source_a = "aa".repeat(32);
+        assert!(
+            observe_event(
+                &mut state,
+                &display_names,
+                &mut summary,
+                &malformed,
+                None,
+                &source_a,
+                100,
+                None,
+                false,
+            )
+            .is_none()
+        );
+        assert!(summary.messages.is_empty());
+        assert!(
+            summary.events.is_empty(),
+            "rejected messages must not be pushed to SyncSummary.events"
+        );
+
+        // 2. Validly signed/canonical device-group kind received outside a device group.
+        let inner = cgka_traits::app_event::MarmotAppEvent::new(
+            sender_hex,
+            100,
+            crate::client::device_group::KIND_DEVICE_HEARTBEAT,
+            Vec::new(),
+            "{}",
+        );
+        let device_kind_event = GroupEvent::MessageReceived {
+            group_id,
+            message_id: cgka_traits::MessageId::new(vec![0xbb; 32]),
+            sender,
+            sender_leaf_index: Some(1),
+            epoch: cgka_traits::EpochId(1),
+            payload: inner.encode().unwrap(),
+            retention: None,
+            authority: None,
+            encrypted_media_secret: None,
+        };
+        let mut summary = SyncSummary::default();
+        let source_b = "bb".repeat(32);
+        assert!(
+            observe_event(
+                &mut state,
+                &display_names,
+                &mut summary,
+                &device_kind_event,
+                None,
+                &source_b,
+                100,
+                None,
+                false,
+            )
+            .is_none()
+        );
+        assert!(summary.messages.is_empty());
+        assert!(
+            summary.events.is_empty(),
+            "device-group kinds in non-device chats must not reach SyncSummary.events"
+        );
     }
 }

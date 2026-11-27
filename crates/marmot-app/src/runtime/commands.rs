@@ -426,19 +426,36 @@ impl AccountManager {
         }
     }
 
-    fn spawn_create_catch_up(&self, command: WorkerCommands) {
+    pub(super) fn spawn_create_catch_up(&self, command: WorkerCommands) {
+        let mut tasks = self
+            .invite_catch_up_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tasks.handles.retain(|task| !task.is_finished());
+        if !tasks.accepting {
+            return;
+        }
         let manager = self.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
+            let mut stopping = manager.shared.lifecycle().subscribe_shutdown();
             // Test-only barrier (`test-policy-overrides`): lets integration
             // tests prove the caller returned while this catch-up was still
             // blocked, instead of depending on scheduler timing.
             if cfg!(feature = "test-policy-overrides")
                 && let Some(barrier) = manager.shared.create_group_catch_up_barrier()
             {
-                barrier.notified().await;
+                tokio::select! {
+                    biased;
+                    _ = super::wait_for_runtime_shutdown(&mut stopping) => return,
+                    _ = barrier.notified() => {}
+                }
             }
             let started_at = Instant::now();
-            let result = manager.catch_up_account_commands(vec![command]).await;
+            let result = tokio::select! {
+                biased;
+                _ = super::wait_for_runtime_shutdown(&mut stopping) => return,
+                result = manager.catch_up_account_commands(vec![command]) => result,
+            };
             manager
                 .shared
                 .observer
@@ -465,6 +482,7 @@ impl AccountManager {
                 );
             }
         });
+        tasks.handles.push(handle);
     }
 
     /// Force one complete relay-history query for a local account and project
@@ -771,19 +789,26 @@ impl AccountManager {
                 })
                 .await
                 .map_err(|_| AppError::TransportClosed)?;
-            long_account_worker_response(response).await
+            let created = long_account_worker_response(response).await?;
+            if created.operation.is_some() {
+                self.spawn_create_catch_up(command);
+            }
+            Ok::<_, AppError>(created)
         }
         .await;
-        let result = result.map(|created| crate::GroupMemberResult {
-            operation: created.operation.map(|created| created.group_id),
-            member_outcomes: created.member_outcomes,
-        });
         self.shared.observer.performance().record(
             AppPerformanceOperation::GroupCreateTotalCallerLatency,
             started_at.elapsed(),
             result.is_ok(),
         );
-        result
+        let created = result?;
+        if created.operation.is_some() {
+            self.schedule_audit_log_tracker_update("create_group");
+        }
+        Ok(crate::GroupMemberResult {
+            operation: created.operation.map(|created| created.group_id),
+            member_outcomes: created.member_outcomes,
+        })
     }
 
     pub async fn create_group_with_initial_image_detailed(

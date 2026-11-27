@@ -1662,4 +1662,33 @@ mod runtime {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(fixture.publisher.publishes().len(), 1);
     }
+
+    /// `deactivate_account` must acquire the generated-setup fence BEFORE the
+    /// moderation-report fence, matching `remove_account` so concurrent
+    /// teardowns cannot invert lock order (mdk#3801).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deactivate_account_fences_generated_setup_before_moderation_reports() {
+        let fixture = runtime_fixture(Mode::Refuse).await;
+        let slot = fixture.app.moderation_reports.slot(&fixture.label);
+        let work_guard = slot.work.lock().await;
+        let accounts = fixture.runtime.accounts();
+        let deactivate = accounts.deactivate_account(&fixture.account_id);
+        tokio::pin!(deactivate);
+        assert!(
+            futures::poll!(deactivate.as_mut()).is_pending(),
+            "deactivation must wait for in-flight moderation-report work"
+        );
+        assert!(
+            fixture
+                .runtime
+                .generated_setup_fenced_for_test(&fixture.account_id),
+            "generated-setup fence must be acquired before moderation-report fence"
+        );
+        drop(work_guard);
+        tokio::time::timeout(Duration::from_secs(5), deactivate)
+            .await
+            .expect("deactivation completes once moderation-report work finishes")
+            .unwrap();
+        fixture.runtime.shutdown_and_close().await.unwrap();
+    }
 }

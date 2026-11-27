@@ -20,9 +20,7 @@ use marmot_account::{
     Nip46Removal, NostrAccountImport,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{
-    Mutex, Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch,
-};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, broadcast, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
@@ -306,6 +304,91 @@ impl Drop for AccountTeardownGuard<'_> {
     fn drop(&mut self) {
         self.manager
             .set_account_tearing_down(&self.account_id, false);
+    }
+}
+
+/// Canonical per-account teardown fence acquisition helper shared by
+/// `remove_account`, `remove_account_fenced`, `reset_incomplete_account_setup`,
+/// and `deactivate_account_marking` (mdk#3801).
+///
+/// Every teardown acquires fences in the same order before taking
+/// `AccountManager::worker_transactions`:
+/// 1. Generated-setup fence (`fence_generated_teardown` for removals/resets, or
+///    the re-entrant `fence_generated_setup` for deactivations whose caller may
+///    already hold `onboarding_transaction`).
+/// 2. Moderation-report fence (`fence_moderation_reports`).
+/// 3. Generated-removal preparation fence (`fence_generated_removal`, for
+///    destructive removals/resets).
+struct AccountLifecycleFences<'a> {
+    _generated_teardown: Option<onboarding::GeneratedTeardownFence>,
+    _generated_setup: Option<onboarding::GeneratedSetupFence>,
+    _moderation_reports: Option<crate::moderation_reports::ModerationReportFence>,
+    _generated_removal: Option<tokio::sync::MutexGuard<'a, ()>>,
+}
+
+impl<'a> AccountLifecycleFences<'a> {
+    async fn acquire_for_deactivation(
+        manager: &'a AccountManager,
+        account_ref: &str,
+    ) -> Result<(Self, Result<(), AppError>), AppError> {
+        let generated_setup = manager.fence_generated_setup(account_ref).await?;
+        let (moderation_reports, report_purge) =
+            manager.fence_moderation_reports(account_ref).await;
+        Ok((
+            Self {
+                _generated_teardown: None,
+                _generated_setup: generated_setup,
+                _moderation_reports: moderation_reports,
+                _generated_removal: None,
+            },
+            report_purge,
+        ))
+    }
+
+    async fn acquire_for_removal(
+        manager: &'a AccountManager,
+        expected: &AccountSummary,
+    ) -> Result<Self, AppError> {
+        let generated_teardown = manager
+            .setup
+            .fence_generated_teardown(manager, &expected.account_id_hex)
+            .await;
+        // A label may have been reused while foreground setup finished.
+        // Check before purging reports and again after taking worker_transactions.
+        manager.resolve_original(expected)?;
+        let (moderation_reports, _) = manager.fence_moderation_reports(&expected.label).await;
+        let generated_removal = manager
+            .setup
+            .fence_generated_removal(&generated_teardown)
+            .await;
+        Ok(Self {
+            _generated_teardown: Some(generated_teardown),
+            _generated_setup: None,
+            _moderation_reports: moderation_reports,
+            _generated_removal: Some(generated_removal),
+        })
+    }
+
+    async fn acquire_for_removal_with_teardown(
+        manager: &'a AccountManager,
+        expected: &AccountSummary,
+        teardown: &onboarding::GeneratedTeardownFence,
+    ) -> Result<Self, AppError> {
+        // A label may have been reused while foreground setup finished.
+        // Check before purging reports and again after taking worker_transactions.
+        manager.resolve_original(expected)?;
+        // Stop and delete the account's moderation reports, and admit none
+        // until the removal below has committed (every removal entry point).
+        // Fenced before the global lock: the purge may open account storage.
+        // Removing the directory deletes the rows even if this purge fails.
+        let (moderation_reports, _) = manager.fence_moderation_reports(&expected.label).await;
+        let generated_removal = manager.setup.fence_generated_removal(teardown).await;
+        Ok(Self {
+            _generated_teardown: None,
+            _generated_setup: None,
+            _moderation_reports: moderation_reports,
+            _generated_removal: Some(generated_removal),
+        })
     }
 }
 
@@ -7030,6 +7113,11 @@ impl MarmotAppRuntime {
     pub fn storage_is_closed(&self) -> bool {
         self.accounts.app.storage_is_closed()
     }
+
+    #[cfg(test)]
+    pub(crate) fn generated_setup_fenced_for_test(&self, account_id: &str) -> bool {
+        self.setup.generated_setup_fenced_for_test(account_id)
+    }
 }
 
 /// Aggregate result of one [`MarmotAppRuntime::catch_up_accounts_reporting`]
@@ -7474,11 +7562,8 @@ impl AccountManager {
     pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {
         let account = self.app.account_home().account(account_ref)?;
         self.finish_nip46_account(&account).await;
-        let fence = self
-            .setup
-            .fence_generated_teardown(self, &account.account_id_hex)
-            .await;
-        self.remove_account_fenced(&account, &fence).await
+        let fences = AccountLifecycleFences::acquire_for_removal(self, &account).await?;
+        self.remove_account_with_fences(&account, fences).await
     }
 
     // Wipe already owns the account's foreground fence before its network
@@ -7488,15 +7573,17 @@ impl AccountManager {
         expected: &AccountSummary,
         fence: &onboarding::GeneratedTeardownFence,
     ) -> Result<(), AppError> {
-        // A label may have been reused while foreground setup finished.
-        // Check before purging reports and after taking the worker transaction.
-        self.resolve_original(expected)?;
-        // Stop and delete the account's moderation reports, and admit none
-        // until the removal below has committed (every removal entry point).
-        // Fenced before the global lock: the purge may open account storage.
-        // Removing the directory deletes the rows even if this purge fails.
-        let (_report_fence, _) = self.fence_moderation_reports(&expected.label).await;
-        let _preparation = self.setup.fence_generated_removal(fence).await;
+        let fences =
+            AccountLifecycleFences::acquire_for_removal_with_teardown(self, expected, fence)
+                .await?;
+        self.remove_account_with_fences(expected, fences).await
+    }
+
+    async fn remove_account_with_fences(
+        &self,
+        expected: &AccountSummary,
+        _fences: AccountLifecycleFences<'_>,
+    ) -> Result<(), AppError> {
         let lock_wait = self
             .shared
             .observer
@@ -7597,6 +7684,14 @@ impl AccountManager {
         nsec: &str,
         acknowledge_possible_key_package_orphan: bool,
     ) -> Result<(), AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        if !acknowledge_possible_key_package_orphan {
+            return Err(AppError::AccountSetupRecoveryRequired);
+        }
+        let account_id = AccountHome::account_id_for_secret(nsec)?;
+        let expected = self.app.account_home().account(&account_id)?;
+        self.finish_nip46_account(&expected).await;
+        let _fences = AccountLifecycleFences::acquire_for_removal(self, &expected).await?;
         let lock_wait = self
             .shared
             .observer
@@ -7605,11 +7700,7 @@ impl AccountManager {
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
-        if !acknowledge_possible_key_package_orphan {
-            return Err(AppError::AccountSetupRecoveryRequired);
-        }
-        let account_id = AccountHome::account_id_for_secret(nsec)?;
-        let account = self.app.account_home().account(&account_id)?;
+        let account = self.resolve_original(&expected)?;
         if !account.local_signing
             || self
                 .app
@@ -7647,6 +7738,10 @@ impl AccountManager {
 
         let _teardown = AccountTeardownGuard::new(self, account.account_id_hex.clone());
         async {
+            self.shared
+                .attachment_permissions
+                .forget_account(&account.account_id_hex);
+            self.shared.attachment_cancellations.send_modify(|_| {});
             if let Some(worker) = self.workers.lock().await.remove(&account.account_id_hex) {
                 self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
                 self.ensure_worker_reaped(&account.account_id_hex).await?;
@@ -7672,9 +7767,13 @@ impl AccountManager {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .cancel_account(&account.account_id_hex);
+                    self.app
+                        .forget_unlinked_publish_stop(&account.account_id_hex);
                 }
                 removed?;
             }
+            self.clear_startup_retry(&account.account_id_hex);
+            self.setup.account_removed(&account.account_id_hex);
             Ok(())
         }
         .await
@@ -7748,13 +7847,13 @@ impl AccountManager {
     ) -> Result<(), AppError> {
         let account = self.resolve(account_ref)?;
         self.finish_nip46_account(&account).await;
-        // Queued moderation reports never outlive a sign-out: stop and delete
-        // them, and admit none until the sign-out below has committed. Fenced
-        // before the global lock: the purge may open account storage. A failed
-        // purge does not stop the sign-out, but it is reported: reports left on
-        // disk would be retried at the next sign-in.
-        let (_report_fence, report_purge) = self.fence_moderation_reports(account_ref).await;
-        let _generated_setup_fence = self.fence_generated_setup(account_ref).await?;
+        // Acquire teardown fences in the same canonical order as removal
+        // (generated setup before moderation reports, both before
+        // `worker_transactions`). A failed report purge does not stop the
+        // sign-out, but it is reported: reports left on disk would be retried
+        // at the next sign-in.
+        let (_fences, report_purge) =
+            AccountLifecycleFences::acquire_for_deactivation(self, account_ref).await?;
         let lock_wait = self
             .shared
             .observer
@@ -7774,6 +7873,8 @@ impl AccountManager {
             }
             let home = self.app.account_home();
             if unlinked {
+                self.app
+                    .stop_unlinked_account_publishing(&account.account_id_hex);
                 home.mark_account_unlinked(&account.label)?;
             } else {
                 home.set_account_signed_out(&account.label, true)?;
@@ -8159,10 +8260,10 @@ impl AccountManager {
                         self.app.account_open_progress(&account.label),
                     );
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-                    let (command_tx, command_rx) = mpsc::channel(8);
                     let unit = Arc::new(WorkerUnitGauge::recording(
                         self.shared.observer.performance().clone(),
                     ));
+                    let (commands, command_rx) = WorkerCommands::host_channel(8, unit.clone());
                     let (read_state_tx, read_state) = read_state_channel();
                     let (relay_checks_tx, relay_checks) = watch::channel(Default::default());
                     let (unlinked_tx, unlinked_rx) = oneshot::channel();
@@ -8195,7 +8296,7 @@ impl AccountManager {
                         ManagedAccountWorker {
                             ready: false,
                             handle,
-                            commands: WorkerCommands::observed(command_tx, unit.clone()),
+                            commands,
                             media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
                             shutdown: shutdown_tx,
                             unit,

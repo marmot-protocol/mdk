@@ -1015,7 +1015,9 @@ impl MarmotAppRuntime {
         tokio::spawn(async move {
             loop {
                 let event = tokio::select! {
+                    biased;
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                    _ = updates_tx.closed() => return,
                     event = events.recv() => event,
                 };
                 let event = match event {
@@ -1170,7 +1172,9 @@ impl MarmotAppRuntime {
         tokio::spawn(async move {
             loop {
                 let event = tokio::select! {
+                    biased;
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                    _ = updates_tx.closed() => return,
                     event = events.recv() => event,
                     changed = block_changes.changed() => {
                         if changed.is_err() {
@@ -1261,7 +1265,9 @@ impl MarmotAppRuntime {
         tokio::spawn(async move {
             loop {
                 let event = tokio::select! {
+                    biased;
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                    _ = updates_tx.closed() => return,
                     event = async { tokio::select! {
                         event = events.recv() => event,
                         _ = block_changes.changed() => Err(broadcast::error::RecvError::Lagged(0)),
@@ -1424,6 +1430,7 @@ impl MarmotAppRuntime {
                     .await;
                 };
                 let event = tokio::select! {
+                    biased;
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
                     _ = updates_tx.closed() => return,
                     event = events.recv() => Some(event),
@@ -1679,7 +1686,9 @@ impl MarmotAppRuntime {
         tokio::spawn(async move {
             loop {
                 let event = tokio::select! {
+                    biased;
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                    _ = updates_tx.closed() => return,
                     event = events.recv() => match event {
                         Ok(event) => event,
                         Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1778,7 +1787,9 @@ impl MarmotAppRuntime {
             let recovery_watermark = notifications::unix_now_seconds();
             loop {
                 let event = tokio::select! {
+                    biased;
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                    _ = updates_tx.closed() => return,
                     event = events.recv() => event,
                 };
                 match event {

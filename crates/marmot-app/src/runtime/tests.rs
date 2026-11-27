@@ -4,6 +4,8 @@ use cgka_traits::transport_adapter::{
     TransportEndpointRejectionCategory, TransportPublishFailure,
 };
 
+use tokio::sync::mpsc;
+
 use super::account_worker::AccountStartupStage;
 use super::subscriptions::{chat_list_mute_expiries, message_kind_filter_allows};
 use super::*;
@@ -6290,5 +6292,217 @@ async fn abandoned_invite_decline_does_not_leave_the_group() {
         .expect("an abandoned decline must not consume the pending invite");
     assert!(!accepted.pending_confirmation);
     assert_eq!(accepted.self_membership, crate::SelfMembership::Member);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Dropping any of the six runtime subscription handles must terminate its
+/// background forwarding task promptly without waiting for another event or
+/// runtime shutdown (mdk#3801).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_each_subscription_terminates_its_background_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+    let group_id = runtime
+        .create_group("alice", "sub leak check", &[], None)
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    async fn wait_for_receiver_count(runtime: &MarmotAppRuntime, expected: usize, label: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.events.receiver_count() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{label} leaked its broadcast receiver: expected {expected}, still {}",
+                runtime.events.receiver_count()
+            )
+        });
+    }
+
+    let baseline = runtime.events.receiver_count();
+
+    let sub = runtime
+        .subscribe_messages("alice", AppMessageQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(runtime.events.receiver_count(), baseline + 1);
+    drop(sub);
+    wait_for_receiver_count(&runtime, baseline, "subscribe_messages").await;
+
+    let sub = runtime
+        .subscribe_timeline_messages("alice", TimelineMessageQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(runtime.events.receiver_count(), baseline + 1);
+    drop(sub);
+    wait_for_receiver_count(&runtime, baseline, "subscribe_timeline_messages").await;
+
+    let sub = runtime.subscribe_chats("alice", false).await.unwrap();
+    assert_eq!(runtime.events.receiver_count(), baseline + 1);
+    drop(sub);
+    wait_for_receiver_count(&runtime, baseline, "subscribe_chats").await;
+
+    let sub = runtime.subscribe_chat_list("alice", false).await.unwrap();
+    assert_eq!(runtime.events.receiver_count(), baseline + 1);
+    drop(sub);
+    wait_for_receiver_count(&runtime, baseline, "subscribe_chat_list").await;
+
+    let sub = runtime
+        .subscribe_group_state("alice", &group_id_hex)
+        .await
+        .unwrap();
+    assert_eq!(runtime.events.receiver_count(), baseline + 1);
+    drop(sub);
+    wait_for_receiver_count(&runtime, baseline, "subscribe_group_state").await;
+
+    let sub = runtime.subscribe_notifications().unwrap();
+    assert_eq!(runtime.events.receiver_count(), baseline + 1);
+    drop(sub);
+    wait_for_receiver_count(&runtime, baseline, "subscribe_notifications").await;
+
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// `spawn_create_catch_up` must be tracked alongside invite catch-ups so
+/// shutdown drains it and refuses new spawns once shutting down, and
+/// `create_group_with_prepared_initial_image` must schedule post-create
+/// catch-up just like `create_group` (mdk#3801).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_catch_up_is_tracked_and_wired_for_prepared_initial_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    crate::worker_fences::worker_startup_finished(&runtime, "alice")
+        .await
+        .unwrap();
+
+    // Stage and mark a prepared initial group image uploaded.
+    let mut png = Vec::new();
+    image::ImageEncoder::write_image(
+        image::codecs::png::PngEncoder::new(&mut png),
+        &[0, 0, 0, 255],
+        1,
+        1,
+        image::ExtendedColorType::Rgba8,
+    )
+    .unwrap();
+    let staged = runtime
+        .stage_prepared_group_image("alice", png, "image/png".into())
+        .await
+        .unwrap();
+    {
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .app_storage()
+            .mark_prepared_group_image_upload_uploaded(&staged.upload_id, crate::unix_now_seconds())
+            .unwrap();
+    }
+
+    let telemetry = runtime.shared_services().observer.performance().clone();
+    let before = telemetry
+        .snapshot()
+        .group_create_post_mutation_catch_up
+        .attempts;
+    let created = runtime
+        .create_group_with_prepared_initial_image(
+            "alice",
+            "prepared image group",
+            &[],
+            None,
+            staged.upload_id,
+        )
+        .await
+        .unwrap();
+    assert!(created.operation.is_some());
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while telemetry
+            .snapshot()
+            .group_create_post_mutation_catch_up
+            .attempts
+            <= before
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("create_group_with_prepared_initial_image must trigger post-create catch-up");
+
+    // Once shutdown stops accepting catch-up tasks, `spawn_create_catch_up` must not spawn one.
+    let manager = runtime.accounts.clone();
+    manager
+        .invite_catch_up_tasks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .accepting = false;
+    let (command, mut receiver) = crate::runtime::test_worker_channel(1);
+    manager.spawn_create_catch_up(command);
+    tokio::task::yield_now().await;
+    assert!(
+        receiver.try_recv().is_err(),
+        "spawn_create_catch_up must not spawn after shutdown stops accepting tasks"
+    );
+
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// `reset_incomplete_account_setup` must acquire the same canonical teardown
+/// fences (generated setup + onboarding transaction + moderation reports +
+/// generated removal) as `remove_account` before taking `worker_transactions`
+/// (mdk#3801).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_incomplete_account_setup_acquires_teardown_fences() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(directory.path());
+    let keys = nostr::prelude::Keys::generate();
+    let secret = keys.secret_key().to_secret_hex();
+    let account = home.import_nostr_account(&secret).unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+
+    crate::tests::account_database_from_an_older_build(&app, &account.label);
+    app.ensure_strict_cutover_replacement_intent_before_session_open(&account.label)
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let transaction = app.onboarding_transaction(&account.account_id_hex);
+    let gate = transaction.lock().await;
+    let reset = runtime.reset_incomplete_account_setup(&secret, true);
+    tokio::pin!(reset);
+    assert!(
+        futures::poll!(reset.as_mut()).is_pending(),
+        "reset_incomplete_account_setup must wait on the onboarding transaction fence"
+    );
+    assert!(
+        runtime
+            .setup
+            .generated_setup_fenced_for_test(&account.account_id_hex),
+        "reset_incomplete_account_setup must raise the generated-setup fence"
+    );
+    drop(gate);
+    tokio::time::timeout(Duration::from_secs(5), reset)
+        .await
+        .expect("reset completes once onboarding transaction releases")
+        .unwrap();
+    assert!(matches!(
+        home.account(&account.label),
+        Err(AccountHomeError::UnknownAccount(_))
+    ));
     runtime.shutdown_and_close().await.unwrap();
 }
