@@ -230,7 +230,10 @@ impl SqliteSharedStorage {
 
     pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs_private::create_dir_all_private(parent)
                 .map_err(|err| StorageError::Backend(err.to_string()))?;
         }
@@ -2816,6 +2819,68 @@ mod migration_contract_tests {
                 .to_string(),
             "backend failure: invalid shared store schema shape"
         );
+    }
+
+    #[test]
+    fn shared_storage_open_supports_bare_and_current_dir_paths_without_changing_cwd_mode() {
+        const CHILD_ENV: &str = "MDK_TEST_SHARED_STORAGE_CWD_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let bare = SqliteSharedStorage::open("bare.sqlite3")
+                .expect("bare filename in CWD should open");
+            bare.close().unwrap();
+            let dotted = SqliteSharedStorage::open(Path::new(".").join("dotted.sqlite3"))
+                .expect("./-prefixed filename in CWD should open");
+            dotted.close().unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .current_dir(dir.path())
+            .args([
+                "--exact",
+                "shared::migration_contract_tests::shared_storage_open_supports_bare_and_current_dir_paths_without_changing_cwd_mode",
+            ])
+            .env(CHILD_ENV, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "child CWD open test failed: {status}");
+        assert!(dir.path().join("bare.sqlite3").exists());
+        assert!(dir.path().join("dotted.sqlite3").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                dir.path().metadata().unwrap().permissions().mode() & 0o777,
+                0o755,
+                "opening a shared DB in CWD must preserve CWD permissions"
+            );
+            assert_eq!(
+                dir.path()
+                    .join("bare.sqlite3")
+                    .metadata()
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                dir.path()
+                    .join("dotted.sqlite3")
+                    .metadata()
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 }
 
