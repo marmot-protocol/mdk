@@ -41,7 +41,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -248,11 +248,17 @@ struct Registry {
     next_connection: AtomicU64,
     requests: Mutex<HashMap<String, Arc<Slot>>>,
     verified: Mutex<Verified>,
-    /// Tracked background `send_msg(req)` (when cut before queuing) and
-    /// `Registered::drop` `CLOSE` tasks joined by [`FiniteRequests::shutdown`].
-    cleanup_tasks: Mutex<Vec<JoinHandle<()>>>,
-    shutting_down: AtomicBool,
-    shutdown_notify: Notify,
+    /// Synchronizes `shutting_down` with tracked `send_msg(req)` and
+    /// `Registered::drop` `CLOSE` tasks so no cleanup task can be spawned
+    /// after [`FiniteRequests::begin_shutdown`] or missed by `join_shutdown`.
+    cleanup: Mutex<CleanupState>,
+    shutdown: CancellationToken,
+}
+
+#[derive(Default)]
+struct CleanupState {
+    shutting_down: bool,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 /// FIFO reservation budget bounding total queued bytes reserved across active
@@ -318,7 +324,7 @@ impl QueueBudget {
     async fn admit(
         self: &Arc<Self>,
         requested_bytes: usize,
-        deadline: &mut Pin<&mut tokio::time::Sleep>,
+        admit_deadline: Instant,
         cancel: &CancellationToken,
         registry: &Registry,
     ) -> Result<QueuePermit, FiniteEnd> {
@@ -352,13 +358,11 @@ impl QueueBudget {
             ticket,
             active: true,
         };
+        let mut admit_sleep = std::pin::pin!(tokio::time::sleep_until(admit_deadline));
         loop {
             let budget_notified = self.notify.notified();
             tokio::pin!(budget_notified);
             budget_notified.as_mut().enable();
-            let shutdown_notified = registry.shutdown_notify.notified();
-            tokio::pin!(shutdown_notified);
-            shutdown_notified.as_mut().enable();
             if cancel.is_cancelled() {
                 return Err(FiniteEnd::Cancelled);
             }
@@ -384,8 +388,10 @@ impl QueueBudget {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(FiniteEnd::Cancelled),
-                () = &mut *deadline => return Err(FiniteEnd::TimedOut),
-                () = shutdown_notified => return Err(FiniteEnd::Disconnected),
+                // Failing to obtain local queue-budget capacity before any REQ
+                // is sent is a local setup failure, never a relay timeout.
+                () = &mut admit_sleep => return Err(FiniteEnd::SetupFailed),
+                () = registry.shutdown.cancelled() => return Err(FiniteEnd::Disconnected),
                 () = budget_notified => {}
             }
         }
@@ -562,49 +568,55 @@ impl FiniteRequests {
                 next_connection: AtomicU64::new(0),
                 requests: Mutex::default(),
                 verified: Mutex::default(),
-                cleanup_tasks: Mutex::default(),
-                shutting_down: AtomicBool::new(false),
-                shutdown_notify: Notify::new(),
+                cleanup: Mutex::default(),
+                shutdown: CancellationToken::new(),
             }),
             None,
         )
     }
 
     /// Reject new finite requests, wake any request waiting on the global
-    /// queued-byte budget, and end active slots as [`FiniteEnd::Disconnected`].
+    /// queued-byte budget or NIP-42 authentication, and end active slots as
+    /// [`FiniteEnd::Disconnected`].
     pub(crate) fn begin_shutdown(&self) {
-        self.0.shutting_down.store(true, Ordering::SeqCst);
-        self.0.shutdown_notify.notify_waiters();
+        {
+            let mut cleanup = self.0.cleanup.lock().unwrap_or_else(|e| e.into_inner());
+            cleanup.shutting_down = true;
+        }
+        self.0.shutdown.cancel();
         for slot in self.0.slots() {
             slot.end_for_shutdown();
         }
     }
 
-    /// Join every tracked `send_msg(req)` and `CLOSE` cleanup task spawned by
-    /// interrupted or dropped requests, up to [`FINITE_SHUTDOWN_WAIT`].
+    /// Join every tracked `send_msg(req)` and `CLOSE` cleanup task spawned
+    /// before [`Self::begin_shutdown`], up to one shared
+    /// [`FINITE_SHUTDOWN_WAIT`] deadline and one shared abort wait.
     pub(crate) async fn join_shutdown(&self) {
         let deadline = Instant::now() + FINITE_SHUTDOWN_WAIT;
-        loop {
-            let tasks = {
-                let mut guard = self
-                    .0
-                    .cleanup_tasks
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                std::mem::take(&mut *guard)
-            };
-            if tasks.is_empty() {
-                break;
+        let tasks = {
+            let mut cleanup = self.0.cleanup.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut cleanup.tasks)
+        };
+        if tasks.is_empty() {
+            return;
+        }
+        let mut timed_out = Vec::new();
+        for mut handle in tasks {
+            if tokio::time::timeout_at(deadline, &mut handle)
+                .await
+                .is_err()
+            {
+                timed_out.push(handle);
             }
-            for mut handle in tasks {
-                if tokio::time::timeout_at(deadline, &mut handle)
-                    .await
-                    .is_err()
-                {
-                    handle.abort();
-                    let _ = tokio::time::timeout(FINITE_TASK_ABORT_WAIT, &mut handle).await;
-                }
+        }
+        if !timed_out.is_empty() {
+            for handle in &timed_out {
+                handle.abort();
             }
+            let _ =
+                tokio::time::timeout(FINITE_TASK_ABORT_WAIT, futures::future::join_all(timed_out))
+                    .await;
         }
     }
 
@@ -664,10 +676,7 @@ impl FiniteRequests {
         cancel: &CancellationToken,
         auth: &mut Option<AuthWatch>,
     ) -> FiniteReply {
-        let deadline = Instant::now() + limits.timeout;
-        let first = self
-            .request(relay, &filters, limits, deadline, cancel)
-            .await;
+        let (first, deadline) = self.request(relay, &filters, limits, None, cancel).await;
         let auth_required = match &first.end {
             FiniteEnd::Closed(reason) => is_auth_required(reason),
             FiniteEnd::Eose => first.auth,
@@ -676,11 +685,15 @@ impl FiniteRequests {
         let Some(mut watch) = auth.take_if(|_| auth_required && self.0.can_authenticate) else {
             return first;
         };
+        let Some(deadline) = deadline else {
+            return first;
+        };
         match authenticated(
             &mut watch.notifications,
             deadline,
             watch.challenge_wait,
             cancel,
+            &self.0.shutdown,
         )
         .await
         {
@@ -697,7 +710,9 @@ impl FiniteRequests {
             max_event_bytes: limits.max_event_bytes.saturating_sub(first.event_bytes),
             ..limits
         };
-        let retry = self.request(relay, &filters, left, deadline, cancel).await;
+        let (retry, _) = self
+            .request(relay, &filters, left, Some(deadline), cancel)
+            .await;
         first.then(retry)
     }
 
@@ -706,26 +721,34 @@ impl FiniteRequests {
         relay: &Relay,
         filters: &[Filter],
         limits: FiniteLimits,
-        deadline: Instant,
+        existing_deadline: Option<Instant>,
         cancel: &CancellationToken,
-    ) -> FiniteReply {
+    ) -> (FiniteReply, Option<Instant>) {
         if cancel.is_cancelled() {
-            return FiniteReply::ended(FiniteEnd::Cancelled);
+            return (FiniteReply::ended(FiniteEnd::Cancelled), existing_deadline);
         }
         if self.0.is_shutting_down() {
-            return FiniteReply::ended(FiniteEnd::Disconnected);
+            return (
+                FiniteReply::ended(FiniteEnd::Disconnected),
+                existing_deadline,
+            );
         }
-        let mut deadline = std::pin::pin!(tokio::time::sleep_until(deadline));
+        let admit_deadline = existing_deadline.unwrap_or_else(|| Instant::now() + limits.timeout);
         let queue_bytes = limits.max_event_bytes.saturating_add(MAX_FRAME_BYTES);
         let permit = match self
             .0
             .queue_budget
-            .admit(queue_bytes, &mut deadline, cancel, &self.0)
+            .admit(queue_bytes, admit_deadline, cancel, &self.0)
             .await
         {
             Ok(permit) => permit,
-            Err(end) => return FiniteReply::ended(end),
+            Err(end) => return (FiniteReply::ended(end), existing_deadline),
         };
+        // Start the relay timeout only once local queue admission succeeds so
+        // waiting behind other local requests never marks a healthy relay as
+        // timed out.
+        let relay_deadline = existing_deadline.unwrap_or_else(|| Instant::now() + limits.timeout);
+        let mut deadline = std::pin::pin!(tokio::time::sleep_until(relay_deadline));
         let id = format!(
             "{ID_PREFIX}{:x}",
             self.0.next_id.fetch_add(1, Ordering::Relaxed)
@@ -736,48 +759,39 @@ impl FiniteRequests {
         let registered = Registered::new(&self.0, id.clone(), slot.clone(), relay.clone(), permit);
         if self.0.is_shutting_down() {
             let _ = registered.retire().await;
-            return FiniteReply::ended(FiniteEnd::Disconnected);
+            return (
+                FiniteReply::ended(FiniteEnd::Disconnected),
+                Some(relay_deadline),
+            );
         }
         let subscription_id = SubscriptionId::new(&id);
         let req = ClientMessage::req(subscription_id.clone(), filters.to_vec());
         let mut collector = Collector::new(filters, limits, self, relay.url(), &subscription_id);
-        // Queued on its own task: the SDK queues a REQ under its relay's
-        // subscription lock, and a caller that stopped polling while waiting
-        // for that lock would hold up every live frame on the connection.
-        // A REQ queued after the request ended never goes out (`sending`), and
-        // `TrackedSend` ensures any in-flight send task is joined on shutdown
-        // even if this request is cancelled, timed out, or dropped.
+        // Queued on its own task and registered atomically with `cleanup` at
+        // spawn time: the SDK queues a REQ under its relay's subscription lock,
+        // so a caller that stops polling does not hold up live frames, and
+        // `shutdown()` cannot miss an in-flight send task on any scheduler.
         let (send_tx, send_rx) = oneshot::channel();
-        let mut tracked_send = TrackedSend {
-            registry: &self.0,
-            handle: Some(tokio::spawn({
-                let relay = relay.clone();
-                async move {
-                    let _ = send_tx.send(relay.send_msg(req).await.is_ok());
-                }
-            })),
-        };
-        let shutdown_notified = self.0.shutdown_notify.notified();
-        tokio::pin!(shutdown_notified);
-        shutdown_notified.as_mut().enable();
-        let queued = if self.0.is_shutting_down() {
+        let spawned = self.0.spawn_cleanup(&tokio::runtime::Handle::current(), {
+            let relay = relay.clone();
+            async move {
+                let _ = send_tx.send(relay.send_msg(req).await.is_ok());
+            }
+        });
+        let queued = if !spawned {
             Err(FiniteEnd::Disconnected)
         } else {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => Err(FiniteEnd::Cancelled),
                 () = &mut deadline => Err(FiniteEnd::TimedOut),
-                () = shutdown_notified => Err(FiniteEnd::Disconnected),
-                queued = send_rx => {
-                    tracked_send.handle = None;
-                    match queued {
-                        Ok(true) => Ok(()),
-                        _ => Err(FiniteEnd::SetupFailed),
-                    }
-                }
+                () = self.0.shutdown.cancelled() => Err(FiniteEnd::Disconnected),
+                queued = send_rx => match queued {
+                    Ok(true) => Ok(()),
+                    _ => Err(FiniteEnd::SetupFailed),
+                },
             }
         };
-        drop(tracked_send);
         // Whether the collector read the frame that ended the request. What
         // the relay sent past that frame is not read and not charged, as the
         // SDK's own requests discard it. A request something else ended (a
@@ -792,19 +806,12 @@ impl FiniteRequests {
                 match slot.take() {
                     Ok(mut frames) => {
                         while let Some(frame) = frames.pop_front() {
-                            let shutdown_notified = self.0.shutdown_notify.notified();
-                            tokio::pin!(shutdown_notified);
-                            shutdown_notified.as_mut().enable();
-                            let read = if self.0.is_shutting_down() {
-                                Err(FiniteEnd::Disconnected)
-                            } else {
-                                tokio::select! {
-                                    biased;
-                                    () = cancel.cancelled() => Err(FiniteEnd::Cancelled),
-                                    () = &mut deadline => Err(FiniteEnd::TimedOut),
-                                    () = shutdown_notified => Err(FiniteEnd::Disconnected),
-                                    end = collector.frame(&frame) => Ok(end),
-                                }
+                            let read = tokio::select! {
+                                biased;
+                                () = cancel.cancelled() => Err(FiniteEnd::Cancelled),
+                                () = &mut deadline => Err(FiniteEnd::TimedOut),
+                                () = self.0.shutdown.cancelled() => Err(FiniteEnd::Disconnected),
+                                end = collector.frame(&frame) => Ok(end),
                             };
                             match read {
                                 Ok(Some(end)) => break 'collect (end, true, frames),
@@ -818,17 +825,11 @@ impl FiniteRequests {
                     }
                     Err(Some(end)) => break (end, false, VecDeque::new()),
                     Err(None) => {
-                        let shutdown_notified = self.0.shutdown_notify.notified();
-                        tokio::pin!(shutdown_notified);
-                        shutdown_notified.as_mut().enable();
-                        if self.0.is_shutting_down() {
-                            break (FiniteEnd::Disconnected, false, VecDeque::new());
-                        }
                         tokio::select! {
                             biased;
                             () = cancel.cancelled() => break (FiniteEnd::Cancelled, false, VecDeque::new()),
                             () = &mut deadline => break (FiniteEnd::TimedOut, false, VecDeque::new()),
-                            () = shutdown_notified => break (FiniteEnd::Disconnected, false, VecDeque::new()),
+                            () = self.0.shutdown.cancelled() => break (FiniteEnd::Disconnected, false, VecDeque::new()),
                             () = slot.ready.notified() => {}
                         }
                     }
@@ -841,7 +842,7 @@ impl FiniteRequests {
             collector.charge_unread(unread.frames);
             collector.fetched_bytes += unread.dropped_event_bytes;
         }
-        collector.reply(end)
+        (collector.reply(end), Some(relay_deadline))
     }
 }
 
@@ -865,7 +866,14 @@ async fn authenticated(
     deadline: Instant,
     challenge_wait: Option<Duration>,
     cancel: &CancellationToken,
+    shutdown: &CancellationToken,
 ) -> Result<(), Option<FiniteEnd>> {
+    if cancel.is_cancelled() {
+        return Err(Some(FiniteEnd::Cancelled));
+    }
+    if shutdown.is_cancelled() {
+        return Err(Some(FiniteEnd::Disconnected));
+    }
     let mut challenge_seen = false;
     let challenge_deadline = challenge_wait.map(|wait| Instant::now() + wait);
     let mut deadline_sleep = std::pin::pin!(tokio::time::sleep_until(deadline));
@@ -878,6 +886,7 @@ async fn authenticated(
         tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(Some(FiniteEnd::Cancelled)),
+            () = shutdown.cancelled() => return Err(Some(FiniteEnd::Disconnected)),
             () = &mut deadline_sleep => return Err(Some(FiniteEnd::TimedOut)),
             () = &mut challenge_sleep, if wait_for_challenge => return Err(None),
             update = notifications.next() => match update {
@@ -922,23 +931,9 @@ impl fmt::Debug for AuthWatch {
     }
 }
 
-/// Registers a spawned `send_msg(req)` task with [`Registry::cleanup_tasks`]
-/// if the request stops polling before the send completes.
-struct TrackedSend<'a> {
-    registry: &'a Registry,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl Drop for TrackedSend<'_> {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            self.registry.track_cleanup_task(handle);
-        }
-    }
-}
-
 /// A registered request. Dropping it retires the request, as [`Self::retire`]
-/// does, and tracks the spawned CLOSE task for [`FiniteRequests::shutdown`].
+/// does, and tracks the spawned CLOSE task for [`FiniteRequests::shutdown`]
+/// unless shutdown has already begun.
 struct Registered {
     registry: Arc<Registry>,
     id: String,
@@ -983,7 +978,7 @@ impl Registered {
     /// REQ went out. Whatever it had not read yet is returned.
     async fn retire(mut self) -> Unread {
         let (sent, unread) = self.unregister();
-        if sent {
+        if sent && !self.registry.is_shutting_down() {
             let close = ClientMessage::close(SubscriptionId::new(&self.id));
             let _ = self.relay.send_msg(close).await;
         }
@@ -1000,7 +995,6 @@ impl Registered {
         let mut state = self.slot.lock();
         let sent = matches!(state.binding, Binding::Sent(_));
         state.binding = Binding::Retired;
-        state.queued_bytes = 0;
         let unread = Unread {
             frames: std::mem::take(&mut state.frames),
             dropped_event_bytes: state.dropped_event_bytes,
@@ -1018,10 +1012,9 @@ impl Drop for Registered {
         if sent && let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let close = ClientMessage::close(SubscriptionId::new(&self.id));
             let relay = self.relay.clone();
-            let handle = runtime.spawn(async move {
+            let _ = self.registry.spawn_cleanup(&runtime, async move {
                 let _ = relay.send_msg(close).await;
             });
-            self.registry.track_cleanup_task(handle);
         }
     }
 }
@@ -1252,13 +1245,21 @@ fn classify(text: &str) -> Inbound {
 
 impl Registry {
     fn is_shutting_down(&self) -> bool {
-        self.shutting_down.load(Ordering::SeqCst)
+        self.shutdown.is_cancelled()
     }
 
-    fn track_cleanup_task(&self, handle: JoinHandle<()>) {
-        let mut tasks = self.cleanup_tasks.lock().unwrap_or_else(|e| e.into_inner());
-        tasks.retain(|existing| !existing.is_finished());
-        tasks.push(handle);
+    fn spawn_cleanup(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        let mut cleanup = self.cleanup.lock().unwrap_or_else(|e| e.into_inner());
+        if cleanup.shutting_down {
+            return false;
+        }
+        cleanup.tasks.retain(|existing| !existing.is_finished());
+        cleanup.tasks.push(runtime.spawn(task));
+        true
     }
 
     /// A new request's slot for `relay`, within `limits`.
@@ -1460,6 +1461,7 @@ impl Drop for Diverted {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp};
@@ -2684,8 +2686,10 @@ mod tests {
             .expect("first request must enter admission");
 
         // Second request queues behind the first on the global budget and gets
-        // cancelled while waiting; third queues behind the second and must still
-        // proceed once the first finishes.
+        // cancelled while waiting; third queues with a short admission timeout
+        // and must end `SetupFailed` (a local setup failure, never blaming the
+        // healthy relay as `TimedOut`); fourth queues behind them and must
+        // still proceed with its full relay timeout once the first finishes.
         let cancel_second = CancellationToken::new();
         let second_task = tokio::spawn({
             let finite = finite.clone();
@@ -2695,6 +2699,26 @@ mod tests {
             async move {
                 finite
                     .fetch(&sdk_relay, vec![filter], req_limits, &cancel)
+                    .await
+            }
+        });
+        let timed_out_task = tokio::spawn({
+            let finite = finite.clone();
+            let sdk_relay = sdk_relay.clone();
+            let filter = filter.clone();
+            let cancel = cancel_all.clone();
+            async move {
+                finite
+                    .fetch(
+                        &sdk_relay,
+                        vec![filter],
+                        FiniteLimits {
+                            max_items: 10,
+                            max_event_bytes: 1_500,
+                            timeout: Duration::from_millis(80),
+                        },
+                        &cancel,
+                    )
                     .await
             }
         });
@@ -2710,12 +2734,12 @@ mod tests {
             }
         });
         tokio::time::timeout(Duration::from_secs(5), async {
-            while budget.state.lock().unwrap().waiters.len() < 2 {
+            while budget.state.lock().unwrap().waiters.len() < 3 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("both later requests must wait on the global queue budget");
+        .expect("later requests must wait on the global queue budget");
 
         cancel_second.cancel();
         let second_reply = tokio::time::timeout(Duration::from_secs(5), second_task)
@@ -2723,6 +2747,16 @@ mod tests {
             .expect("cancelled waiter must return promptly")
             .unwrap();
         assert_eq!(second_reply.end, FiniteEnd::Cancelled);
+
+        let timed_out_reply = tokio::time::timeout(Duration::from_secs(5), timed_out_task)
+            .await
+            .expect("timed-out budget waiter must return promptly")
+            .unwrap();
+        assert_eq!(
+            timed_out_reply.end,
+            FiniteEnd::SetupFailed,
+            "local queue-budget wait expiry must not classify a healthy relay as TimedOut"
+        );
         assert!(!third_task.is_finished());
 
         first_release.notify_one();
@@ -3038,7 +3072,7 @@ mod tests {
             }
         }
         assert!(
-            !finite.0.cleanup_tasks.lock().unwrap().is_empty(),
+            !finite.0.cleanup.lock().unwrap().tasks.is_empty(),
             "dropping a live fetch must track its background CLOSE task"
         );
 
@@ -3093,7 +3127,7 @@ mod tests {
         assert_eq!(active_reply.end, FiniteEnd::Disconnected);
         assert_eq!(waiting_reply.end, FiniteEnd::Disconnected);
         assert!(
-            finite.0.cleanup_tasks.lock().unwrap().is_empty(),
+            finite.0.cleanup.lock().unwrap().tasks.is_empty(),
             "joined shutdown must drain and join all tracked cleanup tasks"
         );
         assert_eq!(budget.state.lock().unwrap().reserved, 0);
@@ -3102,5 +3136,143 @@ mod tests {
             .fetch(&sdk_relay, vec![filter], limits(10, 1_500), &cancel)
             .await;
         assert_eq!(after_shutdown.end, FiniteEnd::Disconnected);
+    }
+
+    /// Even on a single-threaded runtime with no yield before shutdown, a
+    /// pending `send_msg(req)` task is already registered in `cleanup` at spawn
+    /// time so `FiniteRequests::shutdown()` joins it before returning (#2895/#2897).
+    #[tokio::test]
+    async fn shutdown_joins_pending_req_send_on_single_thread_runtime() {
+        let relay = LocalRelay::builder().build();
+        relay.run().await.unwrap();
+        let url = relay.url().await;
+        let (finite, client) = client_on(None, &url).await;
+        let sdk_relay = client.relay(&url).await.unwrap().unwrap();
+        let cancel = CancellationToken::new();
+
+        // Poll `fetch` once: it acquires its permit, spawns `send_msg(req)`
+        // atomically into `cleanup.tasks`, and yields on `send_rx` before the
+        // spawned task has run on this single-threaded runtime.
+        let mut pending_fetch = std::pin::pin!(finite.fetch(
+            &sdk_relay,
+            vec![Filter::new().kind(Kind::TextNote)],
+            limits(10, 1 << 20),
+            &cancel,
+        ));
+        assert!(futures::poll!(pending_fetch.as_mut()).is_pending());
+        assert_eq!(
+            finite.0.cleanup.lock().unwrap().tasks.len(),
+            1,
+            "send_msg(req) task must be tracked immediately at spawn time"
+        );
+        assert!(
+            !finite.0.cleanup.lock().unwrap().tasks[0].is_finished(),
+            "send_msg(req) has not yet executed on the single-threaded runtime"
+        );
+
+        // Calling shutdown immediately without yielding must still find and
+        // join the pending `send_msg(req)` task, and dropping `pending_fetch`
+        // afterwards must not spawn any post-shutdown cleanup task.
+        finite.shutdown().await;
+        assert!(finite.0.cleanup.lock().unwrap().tasks.is_empty());
+
+        let reply = pending_fetch.await;
+        assert_eq!(reply.end, FiniteEnd::Disconnected);
+        assert!(
+            finite.0.cleanup.lock().unwrap().tasks.is_empty(),
+            "no cleanup task may be spawned after shutdown"
+        );
+        client.shutdown().await;
+    }
+
+    /// Calling `FiniteRequests::shutdown()` while a request is waiting for
+    /// NIP-42 authentication ends the fetch immediately as `Disconnected`
+    /// instead of waiting until its original deadline (`TimedOut`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_ends_request_waiting_for_authentication() {
+        use tokio_tungstenite::tungstenite::Message as Ws;
+
+        let auth_sent = Arc::new(Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = RelayUrl::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn({
+            let auth_sent = auth_sent.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    let Ws::Text(text) = message else {
+                        continue;
+                    };
+                    let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if let (Some("REQ"), Some(id)) = (frame[0].as_str(), frame[1].as_str()) {
+                        let _ = socket
+                            .send(Ws::Text(
+                                serde_json::json!(["CLOSED", id, "auth-required: sign in"])
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await;
+                        let _ = socket
+                            .send(Ws::Text(
+                                serde_json::json!(["AUTH", "stalled-challenge"])
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await;
+                        auth_sent.notify_one();
+                    }
+                    // Intentionally never answer AUTH with OK so `authenticated()` waits.
+                }
+            }
+        });
+
+        let (finite, client) = client_on(Some(Keys::generate()), &url).await;
+        let relay = client.relay(&url).await.unwrap().unwrap();
+        let cancel = CancellationToken::new();
+        let fetch = tokio::spawn({
+            let finite = finite.clone();
+            let relay = relay.clone();
+            let cancel = cancel.clone();
+            async move {
+                finite
+                    .fetch(
+                        &relay,
+                        vec![Filter::new().kind(Kind::TextNote)],
+                        FiniteLimits {
+                            max_items: 10,
+                            max_event_bytes: 1 << 20,
+                            timeout: Duration::from_secs(30),
+                        },
+                        &cancel,
+                    )
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), auth_sent.notified())
+            .await
+            .expect("relay must send auth-required refusal and AUTH challenge");
+        // Wait for the first attempt's slot to unregister so `fetch` is now
+        // waiting inside `authenticated()`.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !finite.0.slots().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first attempt must retire into authentication wait");
+
+        let started = Instant::now();
+        finite.shutdown().await;
+        let reply = tokio::time::timeout(Duration::from_secs(5), fetch)
+            .await
+            .expect("shutdown must interrupt authentication wait promptly")
+            .unwrap();
+        assert_eq!(reply.end, FiniteEnd::Disconnected);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        client.shutdown().await;
+        server.abort();
     }
 }
