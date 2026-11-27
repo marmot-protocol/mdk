@@ -15,7 +15,6 @@ use crate::openmls_projection::{
     CandidateBranchPeel, CandidateBranchPeelContext, OpenMlsContentKind, project_mls_message,
     retained_anchor_epoch_from_snapshot_name,
 };
-use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use crate::snapshot_guard::{RewindSite, SnapshotRollbackGuard};
 use crate::welcome_content::WelcomeContentId;
@@ -748,6 +747,7 @@ impl<S: StorageProvider> Engine<S> {
         // can_ingest gate so a restart cannot accept group-state changes on an
         // unrepaired base. Runs before the OpenMLS provider borrow below.
         let _ = self.sync_unrecoverable_halt_from_storage(&group_id)?;
+        self.resume_unfinished_staging_cleanup(&group_id)?;
 
         // Load MlsGroup from storage.
         let mut mls_group = match self.take_mls_group(&group_id) {
@@ -2099,6 +2099,10 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(ScheduledAutoCommitReplay::NotApplicable);
         }
 
+        // Resume any failed OpenMLS staging cleanup from an earlier attempt
+        // before loading `mls_group` and checking `has_pending_proposals()`.
+        self.resume_unfinished_staging_cleanup(&schedule.group_id)?;
+
         let mut mls_group = {
             let mls_group = self.load_mls_group(&schedule.group_id)?;
             if EpochId(mls_group.epoch().as_u64()) != schedule.source_epoch {
@@ -2276,8 +2280,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
-        let mut pending_commit_guard =
-            PendingCommitCleanupGuard::arm(Arc::clone(&self.storage), group_id.clone());
+        let mut pending_commit_guard = self.arm_pending_commit_guard(group_id.clone());
         for queued in queued_proposals {
             let stored_proposal_ref = queued.proposal_reference_ref().clone();
             mls_group

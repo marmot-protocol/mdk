@@ -2,7 +2,6 @@
 //! `marmot.group.profile.v1`.
 
 use crate::engine::Engine;
-use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
     APP_OWNED_APP_COMPONENT_ID_START, AccountEntryV1, AppComponentData, AppComponentId,
@@ -21,7 +20,6 @@ use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{KeyPackage as MlsKeyPackage, LeafNodeIndex, MlsMessageOut};
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use tls_codec::{Serialize as _, Size as _, VLByteSlice};
 
 // Local authoring limits for opaque application state carried by later Welcomes.
@@ -491,8 +489,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
-        let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(Arc::clone(&self.storage), group_id.clone());
+        let pending_commit_guard = self.arm_pending_commit_guard(group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 

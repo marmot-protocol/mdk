@@ -1782,6 +1782,8 @@ impl<S: StorageProvider> Engine<S> {
             );
             return Ok(unrecoverable_result(epoch));
         }
+        self.resume_unfinished_staging_cleanup(group_id)
+            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
 
         // A deferred-peel generation buffers recovered evidence
         // durably but must not adjudicate a prefix. The sweep clears this

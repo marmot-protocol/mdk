@@ -7,7 +7,6 @@ use super::route_wrapped_group_message;
 use super::{AdminLeaveEntry, LeaveRedrive, LeaveStep, OutboundQueueReason, PendingProposals};
 use crate::engine::Engine;
 use crate::group_lifecycle::{self};
-use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
 use cgka_traits::engine::{EpochPin, SendIntent, SendResult};
@@ -23,7 +22,6 @@ use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{BasicCredential, MlsMessageOut};
 use openmls_traits::OpenMlsProvider as _;
 use std::collections::HashSet;
-use std::sync::Arc;
 use tls_codec::Serialize as _;
 
 /// A staged Commit's Welcome wrapped for one added KeyPackage, not yet
@@ -116,6 +114,7 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
+        self.resume_unfinished_staging_cleanup(&group_id)?;
         // Retain the intent behind every own group evolution through the
         // rewind horizon, so a supersession can re-issue it
         // (mdk#1734). The baseline is read before staging so it describes the
@@ -443,8 +442,7 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             Some(self.prepare_member_recovery(&group_id, &mls_group, &recovery_sources)?)
         };
-        let mut pending_commit_guard =
-            PendingCommitCleanupGuard::arm(Arc::clone(&self.storage), group_id.clone());
+        let mut pending_commit_guard = self.arm_pending_commit_guard(group_id.clone());
         if let Some(evolution) = &recovery_evolution {
             pending_commit_guard.set_recovery_evolution(evolution.id.clone());
             crate::test_crash_hooks::pause_if_requested("recovery_after_preparing");
@@ -902,8 +900,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
-        let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(Arc::clone(&self.storage), group_id.clone());
+        let pending_commit_guard = self.arm_pending_commit_guard(group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 

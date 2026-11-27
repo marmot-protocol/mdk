@@ -7,7 +7,6 @@
 //! updates to `do_confirm_published`.
 
 use crate::engine::Engine;
-use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::engine::SendResult;
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
@@ -18,7 +17,6 @@ use cgka_traits::types::{EpochId, GroupId};
 use openmls::extensions::{Extension, Extensions, RequiredCapabilitiesExtension};
 use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{ExtensionType, ProposalType};
-use std::sync::Arc;
 use tls_codec::Serialize as _;
 
 impl<S: StorageProvider> Engine<S> {
@@ -27,6 +25,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
     ) -> Result<SendResult, EngineError> {
         self.epoch_manager.ensure_pending_space()?;
+        self.resume_unfinished_staging_cleanup(group_id)?;
         // Must be Stable to upgrade.
         if let Some(state) = self.epoch_manager.state(group_id)
             && !matches!(state, EpochState::Stable { .. })
@@ -136,8 +135,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
-        let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(Arc::clone(&self.storage), group_id.clone());
+        let pending_commit_guard = self.arm_pending_commit_guard(group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 

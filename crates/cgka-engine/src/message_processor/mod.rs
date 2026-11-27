@@ -1010,6 +1010,7 @@ impl<S: StorageProvider> Engine<S> {
 
     pub(crate) async fn do_send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
         let group_id = self.validate_send_acceptance(&intent)?;
+        self.resume_unfinished_staging_cleanup(&group_id)?;
         // Disband is an intent-persistence operation, not a Commit-preparation
         // operation. It remains acceptable while another staged Commit owns
         // the group and while Unrecoverable is paused.
@@ -1377,6 +1378,7 @@ impl<S: StorageProvider> Engine<S> {
         if !self.prepare_convergence_input_advance(group_id)? {
             return Ok(Vec::new());
         }
+        self.resume_unfinished_staging_cleanup(group_id)?;
 
         // This entry point belongs to background recovery even when output is
         // queued. Borrowing a send's four-row preflight allowance here makes

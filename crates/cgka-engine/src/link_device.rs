@@ -45,7 +45,6 @@
 
 use crate::engine::Engine;
 use crate::message_processor::route_wrapped_group_message;
-use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceRosterOperationV1, RejectedSlotReasonV1,
@@ -61,7 +60,6 @@ use cgka_traits::transport::{EncryptedPayload, Timestamp};
 use cgka_traits::types::{EpochId, GroupId};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
-use std::sync::Arc;
 use tls_codec::Serialize as _;
 
 const INTENT: &str = "LinkDevice";
@@ -100,8 +98,7 @@ impl<S: StorageProvider> Engine<S> {
         validate_link_roster_update(&roster_update)?;
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
-        let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(Arc::clone(&self.storage), group_id.clone());
+        let pending_commit_guard = self.arm_pending_commit_guard(group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let roster_proposal = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
@@ -271,8 +268,7 @@ impl<S: StorageProvider> Engine<S> {
         validate_unlink_roster_update(&mls_group, &roster_update, removed_leaf.as_ref())?;
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
-        let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(Arc::clone(&self.storage), group_id.clone());
+        let pending_commit_guard = self.arm_pending_commit_guard(group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let roster_proposal = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(

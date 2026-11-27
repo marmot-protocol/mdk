@@ -12,14 +12,107 @@ use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::types::{GroupId, MessageId};
 use openmls::ciphersuite::hash_ref::ProposalRef;
 use openmls::group::{MlsGroup, RemoveProposalError};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 const TRACE_TARGET: &str = "cgka_engine::pending_commit_guard";
+
+/// In-session ownership of staging cleanups that [`PendingCommitCleanupGuard::drop`]
+/// could not complete because the cleanup transaction failed.
+///
+/// Mirrors [`crate::snapshot_guard::Rewinds`]: `Drop` cannot call `&mut Engine`,
+/// so a failed cleanup records its group and exact stored `ProposalRef`s here
+/// instead of silently dropping them. Normal engine retry and send paths resume
+/// the atomic cleanup transaction before reading or mutating the group.
+#[derive(Clone, Default)]
+pub(crate) struct UnfinishedStagingCleanups {
+    pending: Arc<Mutex<HashMap<GroupId, Vec<ProposalRef>>>>,
+}
+
+impl UnfinishedStagingCleanups {
+    pub(crate) fn record(&self, group_id: GroupId, proposal_refs: Vec<ProposalRef>) {
+        let mut map = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = map.entry(group_id).or_default();
+        for proposal_ref in proposal_refs {
+            if !entry.contains(&proposal_ref) {
+                entry.push(proposal_ref);
+            }
+        }
+    }
+
+    pub(crate) fn pending_refs(&self, group_id: &GroupId) -> Option<Vec<ProposalRef>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_id)
+            .cloned()
+    }
+
+    pub(crate) fn clear(&self, group_id: &GroupId) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(group_id);
+    }
+}
+
+/// Atomically clear any staged OpenMLS pending commit and remove the exact
+/// proposals stored by an aborted staging attempt inside one storage transaction.
+///
+/// Running both steps in one transaction ensures a mid-cleanup storage fault
+/// cannot tear `ProposalQueueRefs` from `QueuedProposal` or leave stored
+/// proposals orphaned after clearing the pending commit.
+pub(crate) fn cleanup_staged_commit_and_proposals<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    stored_proposal_refs: &[ProposalRef],
+) -> Result<(), StorageError> {
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    storage.with_transaction(|tx_storage| {
+        let mls_storage = tx_storage.mls_storage();
+        // Clears the commit an aborted send staged on a live group (see clippy.toml).
+        #[allow(clippy::disallowed_methods)]
+        let loaded = MlsGroup::load(mls_storage, &mls_gid)
+            .map_err(|e| StorageError::Backend(format!("load group for cleanup: {e:?}")))?;
+        let Some(mut mls_group) = loaded else {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "cleanup_staged_commit_and_proposals",
+                "pending commit cleanup found no group"
+            );
+            return Ok(());
+        };
+        if mls_group.pending_commit().is_some() {
+            mls_group
+                .clear_pending_commit(mls_storage)
+                .map_err(|e| StorageError::Backend(format!("clear_pending: {e:?}")))?;
+        }
+        // Restore the proposal store to its pre-attempt state when the aborted
+        // path stored proposals itself. A proposal that is already gone is
+        // benign (`clear_pending_commit` does not remove stored proposals, but
+        // a concurrent merge would have consumed it).
+        for proposal_ref in stored_proposal_refs {
+            match mls_group.remove_pending_proposal(mls_storage, proposal_ref) {
+                Ok(()) | Err(RemoveProposalError::ProposalNotFound) => {}
+                Err(e) => {
+                    return Err(StorageError::Backend(format!(
+                        "remove_pending_proposal: {e:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    })
+}
 
 /// Clears an OpenMLS pending commit on early return / cancellation unless the
 /// caller disarms it after creating the engine-level pending state.
 pub(crate) struct PendingCommitCleanupGuard<S: StorageProvider> {
     storage: Arc<S>,
+    unfinished_cleanups: UnfinishedStagingCleanups,
     group_id: GroupId,
     // Proposals this staging attempt stored via `store_pending_proposal`, to
     // remove from the OpenMLS proposal store on Drop. Empty for send paths,
@@ -30,9 +123,14 @@ pub(crate) struct PendingCommitCleanupGuard<S: StorageProvider> {
 }
 
 impl<S: StorageProvider> PendingCommitCleanupGuard<S> {
-    pub(crate) fn arm(storage: Arc<S>, group_id: GroupId) -> Self {
+    pub(crate) fn arm(
+        storage: Arc<S>,
+        unfinished_cleanups: UnfinishedStagingCleanups,
+        group_id: GroupId,
+    ) -> Self {
         Self {
             storage,
+            unfinished_cleanups,
             group_id,
             stored_proposal_refs: Vec::new(),
             recovery_evolution: None,
@@ -93,50 +191,25 @@ impl<S: StorageProvider> Drop for PendingCommitCleanupGuard<S> {
         // Clear the staged OpenMLS pending commit and any proposals stored by
         // this attempt inside one storage transaction so a fault cannot tear
         // `ProposalQueueRefs` from `QueuedProposal` or leave a stored proposal
-        // behind after clearing the pending commit. Best-effort: log on error
-        // and never panic in Drop.
-        let mls_gid = openmls::group::GroupId::from_slice(self.group_id.as_slice());
-        let cleanup_result: Result<(), StorageError> = self.storage.with_transaction(|storage| {
-            let mls_storage = storage.mls_storage();
-            // Clears the commit this guard's own send staged on a live group;
-            // the guard holds no engine to ask (see clippy.toml).
-            #[allow(clippy::disallowed_methods)]
-            let loaded = MlsGroup::load(mls_storage, &mls_gid)
-                .map_err(|e| StorageError::Backend(format!("load group for cleanup: {e:?}")))?;
-            let Some(mut mls_group) = loaded else {
-                tracing::warn!(
-                    target: TRACE_TARGET,
-                    method = "drop",
-                    "pending commit guard found no group for cleanup"
-                );
-                return Ok(());
-            };
-            if mls_group.pending_commit().is_some() {
-                mls_group
-                    .clear_pending_commit(mls_storage)
-                    .map_err(|e| StorageError::Backend(format!("clear_pending: {e:?}")))?;
-            }
-            // Restore the proposal store to its pre-attempt state when this
-            // path stored the proposal itself. A proposal that is already gone
-            // is benign (`clear_pending_commit` does not remove stored
-            // proposals, but a concurrent merge would have consumed it).
-            for proposal_ref in &self.stored_proposal_refs {
-                match mls_group.remove_pending_proposal(mls_storage, proposal_ref) {
-                    Ok(()) | Err(RemoveProposalError::ProposalNotFound) => {}
-                    Err(e) => {
-                        return Err(StorageError::Backend(format!(
-                            "remove_pending_proposal: {e:?}"
-                        )));
-                    }
-                }
-            }
-            Ok(())
-        });
-        if cleanup_result.is_err() {
+        // behind after clearing the pending commit. If the transaction fails,
+        // transfer ownership of the group and exact stored proposal refs back
+        // to the engine so the next retry or send resumes cleanup instead of
+        // stranding the group. Best-effort: log on error and never panic in Drop.
+        if cleanup_staged_commit_and_proposals(
+            self.storage.as_ref(),
+            &self.group_id,
+            &self.stored_proposal_refs,
+        )
+        .is_err()
+        {
+            self.unfinished_cleanups.record(
+                self.group_id.clone(),
+                std::mem::take(&mut self.stored_proposal_refs),
+            );
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "drop",
-                "pending commit guard could not clean up staged commit or stored proposals"
+                "pending commit guard could not clean up staged commit or stored proposals; deferred to engine retry"
             );
         }
     }
@@ -305,10 +378,14 @@ mod tests {
             .unwrap();
 
         let alice_storage_arc = Arc::new(alice_storage.clone());
+        let unfinished_cleanups = UnfinishedStagingCleanups::default();
         let group_id = GroupId::new(alice_group.group_id().as_slice().to_vec());
         {
-            let mut guard =
-                PendingCommitCleanupGuard::arm(Arc::clone(&alice_storage_arc), group_id.clone());
+            let mut guard = PendingCommitCleanupGuard::arm(
+                Arc::clone(&alice_storage_arc),
+                unfinished_cleanups.clone(),
+                group_id.clone(),
+            );
             guard.set_stored_proposal_ref(proposal_ref.clone());
         }
 
@@ -322,6 +399,11 @@ mod tests {
             queued_before,
             "failed proposal delete must leave QueuedProposal consistent with ProposalQueueRefs"
         );
+        assert_eq!(
+            unfinished_cleanups.pending_refs(&group_id),
+            Some(vec![proposal_ref.clone()]),
+            "failed guard drop must transfer ownership of unfinished cleanup and proposal refs"
+        );
         let reloaded_after_fault =
             MlsGroup::load(alice_storage.mls_storage(), alice_group.group_id())
                 .unwrap()
@@ -332,15 +414,18 @@ mod tests {
         );
         assert!(reloaded_after_fault.has_pending_proposals());
 
-        // Once the fault clears, a drop cleans up both pending commit and stored proposal.
+        // Once the fault clears, resuming cleanup from the recorded unfinished
+        // state clears both the pending commit and stored proposal atomically.
         observer
             .execute_batch("DROP TRIGGER fail_queued_proposal_delete")
             .unwrap();
-        {
-            let mut guard =
-                PendingCommitCleanupGuard::arm(Arc::clone(&alice_storage_arc), group_id);
-            guard.set_stored_proposal_ref(proposal_ref);
-        }
+        let recorded = unfinished_cleanups
+            .pending_refs(&group_id)
+            .expect("unfinished cleanup remains owned until resumed");
+        cleanup_staged_commit_and_proposals(alice_storage_arc.as_ref(), &group_id, &recorded)
+            .expect("resumed cleanup succeeds once fault clears");
+        unfinished_cleanups.clear(&group_id);
+        assert!(unfinished_cleanups.pending_refs(&group_id).is_none());
 
         let reloaded_after_heal =
             MlsGroup::load(alice_storage.mls_storage(), alice_group.group_id())

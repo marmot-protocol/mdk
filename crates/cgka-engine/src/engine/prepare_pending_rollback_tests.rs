@@ -28,8 +28,11 @@ use cgka_traits::storage::{
 use cgka_traits::transport::Timestamp;
 use cgka_traits::types::{EpochId, GroupId};
 use openmls::group::MlsGroup;
+use rusqlite::{Connection, types::Value};
 use std::sync::Arc;
-use storage_sqlite::SqliteAccountStorage;
+use storage_sqlite::{
+    SqlCipherHardening, SqlCipherKey, SqliteAccountStorage, open_hardened_sqlcipher,
+};
 
 const ACCOUNT_DEVICES_FEATURE: Feature = Feature("account-devices");
 
@@ -832,4 +835,343 @@ async fn legacy_create_group_prepare_pending_failure_leaves_no_orphans_and_retri
     };
     alice.confirm_published(pending).await.unwrap();
     assert_eq!(storage.get_group(&group_id).unwrap().name, "legacy group");
+}
+
+fn app_payload_for(engine: &impl CgkaEngine, body: &str) -> Vec<u8> {
+    cgka_traits::app_event::MarmotAppEvent::new(
+        hex::encode(engine.self_id().as_slice()),
+        1_700_000_000,
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        body.to_string(),
+    )
+    .encode()
+    .expect("test app event encodes")
+}
+
+fn openmls_rows_for_label(conn: &Connection, label: &[u8]) -> Vec<Vec<Value>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT storage_key, value FROM openmls_values WHERE label = ?1 ORDER BY storage_key",
+        )
+        .unwrap();
+    stmt.query_map([label], |row| Ok(vec![row.get(0)?, row.get(1)?]))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+struct FailedSelfRemoveCleanupFixture {
+    _dir: tempfile::TempDir,
+    db_path: std::path::PathBuf,
+    db_key: SqlCipherKey,
+    storage: SqliteAccountStorage,
+    observer: Connection,
+    clock: ManualConvergenceClock,
+    alice: Engine<SqliteAccountStorage>,
+    group_id: GroupId,
+    refs_after_fault: Vec<Vec<Value>>,
+    queued_after_fault: Vec<Vec<Value>>,
+}
+
+/// Drive a real `SelfRemove` auto-commit staging attempt into a `prepare_pending`
+/// failure while `PendingCommitCleanupGuard::drop`'s proposal delete is aborted
+/// by a SQLite trigger on `QueuedProposal`, leaving both the staged commit and
+/// stored proposal intact (no torn write) until recovery resumes.
+async fn trigger_failed_self_remove_guard_cleanup() -> FailedSelfRemoveCleanupFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("selfremove-guard-fault.sqlite");
+    let db_key = SqlCipherKey::raw([0x5a; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&db_path, &db_key).unwrap();
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut alice = build_client(
+        b"rollback-alice",
+        storage.clone(),
+        &clock,
+        selfremove_registry(),
+    );
+    let mut bob = build_client(
+        b"rollback-bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        &clock,
+        selfremove_registry(),
+    );
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "selfremove guard fault".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("expected FoundingGroupCreated");
+    };
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+
+    let SendResult::Proposal {
+        msg: leave_proposal,
+    } = bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected Leave Proposal");
+    };
+    let before_group = storage.get_group(&group_id).unwrap();
+    alice.ingest(leave_proposal).await.unwrap();
+    clock.advance_ms(60_000);
+
+    let observer = Connection::open(&db_path).unwrap();
+    open_hardened_sqlcipher(&observer, &db_key, SqlCipherHardening::live_cache()).unwrap();
+    observer
+        .execute_batch(
+            "CREATE TRIGGER fail_queued_proposal_delete \
+             BEFORE DELETE ON openmls_values \
+             WHEN OLD.label = CAST('QueuedProposal' AS BLOB) \
+             BEGIN SELECT RAISE(ABORT, 'injected-proposal-delete-fault'); END;",
+        )
+        .unwrap();
+
+    alice.epoch_manager.fail_next_prepare_pending_for_test();
+    let result = alice
+        .converge_and_drain_queued_outbound_intents(&group_id, clock.now().monotonic_ms)
+        .await;
+    assert_injected_prepare_pending_error(&result);
+
+    // Guard drop failed under the trigger: ProposalQueueRefs and QueuedProposal
+    // must remain consistent (no torn write), and clear_pending_commit rolled back.
+    let refs_after_fault = openmls_rows_for_label(&observer, b"ProposalQueueRefs");
+    let queued_after_fault = openmls_rows_for_label(&observer, b"QueuedProposal");
+    assert!(!refs_after_fault.is_empty());
+    assert!(!queued_after_fault.is_empty());
+    let mls_after_fault = stored_mls_group(&storage, &group_id);
+    assert!(mls_after_fault.pending_commit().is_some());
+    assert!(mls_after_fault.has_pending_proposals());
+    assert_eq!(storage.get_group(&group_id).unwrap(), before_group);
+    assert!(alice.drain_auto_publish().is_empty());
+    assert!(alice.epoch_state(&group_id).unwrap().is_stable());
+
+    FailedSelfRemoveCleanupFixture {
+        _dir: dir,
+        db_path,
+        db_key,
+        storage,
+        observer,
+        clock,
+        alice,
+        group_id,
+        refs_after_fault,
+        queued_after_fault,
+    }
+}
+
+#[tokio::test]
+async fn auto_commit_guard_drop_fault_resumes_on_engine_retry_and_allows_send() {
+    let mut fixture = trigger_failed_self_remove_guard_cleanup().await;
+
+    // While the storage fault persists, a retry must fail cleanly without tearing
+    // ProposalQueueRefs from QueuedProposal or dropping ownership of the cleanup.
+    let still_failing = fixture
+        .alice
+        .converge_and_drain_queued_outbound_intents(
+            &fixture.group_id,
+            fixture.clock.now().monotonic_ms,
+        )
+        .await;
+    assert!(still_failing.is_err());
+    assert_eq!(
+        openmls_rows_for_label(&fixture.observer, b"ProposalQueueRefs"),
+        fixture.refs_after_fault
+    );
+    assert_eq!(
+        openmls_rows_for_label(&fixture.observer, b"QueuedProposal"),
+        fixture.queued_after_fault
+    );
+
+    // Once the storage fault clears, normal engine retry resumes unfinished
+    // cleanup, stages the SelfRemove auto-commit, and outbound chat succeeds.
+    fixture
+        .observer
+        .execute_batch("DROP TRIGGER fail_queued_proposal_delete")
+        .unwrap();
+    fixture
+        .alice
+        .converge_and_drain_queued_outbound_intents(
+            &fixture.group_id,
+            fixture.clock.now().monotonic_ms,
+        )
+        .await
+        .expect("normal retry resumes unfinished cleanup and stages SelfRemove");
+    let mut auto_publishes = fixture.alice.drain_auto_publish();
+    assert_eq!(
+        auto_publishes.len(),
+        1,
+        "retry must stage SelfRemove rather than deferring on leftover proposals"
+    );
+    fixture
+        .alice
+        .confirm_published(auto_publishes.remove(0).pending)
+        .await
+        .unwrap();
+    let mls_after_confirm = stored_mls_group(&fixture.storage, &fixture.group_id);
+    assert!(mls_after_confirm.pending_commit().is_none());
+    assert!(!mls_after_confirm.has_pending_proposals());
+    assert_eq!(fixture.alice.members(&fixture.group_id).unwrap().len(), 1);
+
+    let sent = fixture
+        .alice
+        .send(SendIntent::AppMessage {
+            group_id: fixture.group_id.clone(),
+            payload: app_payload_for(&fixture.alice, "post-recovery chat"),
+            expected_epoch: None,
+            only_to_members: None,
+        })
+        .await
+        .expect("outbound chat send succeeds after retry recovery");
+    assert!(matches!(sent, SendResult::ApplicationMessage { .. }));
+}
+
+#[tokio::test]
+async fn auto_commit_guard_drop_fault_resumes_before_direct_outbound_chat_send() {
+    let mut fixture = trigger_failed_self_remove_guard_cleanup().await;
+
+    fixture
+        .observer
+        .execute_batch("DROP TRIGGER fail_queued_proposal_delete")
+        .unwrap();
+
+    // Even without an explicit convergence retry first, an outbound chat send
+    // must resume the unfinished cleanup rather than failing on OpenMLS's
+    // leftover pending commit / proposal queue. Because Bob's SelfRemove
+    // auto-commit is already due, `do_send` cleans up, stages the SelfRemove
+    // auto-commit, and queues the chat behind the departure instead of failing
+    // with `GroupStateError(PendingProposal)`.
+    let sent = fixture
+        .alice
+        .send(SendIntent::AppMessage {
+            group_id: fixture.group_id.clone(),
+            payload: app_payload_for(&fixture.alice, "direct chat after fault clears"),
+            expected_epoch: None,
+            only_to_members: None,
+        })
+        .await
+        .expect("direct outbound chat send resumes unfinished cleanup instead of failing");
+    assert!(
+        matches!(sent, SendResult::Queued { .. }),
+        "due SelfRemove should stage ahead of chat, got {sent:?}"
+    );
+    let mut auto_publishes = fixture.alice.drain_auto_publish();
+    assert_eq!(auto_publishes.len(), 1);
+    fixture
+        .alice
+        .confirm_published(auto_publishes.remove(0).pending)
+        .await
+        .unwrap();
+    assert_eq!(fixture.alice.members(&fixture.group_id).unwrap().len(), 1);
+
+    let drained = fixture
+        .alice
+        .converge_and_drain_queued_outbound_intents(
+            &fixture.group_id,
+            fixture.clock.now().monotonic_ms,
+        )
+        .await
+        .expect("queued chat drains after SelfRemove confirmation");
+    assert!(
+        matches!(drained.as_slice(), [SendResult::ApplicationMessage { .. }]),
+        "queued outbound chat should drain as ApplicationMessage, got {drained:?}"
+    );
+    let mls_after_drain = stored_mls_group(&fixture.storage, &fixture.group_id);
+    assert!(mls_after_drain.pending_commit().is_none());
+    assert!(!mls_after_drain.has_pending_proposals());
+}
+
+#[tokio::test]
+async fn auto_commit_guard_drop_fault_recovers_on_reopen_and_allows_send() {
+    let fixture = trigger_failed_self_remove_guard_cleanup().await;
+    let FailedSelfRemoveCleanupFixture {
+        _dir,
+        db_path,
+        db_key,
+        storage,
+        observer,
+        clock,
+        alice,
+        group_id,
+        refs_after_fault,
+        queued_after_fault,
+    } = fixture;
+
+    // Simulate process restart: drop the in-memory engine completely.
+    drop(alice);
+    drop(storage);
+
+    // While the storage fault persists across reopen, hydration must keep
+    // proposal writes atomic (rolling back cleanly) and quarantine the group.
+    let reopened_storage = SqliteAccountStorage::open_encrypted(&db_path, &db_key).unwrap();
+    let mut alice_reopened = build_client(
+        b"rollback-alice",
+        reopened_storage.clone(),
+        &clock,
+        selfremove_registry(),
+    );
+    alice_reopened.hydrate_all_stored_groups().unwrap();
+    assert_eq!(
+        alice_reopened.quarantined_reason(&group_id),
+        Some(cgka_traits::engine::GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)
+    );
+    assert_eq!(
+        openmls_rows_for_label(&observer, b"ProposalQueueRefs"),
+        refs_after_fault
+    );
+    assert_eq!(
+        openmls_rows_for_label(&observer, b"QueuedProposal"),
+        queued_after_fault
+    );
+
+    // Once the storage fault clears, retrying hydration recovers the unpublished
+    // SelfRemove commit and stored proposal atomically so outbound chat and
+    // auto-commit retry both succeed.
+    observer
+        .execute_batch("DROP TRIGGER fail_queued_proposal_delete")
+        .unwrap();
+    assert!(
+        alice_reopened
+            .retry_hydrate_quarantined_group(&group_id)
+            .unwrap()
+    );
+    let mls_after_reopen = stored_mls_group(&reopened_storage, &group_id);
+    assert!(mls_after_reopen.pending_commit().is_none());
+    assert!(!mls_after_reopen.has_pending_proposals());
+
+    let sent = alice_reopened
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice_reopened, "chat after reopen recovery"),
+            expected_epoch: None,
+            only_to_members: None,
+        })
+        .await
+        .expect("outbound chat send succeeds after reopen recovery");
+    assert!(matches!(sent, SendResult::ApplicationMessage { .. }));
+
+    clock.advance_ms(60_000);
+    alice_reopened
+        .converge_and_drain_queued_outbound_intents(&group_id, clock.now().monotonic_ms)
+        .await
+        .unwrap();
+    let mut auto_publishes = alice_reopened.drain_auto_publish();
+    assert_eq!(auto_publishes.len(), 1);
+    alice_reopened
+        .confirm_published(auto_publishes.remove(0).pending)
+        .await
+        .unwrap();
+    assert_eq!(alice_reopened.members(&group_id).unwrap().len(), 1);
 }

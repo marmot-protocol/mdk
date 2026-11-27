@@ -5,7 +5,6 @@
 //! bounded convergence gate have completed.
 
 use crate::engine::Engine;
-use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
     APP_COMPONENTS_COMPONENT_ID, AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID,
@@ -27,7 +26,6 @@ use openmls::prelude::BasicCredential;
 use openmls_traits::OpenMlsProvider as _;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::sync::Arc;
 use tls_codec::Serialize as _;
 
 impl<S: StorageProvider> Engine<S> {
@@ -254,6 +252,7 @@ impl<S: StorageProvider> Engine<S> {
         if !matches!(state, EpochState::Stable { .. }) {
             return Ok(None);
         }
+        self.resume_unfinished_staging_cleanup(group_id)?;
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let Some(mut mls_group) = self.load_mls_group_in(provider.storage(), group_id)? else {
@@ -307,7 +306,7 @@ impl<S: StorageProvider> Engine<S> {
         ];
 
         self.epoch_manager.ensure_pending_space()?;
-        let guard = PendingCommitCleanupGuard::arm(Arc::clone(&self.storage), group_id.clone());
+        let guard = self.arm_pending_commit_guard(group_id.clone());
         let context = crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let commit = self
             .stage_commit_with_app_data_updates(

@@ -13,7 +13,6 @@
 //! the same way (device-tag-v1.md, "Producing tags").
 
 use crate::engine::Engine;
-use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::engine::SendResult;
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
@@ -139,8 +138,7 @@ impl<S: StorageProvider> Engine<S> {
         let preparation_guard =
             PreparingEvolutionGuard::arm(Arc::clone(&self.storage), evolution_id.clone());
 
-        let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(Arc::clone(&self.storage), group_id.clone());
+        let pending_commit_guard = self.arm_pending_commit_guard(group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 

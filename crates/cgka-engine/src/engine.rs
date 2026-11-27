@@ -449,6 +449,12 @@ pub struct Engine<S: StorageProvider> {
     /// `RewindRestoreFailed` quarantine until the move.
     pub(crate) rewinds: crate::snapshot_guard::Rewinds,
 
+    /// Groups whose [`crate::pending_commit_guard::PendingCommitCleanupGuard`]
+    /// could not finish its atomic OpenMLS cleanup transaction on `Drop`
+    /// (mdk#3794). Normal engine retry, send, and convergence entry points
+    /// resume that cleanup before reading or mutating the group.
+    pub(crate) unfinished_staging_cleanups: crate::pending_commit_guard::UnfinishedStagingCleanups,
+
     /// Groups seeded by the session-open cheap pass whose full per-group
     /// hydration (MLS load, validation, pending-commit recovery) has not run
     /// yet (mdk#1161). The seed grants each group a provisional
@@ -879,6 +885,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
             current_audit_context: None,
             quarantined_groups: HashMap::new(),
             rewinds,
+            unfinished_staging_cleanups:
+                crate::pending_commit_guard::UnfinishedStagingCleanups::default(),
             unhydrated_groups: HashSet::new(),
             route_backfill_pending: HashSet::new(),
             transport_group_id_index: HashMap::new(),
@@ -2767,16 +2775,55 @@ impl<S: StorageProvider> Engine<S> {
         // state of a deferred SelfRemove auto-commit, whose Marmot record
         // is already projected forward past the leave. Rolling back a
         // commit that removes a member would re-add the departed member and
-        // fork convergence, so we only recover commits that add no
-        // member-removal (no `Remove`, no `SelfRemove`). Removal-bearing
-        // staged commits without a recovery Preparing descriptor are left
-        // exactly as they were before this compatibility path existed.
+        // fork convergence, so we preserve removal-bearing commits once their
+        // forward projection has been committed.
+        //
+        // By contrast, if a SelfRemove auto-commit aborted before committing
+        // `record_sent_openmls_message_with_group` and its cleanup guard
+        // failed on a transient storage fault (or the process crashed mid-
+        // staging), the group record stays at `source_epoch` with every
+        // departing member still present. Recover that unpublished SelfRemove
+        // commit together with its stored SelfRemove proposals inside one
+        // storage transaction so reopen heals cleanly instead of wedging
+        // outbound chat and retries.
         let staged_removes_member = mls_group.pending_commit().is_some_and(|staged| {
             staged.queued_proposals().any(|queued| {
                 matches!(
                     queued.proposal(),
                     openmls::prelude::Proposal::Remove(_) | openmls::prelude::Proposal::SelfRemove
                 )
+            })
+        });
+        let unpublished_staged_self_remove = mls_group.pending_commit().is_some_and(|staged| {
+            let mut saw_self_remove = false;
+            let all_self_remove = staged.queued_proposals().all(|queued| {
+                if matches!(queued.proposal(), openmls::prelude::Proposal::SelfRemove) {
+                    saw_self_remove = true;
+                    true
+                } else {
+                    false
+                }
+            });
+            if !saw_self_remove || !all_self_remove {
+                return false;
+            }
+            let source_epoch = EpochId(mls_group.epoch().as_u64());
+            if group.epoch != source_epoch {
+                return false;
+            }
+            staged.queued_proposals().all(|queued| {
+                let openmls::prelude::Sender::Member(index) = queued.sender() else {
+                    return false;
+                };
+                mls_group
+                    .members()
+                    .find(|member| member.index == *index)
+                    .is_some_and(|member| {
+                        group
+                            .members
+                            .iter()
+                            .any(|record_member| record_member.credential == member.signature_key)
+                    })
             })
         });
         let restored_durable_evolution =
@@ -2786,14 +2833,27 @@ impl<S: StorageProvider> Engine<S> {
                 false
             };
         if mls_group.pending_commit().is_some()
-            && !staged_removes_member
+            && (!staged_removes_member || unpublished_staged_self_remove)
             && !restored_pending
             && !restored_durable_evolution
         {
-            // Retire the staged Welcomes, clear the pending MLS commit and
-            // persist its corrected mirror in one durable unit (#421, #2422).
-            // Losing the pending marker before the mirror is durable would
-            // let a later hydration promote the canceled invitees as members.
+            let self_remove_proposal_refs: Vec<openmls::ciphersuite::hash_ref::ProposalRef> =
+                if unpublished_staged_self_remove {
+                    mls_group
+                        .pending_proposals()
+                        .filter(|proposal| {
+                            matches!(proposal.proposal(), openmls::prelude::Proposal::SelfRemove)
+                        })
+                        .map(|proposal| proposal.proposal_reference_ref().clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            // Retire the staged Welcomes, clear the pending MLS commit (and any
+            // unpublished SelfRemove proposals), and persist its corrected
+            // mirror in one durable unit (#421, #2422, #3794). Losing the
+            // pending marker before the mirror is durable would let a later
+            // hydration promote the canceled invitees as members.
             let recovered_epoch = self.storage
                 .with_transaction(|storage| {
                     let source_epoch = EpochId(mls_group.epoch().as_u64());
@@ -2808,11 +2868,21 @@ impl<S: StorageProvider> Engine<S> {
                         &self.crypto,
                         storage.mls_storage(),
                     );
+                    let tx_mls_storage = <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&tx_provider);
                     mls_group
-                        .clear_pending_commit(
-                            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&tx_provider),
-                        )
+                        .clear_pending_commit(tx_mls_storage)
                         .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))?;
+                    for proposal_ref in &self_remove_proposal_refs {
+                        match mls_group.remove_pending_proposal(tx_mls_storage, proposal_ref) {
+                            Ok(())
+                            | Err(openmls::group::RemoveProposalError::ProposalNotFound) => {}
+                            Err(e) => {
+                                return Err(EngineError::Backend(format!(
+                                    "remove_pending_proposal: {e:?}"
+                                )));
+                            }
+                        }
+                    }
                     crate::test_crash_hooks::pause_if_requested("orphan-pending-after-clear");
                     let recovered_epoch = EpochId(mls_group.epoch().as_u64());
                     group.epoch = recovered_epoch;
@@ -2835,6 +2905,46 @@ impl<S: StorageProvider> Engine<S> {
                     group_id: group_id.clone(),
                     recovered_epoch,
                 });
+        } else if mls_group.pending_commit().is_none()
+            && !restored_pending
+            && !restored_durable_evolution
+        {
+            // A SelfRemove staging failure before `stage_commit` (plus a failed
+            // guard drop or crash) can leave stored SelfRemove proposals in
+            // OpenMLS with no pending commit. Normal engine operation keeps
+            // inbound proposals in MessageStorage rather than OpenMLS's store
+            // (mdk#154), so remove stranded SelfRemove proposals atomically.
+            let stranded_self_remove_refs: Vec<openmls::ciphersuite::hash_ref::ProposalRef> =
+                mls_group
+                    .pending_proposals()
+                    .filter(|proposal| {
+                        matches!(proposal.proposal(), openmls::prelude::Proposal::SelfRemove)
+                    })
+                    .map(|proposal| proposal.proposal_reference_ref().clone())
+                    .collect();
+            if !stranded_self_remove_refs.is_empty() {
+                self.storage
+                    .with_transaction(|storage| {
+                        let tx_provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+                            &self.crypto,
+                            storage.mls_storage(),
+                        );
+                        let tx_mls_storage = <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&tx_provider);
+                        for proposal_ref in &stranded_self_remove_refs {
+                            match mls_group.remove_pending_proposal(tx_mls_storage, proposal_ref) {
+                                Ok(())
+                                | Err(openmls::group::RemoveProposalError::ProposalNotFound) => {}
+                                Err(e) => {
+                                    return Err(EngineError::Backend(format!(
+                                        "remove_pending_proposal: {e:?}"
+                                    )));
+                                }
+                            }
+                        }
+                        Ok::<_, EngineError>(())
+                    })
+                    .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            }
         }
 
         // The one full message scan for this hydration (mdk#1161): the
@@ -3027,6 +3137,7 @@ impl<S: StorageProvider> Engine<S> {
         {
             self.schedule_pending_convergence_group(group_id);
         }
+        self.unfinished_staging_cleanups.clear(group_id);
         Ok(group.epoch)
     }
 
@@ -4163,6 +4274,42 @@ impl<S: StorageProvider> Engine<S> {
         self.pending_origin_commits.remove(&pending)
     }
 
+    /// Arm a [`crate::pending_commit_guard::PendingCommitCleanupGuard`] bound to
+    /// this engine's storage and unfinished-cleanup tracker.
+    pub(crate) fn arm_pending_commit_guard(
+        &self,
+        group_id: GroupId,
+    ) -> crate::pending_commit_guard::PendingCommitCleanupGuard<S> {
+        crate::pending_commit_guard::PendingCommitCleanupGuard::arm(
+            Arc::clone(&self.storage),
+            self.unfinished_staging_cleanups.clone(),
+            group_id,
+        )
+    }
+
+    /// Resume any OpenMLS pending-commit / stored-proposal cleanup that an
+    /// earlier [`crate::pending_commit_guard::PendingCommitCleanupGuard::drop`]
+    /// could not finish due to a transient storage fault.
+    ///
+    /// Fast-paths when no cleanup is pending for `group_id`. If the retry
+    /// transaction fails again, ownership stays recorded for a later attempt.
+    pub(crate) fn resume_unfinished_staging_cleanup(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), EngineError> {
+        let Some(proposal_refs) = self.unfinished_staging_cleanups.pending_refs(group_id) else {
+            return Ok(());
+        };
+        crate::pending_commit_guard::cleanup_staged_commit_and_proposals(
+            self.storage.as_ref(),
+            group_id,
+            &proposal_refs,
+        )?;
+        self.unfinished_staging_cleanups.clear(group_id);
+        self.mls_group_cache.forget_group(group_id);
+        Ok(())
+    }
+
     /// Reset this group on this account-device, without network
     /// traffic. Storage commits the deletion before any in-memory state changes.
     pub fn forget_group_local(&mut self, group_id: &GroupId) -> Result<bool, EngineError> {
@@ -4186,6 +4333,7 @@ impl<S: StorageProvider> Engine<S> {
         self.unhydrated_groups.remove(group_id);
         self.quarantined_groups.remove(group_id);
         self.rewinds.forget(group_id);
+        self.unfinished_staging_cleanups.clear(group_id);
         self.leaving_groups.remove(group_id);
         self.leave_requests.remove(group_id);
         self.valid_proposal_groups.remove(group_id);
