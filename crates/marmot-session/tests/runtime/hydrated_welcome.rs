@@ -335,6 +335,47 @@ async fn lost_recovery_hides_welcome() {
 }
 
 #[tokio::test]
+async fn prepared_recovery_reopens() {
+    let (_dir, session, _, group, unbound, commit) =
+        hydrated_recovery_fixture(RecoveryFixtureMode::Prepared).await;
+    let adapter = RecordingAdapter::default();
+    let endpoint = TransportEndpoint("wss://resume-recovery.example".into());
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        StaticTransportRouting::new(vec![])
+            .with_group_route(
+                group.clone(),
+                group.as_slice().to_vec(),
+                vec![endpoint.clone()],
+            )
+            .with_inbox_route(MemberId::new(pad32(b"hydrated-bob")), vec![endpoint]),
+        RecordingKeyPackages::default(),
+    );
+    let premature = runtime
+        .prepare_welcome_retry_task_with_audit_context(vec![unbound], Default::default())
+        .unwrap();
+    assert!(
+        premature.message_ids().is_empty(),
+        "reopen must not release an unbound Welcome"
+    );
+    let recovered = runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        recovered
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. }))
+    );
+    assert!(
+        adapter
+            .commit_publishes()
+            .iter()
+            .any(|request| request.message.id == commit)
+    );
+    assert_eq!(staged_welcome_publishes(&adapter).len(), 1);
+}
+
+#[tokio::test]
 async fn recovery_welcome_reopens() {
     let (_dir, session, _a, _b, welcome, _) =
         hydrated_recovery_fixture(RecoveryFixtureMode::Confirmed).await;
@@ -388,7 +429,10 @@ impl InboxSealer for RecoveryControlSealer {
         self.0.unseal(message).await
     }
 
-    async fn seal_welcome(&self, welcome: &OutboundWelcome) -> Result<TransportMessage, PeelerError> {
+    async fn seal_welcome(
+        &self,
+        welcome: &OutboundWelcome,
+    ) -> Result<TransportMessage, PeelerError> {
         MockSealer.seal_welcome(welcome).await
     }
 

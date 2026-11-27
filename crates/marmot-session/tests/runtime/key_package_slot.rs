@@ -72,7 +72,10 @@ async fn the_slot_is_republished_weekly_with_a_thirty_day_lifetime() {
     assert_eq!(metadata.not_after - metadata.not_before, 2_595_600);
     let published = slot_lifecycle(&runtime);
     let published_at = published.authored_event_created_at.unwrap().0;
-    assert_eq!(published.refresh_at, Some(Timestamp(published_at + 7 * DAY)));
+    assert_eq!(
+        published.refresh_at,
+        Some(Timestamp(published_at + 7 * DAY))
+    );
     assert!(published.refresh_at < published.current_not_after);
 
     // Nothing is republished until the week is up.
@@ -331,10 +334,20 @@ async fn a_consumed_replacement_superseded_before_confirmation_keeps_its_day() {
     // It keeps the consumed rule: deleted a day after it was superseded.
     wall.set(superseded_at + cgka_traits::KEY_PACKAGE_REPLACEMENT_GRACE_SECS - 1);
     alice.run_due_maintenance().await.unwrap();
-    assert!(alice.durably_owned_key_packages().unwrap().contains(&consumed));
+    assert!(
+        alice
+            .durably_owned_key_packages()
+            .unwrap()
+            .contains(&consumed)
+    );
     wall.set(superseded_at + cgka_traits::KEY_PACKAGE_REPLACEMENT_GRACE_SECS);
     alice.run_due_maintenance().await.unwrap();
-    assert!(!alice.durably_owned_key_packages().unwrap().contains(&consumed));
+    assert!(
+        !alice
+            .durably_owned_key_packages()
+            .unwrap()
+            .contains(&consumed)
+    );
     assert!(slot_lifecycle(&alice).pending_replacement.is_some());
 }
 
@@ -538,7 +551,12 @@ async fn a_replacement_the_publisher_can_no_longer_send_is_resigned() {
             .held_publications()
             .any(|(id, _)| id == &stale_event.id)
     );
-    assert!(runtime.durably_owned_key_packages().unwrap().contains(&stale));
+    assert!(
+        runtime
+            .durably_owned_key_packages()
+            .unwrap()
+            .contains(&stale)
+    );
 }
 
 #[tokio::test]
@@ -558,10 +576,17 @@ async fn a_publisher_that_refuses_its_own_artifacts_gets_one_resigned_replacemen
 
     let error = runtime.publish_fresh_key_package().await.unwrap_err();
     assert!(matches!(&error, AccountError::KeyPackage(error) if error.artifact_unusable));
-    assert_eq!(publisher.attempts().len(), 2, "the original and one re-signed");
+    assert_eq!(
+        publisher.attempts().len(),
+        2,
+        "the original and one re-signed"
+    );
     let lifecycle = slot_lifecycle(&runtime);
     let pending = lifecycle.pending_replacement.as_ref().unwrap();
-    assert_eq!(pending.last_failure_code.as_deref(), Some("artifact_unusable"));
+    assert_eq!(
+        pending.last_failure_code.as_deref(),
+        Some("artifact_unusable")
+    );
     assert_eq!(runtime.durably_owned_key_packages().unwrap().len(), 2);
 
     // The re-signed bytes are not superseded again, so later attempts mint no
@@ -753,7 +778,12 @@ async fn a_superseded_replacement_recorded_by_an_earlier_build_waits_for_a_confi
     // Days pass without a confirmed replacement, and the key is kept.
     wall.set(wall.now().0 + 3 * DAY);
     runtime.run_due_maintenance().await.unwrap();
-    assert!(runtime.durably_owned_key_packages().unwrap().contains(&superseded));
+    assert!(
+        runtime
+            .durably_owned_key_packages()
+            .unwrap()
+            .contains(&superseded)
+    );
 
     // Its grace period starts at the confirmed replacement.
     publisher.refuse_all.store(false, Ordering::Relaxed);
@@ -763,10 +793,20 @@ async fn a_superseded_replacement_recorded_by_an_earlier_build_waits_for_a_confi
     assert!(slot_lifecycle(&runtime).pending_replacement.is_none());
     wall.set(confirmed_at + cgka_traits::KEY_PACKAGE_REPLACEMENT_GRACE_SECS - 1);
     runtime.run_due_maintenance().await.unwrap();
-    assert!(runtime.durably_owned_key_packages().unwrap().contains(&superseded));
+    assert!(
+        runtime
+            .durably_owned_key_packages()
+            .unwrap()
+            .contains(&superseded)
+    );
     wall.set(confirmed_at + cgka_traits::KEY_PACKAGE_REPLACEMENT_GRACE_SECS);
     runtime.run_due_maintenance().await.unwrap();
-    assert!(!runtime.durably_owned_key_packages().unwrap().contains(&superseded));
+    assert!(
+        !runtime
+            .durably_owned_key_packages()
+            .unwrap()
+            .contains(&superseded)
+    );
 }
 
 #[tokio::test]
@@ -1191,9 +1231,12 @@ async fn persisted_pending_and_fanout_retries_respect_removed_or_read_only_relay
     );
     let restored_lifecycle = slot_lifecycle(&restored_pending_target);
     assert_eq!(restored_lifecycle.authored_signed_event, Some(signed_event));
-    assert!(restored_lifecycle.publication_targets.iter().all(|target| {
-        target.state == TransportFanoutAttemptState::Accepted
-    }));
+    assert!(
+        restored_lifecycle
+            .publication_targets
+            .iter()
+            .all(|target| { target.state == TransportFanoutAttemptState::Accepted })
+    );
     drop(restored_pending_target);
 
     // Part 2: Current publication fanout with one accepted relay (A) and two
@@ -1230,7 +1273,10 @@ async fn persisted_pending_and_fanout_retries_respect_removed_or_read_only_relay
     assert!(!c_only.key_package_has_pending_fanout().unwrap());
     let calls = partial.publications();
     assert_eq!(calls.len(), 2);
-    assert_eq!(calls[1].0.endpoints, vec![TransportEndpoint(writable.into())]);
+    assert_eq!(
+        calls[1].0.endpoints,
+        vec![TransportEndpoint(writable.into())]
+    );
     assert_eq!(calls[1].1, initial_artifact);
     drop(c_only);
 
@@ -1248,7 +1294,10 @@ async fn persisted_pending_and_fanout_retries_respect_removed_or_read_only_relay
     b_restored.run_due_maintenance().await.unwrap();
     let calls = partial.publications();
     assert_eq!(calls.len(), 3);
-    assert_eq!(calls[2].0.endpoints, vec![TransportEndpoint(read_only.into())]);
+    assert_eq!(
+        calls[2].0.endpoints,
+        vec![TransportEndpoint(read_only.into())]
+    );
     assert_eq!(calls[2].1, initial_artifact);
     assert!(!b_restored.key_package_has_pending_fanout().unwrap());
 }
@@ -1314,7 +1363,8 @@ async fn empty_routes_do_not_announce_unsigned_or_stale_pending_replacement() {
                 database.clone(),
                 SqlCipherKey::new(key_phrase).unwrap(),
                 pad32(b"alice"),
-                Box::new(nostr_peeler(b"alice")),
+                Box::new(transport_nostr_peeler::NostrMlsPeeler::default()),
+                Arc::new(nostr_sealer(b"alice")),
             )
             .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
                 keys: deterministic_nostr_keys(b"alice"),
@@ -1389,7 +1439,12 @@ async fn empty_routes_do_not_announce_unsigned_or_stale_pending_replacement() {
             .unwrap()
             .unwrap();
         let merged = decode_device_roster_v1(&roster_data).unwrap();
-        merged.devices.get(&slot).unwrap().announced_key_package.clone()
+        merged
+            .devices
+            .get(&slot)
+            .unwrap()
+            .announced_key_package
+            .clone()
     };
 
     let build_runtime = |publisher: FailSigningKeyPackages, kp_endpoints: &[&str]| {
@@ -1489,7 +1544,11 @@ async fn empty_routes_do_not_announce_unsigned_or_stale_pending_replacement() {
 
     wall.set(expired_pending.not_after.0);
     let (mut expired_no_routes, expired_adapter) = build_runtime(publisher, &[]);
-    assert!(!expired_no_routes.key_package_network_maintenance_due().unwrap());
+    assert!(
+        !expired_no_routes
+            .key_package_network_maintenance_due()
+            .unwrap()
+    );
     expired_no_routes.run_due_maintenance().await.unwrap();
     assert!(
         expired_adapter.publishes().is_empty(),

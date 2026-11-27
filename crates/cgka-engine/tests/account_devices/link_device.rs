@@ -704,7 +704,9 @@ async fn an_unsealed_founding_welcome_is_withdrawn_by_its_key_package_ref() {
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
-    assert_eq!(first.engine.unsealed_owed_welcomes().unwrap(), welcomes);
+    let (owed, unread) = first.engine.unsealed_owed_welcomes().unwrap();
+    assert_eq!(owed, welcomes);
+    assert!(!unread);
 
     let found = first
         .engine
@@ -715,7 +717,7 @@ async fn an_unsealed_founding_welcome_is_withdrawn_by_its_key_package_ref() {
         first.engine.withdraw_sent_welcome(&found[0]).unwrap(),
         WelcomeWithdrawal::Withdrawn
     );
-    assert!(first.engine.unsealed_owed_welcomes().unwrap().is_empty());
+    assert!(first.engine.unsealed_owed_welcomes().unwrap().0.is_empty());
 }
 
 /// A link's Welcome keeps the `KeyPackageRef` of the KeyPackage it answers

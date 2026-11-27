@@ -10,7 +10,9 @@
 
 #![allow(clippy::disallowed_methods)]
 
-use super::test_support::{PassthroughPeeler, SeedProofSigner, signing_key};
+use super::test_support::{
+    PassthroughPeeler, SeedProofSigner, join_raw, seal_and_bind, signing_key,
+};
 use crate::convergence_clock::{ConvergenceClock, ManualConvergenceClock};
 use crate::feature_registry::FeatureRegistry;
 use crate::{Engine, EngineBuilder};
@@ -190,10 +192,11 @@ async fn create_two_member_group(
         })
         .await
         .unwrap();
-    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("expected FoundingGroupCreated");
     };
-    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
+    join_raw(&mut bob, welcome).await;
     (alice_storage, alice, bob, group_id)
 }
 
@@ -388,9 +391,7 @@ async fn invite_prepare_pending_failure_leaves_no_orphans_and_retries() {
     assert!(alice.epoch_state(&group_id).unwrap().is_stable());
 
     let SendResult::GroupEvolution {
-        pending,
-        mut welcomes,
-        ..
+        pending, welcomes, ..
     } = alice
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
@@ -402,8 +403,9 @@ async fn invite_prepare_pending_failure_leaves_no_orphans_and_retries() {
     else {
         panic!("expected GroupEvolution");
     };
+    let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
     alice.confirm_published(pending).await.unwrap();
-    carol.join_welcome(welcomes.remove(0)).await.unwrap();
+    join_raw(&mut carol, welcome).await;
     assert_eq!(alice.members(&group_id).unwrap().len(), 3);
 }
 
@@ -908,10 +910,11 @@ async fn trigger_failed_self_remove_guard_cleanup() -> FailedSelfRemoveCleanupFi
         })
         .await
         .unwrap();
-    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("expected FoundingGroupCreated");
     };
-    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
+    join_raw(&mut bob, welcome).await;
 
     let SendResult::Proposal {
         msg: leave_proposal,
@@ -1209,10 +1212,11 @@ async fn leaver_reopen_preserves_own_pending_self_remove_proposal_for_commit_app
         })
         .await
         .unwrap();
-    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("expected FoundingGroupCreated");
     };
-    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
+    join_raw(&mut bob, welcome).await;
 
     // Bob sends Leave (SelfRemove proposal), then restarts before Alice's
     // SelfRemove commit arrives.

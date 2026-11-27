@@ -81,12 +81,11 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     holds, as a device or a rejected slot, is left out: a rejection never replaces an entry.
   - `runtime/welcome_audit.rs` — the sender's v5 Welcome rows for every retained Nostr Welcome, each built from the
     Welcome's stored row (`Engine::outbound_welcome_audit_facts`), never from a caller's context. `welcome_prepared`
-    and `welcome_event_size` come from `note_retained_welcomes`, where a retained Welcome first reaches the runtime
-    (every create path, a host's accepted commit, `publish_group_evolution` for a drained or automatic one), which
-    also starts its watch. `welcome_withdrawn` comes from the size refusal that retired the Welcome (direct, queued
-    or fanout refusal: only the ids whose rows that rollback moved `Sent` → `Failed`, each with its own verdict; it
-    stops the watch), or from the watcher when a watched Welcome settles undelivered; one read from the store already
-    settled is not watched. One started/finished pair per relay pass. The attempt that meets a Welcome's policy marks
+    and `welcome_event_size` use the still-unsealed local row for a deferred commit, or the sealed row otherwise.
+    `note_retained_welcomes` starts the watch after binding. A size refusal records `welcome_withdrawn` only for rows
+    its rollback moved from `Sent` to `Failed`, with each Welcome's verdict, and stops their watches. The watcher
+    records the same event when a Welcome it already watches settles undelivered. One started/finished pair per relay
+    pass. The attempt that meets a Welcome's policy marks
     it delivered (`finish_prepared_legacy_publish`, maintenance's retry, or the preparation that finds it already met)
     before its finished row; never mark it elsewhere. Start a pass
     (`V5WelcomePass::start`) only where the transport is called, after the last hold check, so a stopped attempt
@@ -199,11 +198,13 @@ multi-device Welcome delivery, Welcome withdrawal, staged and owed Welcome deliv
 
 - Keep SQLCipher keys app-provided. Do not add key derivation or recovery here.
 - Keep transport-specific code out. Inject a `TransportPeeler` and an `InboxSealer`; Nostr crates are dev-dependencies
-  only. The session owns the sealer: it seals a commit's Welcomes and binds them in the commit's first fanout write,
-  seals founding Welcomes before a create's effects leave it, and unseals inbox deliveries the engine stops at
-  `InboxSealed` (mdk#3498). A founding Welcome that fails to seal does not fail the create and is left out of its
-  `PublishWork::FoundingGroupCreated`; it stays owed until maintenance seals it, and holds back no other Welcome.
-  A commit whose call is dropped while its Welcomes are sealed is rolled back by the next maintenance run.
+  only. The session seals a commit's Welcomes and binds them with its first fanout. Preparing an invite or a recovery
+  Add exposes the sealed bytes to the caller without replacing the unsealed rows before that write. A size refusal
+  binds rejected invite Welcomes for the audit before retiring them without publication. If a call drops before
+  handing off its prepared commit or writing the fanout, maintenance attempts the rollback and retries a failure.
+  The session unseals inbox deliveries the engine stops at `InboxSealed` (mdk#3498). A founding Welcome that fails
+  to seal stays out of `PublishWork::FoundingGroupCreated` without failing the create. Maintenance drives already
+  sealed Welcomes before asking the signer for the ones still owed.
 - Surface engine effects as app events plus publishable transport work.
 - Own detached Welcome admission in the session. Every native-selection entry point, including roster sends and
   direct session calls, excludes queued adapter starts until its Welcome holds are refreshed.

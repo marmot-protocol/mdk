@@ -32,7 +32,7 @@ use storage_sqlite::SqliteAccountStorage;
 
 mod support;
 use support::proof_signer;
-use support::raw_inbox::{join_raw, seal_and_bind};
+use support::raw_inbox::{join_raw, raw_unseal, seal_and_bind};
 
 fn valid_identity(seed: &[u8]) -> Vec<u8> {
     use k256::schnorr::SigningKey;
@@ -511,6 +511,158 @@ async fn audit_log_records_transport_received_before_ingest_entry() {
         }
         _ => unreachable!(),
     }
+}
+
+#[tokio::test]
+async fn overlapping_inbox_ingests_keep_each_deliveries_audit_context() {
+    use cgka_engine::engine::AuditedIngest;
+    use cgka_traits::ingest::InputRejectionCategory;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let audit = jsonl_audit(&path, "overlapping-inbox");
+    let mut sender = current_profile_engine(b"inbox-sender", Box::new(StubPeeler), None);
+    let mut receiver =
+        current_profile_engine(b"inbox-receiver", Box::new(StubPeeler), Some(&audit));
+    let mut messages = Vec::new();
+    for _ in 0..2 {
+        let key_package = receiver.fresh_key_package().await.unwrap();
+        let (_, SendResult::FoundingGroupCreated { welcomes }) = sender
+            .create_group(group_request(vec![key_package]))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a founding Welcome");
+        };
+        messages.extend(seal_and_bind(&mut sender, &welcomes));
+    }
+    let [first, second] = messages.as_slice() else {
+        panic!("expected two inbox messages");
+    };
+    assert_ne!(first.id, second.id);
+
+    let provenance = |msg: &TransportMessage, relay: &str| AuditTransportContext {
+        transport_source: "nostr".into(),
+        delivery_plane: Some("account_inbox".into()),
+        relay_url: Some(relay.into()),
+        wire: Some(AuditTransportWire {
+            wire_id: Some(hex::encode(msg.id.as_slice())),
+            relay_url: Some(relay.into()),
+            nostr_kind: Some(1059),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let duplicate = IngestOutcome::Ignored {
+        category: InputRejectionCategory::Duplicate,
+    };
+    let deliveries = [
+        (
+            first,
+            provenance(first, "wss://one.example"),
+            IngestOutcome::Processed,
+        ),
+        (
+            second,
+            provenance(second, "wss://two.example"),
+            IngestOutcome::Processed,
+        ),
+        (
+            first,
+            provenance(first, "wss://three.example"),
+            duplicate.clone(),
+        ),
+    ];
+    let mut pending = Vec::new();
+    for (msg, transport, _) in &deliveries {
+        let AuditedIngest::InboxSealed(continuation) = receiver
+            .begin_ingest_with_audit_context(msg, Some(transport.clone()))
+            .await
+            .unwrap()
+        else {
+            panic!("expected the delivery to wait for unseal");
+        };
+        pending.push(continuation);
+    }
+    for (continuation, (msg, _, expected)) in pending.into_iter().zip(&deliveries) {
+        let outcome = receiver
+            .ingest_unsealed_with_audit_context(continuation, Ok(raw_unseal(msg)))
+            .await
+            .unwrap();
+        assert_eq!(&outcome, expected);
+    }
+    let replay = provenance(first, "wss://four.example");
+    assert!(matches!(
+        receiver.begin_ingest_with_audit_context(first, Some(replay.clone())).await.unwrap(),
+        AuditedIngest::Complete(outcome) if outcome == duplicate
+    ));
+    drop(receiver);
+    drop(audit);
+
+    let events = read_events(&path);
+    let rows: Vec<_> = events
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.kind,
+                AuditEventKind::TransportReceived { .. }
+                    | AuditEventKind::IngestEntry { .. }
+                    | AuditEventKind::IngestOutcome { .. }
+                    | AuditEventKind::IngestError { .. }
+            )
+        })
+        .collect();
+    let mut operation_ids = std::collections::HashSet::new();
+    let [
+        wire_a,
+        entry_a,
+        wire_b,
+        entry_b,
+        wire_c,
+        entry_c,
+        done_a,
+        done_b,
+        done_c,
+        replay_row,
+    ] = rows.as_slice()
+    else {
+        panic!("expected one wire and entry row for each pending delivery, then four outcomes");
+    };
+    for ((msg, transport, expected), (wire, entry, done)) in deliveries.iter().zip([
+        (wire_a, entry_a, done_a),
+        (wire_b, entry_b, done_b),
+        (wire_c, entry_c, done_c),
+    ]) {
+        let id = hex::encode(msg.id.as_slice());
+        assert!(matches!(&wire.kind, AuditEventKind::TransportReceived {
+            msg_id: Some(msg_id), transport: actual, ..
+        } if msg_id == &id && Some(actual) == transport.wire.as_ref()));
+        assert!(matches!(&entry.kind, AuditEventKind::IngestEntry { msg_id, .. } if msg_id == &id));
+        let (kind, reason) = if expected == &duplicate {
+            ("ignored", Some("duplicate"))
+        } else {
+            ("processed", None)
+        };
+        assert!(
+            matches!(&done.kind, AuditEventKind::IngestOutcome { msg_id, outcome_kind, stale_reason, .. }
+            if msg_id == &id && outcome_kind == kind && stale_reason.as_deref() == reason)
+        );
+        let entry_context = entry.context.as_ref().unwrap();
+        let operation_id = entry_context.operation_id.as_deref().unwrap();
+        assert!(operation_ids.insert(operation_id));
+        for row in [wire, entry, done] {
+            let context = row.context.as_ref().unwrap();
+            assert_eq!(context.operation_id.as_deref(), Some(operation_id));
+            assert_eq!(context.transport.as_ref(), Some(transport));
+        }
+    }
+    assert!(
+        matches!(&replay_row.kind, AuditEventKind::IngestOutcome { stale_reason, .. }
+        if stale_reason.as_deref() == Some("duplicate"))
+    );
+    let replay_context = replay_row.context.as_ref().unwrap();
+    assert_eq!(replay_context.transport.as_ref(), Some(&replay));
+    assert!(operation_ids.insert(replay_context.operation_id.as_deref().unwrap()));
 }
 
 /// The wire context the session supplies for a Nostr group delivery.

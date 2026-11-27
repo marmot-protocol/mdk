@@ -106,6 +106,21 @@ pub(crate) fn transition_staged_invite_welcomes<S: StorageProvider>(
         }
         let payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+        // Cold rollback can also find a legacy founding Add that stopped
+        // before its first fanout. Its unsealed rows were never published.
+        if origin_commit_id.is_none()
+            && state == MessageState::Failed
+            && matches!(
+                payload,
+                StoredMessagePayload::UnsealedWelcome {
+                    origin: UnsealedWelcomeOrigin::LegacyCreate,
+                    ..
+                }
+            )
+        {
+            storage.delete_message(&record.id)?;
+            continue;
+        }
         // Binding precedes any publish of its Commit, so a staged Welcome
         // still unsealed at a confirm or rollback was never sent.
         if let StoredMessagePayload::UnsealedWelcome {

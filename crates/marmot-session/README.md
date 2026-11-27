@@ -25,11 +25,12 @@ be assumed to decode newly written failures. No database migration or transport 
 
 ## Opening a session
 
-`SessionConfig::new(database_path, database_key, identity, peeler)` takes the SQLCipher database path and key, the
-local identity, and a `TransportPeeler`. `AccountDeviceSession::open` also requires an account identity-proof signer
+`SessionConfig::new(database_path, database_key, identity, peeler, sealer)` takes the SQLCipher database path and key,
+the local identity, a `TransportPeeler` for group messages, and an `InboxSealer` for account inbox messages.
+`AccountDeviceSession::open` also requires a separate account identity-proof signer
 (`SessionConfig::account_identity_proof_signer`). Optional builder methods set the feature registry, supported
 app-component set, protocol profile, storage options, convergence policy, forensic recorder, and maintenance clock/RNG
-sources. `SessionConfig::with_storage(storage, opened_in, identity, peeler)` instead runs the session on a connection the host has
+sources. `SessionConfig::with_storage(storage, opened_in, identity, peeler, sealer)` instead runs the session on a connection the host has
 already opened, for hosts that must close every connection at a known instant (an iOS app before suspension).
 
 Open fails closed before touching storage if the convergence policy is unacceptable or a legacy protocol profile is
@@ -68,7 +69,7 @@ the default.
 ## What the session does
 
 - Opens one encrypted SQLite database for one Marmot account-device identity.
-- Builds `Engine<SqliteAccountStorage>` with an injected `TransportPeeler`.
+- Builds `Engine<SqliteAccountStorage>` with an injected `TransportPeeler` and uses `InboxSealer` outside the engine.
 - Surfaces `GroupEvent`s and publishable transport work as `SessionEffects`.
 - Preserves the publish-before-apply contract: callers confirm or fail pending group operations after transport
   publish, including auto-publish work created while ingesting inbound messages.

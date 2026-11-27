@@ -3,6 +3,7 @@
 #[derive(Clone, Copy)]
 enum RecoveryFixtureMode {
     Staged,
+    Prepared,
     Confirmed,
     Superseded,
     Terminal,
@@ -157,17 +158,44 @@ async fn hydrated_recovery_fixture(
     for (index, (peer, storage)) in peers.iter_mut().take(8).enumerate() {
         grants.push(recovery_grant(&alice, peer, storage, &b, index as u8).await);
     }
+    let recovery = SendIntent::RecoverMembers {
+        group_id: b.clone(),
+        members: grants,
+    };
+    if matches!(mode, RecoveryFixtureMode::Prepared) {
+        drop(alice);
+        let mut runtime = AccountDeviceRuntime::new(
+            current_session(&path, &key, b"hydrated-alice"),
+            RecordingAdapter::default(),
+            StaticTransportRouting::new(vec![]),
+            RecordingKeyPackages::default(),
+        );
+        let marmot_session::PreparedSessionSend::Commit(prepared) = runtime
+            .confirm_commit_without_publish_with_audit_context(recovery, Default::default())
+            .await
+            .unwrap()
+        else {
+            panic!("a recoverable group stages the recovery commit");
+        };
+        let (effects, mut welcomes) = prepared.into_effects_and_welcomes();
+        let commit = effects
+            .publish
+            .into_iter()
+            .find_map(|work| match work {
+                PublishWork::GroupEvolution { msg, .. } => Some(msg.id),
+                _ => None,
+            })
+            .unwrap();
+        let welcome = welcomes.pop().unwrap();
+        drop(runtime);
+        let reopened = current_session(&path, &key, b"hydrated-alice");
+        return (dir, reopened, a, b, welcome, commit);
+    }
     let SendResult::GroupEvolution {
         welcomes,
         pending,
         msg,
-    } = alice
-        .send(SendIntent::RecoverMembers {
-            group_id: b.clone(),
-            members: grants,
-        })
-        .await
-        .unwrap()
+    } = alice.send(recovery).await.unwrap()
     else {
         panic!("native recovery")
     };
@@ -364,4 +392,3 @@ async fn recovery_branch_step(
         peer.epoch(group).unwrap()
     );
 }
-

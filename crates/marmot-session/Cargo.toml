@@ -29,6 +29,7 @@ rand.workspace = true
 sha2.workspace = true
 storage-sqlite.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
@@ -49,6 +50,5 @@ serde_json.workspace = true
 storage-sqlite = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 tls_codec.workspace = true
-tokio.workspace = true
 transport-nostr-adapter.workspace = true
 transport-nostr-peeler.workspace = true

@@ -254,7 +254,8 @@ fn joins(results: &[marmot_session::IngestEffects]) -> Vec<(GroupId, MessageId)>
 /// Peel `welcome` as a device of `account` would: the KeyPackage publication
 /// its rumor names, and the MLS Welcome it carries.
 async fn rumor(welcome: &TransportMessage, account: &[u8]) -> (MessageId, Vec<u8>) {
-    let (peeled, provenance) = nostr_sealer(account).unseal_with_provenance(welcome)
+    let (peeled, provenance) = nostr_sealer(account)
+        .unseal_with_provenance(welcome)
         .await
         .unwrap();
     let PeeledContent::Welcome { bytes, .. } = peeled.content else {
@@ -414,7 +415,10 @@ impl InboxSealer for ClaimlessSealer {
         Ok(peeled)
     }
 
-    async fn seal_welcome(&self, welcome: &OutboundWelcome) -> Result<TransportMessage, PeelerError> {
+    async fn seal_welcome(
+        &self,
+        welcome: &OutboundWelcome,
+    ) -> Result<TransportMessage, PeelerError> {
         self.0.seal_welcome(welcome).await
     }
 
@@ -842,6 +846,131 @@ fn rejoin_required() -> cgka_traits::IngestOutcome {
     cgka_traits::IngestOutcome::LocalState {
         state: cgka_traits::LocalIngestState::RejoinConfirmationRequired,
     }
+}
+
+struct RejoinRecordingSealer {
+    inner: transport_nostr_peeler::NostrInboxSealer,
+    unseals: Mutex<Vec<MessageId>>,
+}
+
+#[async_trait]
+impl InboxSealer for RejoinRecordingSealer {
+    async fn unseal(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        self.unseals.lock().unwrap().push(msg.id.clone());
+        self.inner.unseal(msg).await
+    }
+
+    async fn seal_welcome(
+        &self,
+        welcome: &OutboundWelcome,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner.seal_welcome(welcome).await
+    }
+
+    async fn seal_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner.seal_group_recovery(message, recipient).await
+    }
+
+    fn sealed_welcome_len(&self, welcome: &OutboundWelcome) -> usize {
+        self.inner.sealed_welcome_len(welcome)
+    }
+}
+
+#[tokio::test]
+async fn automatic_rejoin_unseals_only_the_first_successful_offer_for_a_group() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("automatic rejoin offers").unwrap();
+    let sealer = Arc::new(RejoinRecordingSealer {
+        inner: nostr_sealer(b"alice"),
+        unseals: Mutex::default(),
+    });
+    let mut phone = Device::with_session(
+        nostr_device_session_with_sealer(
+            dir.path().join("alice.sqlite"),
+            &key,
+            b"alice",
+            sealer.clone(),
+        ),
+        cgka_traits::engine::KeyPackage::new(Vec::new()),
+    );
+    phone.publish().await;
+    let mut bob = nostr_device_session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let (group_id, welcomes) = create_group(&mut bob, &[&phone.key_package], "rejoin offers").await;
+    assert_eq!(
+        phone.ingest(&welcomes[0]).await.outcome,
+        cgka_traits::IngestOutcome::Processed
+    );
+
+    let mut first_removal = None;
+    let mut offers = Vec::new();
+    for _ in 0..2 {
+        let removal = bob
+            .send(SendIntent::RemoveMembers {
+                group_id: group_id.clone(),
+                members: vec![phone.runtime.self_id()],
+            })
+            .await
+            .unwrap();
+        let [PublishWork::GroupEvolution { msg, pending, .. }] = removal.publish.as_slice() else {
+            panic!("expected removal commit");
+        };
+        first_removal.get_or_insert_with(|| msg.clone());
+        bob.confirm_published(*pending).await.unwrap();
+
+        phone.publish().await;
+        let welcomes = evolve(
+            &mut bob,
+            SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![phone.key_package.clone()],
+                initial_admins: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(phone.ingest(&welcomes[0]).await.outcome, rejoin_required());
+        offers.push(welcomes[0].id.clone());
+    }
+    assert_eq!(phone.rejoin_offers(&group_id), offers);
+    sealer.unseals.lock().unwrap().clear();
+
+    let mut token = phone
+        .runtime
+        .pending_group_rejoins_for(&group_id)
+        .unwrap()
+        .remove(0)
+        .rejoin
+        .unwrap()
+        .local_state_token;
+    token[0] ^= 1;
+    let stale = phone
+        .runtime
+        .confirm_group_rejoin(&offers[0], &token)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale.as_engine_error(),
+        cgka_traits::error::EngineError::InvalidTransition(_)
+    ));
+    assert!(sealer.unseals.lock().unwrap().is_empty());
+
+    let session = phone.runtime.session_mut();
+    session.ingest(first_removal.unwrap()).await.unwrap();
+    if let Some(delay) = session
+        .prepare_convergence_cutoff_delay_ms(&group_id)
+        .unwrap()
+    {
+        tokio::time::sleep(Duration::from_millis(delay.saturating_add(1))).await;
+        session.advance_convergence(&group_id).await.unwrap();
+    }
+    assert!(session.group_record(&group_id).unwrap().removed);
+    assert!(session.retry_rejoins_after_trusted_removal().await.unwrap());
+    assert!(!session.group_record(&group_id).unwrap().removed);
+    assert!(phone.rejoin_offers(&group_id).is_empty());
+    assert_eq!(*sealer.unseals.lock().unwrap(), offers[..1]);
 }
 
 #[tokio::test]

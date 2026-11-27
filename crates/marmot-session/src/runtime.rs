@@ -249,6 +249,31 @@ struct PendingFanoutContinuation {
     bind: Vec<SealedWelcome>,
 }
 
+struct QueuedSealRefusal {
+    refusal: InviteRefusal,
+    welcome_ids: Vec<cgka_traits::MessageId>,
+}
+
+#[derive(Default)]
+struct SealRollbackBatch {
+    output: AccountDeviceEffects,
+    queue: VecDeque<PublishWork>,
+}
+
+struct SealRollbackDelivery {
+    parked: Arc<std::sync::Mutex<SealRollbackBatch>>,
+    batch: SealRollbackBatch,
+}
+
+impl Drop for SealRollbackDelivery {
+    fn drop(&mut self) {
+        *self
+            .parked
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = std::mem::take(&mut self.batch);
+    }
+}
+
 enum PreparedLegacyPublish {
     Complete(PublishStatus),
     Network(Box<PreparedLegacyPublishAttempt>),
@@ -741,6 +766,13 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// to a caller, durably staged for fanout, or rolled back. Maintenance
     /// rolls back any commit left here when a call is dropped.
     sealing_commits: Vec<PendingStateRef>,
+    queued_seal_refusals: HashMap<PendingStateRef, QueuedSealRefusal>,
+    /// A maintenance pass can be dropped after a rollback has returned its
+    /// effects. Retain them until a pass can deliver them to the host.
+    seal_rollback_batch: Option<Arc<std::sync::Mutex<SealRollbackBatch>>>,
+    /// The exact Welcome bytes shown to a caller at prepare time. Keep the
+    /// native rows unsealed until the first commit fanout is also durable.
+    prepared_welcome_seals: HashMap<PendingStateRef, Vec<SealedWelcome>>,
     /// This runtime was asked to withdraw the device's slot for sign-out, so
     /// it publishes nothing more, whether or not a relay accepted. The next
     /// runtime for the account republishes.
@@ -869,6 +901,9 @@ where
             maintenance_timing: MaintenanceTiming::default(),
             maintenance_paused: false,
             sealing_commits: Vec::new(),
+            queued_seal_refusals: HashMap::new(),
+            seal_rollback_batch: None,
+            prepared_welcome_seals: HashMap::new(),
             key_package_slot_withdrawn: false,
             key_package_announcement_group: None,
             slot_superseded_through: None,
@@ -2997,6 +3032,24 @@ where
         self.sweep_expired_key_package_private_material()?;
         self.reconcile_confirmed_own_leaf_rotations(&[]);
         let mut output = AccountDeviceEffects::default();
+        if !self.sealing_commits.is_empty() {
+            self.seal_rollback_batch
+                .get_or_insert_with(Default::default);
+        }
+        let mut rollbacks = self
+            .seal_rollback_batch
+            .as_ref()
+            .map(|parked| SealRollbackDelivery {
+                parked: Arc::clone(parked),
+                batch: std::mem::take(
+                    &mut *parked.lock().unwrap_or_else(|error| error.into_inner()),
+                ),
+            });
+        if let Some(delivery) = &mut rollbacks {
+            let batch = &mut delivery.batch;
+            boxed(|| self.settle_dropped_seals(batch)).await;
+            boxed(|| self.publish_queue(&mut batch.output, &mut batch.queue, None)).await?;
+        }
         // Hydration recreates the publication edge for a surviving staged
         // evolution. Consume that edge before consulting the semantic
         // obligation below. Otherwise a successful retry can confirm the
@@ -3017,8 +3070,6 @@ where
             let recovered = boxed(|| self.publish_session_effects(recovered)).await?;
             output.absorb_account_effects(recovered);
         }
-        let settled = boxed(|| self.settle_dropped_seals()).await?;
-        output.absorb_account_effects(settled);
         let now = self.wall_clock.now();
         // Before anything reads an evolution or an obligation: repair the
         // supersessions whose announcement never reached
@@ -3609,6 +3660,12 @@ where
                 }
             }
         }
+        if let Some(mut delivery) = rollbacks {
+            self.seal_rollback_batch = None;
+            let mut recovered = std::mem::take(&mut delivery.batch.output);
+            recovered.extend(output);
+            return Ok(recovered);
+        }
         Ok(output)
     }
 
@@ -4162,8 +4219,15 @@ where
         let PreparedSessionSend::Commit(commit) = prepared else {
             return Ok(prepared);
         };
-        self.note_retained_welcomes(commit.welcomes());
         if invite && let Some((message_id, refusal)) = self.oversized_invite(&commit).await {
+            // This invite will never get a fanout. Retain its sealed ids for
+            // the refusal audit, then retire the rows with the commit.
+            if let Some(sealed) = self.prepared_welcome_seals.get(&commit.pending) {
+                match self.session.bind_sealed_welcomes(sealed, None) {
+                    Ok(()) => self.note_retained_welcomes(commit.welcomes()),
+                    Err(error) => log_refused_welcome_bind(&error),
+                }
+            }
             let oversized = refusal.oversized;
             let mut output = self
                 .rollback_prepared_session_commit_refused(commit, Some(refusal))
@@ -4243,9 +4307,9 @@ where
         })
     }
 
-    /// Split a prepared send into its commit and its Welcomes, sealed and
-    /// bound. A Welcome that cannot be sealed rolls the commit back before
-    /// any transport side effect.
+    /// Split a prepared send into its commit and its sealed Welcomes. Bind
+    /// them only when the first commit fanout is stored. A Welcome that
+    /// cannot be sealed rolls the commit back before any relay I/O.
     async fn classify_prepared_session_send(
         &mut self,
         mut effects: SessionEffects,
@@ -4266,15 +4330,7 @@ where
             .into());
         };
         let welcomes = take_deferred_welcomes(&mut effects);
-        let bound = match self.seal_commit_welcomes(pending, &welcomes).await {
-            Ok(sealed) => self
-                .session
-                .bind_sealed_welcomes(&sealed, None)
-                .map(|()| sealed)
-                .map_err(AccountError::from),
-            Err(error) => Err(EngineError::Peeler(error).into()),
-        };
-        let sealed = match bound {
+        let sealed = match self.seal_commit_welcomes(pending, &welcomes).await {
             Ok(sealed) => sealed,
             Err(error) => {
                 let commit = PreparedSessionCommit {
@@ -4284,12 +4340,20 @@ where
                 };
                 self.rollback_prepared_session_commit_refused(commit, None)
                     .await?;
-                return Err(error);
+                return Err(EngineError::Peeler(error).into());
             }
         };
+        let welcomes = sealed.iter().map(|seal| seal.message.clone()).collect();
+        if !sealed.is_empty() {
+            self.note_prepared_seals(&sealed);
+            // A prepared commit can be superseded before its caller returns.
+            self.prepared_welcome_seals
+                .retain(|pending, _| self.session.pending_group_id(*pending).is_ok());
+            self.prepared_welcome_seals.insert(pending, sealed);
+        }
         Ok(PreparedSessionSend::Commit(PreparedSessionCommit {
             effects,
-            welcomes: sealed.into_iter().map(|sealed| sealed.message).collect(),
+            welcomes,
             pending,
         }))
     }
@@ -6202,6 +6266,8 @@ where
         let sealed = match self.seal_commit_welcomes(pending, &welcomes).await {
             Ok(sealed) => sealed,
             Err(error) => {
+                // Legacy creation already staged the founding Add. No Welcome
+                // reached a relay, so roll back to the solo group.
                 self.rollback_unstaged_pending(Some(pending), output, queue)
                     .await?;
                 return Err(EngineError::Peeler(error).into());
@@ -6277,6 +6343,27 @@ where
             return Ok(());
         }
 
+        if let Some(sealed) = self.prepared_welcome_seals.remove(&pending) {
+            self.note_sealing_commit(pending);
+            let kind = self.session.pending_fanout_kind(pending)?;
+            // The host owns delivery of these exact bytes after confirmation.
+            Box::pin(self.publish_one_with_post_confirmation_welcomes(
+                commit,
+                Some(PendingFanoutContinuation {
+                    pending,
+                    kind,
+                    post_confirmation_welcomes: Vec::new(),
+                    bind: sealed,
+                }),
+                None,
+                output,
+                queue,
+                context,
+            ))
+            .await?;
+            return Ok(());
+        }
+
         // A Welcome that cannot be sealed rolls its commit back before any
         // relay I/O, as a publish that reached no relay would.
         let sealed = match self.seal_commit_welcomes(pending, &welcomes).await {
@@ -6295,29 +6382,21 @@ where
         if self.session.pending_is_queued_invite(pending)?
             && let Some(refusal) = self.oversized_invite_events(&commit, &welcomes).await
         {
-            // Bound first, so the rollback fails the sealed rows by their
-            // transport ids and they are recorded as refused.
-            if let Err(error) = self.session.bind_sealed_welcomes(&sealed, None) {
-                self.rollback_unstaged_pending(Some(pending), output, queue)
-                    .await?;
-                return Err(error.into());
-            }
-            self.note_retained_welcomes(&welcomes);
-            let unretired =
-                self.unretired_welcomes(welcomes.iter().map(|welcome| welcome.id.clone()));
-            let effects = refuse_too_large(
-                &mut self.session,
+            self.note_sealing_commit(pending);
+            self.queued_seal_refusals.insert(
                 pending,
-                None,
-                refusal.oversized,
-                RollbackPass::Staging,
-            )
-            .await;
-            self.finish_unstaged_rollback(pending, &effects);
-            // Recorded even when the rollback fails after it committed.
-            let retired = self.retired_welcomes(unretired);
-            self.record_v5_welcomes_refused(&retired, &refusal);
-            let effects = effects?;
+                QueuedSealRefusal {
+                    refusal,
+                    welcome_ids: welcomes.iter().map(|welcome| welcome.id.clone()).collect(),
+                },
+            );
+            // Bind for the refusal audit if possible. A bind error does not
+            // undo the size verdict or let the queue stage the invite again.
+            match self.session.bind_sealed_welcomes(&sealed, None) {
+                Ok(()) => self.note_retained_welcomes(&welcomes),
+                Err(error) => log_refused_welcome_bind(&error),
+            }
+            let effects = self.rollback_sealing_commit(pending).await?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -6875,10 +6954,16 @@ where
         pending: PendingStateRef,
         welcomes: &[OutboundWelcome],
     ) -> Result<Vec<SealedWelcome>, cgka_traits::error::PeelerError> {
-        if !welcomes.is_empty() && !self.sealing_commits.contains(&pending) {
-            self.sealing_commits.push(pending);
+        if !welcomes.is_empty() {
+            self.note_sealing_commit(pending);
         }
         self.session.seal_welcomes(welcomes).await
+    }
+
+    fn note_sealing_commit(&mut self, pending: PendingStateRef) {
+        if !self.sealing_commits.contains(&pending) {
+            self.sealing_commits.push(pending);
+        }
     }
 
     /// Drop the note [`Self::seal_commit_welcomes`] keeps for `pending`.
@@ -6897,24 +6982,57 @@ where
                 .is_err_and(|error| matches!(error.as_engine_error(), EngineError::UnknownPending))
         {
             self.forget_sealing_commit(pending);
+            self.prepared_welcome_seals.remove(&pending);
+            self.queued_seal_refusals.remove(&pending);
         }
+    }
+
+    async fn rollback_sealing_commit(
+        &mut self,
+        pending: PendingStateRef,
+    ) -> SessionResult<SessionEffects> {
+        let rollback = if let Some(refused) = self.queued_seal_refusals.get(&pending) {
+            let unretired = self.unretired_welcomes(refused.welcome_ids.iter().cloned());
+            let oversized = refused.refusal.oversized;
+            let rollback = refuse_too_large(
+                &mut self.session,
+                pending,
+                None,
+                oversized,
+                RollbackPass::Staging,
+            )
+            .await;
+            let retired = self.retired_welcomes(unretired);
+            if !retired.is_empty() {
+                let refused = self
+                    .queued_seal_refusals
+                    .remove(&pending)
+                    .expect("known refusal");
+                self.record_v5_welcomes_refused(&retired, &refused.refusal);
+                self.queued_seal_refusals.insert(pending, refused);
+            }
+            rollback
+        } else {
+            self.session.publish_failed(pending).await
+        };
+        self.finish_unstaged_rollback(pending, &rollback);
+        rollback
     }
 
     /// Roll back commits whose call dropped before handing them off. A
     /// failed or canceled rollback stays owed until the engine no longer
     /// holds the commit.
-    async fn settle_dropped_seals(&mut self) -> AccountResult<AccountDeviceEffects> {
-        let mut output = AccountDeviceEffects::default();
-        let mut queue = VecDeque::new();
+    async fn settle_dropped_seals(&mut self, batch: &mut SealRollbackBatch) {
         for pending in self.sealing_commits.clone() {
-            let rollback = self.session.publish_failed(pending).await;
-            self.finish_unstaged_rollback(pending, &rollback);
-            match rollback {
+            match self.rollback_sealing_commit(pending).await {
                 Ok(effects) => {
-                    output
+                    batch
+                        .output
                         .pending
                         .push(PendingResolution::RolledBack { pending });
-                    output.absorb_session_effects(effects, &mut queue);
+                    batch
+                        .output
+                        .absorb_session_effects(effects, &mut batch.queue);
                 }
                 Err(error) if matches!(error.as_engine_error(), EngineError::UnknownPending) => {}
                 Err(error) => {
@@ -6927,8 +7045,6 @@ where
                 }
             }
         }
-        self.publish_queue(&mut output, &mut queue, None).await?;
-        Ok(output)
     }
 
     /// Drive one frozen fanout's pass. `pass` says whether it runs inside the
@@ -8975,6 +9091,15 @@ where
             .flatten()
             .collect()
     }
+}
+
+fn log_refused_welcome_bind(error: &SessionError) {
+    tracing::warn!(
+        target: TRACE_TARGET,
+        method = "log_refused_welcome_bind",
+        error_kind = error.as_engine_error().privacy_safe_kind(),
+        "refused invite Welcome could not be bound for audit"
+    );
 }
 
 fn refused_before_publishing(

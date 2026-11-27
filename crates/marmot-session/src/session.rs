@@ -20,6 +20,7 @@ pub use cgka_engine::account_identity_proof::{
 };
 pub use cgka_engine::application_message_len;
 pub use cgka_engine::canonicalization::{CanonicalizationPolicy, V1_SETTLEMENT_QUIESCENCE_MS};
+use cgka_engine::engine::AuditedIngest;
 pub(crate) use cgka_engine::engine::{
     OutboundWelcomeStatus, OutboundWelcomeWork, WelcomeSettlement,
 };
@@ -78,6 +79,12 @@ use storage_sqlite::{
 mod device_group_moves;
 
 const TRACE_TARGET: &str = "marmot_session::session";
+const MAINTENANCE_SEAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+enum FoundingSeal {
+    Create,
+    Maintenance,
+}
 
 pub type SessionResult<T> = Result<T, SessionError>;
 
@@ -1733,12 +1740,19 @@ impl AccountDeviceSession {
             "ingesting transport message"
         );
         let _selection = self.pause_welcome_publishes().await;
-        let outcome = match self.engine.ingest(msg.clone()).await {
-            Ok(IngestOutcome::InboxSealed) => {
+        let outcome = match self
+            .engine
+            .begin_ingest_with_audit_context(&msg, None)
+            .await
+        {
+            Ok(AuditedIngest::InboxSealed(pending)) => {
                 let unsealed = self.sealer.unseal(&msg).await;
-                self.engine.ingest_unsealed(msg, unsealed).await
+                self.engine
+                    .ingest_unsealed_with_audit_context(pending, unsealed)
+                    .await
             }
-            outcome => outcome,
+            Ok(AuditedIngest::Complete(outcome)) => Ok(outcome),
+            Err(error) => Err(error),
         };
         self.refresh_welcome_holds();
         let outcome = outcome?;
@@ -1774,16 +1788,17 @@ impl AccountDeviceSession {
         let _selection = self.pause_welcome_publishes().await;
         let outcome = self
             .engine
-            .ingest_with_audit_context(&delivery.message, Some(transport_context))
+            .begin_ingest_with_audit_context(&delivery.message, Some(transport_context))
             .await;
         let outcome = match outcome {
-            Ok(IngestOutcome::InboxSealed) => {
+            Ok(AuditedIngest::InboxSealed(pending)) => {
                 let unsealed = self.sealer.unseal(&delivery.message).await;
                 self.engine
-                    .ingest_unsealed_with_audit_context(&delivery.message, unsealed)
+                    .ingest_unsealed_with_audit_context(pending, unsealed)
                     .await
             }
-            outcome => outcome,
+            Ok(AuditedIngest::Complete(outcome)) => Ok(outcome),
+            Err(error) => Err(error),
         };
         self.refresh_welcome_holds();
         let outcome = outcome?;
@@ -2085,14 +2100,13 @@ impl AccountDeviceSession {
     }
 
     async fn retry_rejoins_unsealed(&mut self) -> Result<bool, EngineError> {
-        let candidates = self.engine.rejoin_candidates_after_trusted_removal()?;
-        let mut unsealed = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            unsealed.push((candidate.id.clone(), self.sealer.unseal(&candidate).await));
+        let mut retry = self.engine.rejoin_retry()?;
+        let mut joined = false;
+        while let Some(offer) = retry.next_offer()? {
+            let unsealed = self.sealer.unseal(offer.welcome()).await;
+            joined |= offer.apply(unsealed).await?;
         }
-        self.engine
-            .retry_rejoins_after_trusted_removal(unsealed)
-            .await
+        Ok(joined)
     }
 
     pub fn pending_group_rejoins_for(
@@ -2503,8 +2517,10 @@ impl AccountDeviceSession {
     }
 
     /// Founding Welcomes still owed and not sealed yet.
+    #[cfg(feature = "test-support")]
     pub fn unsealed_owed_welcomes(&self) -> SessionResult<Vec<OutboundWelcome>> {
-        Ok(self.engine.unsealed_owed_welcomes()?)
+        let (welcomes, _) = self.engine.unsealed_owed_welcomes()?;
+        Ok(welcomes)
     }
 
     pub(super) fn set_founding_welcome_clock(&mut self, clock: Arc<dyn WallClock>) {
@@ -2519,9 +2535,11 @@ impl AccountDeviceSession {
         &mut self,
     ) -> SessionResult<Vec<TransportMessage>> {
         self.founding_welcomes_unfinished = true;
-        let welcomes = self.unsealed_owed_welcomes()?;
-        self.founding_welcomes_unfinished = false;
-        Ok(self.seal_founding_welcomes(&welcomes).await)
+        let (welcomes, unread) = self.engine.unsealed_owed_welcomes()?;
+        self.founding_welcomes_unfinished = unread;
+        Ok(self
+            .seal_founding_welcomes(&welcomes, FoundingSeal::Maintenance)
+            .await)
     }
 
     pub fn pending_origin_message_id(&self, pending: PendingStateRef) -> SessionResult<MessageId> {
@@ -2858,7 +2876,9 @@ impl AccountDeviceSession {
         let SendResult::FoundingGroupCreated { welcomes } = result else {
             return Ok(self.collect_effects(vec![result]));
         };
-        let welcomes = self.seal_founding_welcomes(&welcomes).await;
+        let welcomes = self
+            .seal_founding_welcomes(&welcomes, FoundingSeal::Create)
+            .await;
         let mut effects = self.collect_effects(Vec::new());
         effects
             .publish
@@ -2873,6 +2893,7 @@ impl AccountDeviceSession {
     async fn seal_founding_welcomes(
         &mut self,
         welcomes: &[OutboundWelcome],
+        source: FoundingSeal,
     ) -> Vec<TransportMessage> {
         if welcomes.is_empty() {
             return Vec::new();
@@ -2884,7 +2905,15 @@ impl AccountDeviceSession {
             if !self.founding_welcome_may_seal(&welcome.local_id, &mut unfinished) {
                 continue;
             }
-            if let Ok(message) = self.sealer.seal_welcome(welcome).await {
+            let seal = self.sealer.seal_welcome(welcome);
+            let message = match source {
+                FoundingSeal::Create => seal.await.ok(),
+                FoundingSeal::Maintenance => tokio::time::timeout(MAINTENANCE_SEAL_TIMEOUT, seal)
+                    .await
+                    .ok()
+                    .and_then(Result::ok),
+            };
+            if let Some(message) = message {
                 sealed.push(SealedWelcome {
                     local_id: welcome.local_id.clone(),
                     message,

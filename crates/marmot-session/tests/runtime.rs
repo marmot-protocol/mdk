@@ -1341,6 +1341,9 @@ async fn invite_dropped_mid_seal_is_rolled_back_by_maintenance() {
         key_packages: vec![key_package],
         initial_admins: Vec::new(),
     };
+    runtime.pause_maintenance();
+    runtime.run_due_maintenance().await.unwrap();
+    assert!(!runtime.maintenance_due(&[]).unwrap().retry_while_owed);
     sealer.park.store(true, Ordering::SeqCst);
     // Drop the send once its seal parks.
     tokio::select! {
@@ -1389,7 +1392,14 @@ async fn invite_dropped_mid_seal_is_rolled_back_by_maintenance() {
 async fn cancel_welcome_preflight() {
     let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("invite preflight cancellation key").unwrap();
-    let mut alice = current_session(dir.path().join("alice.sqlite"), &key, b"alice");
+    let sealer = Arc::new(SwitchableSealer::default());
+    let mut alice = AccountDeviceSession::open(mock_session_config(
+        dir.path().join("alice.sqlite"),
+        &key,
+        b"alice",
+        sealer.clone(),
+    ))
+    .unwrap();
     let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob");
     let bob_id = bob.self_id();
     let created = alice
@@ -1404,6 +1414,19 @@ async fn cancel_welcome_preflight() {
         .await
         .unwrap();
     let group = created.group_id;
+    sealer.fail.store(true, Ordering::SeqCst);
+    alice
+        .create_group(CreateGroupRequest {
+            name: "founding seal owed".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    sealer.fail.store(false, Ordering::SeqCst);
     let routing = staged_invite_routing(&group, &TransportEndpoint("wss://group.example".into()))
         .with_inbox_route(
             bob_id.clone(),
@@ -1431,6 +1454,17 @@ async fn cancel_welcome_preflight() {
         result = preflight => result.unwrap(),
     };
 
+    sealer.park.store(true, Ordering::SeqCst);
+    tokio::select! {
+        _ = runtime.run_due_maintenance() => panic!("the founding seal did not park"),
+        () = sealer.parked.notified() => {}
+    }
+    assert!(matches!(
+        runtime.epoch_state(&group),
+        Some(cgka_traits::EpochState::Stable { .. })
+    ));
+    sealer.park.store(false, Ordering::SeqCst);
+    sealer.fail.store(true, Ordering::SeqCst);
     let maintained = runtime.run_due_maintenance().await.unwrap();
     assert!(matches!(
         maintained.pending.as_slice(),
@@ -1439,6 +1473,7 @@ async fn cancel_welcome_preflight() {
     assert!(adapter.commit_publishes().is_empty());
     assert!(adapter.publishes().is_empty());
 
+    sealer.fail.store(false, Ordering::SeqCst);
     let sent = runtime.send(invite).await.unwrap();
     assert!(matches!(
         sent.pending.as_slice(),

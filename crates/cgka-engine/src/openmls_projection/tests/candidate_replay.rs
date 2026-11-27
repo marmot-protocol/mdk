@@ -9,12 +9,13 @@ use super::{
 // Stands still at zero: a zero deadline has passed, and a later one never comes.
 use super::resumable::StoppedClock;
 use crate::convergence::V1_MAX_REWIND_COMMITS;
-use crate::engine::test_support::{PassthroughPeeler, SeedProofSigner, carried, signing_key};
+use crate::engine::test_support::{
+    PassthroughPeeler, SeedProofSigner, carried, join_raw, seal_and_bind, signing_key,
+};
 use crate::message_processor::MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS;
 use crate::provider::EngineOpenMlsProvider;
 use crate::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
-use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::maintenance::MonotonicClock as _;
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{
@@ -23,7 +24,6 @@ use cgka_traits::storage::{
 };
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
-use cgka_traits::{OutboundWelcome, SealedWelcome};
 use openmls::group::MlsGroup;
 use openmls::prelude::{MlsMessageIn, ProcessedMessageContent};
 use openmls_basic_credential::SignatureKeyPair;
@@ -43,53 +43,6 @@ fn member_id(seed: &[u8]) -> MemberId {
 
 fn transport_message(payload: &[u8], envelope: TransportEnvelope) -> TransportMessage {
     carried("candidate-branch-peel-test", payload, envelope)
-}
-
-fn seal_and_bind(
-    engine: &mut Engine<SqliteAccountStorage>,
-    welcomes: &[OutboundWelcome],
-) -> Vec<TransportMessage> {
-    let sealed: Vec<_> = welcomes
-        .iter()
-        .map(|welcome| {
-            let mut message = transport_message(
-                &welcome.payload.ciphertext,
-                TransportEnvelope::Welcome {
-                    recipient: welcome.recipient.clone(),
-                },
-            );
-            // Co-invitees can share MLS Welcome bytes, but not a transport id.
-            message.id = MessageId::new(
-                Sha256::new()
-                    .chain_update(welcome.local_id.as_slice())
-                    .chain_update(welcome.recipient.as_slice())
-                    .chain_update(&message.payload)
-                    .finalize()
-                    .to_vec(),
-            );
-            SealedWelcome {
-                local_id: welcome.local_id.clone(),
-                message,
-            }
-        })
-        .collect();
-    engine.bind_sealed_welcomes(&sealed, None).unwrap();
-    sealed.into_iter().map(|welcome| welcome.message).collect()
-}
-
-async fn join_raw(engine: &mut Engine<SqliteAccountStorage>, welcome: TransportMessage) {
-    let unsealed = PeeledMessage {
-        id: welcome.id.clone(),
-        group_id: None,
-        sender: None,
-        content: PeeledContent::Welcome {
-            created_at: None,
-            bytes: welcome.payload.clone(),
-            key_package_event_id: None,
-        },
-        origin: welcome.clone(),
-    };
-    engine.join_welcome(welcome, unsealed).await.unwrap();
 }
 
 fn build_client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {

@@ -1,6 +1,8 @@
 //! Shared unit-test identity and pass-through transport fixtures for engine tests.
 
+use crate::Engine;
 use crate::account_identity_proof::{AccountIdentityProofRequest, AccountIdentityProofSigner};
+use cgka_traits::engine::{CgkaEngine, OutboundWelcome, SealedWelcome};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
@@ -11,6 +13,7 @@ use cgka_traits::transport::{
 use cgka_traits::types::MessageId;
 use k256::schnorr::{SigningKey, signature::hazmat::PrehashSigner};
 use sha2::{Digest, Sha256};
+use storage_sqlite::SqliteAccountStorage;
 
 pub(crate) fn signing_key(seed: &[u8]) -> SigningKey {
     for counter in 0u64.. {
@@ -88,4 +91,50 @@ impl TransportPeeler for PassthroughPeeler {
             },
         ))
     }
+}
+
+pub(crate) fn seal_and_bind(
+    engine: &mut Engine<SqliteAccountStorage>,
+    welcomes: &[OutboundWelcome],
+) -> Vec<TransportMessage> {
+    let sealed: Vec<_> = welcomes
+        .iter()
+        .map(|welcome| SealedWelcome {
+            local_id: welcome.local_id.clone(),
+            message: TransportMessage {
+                id: MessageId::new(
+                    Sha256::new()
+                        .chain_update(welcome.local_id.as_slice())
+                        .chain_update(welcome.recipient.as_slice())
+                        .chain_update(&welcome.payload.ciphertext)
+                        .finalize()
+                        .to_vec(),
+                ),
+                payload: welcome.payload.ciphertext.clone(),
+                timestamp: Timestamp(0),
+                causal_deps: vec![],
+                source: TransportSource("engine-unit-test".into()),
+                envelope: TransportEnvelope::Welcome {
+                    recipient: welcome.recipient.clone(),
+                },
+            },
+        })
+        .collect();
+    engine.bind_sealed_welcomes(&sealed, None).unwrap();
+    sealed.into_iter().map(|welcome| welcome.message).collect()
+}
+
+pub(crate) async fn join_raw(engine: &mut Engine<SqliteAccountStorage>, welcome: TransportMessage) {
+    let unsealed = PeeledMessage {
+        id: welcome.id.clone(),
+        group_id: None,
+        sender: None,
+        content: PeeledContent::Welcome {
+            created_at: None,
+            bytes: welcome.payload.clone(),
+            key_package_event_id: None,
+        },
+        origin: welcome.clone(),
+    };
+    engine.join_welcome(welcome, unsealed).await.unwrap();
 }

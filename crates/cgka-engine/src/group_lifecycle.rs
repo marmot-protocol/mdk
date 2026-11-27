@@ -1257,113 +1257,67 @@ impl<S: StorageProvider> Engine<S> {
             .any(|candidate| candidate.rejoin.is_some()))
     }
 
-    /// Whether `candidate` is a rejoin offer that trusted removal (or
-    /// Unrecoverable repair) has made ordinarily joinable: its group record
-    /// reads, the local copy is removed or unrecoverable, and it is not
-    /// disbanded.
-    fn rejoin_offer_is_joinable(&self, candidate: &PendingWelcome) -> bool {
+    /// Retry stored offers after trusted removal or Unrecoverable repair.
+    /// The caller unseals each eligible offer before asking for the next one.
+    pub fn rejoin_retry(&mut self) -> Result<RejoinRetry<'_, S>, EngineError> {
+        let candidates = self.storage.list_welcomes()?.into_iter();
+        Ok(RejoinRetry {
+            engine: self,
+            candidates,
+        })
+    }
+
+    fn prepare_rejoin_after_trusted_removal(
+        &mut self,
+        candidate: &PendingWelcome,
+    ) -> Result<Option<TransportMessage>, EngineError> {
         if candidate.rejoin.is_none() {
-            return false;
+            return Ok(None);
         }
         let group = match self.stored_group_record(&candidate.group_id) {
             Ok(Some(group)) => group,
-            Ok(None) => return false,
+            Ok(None) => return Ok(None),
             Err(_) => {
                 tracing::debug!(target: "cgka_engine::group_lifecycle",
-                    method = "rejoin_offer_is_joinable", "skipping an unreadable group");
-                return false;
+                    method = "prepare_rejoin_after_trusted_removal", "skipping an unreadable group");
+                return Ok(None);
             }
         };
-        (group.removed || group.unrecoverable) && group.disbanded.is_none()
+        if (!group.removed && !group.unrecoverable) || group.disbanded.is_some() {
+            return Ok(None);
+        }
+        let Ok(welcome) = serde_json::from_slice(&candidate.welcome_bytes) else {
+            self.storage.take_welcome(&candidate.message_id)?;
+            tracing::debug!(target: "cgka_engine::group_lifecycle",
+                method = "prepare_rejoin_after_trusted_removal", "retired an undecodable offer");
+            return Ok(None);
+        };
+        if self.ensure_hydrated(&candidate.group_id).is_err()
+            || self.quarantined_reason(&candidate.group_id).is_some()
+        {
+            tracing::debug!(target: "cgka_engine::group_lifecycle",
+                method = "prepare_rejoin_after_trusted_removal", "skipping a group awaiting hydration repair");
+            return Ok(None);
+        }
+        if let Err(error) = self.check_welcome_delivery(&welcome) {
+            self.finish_failed_rejoin(&candidate.message_id, &error)?;
+            return Ok(None);
+        }
+        Ok(Some(welcome))
     }
 
-    /// The stored rejoin offers trusted removal has made joinable, as their
-    /// sealed deliveries, for the session to unseal and pass to
-    /// [`Self::retry_rejoins_after_trusted_removal`]. Offers that do not
-    /// decode are left for that call to retire.
-    pub fn rejoin_candidates_after_trusted_removal(
+    fn finish_failed_rejoin(
         &self,
-    ) -> Result<Vec<TransportMessage>, EngineError> {
-        Ok(self
-            .storage
-            .list_welcomes()?
-            .iter()
-            .filter(|candidate| self.rejoin_offer_is_joinable(candidate))
-            .filter_map(|candidate| serde_json::from_slice(&candidate.welcome_bytes).ok())
-            .collect())
-    }
-
-    /// Retry owned offers once trusted removal (or Unrecoverable repair) makes
-    /// ordinary joining legal, with the session's unseal result for each
-    /// candidate [`Self::rejoin_candidates_after_trusted_removal`] listed.
-    /// Hosts call this on their maintenance seam, so recovery does not depend
-    /// on another relay copy passing app deduplication.
-    pub async fn retry_rejoins_after_trusted_removal(
-        &mut self,
-        unsealed: Vec<(
-            MessageId,
-            Result<cgka_traits::ingest::PeeledMessage, cgka_traits::error::PeelerError>,
-        )>,
-    ) -> Result<bool, EngineError> {
-        for candidate in self.storage.list_welcomes()? {
-            if self.rejoin_offer_is_joinable(&candidate)
-                && serde_json::from_slice::<TransportMessage>(&candidate.welcome_bytes).is_err()
-            {
-                // This stored payload can never be retried successfully.
-                self.storage.take_welcome(&candidate.message_id)?;
-                tracing::debug!(target: "cgka_engine::group_lifecycle",
-                    method = "retry_rejoins_after_trusted_removal", "retired an undecodable offer");
-            }
+        welcome_id: &MessageId,
+        error: &EngineError,
+    ) -> Result<(), EngineError> {
+        if terminal_welcome_error(error) {
+            self.storage.take_welcome(welcome_id)?;
+        } else {
+            tracing::debug!(target: "cgka_engine::group_lifecycle",
+                method = "rejoin_retry", "rejoin remains pending");
         }
-        let mut joined = false;
-        for (welcome_id, result) in unsealed {
-            let Some(candidate) = self
-                .storage
-                .list_welcomes()?
-                .into_iter()
-                .find(|candidate| candidate.message_id == welcome_id)
-            else {
-                continue;
-            };
-            if !self.rejoin_offer_is_joinable(&candidate) {
-                continue;
-            }
-            let Ok(welcome) = serde_json::from_slice::<TransportMessage>(&candidate.welcome_bytes)
-            else {
-                continue;
-            };
-            if self.ensure_hydrated(&candidate.group_id).is_err()
-                || self.quarantined_reason(&candidate.group_id).is_some()
-            {
-                tracing::debug!(target: "cgka_engine::group_lifecycle",
-                    method = "retry_rejoins_after_trusted_removal", "skipping a group awaiting hydration repair");
-                continue;
-            }
-            let prepared = result.map_err(EngineError::Peeler).and_then(|peeled| {
-                let content_id = WelcomeContentId::of(&peeled)?;
-                Ok((peeled, content_id))
-            });
-            let outcome = match prepared {
-                Ok(prepared) => {
-                    self.do_join_welcome(welcome, prepared, WelcomeRoute::Delivery)
-                        .await
-                }
-                Err(error) => Err(error),
-            };
-            match outcome {
-                Ok(_) => joined = true,
-                Err(error) if terminal_welcome_error(&error) => {
-                    self.storage.take_welcome(&candidate.message_id)?;
-                }
-                Err(_) => {
-                    // Keep retryable material owned, but isolate this offer's
-                    // failure from other rejoins and inviter-side recovery.
-                    tracing::debug!(target: "cgka_engine::group_lifecycle",
-                        method = "retry_rejoins_after_trusted_removal", "rejoin remains pending");
-                }
-            }
-        }
-        Ok(joined)
+        Ok(())
     }
 
     /// Explicit recipient consent to discard the exact local branch shown by
@@ -1461,6 +1415,12 @@ impl<S: StorageProvider> Engine<S> {
         (peeled, content_id): (cgka_traits::ingest::PeeledMessage, WelcomeContentId),
         route: WelcomeRoute,
     ) -> Result<GroupId, EngineError> {
+        self.check_welcome_delivery(&welcome_msg)?;
+        self.join_checked_welcome(welcome_msg, peeled, content_id, route)
+            .await
+    }
+
+    fn check_welcome_delivery(&self, welcome_msg: &TransportMessage) -> Result<(), EngineError> {
         // 1. Dedupe. The ingest-path welcome handler already guards with
         // `seen_message_ids`; direct `CgkaEngine::join_welcome` callers
         // skipped that. Without this check, a re-call would re-stage a
@@ -1498,8 +1458,17 @@ impl<S: StorageProvider> Engine<S> {
                 ));
             }
         }
-        let welcome_id = welcome_msg.id.clone();
+        Ok(())
+    }
 
+    async fn join_checked_welcome(
+        &mut self,
+        welcome_msg: TransportMessage,
+        peeled: cgka_traits::ingest::PeeledMessage,
+        content_id: WelcomeContentId,
+        route: WelcomeRoute,
+    ) -> Result<GroupId, EngineError> {
+        let welcome_id = welcome_msg.id.clone();
         if content_id.is_settled(self.storage.as_ref())? {
             self.storage.put_ingress_dedup_marker(&welcome_id)?;
             return Err(EngineError::WelcomeAlreadyProcessed);
@@ -2806,6 +2775,70 @@ fn rejoin_confirmation_required() -> EngineError {
         to: "JoinWelcome",
         reason: "replacement Welcome requires trusted removal evidence or explicit recipient confirmation",
     })
+}
+
+/// A pass over stored rejoin offers in storage order ([`Engine::rejoin_retry`]).
+pub struct RejoinRetry<'a, S: StorageProvider> {
+    engine: &'a mut Engine<S>,
+    candidates: std::vec::IntoIter<PendingWelcome>,
+}
+
+impl<S: StorageProvider> RejoinRetry<'_, S> {
+    /// Check each offer against the current group state, including any rejoin
+    /// applied earlier in this pass.
+    pub fn next_offer(&mut self) -> Result<Option<PreparedRejoin<'_, S>>, EngineError> {
+        for candidate in self.candidates.by_ref() {
+            if let Some(welcome) = self
+                .engine
+                .prepare_rejoin_after_trusted_removal(&candidate)?
+            {
+                return Ok(Some(PreparedRejoin {
+                    engine: self.engine,
+                    message_id: candidate.message_id,
+                    welcome,
+                }));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// An automatic rejoin ready for the caller to unseal.
+pub struct PreparedRejoin<'a, S: StorageProvider> {
+    engine: &'a mut Engine<S>,
+    message_id: MessageId,
+    welcome: TransportMessage,
+}
+
+impl<S: StorageProvider> PreparedRejoin<'_, S> {
+    pub fn welcome(&self) -> &TransportMessage {
+        &self.welcome
+    }
+
+    /// Apply the unseal result. Returns true if the offer joined.
+    pub async fn apply(
+        self,
+        unsealed: Result<cgka_traits::ingest::PeeledMessage, cgka_traits::error::PeelerError>,
+    ) -> Result<bool, EngineError> {
+        let outcome = match unsealed.map_err(EngineError::Peeler).and_then(|peeled| {
+            let content_id = WelcomeContentId::of(&peeled)?;
+            Ok((peeled, content_id))
+        }) {
+            Ok((peeled, content_id)) => {
+                self.engine
+                    .join_checked_welcome(self.welcome, peeled, content_id, WelcomeRoute::Delivery)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                self.engine.finish_failed_rejoin(&self.message_id, &error)?;
+                Ok(false)
+            }
+        }
+    }
 }
 
 /// Re-join offers with their consent tokens ([`Engine::rejoin_offers`]).

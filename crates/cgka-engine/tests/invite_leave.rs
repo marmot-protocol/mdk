@@ -283,15 +283,13 @@ impl WelcomeSeals {
 }
 
 async fn retry_raw_rejoins(engine: &mut Engine<SqliteAccountStorage>) -> Result<bool, EngineError> {
-    let unsealed = engine
-        .rejoin_candidates_after_trusted_removal()?
-        .into_iter()
-        .map(|msg| {
-            let peeled = raw_unseal(&msg);
-            (msg.id, Ok(peeled))
-        })
-        .collect();
-    engine.retry_rejoins_after_trusted_removal(unsealed).await
+    let mut retry = engine.rejoin_retry()?;
+    let mut joined = false;
+    while let Some(offer) = retry.next_offer()? {
+        let unsealed = raw_unseal(offer.welcome());
+        joined |= offer.apply(Ok(unsealed)).await?;
+    }
+    Ok(joined)
 }
 
 fn selfremove_registry() -> FeatureRegistry {
@@ -3694,7 +3692,7 @@ async fn removed_member_applying_removal_commit_marks_local_copy_removed() {
 }
 
 /// A copy this device was removed from must stay hydratable — the re-add path
-/// (`retry_rejoins_after_trusted_removal`) calls `ensure_hydrated` before it can
+/// (`rejoin_retry`) calls `ensure_hydrated` before it can
 /// install a replacement Welcome — so the session-open cheap pass still seeds it.
 /// What must differ from a live copy is the forensic trail and the live-member
 /// listing: a departed copy's open writes `hydrate_removed_group` where a live

@@ -104,14 +104,27 @@ async fn retained_invite_failing(
     };
     let (effects, mut welcomes) = prepared.into_effects_and_welcomes();
     assert_eq!(welcomes.len(), 1);
+    let held = runtime
+        .prepare_welcome_retry_task_with_audit_context(welcomes.clone(), Default::default())
+        .unwrap();
+    assert!(
+        held.message_ids().is_empty(),
+        "preparing a commit must not release its Welcome"
+    );
     fail(&adapter, group_relay.clone());
     let published = runtime
         .publish_prepared_session_effects_with_audit_context(effects, Default::default())
         .await
         .unwrap();
     assert!(published.failures.is_empty());
-    assert!(!published.unresolved_publishes.is_empty(), "commit retained");
-    assert!(published.pending.is_empty(), "neither confirmed nor rolled back");
+    assert!(
+        !published.unresolved_publishes.is_empty(),
+        "commit retained"
+    );
+    assert!(
+        published.pending.is_empty(),
+        "neither confirmed nor rolled back"
+    );
     RetainedInvite {
         runtime,
         adapter,
@@ -130,14 +143,12 @@ fn staged_invite_routing(
     group_id: &GroupId,
     group_relay: &TransportEndpoint,
 ) -> StaticTransportRouting {
-    StaticTransportRouting::new(vec![TransportEndpoint(
-        "wss://alice-inbox.example".into(),
-    )])
-    .with_group_route(
-        group_id.clone(),
-        group_id.as_slice().to_vec(),
-        vec![group_relay.clone()],
-    )
+    StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+        .with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![group_relay.clone()],
+        )
 }
 
 impl RetainedInvite {
@@ -169,14 +180,22 @@ impl RetainedInvite {
     /// Stop the runtime and open it again over the same store, as an app
     /// restart does.
     fn restart(&mut self, dir: &std::path::Path) {
-        self.reopen(dir, SessionConfig::legacy_compatibility_profile, Arc::new(MockSealer));
+        self.reopen(
+            dir,
+            SessionConfig::legacy_compatibility_profile,
+            Arc::new(MockSealer),
+        );
     }
 
     /// [`Self::restart`], leaving the group unhydrated.
     fn restart_unhydrated(&mut self, dir: &std::path::Path) {
         self.reopen(
             dir,
-            |config| config.legacy_compatibility_profile().defer_group_hydration(),
+            |config| {
+                config
+                    .legacy_compatibility_profile()
+                    .defer_group_hydration()
+            },
             Arc::new(MockSealer),
         );
     }
@@ -188,7 +207,12 @@ impl RetainedInvite {
         sealer: Arc<dyn InboxSealer>,
     ) {
         let restarted = reopen_staged_invite_runtime(
-            dir, configure, sealer, self.adapter.clone(), self.policy.clone(), self.wall.clone(),
+            dir,
+            configure,
+            sealer,
+            self.adapter.clone(),
+            self.policy.clone(),
+            self.wall.clone(),
         );
         drop(std::mem::replace(&mut self.runtime, restarted));
     }
@@ -273,7 +297,9 @@ async fn retry_founding_after_restart(restart: FoundingRestart) {
         .unwrap();
     assert!(staged_welcome_publishes(&adapter).is_empty());
     let unsealed = runtime.session().unsealed_owed_welcomes().unwrap();
-    let [welcome] = unsealed.as_slice() else { panic!("expected one unsealed founding Welcome") };
+    let [welcome] = unsealed.as_slice() else {
+        panic!("expected one unsealed founding Welcome")
+    };
     let local_id = welcome.local_id.clone();
     assert_eq!(sealer.attempts.load(Ordering::SeqCst), 1);
     drop(runtime);
@@ -298,15 +324,27 @@ async fn retry_founding_after_restart(restart: FoundingRestart) {
     if matches!(restart, FoundingRestart::AtDeadline) {
         assert_eq!(sealer.attempts.load(Ordering::SeqCst), 1);
         assert!(staged_welcome_publishes(&adapter).is_empty());
-        assert_eq!(runtime.session().stored_message_state(&local_id).unwrap(), Some(cgka_traits::MessageState::Failed));
-        assert!(runtime.session().outbound_welcome_audit_facts(&local_id).unwrap().is_none());
+        assert_eq!(
+            runtime.session().stored_message_state(&local_id).unwrap(),
+            Some(cgka_traits::MessageState::Failed)
+        );
+        assert!(
+            runtime
+                .session()
+                .outbound_welcome_audit_facts(&local_id)
+                .unwrap()
+                .is_none()
+        );
 
         wall.set(now);
         runtime.run_due_maintenance().await.unwrap();
         assert_eq!(sealer.attempts.load(Ordering::SeqCst), 1);
         assert!(staged_welcome_publishes(&adapter).is_empty());
         assert_eq!(
-            runtime.session().expire_sent_welcome(&local_id, Timestamp(now)).unwrap(),
+            runtime
+                .session()
+                .expire_sent_welcome(&local_id, Timestamp(now))
+                .unwrap(),
             Some(cgka_traits::message::WelcomeExpiry::Recorded),
             "the local row stays expired even before the deadline"
         );
@@ -314,21 +352,42 @@ async fn retry_founding_after_restart(restart: FoundingRestart) {
     }
     assert_eq!(sealer.attempts.load(Ordering::SeqCst), 2);
     let publishes = adapter.publishes();
-    let welcomes = publishes.iter().filter(|request| {
-        matches!(request.message.envelope, TransportEnvelope::Welcome { .. })
-    }).collect::<Vec<_>>();
+    let welcomes = publishes
+        .iter()
+        .filter(|request| matches!(request.message.envelope, TransportEnvelope::Welcome { .. }))
+        .collect::<Vec<_>>();
     let [published] = welcomes.as_slice() else {
-        panic!("maintenance must publish exactly one founding Welcome, got {}", welcomes.len());
+        panic!(
+            "maintenance must publish exactly one founding Welcome, got {}",
+            welcomes.len()
+        );
     };
     assert_eq!(published.target.endpoints(), &[bob_inbox]);
-    assert_eq!(published.message.envelope, TransportEnvelope::Welcome { recipient: bob_id.clone() });
-    let outcomes = runtime.welcome_delivery_outcomes(Some(&group), Some(&bob_id)).unwrap();
-    let [outcome] = outcomes.as_slice() else { panic!("expected one founding invite") };
-    let [outcome] = outcome.as_slice() else { panic!("expected one founding Welcome") };
-    assert_eq!(outcome.record.welcome_id, published.message.id);
-    assert_eq!(outcome.state, cgka_traits::maintenance::WelcomeDeliveryState::RelayAccepted);
     assert_eq!(
-        runtime.session().stored_message_state(&published.message.id).unwrap(),
+        published.message.envelope,
+        TransportEnvelope::Welcome {
+            recipient: bob_id.clone()
+        }
+    );
+    let outcomes = runtime
+        .welcome_delivery_outcomes(Some(&group), Some(&bob_id))
+        .unwrap();
+    let [outcome] = outcomes.as_slice() else {
+        panic!("expected one founding invite")
+    };
+    let [outcome] = outcome.as_slice() else {
+        panic!("expected one founding Welcome")
+    };
+    assert_eq!(outcome.record.welcome_id, published.message.id);
+    assert_eq!(
+        outcome.state,
+        cgka_traits::maintenance::WelcomeDeliveryState::RelayAccepted
+    );
+    assert_eq!(
+        runtime
+            .session()
+            .stored_message_state(&published.message.id)
+            .unwrap(),
         Some(cgka_traits::MessageState::Processed),
     );
     let joined = bob.ingest(published.message.clone()).await.unwrap();
@@ -456,9 +515,92 @@ async fn an_unsealable_founding_welcome_holds_back_no_other() {
         panic!("the unsealable founding Welcome stays owed");
     };
     assert_ne!(&still_owed.recipient, recipient);
-    let joiner = if *recipient == bob_id { &mut bob } else { &mut carol };
+    let joiner = if *recipient == bob_id {
+        &mut bob
+    } else {
+        &mut carol
+    };
     let joined = joiner.ingest(published.clone()).await.unwrap();
     assert_eq!(joined.outcome, cgka_traits::IngestOutcome::Processed);
+}
+
+#[tokio::test]
+async fn ready_welcome_before_parked_signer() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new(STAGED_INVITE_KEY).unwrap();
+    let mut alice = AccountDeviceSession::open(mock_session_config(
+        dir.path().join("alice.sqlite"),
+        &key,
+        STAGED_INVITE_ALICE,
+        Arc::new(FirstRecipientRefusingSealer::default()),
+    ))
+    .unwrap();
+    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"ready-bob");
+    let mut carol = current_session(dir.path().join("carol.sqlite"), &key, b"ready-carol");
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "ready before signer".into(),
+            description: String::new(),
+            members: vec![
+                bob.fresh_key_package().await.unwrap(),
+                carol.fresh_key_package().await.unwrap(),
+            ],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let [PublishWork::FoundingGroupCreated { welcomes }] = created.effects.publish.as_slice()
+    else {
+        panic!("expected a founding create");
+    };
+    let [ready] = welcomes.as_slice() else {
+        panic!("exactly one Welcome sealed")
+    };
+    drop(alice);
+
+    let endpoint = TransportEndpoint("wss://ready-welcome.example".into());
+    let routing = SharedRouting(Arc::new(Mutex::new(
+        staged_invite_routing(&created.group_id, &endpoint)
+            .with_inbox_route(bob.self_id(), vec![endpoint.clone()])
+            .with_inbox_route(carol.self_id(), vec![endpoint]),
+    )));
+    let adapter = RecordingAdapter::default();
+    let sealer = Arc::new(SwitchableSealer::default());
+    sealer.park.store(true, Ordering::SeqCst);
+    let mut runtime = reopen_staged_invite_runtime(
+        dir.path(),
+        std::convert::identity,
+        sealer.clone(),
+        adapter.clone(),
+        routing,
+        Arc::new(TestWallClock::new(unix_now())),
+    );
+    runtime.set_detached_welcome_waves(true);
+    tokio::select! {
+        output = runtime.run_due_maintenance() => { output.unwrap(); }
+        () = sealer.parked.notified() => panic!("maintenance waited for the signer before handing off the ready wave"),
+    }
+    let [wave]: [_; 1] = runtime
+        .take_prepared_welcome_tasks()
+        .try_into()
+        .ok()
+        .unwrap();
+    assert_eq!(wave.message_ids(), [ready.id.clone()]);
+    runtime
+        .finish_welcome_publish_task(wave.run().await)
+        .await
+        .unwrap();
+    tokio::select! {
+        _ = runtime.run_due_maintenance() => panic!("the remaining seal must park"),
+        () = sealer.parked.notified() => {}
+    }
+    assert_eq!(
+        staged_welcome_publishes(&adapter).as_slice(),
+        [ready.clone()]
+    );
+    assert_eq!(runtime.session().unsealed_owed_welcomes().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -466,61 +608,55 @@ async fn prepared_send_preserves_a_durably_queued_invite() {
     let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new(STAGED_INVITE_KEY).unwrap();
     let mut alice = current_session(dir.path().join("alice.sqlite"), &key, b"queued-alice");
-    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"queued-bob");
     let mut carol = current_session(dir.path().join("carol.sqlite"), &key, b"queued-carol");
-    let bob_id = bob.self_id();
     let created = alice
         .create_group(CreateGroupRequest {
             name: "queued prepared invite".into(),
             description: String::new(),
-            members: vec![bob.fresh_key_package().await.unwrap()],
+            members: Vec::new(),
             required_features: Vec::new(),
             app_components: Vec::new(),
-            initial_admins: vec![bob_id],
+            initial_admins: Vec::new(),
         })
         .await
         .unwrap();
     let group = created.group_id;
-    let [PublishWork::FoundingGroupCreated { welcomes }] = created.effects.publish.as_slice() else {
-        panic!("expected a founding Welcome");
-    };
-    let joined = bob.ingest(welcomes[0].clone()).await.unwrap();
-    assert_eq!(joined.outcome, cgka_traits::IngestOutcome::Processed);
-
-    let effects = alice.send(SendIntent::SelfUpdate { group_id: group.clone() }).await.unwrap();
-    let [PublishWork::GroupEvolution { msg, pending, .. }] = effects.publish.as_slice() else {
-        panic!("expected a self-update commit");
-    };
-    alice.confirm_published(*pending).await.unwrap();
-    let mut commit = msg.clone();
-    commit.envelope = TransportEnvelope::GroupMessage {
-        transport_group_id: group.as_slice().to_vec(),
-    };
-    bob.set_convergence_policy(cgka_engine::canonicalization::CanonicalizationPolicy {
-        settlement_quiescence_ms: 3_600_000,
-        ..Default::default()
-    }).unwrap();
-    assert!(matches!(bob.ingest(commit).await.unwrap().outcome, cgka_traits::IngestOutcome::Buffered { .. }));
+    // A foreground invite cannot overtake an earlier durable intent. No
+    // settlement timer or policy override is needed to hold the invite.
+    alice
+        .queue_app_message_with_audit_context(
+            group.clone(),
+            b"earlier message".to_vec(),
+            None,
+            Default::default(),
+        )
+        .await
+        .unwrap();
 
     let adapter = RecordingAdapter::default();
     let mut runtime = AccountDeviceRuntime::new(
-        bob,
+        alice,
         adapter.clone(),
         staged_invite_routing(&group, &TransportEndpoint("wss://group.example".into())),
         RecordingKeyPackages::default(),
     );
-    let prepared = runtime.confirm_commit_without_publish_with_audit_context(
-        SendIntent::Invite {
-            group_id: group.clone(),
-            key_packages: vec![carol.fresh_key_package().await.unwrap()],
-            initial_admins: Vec::new(),
-        },
-        Default::default(),
-    ).await.unwrap();
+    let prepared = runtime
+        .confirm_commit_without_publish_with_audit_context(
+            SendIntent::Invite {
+                group_id: group.clone(),
+                key_packages: vec![carol.fresh_key_package().await.unwrap()],
+                initial_admins: Vec::new(),
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
     let marmot_session::PreparedSessionSend::Queued(effects) = prepared else {
         panic!("queued invite must not pretend to be staged");
     };
-    let [queued] = effects.queued.as_slice() else { panic!("expected one queued invite") };
+    let [queued] = effects.queued.as_slice() else {
+        panic!("expected one queued invite")
+    };
     assert_eq!(queued.group_id, group);
     assert!(runtime.session().is_queued_outbound_intent(queued).unwrap());
     assert_eq!(effects.pending_convergence, [group]);
@@ -741,7 +877,10 @@ async fn staged_invite_welcome_goes_out_after_a_restart(first_read: FirstRead) {
             .runtime
             .prepare_owed_welcome_retry_task_with_audit_context(Default::default())
             .unwrap();
-        assert!(startup.is_none(), "nothing is owed while the commit is staged");
+        assert!(
+            startup.is_none(),
+            "nothing is owed while the commit is staged"
+        );
     }
     if !matches!(first_read, FirstRead::MaintenanceAfterConfirm) {
         invite.runtime.run_due_maintenance().await.unwrap();
@@ -796,7 +935,12 @@ async fn staged_invite_welcome_goes_out_once_its_group_is_hydrated() {
 
     invite.runtime.run_due_maintenance().await.unwrap();
     assert!(staged_welcome_publishes(&invite.adapter).is_empty());
-    assert!(invite.runtime.ensure_group_hydrated(&invite.group_id).unwrap());
+    assert!(
+        invite
+            .runtime
+            .ensure_group_hydrated(&invite.group_id)
+            .unwrap()
+    );
     invite.confirm_commit().await;
     invite.runtime.run_due_maintenance().await.unwrap();
 
@@ -852,7 +996,10 @@ async fn staged_invite_welcome_without_a_route_waits_for_its_paced_retry() {
         "a send that found no route leaves no retry record"
     );
     let first = attempts(&invite);
-    assert_eq!(invite.runtime.take_welcome_delivery_changes(), carol_changed);
+    assert_eq!(
+        invite.runtime.take_welcome_delivery_changes(),
+        carol_changed
+    );
 
     invite.wall.set(300_100 + 599);
     let held = invite.runtime.run_due_maintenance().await.unwrap();
@@ -874,7 +1021,10 @@ async fn staged_invite_welcome_without_a_route_waits_for_its_paced_retry() {
     invite.wall.set(300_100 + 600);
     invite.runtime.run_due_maintenance().await.unwrap();
     assert_eq!(attempts(&invite), first + 1);
-    assert_eq!(invite.runtime.take_welcome_delivery_changes(), carol_changed);
+    assert_eq!(
+        invite.runtime.take_welcome_delivery_changes(),
+        carol_changed
+    );
 
     invite.route_carol(true);
     invite.wall.set(300_700 + 1_199);
@@ -1062,11 +1212,7 @@ async fn welcomes_named_by_id_go_out_only_while_owed() {
 
     let staged = invite
         .runtime
-        .deliver_owed_welcomes_with_audit_context(
-            &ids,
-            invite.group_id.clone(),
-            Default::default(),
-        )
+        .deliver_owed_welcomes_with_audit_context(&ids, invite.group_id.clone(), Default::default())
         .await
         .unwrap();
     assert!(staged.welcome_failures.is_empty());
@@ -1114,11 +1260,7 @@ async fn a_withdrawn_welcome_named_by_id_stays_unsent() {
 
     let effects = invite
         .runtime
-        .deliver_owed_welcomes_with_audit_context(
-            &ids,
-            invite.group_id.clone(),
-            Default::default(),
-        )
+        .deliver_owed_welcomes_with_audit_context(&ids, invite.group_id.clone(), Default::default())
         .await
         .unwrap();
     assert!(effects.welcome_failures.is_empty());

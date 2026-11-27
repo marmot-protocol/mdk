@@ -123,11 +123,8 @@ where
     /// Record `welcome_prepared` and `welcome_event_size` for each Welcome
     /// just retained, exactly as the engine stored it: the commit it waits
     /// on (none for a founding Welcome) and the KeyPackage it answers.
-    /// Called where each first reaches the runtime: a create, a host's
-    /// accepted commit, and a drained or automatic commit when published.
-    /// Each is watched from here, so it is seen to settle. With a v5
-    /// recorder, a Welcome is remembered once its row is read, so a failed
-    /// read is tried again.
+    /// Each is watched once its sealed row exists. Deferred Welcomes can
+    /// have their preparation recorded earlier, from the local row.
     pub(super) fn note_retained_welcomes(&mut self, welcomes: &[TransportMessage]) {
         self.watch_welcomes(welcomes.iter().map(|welcome| welcome.id.clone()));
         if !self.audit.records_v5() {
@@ -137,17 +134,39 @@ where
             if self.v5_prepared_welcomes.contains(&welcome.id) {
                 continue;
             }
-            let Ok(facts) = self.session.outbound_welcome_audit_facts(&welcome.id) else {
+            let Ok(Some(facts)) = self.session.outbound_welcome_audit_facts(&welcome.id) else {
                 continue;
             };
-            if self.v5_prepared_welcomes.len() >= MAX_PREPARED_WELCOMES_REMEMBERED {
-                self.v5_prepared_welcomes.clear();
+            self.record_welcome_preparation(welcome, facts);
+        }
+    }
+
+    pub(super) fn note_prepared_seals(&mut self, seals: &[SealedWelcome]) {
+        if !self.audit.records_v5() {
+            return;
+        }
+        for seal in seals {
+            if self.v5_prepared_welcomes.contains(&seal.message.id) {
+                continue;
             }
-            self.v5_prepared_welcomes.insert(welcome.id.clone());
-            if let Some(v5) = facts.and_then(|facts| self.v5_welcome_of(facts)) {
-                self.record_v5_welcome_prepared(&v5);
-                self.record_v5_welcome_size(&v5, welcome);
+            if let Ok(Some(facts)) = self.session.engine.prepared_welcome_audit_facts(seal) {
+                self.record_welcome_preparation(&seal.message, facts);
             }
+        }
+    }
+
+    fn record_welcome_preparation(
+        &mut self,
+        welcome: &TransportMessage,
+        facts: cgka_engine::engine::OutboundWelcomeAuditFacts,
+    ) {
+        if self.v5_prepared_welcomes.len() >= MAX_PREPARED_WELCOMES_REMEMBERED {
+            self.v5_prepared_welcomes.clear();
+        }
+        self.v5_prepared_welcomes.insert(welcome.id.clone());
+        if let Some(v5) = self.v5_welcome_of(facts) {
+            self.record_v5_welcome_prepared(&v5);
+            self.record_v5_welcome_size(&v5, welcome);
         }
     }
 

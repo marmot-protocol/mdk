@@ -59,7 +59,7 @@ use tls_codec::Serialize as _;
 
 mod support;
 use support::proof_signer;
-use support::raw_inbox::{join_raw, seal_and_bind};
+use support::raw_inbox::{join_raw, raw_unseal, seal_and_bind};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
@@ -5396,8 +5396,9 @@ async fn upgraded_fork_rejoin_does_not_chain_discarded_branch_processed_commits(
         .find(|w| w.group_id == group_id && w.rejoin.is_some())
         .expect("rejoin offer stored");
     let token = offer.rejoin.unwrap().local_state_token;
+    let stored = carol.stored_welcome(&offer.message_id, &token).unwrap();
     carol
-        .confirm_group_rejoin(&offer.message_id, &token)
+        .confirm_group_rejoin(&offer.message_id, &token, raw_unseal(&stored))
         .await
         .unwrap();
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));

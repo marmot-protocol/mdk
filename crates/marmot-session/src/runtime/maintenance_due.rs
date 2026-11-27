@@ -66,6 +66,7 @@ where
             || !self.pending_leaf_reconciliations.is_empty()
             || self.welcome_expiries_unfinished()
             || !self.sealing_commits.is_empty()
+            || self.seal_rollback_batch.is_some()
         {
             due.owed();
         }
@@ -88,6 +89,13 @@ where
             Vec::new()
         };
         if founding_welcomes_unfinished && !live_groups.is_empty() {
+            due.owed();
+        }
+        if self
+            .unread_welcome_groups
+            .iter()
+            .any(|group| self.session.engine.check_group_live(group).is_ok())
+        {
             due.owed();
         }
         if !self.maintenance_paused {

@@ -51,7 +51,7 @@ use openmls_rust_crypto::RustCrypto;
 pub use openmls_traits::types::Ciphersuite;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tls_codec::Serialize as _;
 use web_time::Instant;
@@ -98,10 +98,14 @@ pub struct OutboundWelcomeWork {
     /// Welcomes waiting for a Commit: staged with an unconfirmed one, or
     /// holding while their retained origin is temporarily unavailable.
     pub staged: Vec<MessageId>,
-    /// Groups the pass did not read because they are not live (unhydrated
-    /// or quarantined). [`Engine::outbound_welcome_work_in`] reads one once
-    /// it is.
+    /// Groups not read because they are not live or their rows could not be
+    /// read. [`Engine::outbound_welcome_work_in`] can retry one group.
     pub unread_groups: Vec<GroupId>,
+}
+
+enum WelcomeScan {
+    Strict,
+    RetryUnread,
 }
 
 /// Where one retained outbound Welcome stands for delivery.
@@ -184,6 +188,29 @@ enum SendAcceptance {
 enum IngestEntry {
     Unrecorded,
     Recorded,
+}
+
+/// Result of [`Engine::begin_ingest_with_audit_context`].
+#[allow(clippy::large_enum_variant)] // Keep the pending context inline; no per-delivery allocation.
+pub enum AuditedIngest<'msg> {
+    Complete(IngestOutcome),
+    InboxSealed(PendingInboxIngest<'msg>),
+}
+
+impl AuditedIngest<'_> {
+    fn into_outcome(self) -> IngestOutcome {
+        match self {
+            Self::Complete(outcome) => outcome,
+            Self::InboxSealed(_) => IngestOutcome::InboxSealed,
+        }
+    }
+}
+
+/// Owns one delivery's audit context while the caller unseals its message.
+pub struct PendingInboxIngest<'msg> {
+    msg: &'msg TransportMessage,
+    context: AuditEventContext,
+    recorder: Weak<dyn ForensicRecorder>,
 }
 
 /// Holds the engine for one local operation and keeps its audit context as
@@ -357,10 +384,6 @@ pub struct Engine<S: StorageProvider> {
     /// durable trace, so only relay redelivery can present it again. See
     /// [`Engine::last_ingest_left_object_unpersisted`].
     pub(crate) last_ingest_left_object_unpersisted: bool,
-    /// The audit context of the last delivery ingest stopped as
-    /// [`IngestOutcome::InboxSealed`], so its unsealed half continues the same
-    /// evidence: one entry row and one outcome row per delivery.
-    sealed_ingest: Option<(MessageId, AuditEventContext)>,
 
     /// MessageIds this engine has produced via `send` or `create_group` /
     /// `invite`. Backs the typed own-echo exclusion when a message we produced
@@ -876,7 +899,6 @@ impl<S: StorageProvider> EngineBuilder<S> {
             seen_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
             retryable_unpersisted_ingest_id: None,
             last_ingest_left_object_unpersisted: false,
-            sealed_ingest: None,
             sent_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
             leave_requests: HashMap::new(),
             leaving_groups: HashSet::new(),
@@ -1154,6 +1176,23 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         id: &MessageId,
     ) -> Result<Option<OutboundWelcomeAuditFacts>, EngineError> {
+        self.read_welcome_audit_facts(id, None)
+    }
+
+    /// Audit a sealed Welcome before its first fanout binds the transport id.
+    /// The retained local row supplies the origin and KeyPackage provenance.
+    pub fn prepared_welcome_audit_facts(
+        &self,
+        seal: &SealedWelcome,
+    ) -> Result<Option<OutboundWelcomeAuditFacts>, EngineError> {
+        self.read_welcome_audit_facts(&seal.local_id, Some(&seal.message))
+    }
+
+    fn read_welcome_audit_facts(
+        &self,
+        id: &MessageId,
+        sealed: Option<&TransportMessage>,
+    ) -> Result<Option<OutboundWelcomeAuditFacts>, EngineError> {
         let record = match self.storage.get_message(id) {
             Ok(record) => record,
             Err(StorageError::NotFound) => return Ok(None),
@@ -1161,17 +1200,36 @@ impl<S: StorageProvider> Engine<S> {
         };
         let payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
-        let (message, origin_commit_id) = match &payload {
-            StoredMessagePayload::OutboundWelcome {
-                message,
-                origin_commit_id,
-                ..
-            } => (message, origin_commit_id.clone()),
-            StoredMessagePayload::StagedInviteWelcome {
-                message,
-                origin_commit_id,
-                ..
-            } => (message, Some(origin_commit_id.clone())),
+        let (message, origin_commit_id) = match (&payload, sealed) {
+            (
+                StoredMessagePayload::OutboundWelcome {
+                    message,
+                    origin_commit_id,
+                    ..
+                },
+                None,
+            ) => (message, origin_commit_id.clone()),
+            (
+                StoredMessagePayload::StagedInviteWelcome {
+                    message,
+                    origin_commit_id,
+                    ..
+                },
+                None,
+            ) => (message, Some(origin_commit_id.clone())),
+            (
+                StoredMessagePayload::UnsealedWelcome {
+                    welcome,
+                    origin: UnsealedWelcomeOrigin::StagedCommit(commit),
+                    ..
+                },
+                Some(message),
+            ) if matches!(&message.envelope,
+                TransportEnvelope::Welcome { recipient } if *recipient == welcome.recipient
+            ) =>
+            {
+                (message, Some(commit.clone()))
+            }
             _ => return Ok(None),
         };
         let TransportEnvelope::Welcome { recipient } = &message.envelope else {
@@ -1276,6 +1334,7 @@ impl<S: StorageProvider> Engine<S> {
             let mut bound = Vec::with_capacity(sealed.len());
             for entry in sealed {
                 let record = storage.get_message(&entry.local_id)?;
+                self.ensure_group_live(&record.group_id)?;
                 let payload = StoredMessagePayload::decode(&record.payload)
                     .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
                 let StoredMessagePayload::UnsealedWelcome {
@@ -1672,37 +1731,60 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Ingest a borrowed transport message with its audit provenance.
-    /// The caller retains the original wire payload across the entire operation.
+    /// [`IngestOutcome::InboxSealed`] records no ingest rows here. Use
+    /// [`Self::begin_ingest_with_audit_context`] to keep the provenance of an
+    /// inbox delivery through unsealing.
     pub async fn ingest_with_audit_context(
         &mut self,
         msg: &TransportMessage,
         transport_context: Option<marmot_forensics::AuditTransportContext>,
     ) -> Result<IngestOutcome, EngineError> {
         let context = self.ingest_audit_context(transport_context);
-        let result = self
-            .audited_ingest(msg, context.clone(), IngestEntry::Unrecorded, None)
-            .await;
-        if matches!(result, Ok(IngestOutcome::InboxSealed)) {
-            self.sealed_ingest = Some((msg.id.clone(), context));
-        }
-        result
+        self.audited_ingest(msg, context, IngestEntry::Unrecorded, None)
+            .await
+            .map(AuditedIngest::into_outcome)
     }
 
-    /// Finish ingesting an account-inbox delivery that
-    /// [`Self::ingest_with_audit_context`] stopped as
-    /// [`IngestOutcome::InboxSealed`], with the caller's unseal result. The
-    /// delivery keeps the audit context its first half opened.
+    /// Ingest a borrowed delivery or return its continuation if it needs
+    /// unsealing. The caller retains the original message and can start other
+    /// deliveries before finishing this one.
+    pub async fn begin_ingest_with_audit_context<'msg>(
+        &mut self,
+        msg: &'msg TransportMessage,
+        transport_context: Option<marmot_forensics::AuditTransportContext>,
+    ) -> Result<AuditedIngest<'msg>, EngineError> {
+        let context = self.ingest_audit_context(transport_context);
+        let result = self
+            .audited_ingest(msg, context, IngestEntry::Unrecorded, None)
+            .await?;
+        if let AuditedIngest::InboxSealed(pending) = &result {
+            self.record_ingest_entry(pending.msg, &pending.context);
+        }
+        Ok(result)
+    }
+
+    /// Finish an audited inbox delivery on the engine that started it, with
+    /// the caller's unseal result. This consumes the continuation and records
+    /// the outcome under the delivery's original audit context.
     pub async fn ingest_unsealed_with_audit_context(
         &mut self,
-        msg: &TransportMessage,
+        pending: PendingInboxIngest<'_>,
         unsealed: Result<cgka_traits::ingest::PeeledMessage, cgka_traits::error::PeelerError>,
     ) -> Result<IngestOutcome, EngineError> {
-        let (context, entry) = match self.sealed_ingest.take() {
-            Some((id, context)) if id == msg.id => (context, IngestEntry::Recorded),
-            _ => (self.ingest_audit_context(None), IngestEntry::Unrecorded),
-        };
-        self.audited_ingest(msg, context, entry, Some(unsealed))
-            .await
+        // Each engine owns its recorder Arc, even when the recorders share a sink.
+        if !std::ptr::addr_eq(pending.recorder.as_ptr(), Arc::as_ptr(&self.recorder)) {
+            return Err(EngineError::Backend(
+                "pending inbox delivery belongs to another engine".into(),
+            ));
+        }
+        self.audited_ingest(
+            pending.msg,
+            pending.context,
+            IngestEntry::Recorded,
+            Some(unsealed),
+        )
+        .await
+        .map(AuditedIngest::into_outcome)
     }
 
     fn ingest_audit_context(
@@ -1721,20 +1803,18 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
-    /// Ingest `msg` and record its evidence: the entry row unless `entry`
-    /// says the delivery's first half wrote it, then the outcome row, except
-    /// for [`IngestOutcome::InboxSealed`], whose outcome follows its unsealed
-    /// half.
-    async fn audited_ingest(
+    /// Record the entry and outcome unless the engine needs the caller to
+    /// unseal the delivery first. In that case the audited split API writes
+    /// the entry when it returns the continuation.
+    async fn audited_ingest<'msg>(
         &mut self,
-        msg: &TransportMessage,
+        msg: &'msg TransportMessage,
         mut context: AuditEventContext,
         entry: IngestEntry,
         unsealed: Option<
             Result<cgka_traits::ingest::PeeledMessage, cgka_traits::error::PeelerError>,
         >,
-    ) -> Result<IngestOutcome, EngineError> {
-        let msg_id_hex = hex::encode(msg.id.as_slice());
+    ) -> Result<AuditedIngest<'msg>, EngineError> {
         // A relay replay of a message this engine already holds or sent ends
         // `Ignored { Duplicate | OwnEcho }` before any work, and replay storms
         // repeat that per message. Learn it from the same reads ingest starts
@@ -1742,22 +1822,36 @@ impl<S: StorageProvider> Engine<S> {
         let recorded = self.recorded_ingest(msg);
         let replay = matches!(&recorded, Ok(Some(recorded)) if recorded.is_ignored_replay());
         let record_entry = entry == IngestEntry::Unrecorded;
-        if !replay && record_entry {
+        // Routing a sealed inbox delivery emits no internal audit rows. Wait
+        // for routing so the plain split API can leave the entry and outcome
+        // to the call that has the unseal result.
+        let inbox_preflight = matches!(&recorded, Ok(None))
+            && unsealed.is_none()
+            && matches!(&msg.envelope, TransportEnvelope::Welcome { .. });
+        if record_entry && !replay && !inbox_preflight {
             self.record_ingest_entry(msg, &context);
         }
         let result = self.do_ingest(msg, recorded, unsealed).await;
+        if matches!(&result, Ok(IngestOutcome::InboxSealed)) {
+            return Ok(AuditedIngest::InboxSealed(PendingInboxIngest {
+                msg,
+                context,
+                recorder: Arc::downgrade(&self.recorder),
+            }));
+        }
         // Only a failed echo write can turn a replay into something else.
         // Everything else keeps its full evidence, entry first.
-        if replay
-            && record_entry
-            && !result
-                .as_ref()
-                .is_ok_and(crate::message_processor::is_ignored_replay)
+        if record_entry
+            && (inbox_preflight
+                || (replay
+                    && !result
+                        .as_ref()
+                        .is_ok_and(crate::message_processor::is_ignored_replay)))
         {
             self.record_ingest_entry(msg, &context);
         }
+        let msg_id_hex = hex::encode(msg.id.as_slice());
         match &result {
-            Ok(IngestOutcome::InboxSealed) => {}
             Ok(outcome) => {
                 let group_ref = crate::audit_helpers::ingest_outcome_group_ref(outcome);
                 self.recorder.record(AuditRecord {
@@ -1779,7 +1873,7 @@ impl<S: StorageProvider> Engine<S> {
                 );
             }
         }
-        result
+        result.map(AuditedIngest::Complete)
     }
 
     /// The rows that open an inbound message's evidence. The transport wire
@@ -4796,20 +4890,41 @@ impl<S: StorageProvider> Engine<S> {
     pub fn outstanding_sent_welcomes(
         &self,
     ) -> Result<Vec<(GroupId, TransportMessage)>, EngineError> {
-        Ok(self.outbound_welcome_work()?.owed)
+        Ok(self.scan_outbound_welcomes(WelcomeScan::Strict)?.owed)
     }
 
     /// [`Self::outstanding_sent_welcomes`], plus the ids of Welcomes still
     /// staged with their commits, from the same pass. A restart uses it to
     /// deliver what is owed and to watch what may become owed.
     pub fn outbound_welcome_work(&self) -> Result<OutboundWelcomeWork, EngineError> {
+        self.scan_outbound_welcomes(WelcomeScan::RetryUnread)
+    }
+
+    fn scan_outbound_welcomes(
+        &self,
+        scan: WelcomeScan,
+    ) -> Result<OutboundWelcomeWork, EngineError> {
         let mut work = OutboundWelcomeWork::default();
         for group_id in self.storage.list_groups()? {
             if self.ensure_group_live(&group_id).is_err() {
                 work.unread_groups.push(group_id);
                 continue;
             }
-            self.read_outbound_welcome_work(&group_id, &mut work)?;
+            let (owed, staged) = (work.owed.len(), work.staged.len());
+            if let Err(error) = self.read_outbound_welcome_work(&group_id, &mut work) {
+                if matches!(scan, WelcomeScan::Strict) {
+                    return Err(error);
+                }
+                work.owed.truncate(owed);
+                work.staged.truncate(staged);
+                work.unread_groups.push(group_id);
+                tracing::warn!(
+                    target: "cgka_engine::engine",
+                    method = "scan_outbound_welcomes",
+                    error_kind = error.privacy_safe_kind(),
+                    "group Welcome read failed"
+                );
+            }
         }
         Ok(work)
     }
@@ -4818,27 +4933,42 @@ impl<S: StorageProvider> Engine<S> {
     /// create whose session stopped, or failed to seal, before binding them.
     /// Staged and legacy-create Welcomes are left out: their Commit's first
     /// fanout binds them, or they roll back with it.
+    /// The flag reports whether a live group's rows could not be read.
     pub fn unsealed_owed_welcomes(
         &self,
-    ) -> Result<Vec<cgka_traits::engine::OutboundWelcome>, EngineError> {
+    ) -> Result<(Vec<cgka_traits::engine::OutboundWelcome>, bool), EngineError> {
         let mut welcomes = Vec::new();
+        let mut unread = false;
         for group_id in self.storage.list_groups()? {
             if self.ensure_group_live(&group_id).is_err() {
                 continue;
             }
-            self.visit_group_welcome_records(&group_id, &[MessageState::Sent], |_, _, payload| {
-                if let StoredMessagePayload::UnsealedWelcome {
-                    welcome,
-                    origin: UnsealedWelcomeOrigin::Founding,
-                    ..
-                } = payload
-                {
-                    welcomes.push(welcome);
-                }
-                Ok(())
-            })?;
+            let read = self.visit_group_welcome_records(
+                &group_id,
+                &[MessageState::Sent],
+                |_, _, payload| {
+                    if let StoredMessagePayload::UnsealedWelcome {
+                        welcome,
+                        origin: UnsealedWelcomeOrigin::Founding,
+                        ..
+                    } = payload
+                    {
+                        welcomes.push(welcome);
+                    }
+                    Ok(())
+                },
+            );
+            if let Err(error) = read {
+                tracing::warn!(
+                    target: "cgka_engine::engine",
+                    method = "unsealed_owed_welcomes",
+                    error_kind = error.privacy_safe_kind(),
+                    "group unsealed Welcome read failed"
+                );
+                unread = true;
+            }
         }
-        Ok(welcomes)
+        Ok((welcomes, unread))
     }
 
     /// [`Self::outbound_welcome_work`] for one group, or `None` while the
@@ -5824,8 +5954,10 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         msg: TransportMessage,
         unsealed: Result<cgka_traits::ingest::PeeledMessage, cgka_traits::error::PeelerError>,
     ) -> Result<IngestOutcome, EngineError> {
-        self.ingest_unsealed_with_audit_context(&msg, unsealed)
+        let context = self.ingest_audit_context(None);
+        self.audited_ingest(&msg, context, IngestEntry::Unrecorded, Some(unsealed))
             .await
+            .map(AuditedIngest::into_outcome)
     }
 
     fn drain_events(&mut self) -> Vec<GroupEvent> {

@@ -3759,21 +3759,11 @@ async fn rejoin_retries_failed_replay() {
                 );
             }
             Route::RetainedOffer => {
-                let unsealed = alice
-                    .rejoin_candidates_after_trusted_removal()
-                    .unwrap()
-                    .into_iter()
-                    .map(|message| {
-                        let unsealed = raw_unseal(&message);
-                        (message.id, Ok(unsealed))
-                    })
-                    .collect();
-                assert!(
-                    alice
-                        .retry_rejoins_after_trusted_removal(unsealed)
-                        .await
-                        .unwrap()
-                );
+                let mut retry = alice.rejoin_retry().unwrap();
+                let offer = retry.next_offer().unwrap().unwrap();
+                let unsealed = raw_unseal(offer.welcome());
+                assert!(offer.apply(Ok(unsealed)).await.unwrap());
+                assert!(retry.next_offer().unwrap().is_none());
             }
         }
         assert!(!storage.get_group(&group_id).unwrap().removed);

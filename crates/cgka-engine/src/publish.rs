@@ -34,7 +34,7 @@ use cgka_traits::OutboundFanout;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
-use cgka_traits::message::MessageState;
+use cgka_traits::message::{MessageState, StoredMessagePayload, UnsealedWelcomeOrigin};
 use cgka_traits::storage::{
     ChangeNotDelivered, ChangeOrigin, QueuedOutboundIntent, StorageProvider,
 };
@@ -625,6 +625,30 @@ impl<S: StorageProvider> Engine<S> {
                             origin_commit_id.as_ref(),
                             MessageState::Failed,
                         )?;
+                    } else if kind == crate::epoch_manager::PendingKind::CreateGroup
+                        && rolled_back_fanout.is_none()
+                    {
+                        // A legacy create can fail before sealing and binding
+                        // its first fanout. Discard the unpublished artifacts
+                        // with the founding Add, not the solo group itself.
+                        for record in storage.list_messages_in_states(
+                            &group_id,
+                            &[MessageState::Sent],
+                            source_epoch,
+                        )? {
+                            if record.epoch == source_epoch
+                                && matches!(
+                                    StoredMessagePayload::decode(&record.payload)
+                                        .map_err(|e| EngineError::Serialize(format!("{e:?}")))?,
+                                    StoredMessagePayload::UnsealedWelcome {
+                                        origin: UnsealedWelcomeOrigin::LegacyCreate,
+                                        ..
+                                    }
+                                )
+                            {
+                                storage.delete_message(&record.id)?;
+                            }
+                        }
                     }
                     let tx_provider =
                         EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());

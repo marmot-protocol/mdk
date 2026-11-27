@@ -1864,7 +1864,8 @@ async fn current_group_rejects_colliding_founding_welcome_delivery_ids_atomicall
         EngineError::Backend(ref message) if message == "sealed Welcomes share a transport id"
     ));
     assert!(alice.outstanding_sent_welcomes().unwrap().is_empty());
-    let owed = alice.unsealed_owed_welcomes().unwrap();
+    let (owed, unread) = alice.unsealed_owed_welcomes().unwrap();
+    assert!(!unread);
     assert_eq!(owed.len(), welcomes.len());
     assert!(welcomes.iter().all(|welcome| owed.contains(welcome)));
     assert_eq!(alice.live_group_ids().unwrap(), vec![group_id.clone()]);
