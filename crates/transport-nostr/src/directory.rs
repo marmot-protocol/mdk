@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -7,11 +8,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::TransportEndpoint;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use nostr_sdk::authenticator::{Authenticator, SignerAuthenticator};
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, Event, EventId, Filter, Kind, PublicKey, RelayMessage, RelayUrl,
-    SingleLetterTag, Timestamp,
+    Client as NostrSdkClient, ClientBuilder, Event, EventId, Filter, Kind, PublicKey, RelayMessage,
+    RelayUrl, SingleLetterTag, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -245,11 +246,34 @@ struct InflightFetch<T> {
     waiters: Vec<(u64, oneshot::Sender<T>)>,
 }
 
-#[derive(Clone, Copy)]
-enum CoalescedKind {
-    Plain,
-    Completion,
+trait CoalescedMap {
+    type Output: Clone + Send + 'static;
+
+    fn map(state: &mut DirectoryRelayPlaneState) -> &mut InflightMap<Self::Output>;
 }
+
+struct PlainFetchMap;
+
+impl CoalescedMap for PlainFetchMap {
+    type Output = Vec<DirectoryRelayEventRecord>;
+
+    fn map(state: &mut DirectoryRelayPlaneState) -> &mut InflightMap<Self::Output> {
+        &mut state.inflight
+    }
+}
+
+struct CompletionFetchMap;
+
+impl CoalescedMap for CompletionFetchMap {
+    type Output = DirectoryFetchOutcome;
+
+    fn map(state: &mut DirectoryRelayPlaneState) -> &mut InflightMap<Self::Output> {
+        &mut state.inflight_completion
+    }
+}
+
+type RemoveWaiterFn =
+    fn(&mut DirectoryRelayPlaneState, &DirectoryFetchKey, u64, u64) -> Option<CancellationToken>;
 
 #[derive(Default)]
 struct DirectoryRelayPlaneState {
@@ -282,7 +306,7 @@ impl DirectoryRelayPlaneState {
 /// the shared fetch immediately; remaining waiters keep the fetch running.
 struct CoalescedWaiterGuard {
     state: Arc<Mutex<DirectoryRelayPlaneState>>,
-    kind: CoalescedKind,
+    remove_waiter: RemoveWaiterFn,
     key: DirectoryFetchKey,
     entry_id: u64,
     waiter_id: u64,
@@ -304,20 +328,7 @@ impl Drop for CoalescedWaiterGuard {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let cancel = match self.kind {
-            CoalescedKind::Plain => remove_waiter_from_map(
-                &mut state.inflight,
-                &self.key,
-                self.entry_id,
-                self.waiter_id,
-            ),
-            CoalescedKind::Completion => remove_waiter_from_map(
-                &mut state.inflight_completion,
-                &self.key,
-                self.entry_id,
-                self.waiter_id,
-            ),
-        };
+        let cancel = (self.remove_waiter)(&mut state, &self.key, self.entry_id, self.waiter_id);
         drop(state);
         if let Some(cancel) = cancel {
             cancel.cancel();
@@ -325,12 +336,13 @@ impl Drop for CoalescedWaiterGuard {
     }
 }
 
-fn remove_waiter_from_map<T>(
-    map: &mut HashMap<DirectoryFetchKey, InflightFetch<T>>,
+fn remove_waiter_for<M: CoalescedMap>(
+    state: &mut DirectoryRelayPlaneState,
     key: &DirectoryFetchKey,
     entry_id: u64,
     waiter_id: u64,
 ) -> Option<CancellationToken> {
+    let map = M::map(state);
     let empty = {
         let entry = map.get_mut(key)?;
         if entry.id != entry_id {
@@ -460,7 +472,11 @@ struct ScopedDirectoryClient {
 
 impl ScopedDirectoryClient {
     fn new() -> Self {
-        let (builder, finite) = FiniteRequests::install(super::nostr_builder());
+        Self::from_builder(super::nostr_builder())
+    }
+
+    fn from_builder(builder: ClientBuilder) -> Self {
+        let (builder, finite) = FiniteRequests::install(builder);
         Self {
             client: builder.build(),
             finite,
@@ -490,25 +506,6 @@ impl Drop for ScopedDirectoryClient {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, client.shutdown()).await;
-            });
-        }
-    }
-}
-
-/// A client owned by one bounded read. Dropped, it stops the relay it holds
-/// at once (`Relay::shutdown` ends its dial, socket and AUTH handling before
-/// it returns), so a cancelled read leaves no connection behind, and then
-/// shuts the client down.
-struct ScopedInspectionClient(NostrSdkClient, Option<nostr_sdk::prelude::Relay>);
-impl Drop for ScopedInspectionClient {
-    fn drop(&mut self) {
-        if let Some(relay) = &self.1 {
-            relay.shutdown();
-        }
-        let client = self.0.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = client.shutdown().await;
             });
         }
     }
@@ -762,21 +759,19 @@ impl DirectoryRelayPlane {
         .await;
     }
 
-    async fn coalesce_fetch<T, F, Fut, S>(
+    async fn coalesce_fetch<M, F, Fut, S>(
         &self,
-        kind: CoalescedKind,
-        map_of: fn(&mut DirectoryRelayPlaneState) -> &mut InflightMap<T>,
         request: DirectoryFetchRequest,
         run_fetch: F,
         is_complete: S,
-    ) -> Result<T, String>
+    ) -> Result<M::Output, String>
     where
-        T: Clone + Send + 'static,
+        M: CoalescedMap,
         F: FnOnce(Arc<dyn DirectoryRelayFetcher>, DirectoryFetchRequest, CancellationToken) -> Fut
             + Send
             + 'static,
-        Fut: Future<Output = Result<T, String>> + Send + 'static,
-        S: FnOnce(&Result<T, String>) -> bool + Send + 'static,
+        Fut: Future<Output = Result<M::Output, String>> + Send + 'static,
+        S: FnOnce(&Result<M::Output, String>) -> bool + Send + 'static,
     {
         let key = request.key();
         let (tx, rx) = oneshot::channel();
@@ -786,7 +781,7 @@ impl DirectoryRelayPlane {
                 return Err(DIRECTORY_PLANE_SHUTTING_DOWN.to_owned());
             }
             let waiter_id = state.alloc_id();
-            if let Some(entry) = map_of(&mut state).get_mut(&key) {
+            if let Some(entry) = M::map(&mut state).get_mut(&key) {
                 let entry_id = entry.id;
                 entry.waiters.push((waiter_id, tx));
                 state.coalesced_waiters += 1;
@@ -794,7 +789,7 @@ impl DirectoryRelayPlane {
             } else {
                 let entry_id = state.alloc_id();
                 let cancel = CancellationToken::new();
-                map_of(&mut state).insert(
+                M::map(&mut state).insert(
                     key.clone(),
                     InflightFetch {
                         id: entry_id,
@@ -807,38 +802,33 @@ impl DirectoryRelayPlane {
                 let task_key = key.clone();
                 let supervisor_cancel = cancel.clone();
                 let handle = tokio::spawn(async move {
-                    // Keep ownership of the inflight entry in this supervisor.
-                    // The child JoinHandle converts a fetcher panic into an
-                    // error so cleanup and waiter notification still run.
-                    let mut child =
-                        tokio::spawn(async move { run_fetch(fetcher, request, cancel).await });
+                    // Run the fetch directly inside the single supervisor task
+                    // with `catch_unwind` so panics still clear the coalescing
+                    // key and aborting this handle during plane shutdown
+                    // drops the fetch future directly without detaching a child.
+                    let fetch =
+                        AssertUnwindSafe(run_fetch(fetcher, request, cancel)).catch_unwind();
                     let result = tokio::select! {
                         biased;
-                        joined = &mut child => match joined {
+                        joined = fetch => match joined {
                             Ok(result) => Some(result),
                             Err(_) => Some(Err("directory fetch task failed".to_owned())),
                         },
-                        () = supervisor_cancel.cancelled() => {
-                            // Give cooperative cancellation (closing relays and
-                            // shutting down the scoped client) a bounded window
-                            // before aborting a non-responsive custom fetcher.
-                            if timeout(RELAY_PLANE_SHUTDOWN_WAIT, &mut child).await.is_err() {
-                                child.abort();
-                                let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut child).await;
-                            }
-                            None
-                        }
+                        () = async {
+                            supervisor_cancel.cancelled().await;
+                            tokio::time::sleep(RELAY_PLANE_SHUTDOWN_WAIT).await;
+                        } => None,
                     };
                     let waiters = {
                         let mut state = state_arc
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         state.active_tasks.remove(&entry_id);
-                        let matches_entry = map_of(&mut state)
+                        let matches_entry = M::map(&mut state)
                             .get(&task_key)
                             .is_some_and(|entry| entry.id == entry_id);
                         if matches_entry {
-                            let entry = map_of(&mut state).remove(&task_key);
+                            let entry = M::map(&mut state).remove(&task_key);
                             if let Some(ref outcome) = result {
                                 if is_complete(outcome) {
                                     state.completed_fetches += 1;
@@ -864,7 +854,7 @@ impl DirectoryRelayPlane {
 
         let mut guard = CoalescedWaiterGuard {
             state: self.state.clone(),
-            kind,
+            remove_waiter: remove_waiter_for::<M>,
             key,
             entry_id,
             waiter_id,
@@ -881,9 +871,7 @@ impl DirectoryRelayPlane {
         &self,
         request: DirectoryFetchRequest,
     ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
-        self.coalesce_fetch(
-            CoalescedKind::Plain,
-            |state| &mut state.inflight,
+        self.coalesce_fetch::<PlainFetchMap, _, _, _>(
             request,
             |fetcher, request, cancel| async move {
                 fetcher
@@ -899,9 +887,7 @@ impl DirectoryRelayPlane {
         &self,
         request: DirectoryFetchRequest,
     ) -> Result<DirectoryFetchOutcome, String> {
-        self.coalesce_fetch(
-            CoalescedKind::Completion,
-            |state| &mut state.inflight_completion,
+        self.coalesce_fetch::<CompletionFetchMap, _, _, _>(
             request,
             |fetcher, request, cancel| async move {
                 fetcher
@@ -1590,9 +1576,9 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             }),
             None => super::nostr_builder(),
         };
-        let (builder, finite) = FiniteRequests::install(builder);
-        let mut scoped = ScopedInspectionClient(builder.build(), None);
-        let client = scoped.0.clone();
+        let mut scoped = ScopedDirectoryClient::from_builder(builder);
+        let client = scoped.client.clone();
+        let finite = scoped.finite.clone();
         let urls = parsed_directory_relay_urls(&request.endpoints).map_err(|_| InvalidRequest)?;
         if urls.len() != 1 {
             return Err(InvalidRequest);
@@ -1607,7 +1593,7 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             .await
             .map_err(|_| Unreachable)?
             .ok_or(Unreachable)?;
-        scoped.1 = Some(relay.clone());
+        scoped.relays.push(relay.clone());
         // Relay health reads the relay's own answers to the signer's AUTH,
         // watched from before the dial too.
         let mut auth_replies = relay.notifications().with_gaps();
@@ -2606,13 +2592,93 @@ mod tests {
         assert_eq!(records[0].event.id, expected_id);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn signerless_inspection_never_retains_relays_in_the_shared_client() {
+    #[test]
+    fn standalone_directory_fetcher_holds_no_client() {
         assert_eq!(
             std::mem::size_of::<NostrSdkDirectoryRelayFetcher>(),
             0,
             "standalone directory fetcher must not hold an idle shared SDK client"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn directory_plane_shutdown_aborts_uncooperative_cancellable_fetcher() {
+        use tokio::sync::watch;
+
+        struct UncooperativeFetcher {
+            started: watch::Sender<bool>,
+            active: Arc<AtomicUsize>,
+        }
+
+        struct ActiveGuard(Arc<AtomicUsize>);
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        #[async_trait]
+        impl DirectoryRelayFetcher for UncooperativeFetcher {
+            async fn fetch_directory_events(
+                &self,
+                _request: DirectoryFetchRequest,
+            ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+                unreachable!("coalesced fetch uses the cancellable override")
+            }
+
+            async fn fetch_directory_events_cancellable(
+                &self,
+                _request: DirectoryFetchRequest,
+                _cancel: CancellationToken,
+            ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+                self.active.fetch_add(1, Ordering::SeqCst);
+                let _guard = ActiveGuard(self.active.clone());
+                let _ = self.started.send(true);
+                // Intentionally ignore `_cancel` to prove shutdown aborts the
+                // single supervisor task and drops this future before returning.
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        }
+
+        let (started_tx, mut started_rx) = watch::channel(false);
+        let active = Arc::new(AtomicUsize::new(0));
+        let plane = DirectoryRelayPlane::new(Arc::new(UncooperativeFetcher {
+            started: started_tx,
+            active: active.clone(),
+        }));
+        let request = DirectoryFetchRequest::new(
+            vec![TransportEndpoint("wss://relay.example".into())],
+            vec![DirectoryEventQuery::new(0, vec!["11".repeat(32)], 1)],
+        )
+        .unwrap();
+        let waiter = tokio::spawn({
+            let plane = plane.clone();
+            async move { plane.fetch_events(request).await }
+        });
+        timeout(Duration::from_secs(2), started_rx.wait_for(|&s| s))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+
+        plane.shutdown(Duration::from_millis(50)).await;
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            0,
+            "shutdown must abort and drop an uncooperative cancellable fetcher before returning"
+        );
+        assert!(
+            waiter
+                .await
+                .unwrap()
+                .expect_err("waiter receives shutdown error")
+                .contains("shutting down")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signerless_inspection_handles_valid_and_invalid_queries() {
         let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
         let endpoint = TransportEndpoint(relay.url().await.to_string());
         let fetcher = NostrSdkDirectoryRelayFetcher::standalone();

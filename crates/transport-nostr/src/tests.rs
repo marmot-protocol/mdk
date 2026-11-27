@@ -2582,26 +2582,25 @@ async fn directory_fetch_owner_cancellation_does_not_orphan_waiters() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_fetch_cancels_when_final_waiter_leaves() {
+    use tokio::sync::watch;
+
     struct CancellableDirectoryFetcher {
         fetch_count: AtomicUsize,
         active_fetches: Arc<AtomicUsize>,
-        dropped_count: Arc<AtomicUsize>,
+        dropped_tx: watch::Sender<usize>,
         started: Notify,
-        dropped: Arc<Notify>,
         release: Notify,
     }
 
     struct ActiveDropGuard {
         active: Arc<AtomicUsize>,
-        dropped_count: Arc<AtomicUsize>,
-        dropped: Arc<Notify>,
+        dropped_tx: watch::Sender<usize>,
     }
 
     impl Drop for ActiveDropGuard {
         fn drop(&mut self) {
             self.active.fetch_sub(1, Ordering::SeqCst);
-            self.dropped_count.fetch_add(1, Ordering::SeqCst);
-            self.dropped.notify_waiters();
+            self.dropped_tx.send_modify(|count| *count += 1);
         }
     }
 
@@ -2615,8 +2614,7 @@ async fn directory_fetch_cancels_when_final_waiter_leaves() {
             self.active_fetches.fetch_add(1, Ordering::SeqCst);
             let _guard = ActiveDropGuard {
                 active: self.active_fetches.clone(),
-                dropped_count: self.dropped_count.clone(),
-                dropped: self.dropped.clone(),
+                dropped_tx: self.dropped_tx.clone(),
             };
             self.started.notify_one();
             self.release.notified().await;
@@ -2625,12 +2623,12 @@ async fn directory_fetch_cancels_when_final_waiter_leaves() {
     }
 
     for with_completion in [false, true] {
+        let (dropped_tx, mut dropped_rx) = watch::channel(0usize);
         let fetcher = Arc::new(CancellableDirectoryFetcher {
             fetch_count: AtomicUsize::new(0),
             active_fetches: Arc::new(AtomicUsize::new(0)),
-            dropped_count: Arc::new(AtomicUsize::new(0)),
+            dropped_tx,
             started: Notify::new(),
-            dropped: Arc::new(Notify::new()),
             release: Notify::new(),
         });
         let plane = relay_plane_with_directory_fetcher(
@@ -2673,13 +2671,13 @@ async fn directory_fetch_cancels_when_final_waiter_leaves() {
         second.abort();
         let _ = second.await;
         assert_eq!(plane.relay_health().await.directory_inflight_fetches, 0);
-        timeout(Duration::from_secs(2), async {
-            while fetcher.dropped_count.load(Ordering::SeqCst) == 0 {
-                fetcher.dropped.notified().await;
-            }
-        })
+        timeout(
+            Duration::from_secs(2),
+            dropped_rx.wait_for(|count| *count >= 1),
+        )
         .await
-        .expect("final waiter drop must cancel the shared directory fetch");
+        .expect("final waiter drop must cancel the shared directory fetch")
+        .unwrap();
         assert_eq!(fetcher.active_fetches.load(Ordering::SeqCst), 0);
 
         // A subsequent request for the same key starts fresh.
@@ -2693,11 +2691,12 @@ async fn directory_fetch_cancels_when_final_waiter_leaves() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_plane_shutdown_cancels_and_joins_active_directory_fetches() {
+    use tokio::sync::watch;
+
     struct ShutdownObservingFetcher {
         fetch_count: AtomicUsize,
         active_fetches: Arc<AtomicUsize>,
-        started_count: AtomicUsize,
-        started: Notify,
+        started_tx: watch::Sender<usize>,
     }
 
     struct ActiveCounter(Arc<AtomicUsize>);
@@ -2716,18 +2715,17 @@ async fn relay_plane_shutdown_cancels_and_joins_active_directory_fetches() {
             self.fetch_count.fetch_add(1, Ordering::SeqCst);
             self.active_fetches.fetch_add(1, Ordering::SeqCst);
             let _active = ActiveCounter(self.active_fetches.clone());
-            self.started_count.fetch_add(1, Ordering::SeqCst);
-            self.started.notify_waiters();
+            self.started_tx.send_modify(|count| *count += 1);
             std::future::pending::<()>().await;
             unreachable!()
         }
     }
 
+    let (started_tx, mut started_rx) = watch::channel(0usize);
     let fetcher = Arc::new(ShutdownObservingFetcher {
         fetch_count: AtomicUsize::new(0),
         active_fetches: Arc::new(AtomicUsize::new(0)),
-        started_count: AtomicUsize::new(0),
-        started: Notify::new(),
+        started_tx,
     });
     let plane = relay_plane_with_directory_fetcher(
         Arc::new(RecordingRelayClient::default()),
@@ -2752,13 +2750,13 @@ async fn relay_plane_shutdown_cancels_and_joins_active_directory_fetches() {
                 .await
         }
     });
-    timeout(Duration::from_secs(2), async {
-        while fetcher.started_count.load(Ordering::SeqCst) < 2 {
-            fetcher.started.notified().await;
-        }
-    })
+    timeout(
+        Duration::from_secs(2),
+        started_rx.wait_for(|count| *count >= 2),
+    )
     .await
-    .expect("both coalesced directory fetches started");
+    .expect("both coalesced directory fetches started")
+    .unwrap();
     assert_eq!(plane.relay_health().await.directory_inflight_fetches, 2);
 
     plane.shutdown().await;
