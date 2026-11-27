@@ -64,10 +64,18 @@ the caller.
 `received_items` and `serialized_event_bytes` include duplicates and the event that trips a budget. The retained
 high-water values count only distinct retained events and their serialized JSON bytes.
 
-These budgets are not total memory or wire-byte bounds. Each endpoint's reply queue may hold its byte budget plus one
-maximum-size frame, and WebSocket and parser buffers, temporary serialization, filter and ID input, event object
-overhead and other concurrent requests are outside them. Callers bound concurrency and admission work separately. The interface provides no pagination cursor and
-makes no exhaustive-history claim.
+These budgets are not total memory or wire-byte bounds. Each endpoint's reply queue is admitted against the shared
+process-wide FIFO `QueueBudget` (`DEFAULT_GLOBAL_QUEUE_BYTES = 192 MiB`), reserving its byte budget plus one
+maximum-size frame (`5 MiB`) — or, for multi-relay fan-out reads using `FiniteRequests::sharing`, reserving the shared
+event-byte budget once per group plus one `5 MiB` frame per active relay. Expiry while waiting for local queue
+admission reports `FiniteEnd::Busy` (never a relay timeout), which callers map explicitly (`LocalBusy`,
+`DIRECTORY_READ_LOCAL_BUSY`, `DirectoryInspectionError::LocalBusy`, or `NostrAcquisitionEnd::SetupFailed`). WebSocket
+and parser buffers, temporary serialization, filter and ID input, and event object overhead remain outside the queue
+reservation; tightly constrained extensions (such as an iOS NSE) are not separately clamped by `FiniteRequests` and
+must account for per-relay `5 MiB` frame room plus non-queue allocations in their caller limits. Callers
+bound concurrency and admission work separately. The interface provides no pagination cursor and makes no
+exhaustive-history claim. See [nostr-consumer-inventory.md](./nostr-consumer-inventory.md) for the full consumer map
+and host synthetic release-build measurements.
 
 ## Outcomes
 
