@@ -1,6 +1,6 @@
 //! Post-link chat progress. The account worker serializes reports for its own
 //! links. A receiver only accepts pages addressed to its current roster entry.
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::StorageResult;
 use rusqlite::{OptionalExtension, params};
@@ -55,6 +55,7 @@ impl SqliteAppStorage {
         group: &str,
         report: &LinkChatReport,
     ) -> StorageResult<u32> {
+        let group = canonical_group_id_hex(group);
         self.lock()?.query_row_cached(
             "INSERT INTO link_chat_reports(group_id,slot,link_ref,digest,revision,total,remaining,expires_at)
              VALUES(?1,?2,?3,?4,1,?5,?6,?7) ON CONFLICT(group_id,slot) DO UPDATE SET
@@ -63,7 +64,7 @@ impl SqliteAppStorage {
              link_ref=excluded.link_ref,digest=excluded.digest,total=excluded.total,
              remaining=excluded.remaining,expires_at=excluded.expires_at RETURNING revision",
             params![
-                group, report.slot, report.link_ref, report.digest, report.total,
+                group.as_ref(), report.slot, report.link_ref, report.digest, report.total,
                 report.remaining, u64_to_i64(report.expires_at)?
             ],
             |row| row.get(0),
@@ -72,6 +73,7 @@ impl SqliteAppStorage {
 
     /// Active reports made by this device.
     pub fn link_chat_reports(&self, group: &str, now: u64) -> StorageResult<Vec<LinkChatReport>> {
+        let group = canonical_group_id_hex(group);
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare_cached(
@@ -79,7 +81,7 @@ impl SqliteAppStorage {
              WHERE group_id=?1 AND expires_at>?2 ORDER BY slot",
             )
             .storage()?;
-        stmt.query_map(params![group, u64_to_i64(now)?], |r| {
+        stmt.query_map(params![group.as_ref(), u64_to_i64(now)?], |r| {
             let expiry: i64 = r.get(5)?;
             Ok(LinkChatReport {
                 slot: r.get(0)?,
@@ -104,6 +106,8 @@ impl SqliteAppStorage {
         group: &str,
         page: &LinkChatPage<'_>,
     ) -> StorageResult<()> {
+        let group = canonical_group_id_hex(group);
+        let group = group.as_ref();
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let previous: Option<(String, u32, u32, i64)> = conn.query_row_cached(
@@ -146,11 +150,12 @@ impl SqliteAppStorage {
         link: &str,
         now: u64,
     ) -> StorageResult<Option<ReceivedLinkChatReport>> {
+        let group = canonical_group_id_hex(group);
         self.lock()?
             .query_row_cached(
                 "SELECT revision,total,COUNT(message_id) FROM link_chat_report_pages
              WHERE group_id=?1 AND link_ref=?2 AND expires_at>?3 GROUP BY revision,total",
-                params![group, link, u64_to_i64(now)?],
+                params![group.as_ref(), link, u64_to_i64(now)?],
                 |row| {
                     Ok(ReceivedLinkChatReport {
                         revision: row.get(0)?,
@@ -172,12 +177,15 @@ impl SqliteAppStorage {
         link: &str,
         revision: u32,
     ) -> StorageResult<Vec<u8>> {
+        let group = canonical_group_id_hex(group);
         let conn = self.lock()?;
         let mut stmt=conn.prepare_cached(
             "SELECT tokens FROM link_chat_report_pages
              WHERE group_id=?1 AND link_ref=?2 AND revision=?3 AND message_id IS NOT NULL ORDER BY page"
         ).storage()?;
-        let mut rows = stmt.query(params![group, link, revision]).storage()?;
+        let mut rows = stmt
+            .query(params![group.as_ref(), link, revision])
+            .storage()?;
         let mut tokens = Vec::new();
         while let Some(row) = rows.next().storage()? {
             tokens.extend(row.get::<_, Vec<u8>>(0).storage()?);
@@ -188,10 +196,11 @@ impl SqliteAppStorage {
     /// Invalidate a withdrawn observation without accepting a stale revision.
     /// Returns whether the carrier belonged to a currently selected incoming page.
     pub fn withdraw_link_chat_page(&self, group: &str, message: &[u8]) -> StorageResult<bool> {
+        let group = canonical_group_id_hex(group);
         let changed = self.lock()?
             .execute_cached(
                 "UPDATE link_chat_report_pages SET message_id=NULL WHERE group_id=?1 AND message_id=?2",
-                params![group, message],
+                params![group.as_ref(), message],
             )
             .storage()?;
         Ok(changed != 0)

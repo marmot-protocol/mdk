@@ -63,8 +63,8 @@ top-level `task` item carries no thread tags.
   refuses an `e` on a kind 1201 without an `E`: there it would read as an edit's target.
 - **Edits.** A later version is a kind-1009 edit whose one `e` names its target, so it carries no parent `e`. It
   may repeat `E`/`K`/`P`, and should, so a late joiner can place it. The item stays where its first event placed it, whatever thread tags an edit carries.
-- **Late joiners.** A member added after an item began holds only its edits. MDK shows the item from its earliest
-  edit (`agent_item_first_event_missing`), placed by that edit's `E` with the root as its parent, since an edit
+- **Late joiners.** A member added after an item began holds only its edits. MDK shows the item from the first
+  edit this device received (`agent_item_first_event_missing`), placed by that edit's `E` with the root as its parent, since an edit
   cannot name the parent. An item of a nested subagent then shows under the top-level subagent's view until its
   first event arrives.
 - **The agent's words** are kind 1111 comments with the same tags. One with an `E`, whose `K` is 1201 and whose `P` is

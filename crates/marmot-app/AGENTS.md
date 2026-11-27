@@ -146,9 +146,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   announcement does. Naming hydrates it, so never name it at a deferred open's end: the post-hydration reconcile
   does, as do settling a join, creating a group, maintenance and every KeyPackage publication. Name it before reading
   whether the current KeyPackage still serves (`key_package_republish_falls_back`), since an untagged one is stale once
-  this device tags. The founder's founding entry carries its own tag signature key; every other device sets its own
-  in maintenance or, before a host KeyPackage publication, through `set_device_tag_key`, once per call, since the
-  runtime stages no KeyPackage while the key is due.
+  this device tags. The founder's founding entry carries its own tag signature key; the Add that links every other
+  device sets its key (marmot#521), and that device makes its first commit there in maintenance or, before a host
+  KeyPackage publication, through `set_device_tag_key`, once per call, since the runtime stages no KeyPackage while
+  that commit is due. Read a link as made from `runtime.made_device_links` (the leaf signing with the slot's key has
+  committed since its Add, or founded the group), never from a key in its entry alone.
 - The overdue-refresh warning (`key_package_refresh_overdue`) asks the runtime's announcement gate, never a copy of
   the roster. The client recomputes it after each maintenance pass; a change sets
   `key_package_refresh_overdue_changed`, which the same two seams drain into one payload-free
@@ -202,9 +204,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   finished on the worker, run off it on the media lane. A backup counts only once a relay accepts a pointer listing it;
   never treat an upload or a sent pointer as done. Record each blob in the ledger (`backup_run_blobs`) before its
   upload, and condemn a dropped backup's blobs before the pointer that drops it goes out. Delete a condemned blob only
-  while the pointer fetched in that same pass, from a relay that answered in full, lists no backup it belongs to,
+  while the pointer fetched in that same pass, with every requested relay answering in full, lists no backup it belongs to,
   and only blobs condemned under the pass's own key; forget other keys' rows on a due pass. Re-check the writer and key on the worker before signing
-  the pointer. Take over only through `edit_roster_account_entry` over the entry read, never resent from here (D75).
+  the pointer, and bound replacement pointer timestamps (including the persisted replaceable-record floor) against excessive future skew. Take over only through `edit_roster_account_entry` over the entry read, never resent from here (D75).
   The archive key lives only in the pass: never store or log it, the words or a blob's contents.
   Worker background admission is memory-only and defaults closed: Wi-Fi AND charging must be reported before
   `prepare_backup_pass`, including cleanup/retry passes. An admitted whole pass still runs and settles after false;
@@ -289,8 +291,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   check share. A sign-in nudge that arrives during a read waits for its continuation and then brings the next check
   forward, since the read may have started before what nudged it. A waiting host check keeps its place: each later
   command that names no existing group (`waits_behind_sign_in_check`) parks in order, up to `PARKED_LIMIT`, after
-  which the worker takes no more host commands; group commands and the worker's own work go ahead, and its timers'
-  retries come through their own channel (`WorkerInbox`). The read task keeps these:
+  which the worker pauses only account-wide host admissions (`WorkerInbox` sequences and routes group-scoped and
+  account-wide host commands atomically under one mutex so cross-lane FIFO cannot reverse); group-scoped commands, the
+  worker's own work, and its timers' retries still go ahead. Long-running units that defer commands (startup hydration,
+  startup sync, catch-up, and `defer_commands_until`) likewise pause host intake at `DEFERRED_COMMAND_LIMIT` (while
+  `defer_commands_until` continues honoring `PARKED_LIMIT` for account-wide commands whenever a host sign-in check holds
+  its place) while worker-owned retries continue (mdk#3801). The read task keeps these:
   - T1: it holds the directory's handle, the relay plane for its endpoint filter, the account id, this device's slot
     and its telemetry step, and nothing of the client.
   - T2: it reaches the directory only through its public API: the cached relay-list read, the discovery fetch, which
@@ -310,13 +316,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   remembers (`roster_tag_keys`), read by every such key. A slot with a `Moved` departure and no `removed` record is
   never gone, whichever keys it had: its device's leaves elsewhere still carry this group's tags. Never this device's
   own slot, and never discard private KeyPackages for a slot the roster lists. Leaves are found with
-  `own_account_leaves_tagged_by`, never by an absent claim, under the slot's keys, or with
-  `own_account_self_signed_tags`, a tag that names the slot and verifies under the key that leaf itself signs with, never
-  another leaf's (mdk#3679): an untagged leaf stays (D55). Every key a roster names is writable by any device of the
-  account, so none is evidence that an untagged leaf is a device's. Removal finds the device-group leaf the same way,
-  by its tag under the roster, else by a tag the leaf signed itself for the slot, both only for a leaf that has
-  committed since its Add, and the record then keeps that leaf's key. A listed device whose entry has no key is refused
-  as `device_link_pending` unless it has such a leaf, which a pending link never does. Each cleanup pass renews,
+  `own_account_leaves_tagged_by`, never by an absent claim, under the slot's keys: an untagged leaf stays (D55).
+  Removal finds the device-group leaf by its entry's key, which the Add that linked the device bound and no Commit
+  changes (marmot#521, "Key binding"), removes it with the entry, and the record keeps that key. A listed device whose
+  entry has no key, or whose leaf is still its Add's KeyPackage leaf, is refused as `device_link_pending`. Each cleanup pass renews,
   through `renew_roster_tag_keys`, every kept key of a slot with a `held_as_removed` key whose leaf a scanned chat
   still holds, in one step that moves only their sighting time and keeps their order, so a leftover outlives the
   30-day retention and no prune drops the key that reads it. The deciding device commits a lone `removed` record after a
@@ -544,8 +547,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `SendIntent::LinkDevice` commit, sent through `runtime.send_with_audit_context` so the runtime releases its Welcome
   only once the commit is confirmed (never split the Welcome off for app delivery). On both paths the prompt stays
   `Linking` after the commit: `decide_device_links` is the one gate for every link in `device_links`, prompt or not
-  (D40). A link is `Linked` once the new device's first commit, which sets its roster entry's `tag_signature_key` to
-  the leaf key the link added (`leaf_signature_key_hex`), is on the selected branch: the device group is `Stable` with
+  (D40). The link's Add sets the new device's `tag_signature_key` to the leaf key it adds (`leaf_signature_key_hex`,
+  marmot#521). A link is `Linked` once the new device's first commit from that leaf is on the selected branch
+  (`made_device_links` lists its slot): the device group is `Stable` with
   no pending convergence input. It fails when its group was never made, when the quiet roster has not listed it as
   this device's link for a whole settlement window (`MarmotApp::settlement_quiescence_ms`, in milliseconds, whose
   override only test-policy builds read), or when that commit is still absent `LINK_DEADLINE_SECS` after the entry's
@@ -690,7 +694,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `deliver_owed_welcomes_with_audit_context`; the founding slot keeps the create's `SessionEffects`, because a legacy
   create's `GroupCreated` work rides them. Note a Welcome a publish could not deliver in one place,
   `note_welcome_delivery_failures`, called from `remember_published_reports` (every seam that applies runtime
-  effects), the device-link send, and explicit `redeliver_welcome` (also used by link maintenance). Drives reuse
+  effects), the device-link send, explicit `redeliver_welcome`, and link maintenance's `redeliver_welcome_internal`. Drives reuse
   those central seams; never write a pending Welcome row or queue `WelcomeDeliveryPending` directly from a drive.
   It announces each Welcome once per process (`announced_welcome_failures`). A startup retry can recover its group
   from the live retained Welcome context and then be noted through the ordinary effects recorder; a failure still
@@ -742,6 +746,19 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
     `shutdown` tears the relay plane down only once none counts or the bound passes. The close never waits for a wave:
     one that settles after `shutdown_and_close` closed storage leaves its Welcome owed, and the next start sends the
     same event once more.
+- Look up an invited recipient's inbox list beside the account worker (mdk#2261, `client/welcome_route_lookups.rs`,
+  `runtime/account_worker/welcome_route_lookups.rs`) only when the session's plan starts it
+  (`plan_welcome_route_lookups`: a paced Welcome attempt found no route and an owed Welcome is still addressed to
+  them), never for a Welcome that is withdrawn, expired, delivered or staged; the worker drops (aborts) a running one
+  the plan stops at each loop turn. At most `LOOKUPS_PER_ACCOUNT` at once, one per recipient, each bounded by
+  `LOOKUP_TIMEOUT`; none starts while maintenance is paused or cursors are frozen. The task keeps T1 and T2 (the
+  directory's `resolve_account_relay_list_status_for_account_id`, from the configured directory relays, which writes
+  only the directory cache). Its continuation runs on the writer: it reads the route from the cache again, installs
+  it with `replace_inbox_route`, and reports the outcome to the session (`finish_welcome_route_lookup`), which keeps a
+  failed lookup's cause in its pacing; only a route releases the retry and wakes maintenance. It never touches a
+  Welcome's stored retry record. L1 and L2 as for the sign-in read, except that
+  cancellation stops waiting at once (shutdown gives the account's work only `WELCOME_WAVE_SHUTDOWN_WAIT`); the
+  next client's session owes its own lookups.
 - Send every host group-change command through the runtime's host-change entry points
   (`send_host_change_with_audit_context`, or `confirm_host_change_without_publish_with_audit_context` for an invite),
   never `send_with_audit_context` (mdk#2332). The commit's fanout then names the change, so a rollback after the
@@ -1437,8 +1454,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
   `nostr_verification.rs` (stateless public-event verification), `relay_caps.rs` (each relay's NIP-11
   `max_limit` and NIP-77 support for the history sweep, cached per relay; unknown caps on any failure), `relay_health.rs`
-  (the account's relay rows and inbox warnings from its held lists and the dial policy, never dialing; the worker's
-  relay-configuration seam announces `RelayHealthChanged` when that answer differs, so liveness never moves it), `profile_pseudonyms.rs` (cosmetic display names; not a
+  (the account's relay rows and inbox warnings from its held lists, the dial policy and the worker's inbox checks; the
+  query never dials. `relay_health/checks.rs` is the inbox probe (the plane's strict `inspect_inbox` read, every probe a
+  future of one task) and what its answers establish; a run no relay answered establishes nothing. The account worker owns the check like its inbox-route lookups:
+  `runtime/account_worker/relay_checks.rs` runs one at a time beside the loop, refuses a host check while one runs
+  (`AppError::RelayCheckRunning`), and cancels and joins it on every exit that drops the client;
+  `client/relay_checks.rs` builds it from the client's own signer and keeps its results on the client, so they go with
+  it. The worker publishes the check state for the query on a `watch` its `ManagedAccountWorker` holds, and announces
+  `RelayHealthChanged` at its relay-configuration seam and when a check ends, comparing `AccountRelayHealth::announced`,
+  so neither liveness nor a confirming check moves it; it starts one check per client, local key only), `profile_pseudonyms.rs` (cosmetic display names; not a
   security primitive), `root_runtime_lease.rs` (cross-process exclusive root lease), `usage_diagnostics.rs`
   (`MarmotApp`'s usage-diagnostics consent persistence and the headless-host analytics configuration; it reaches the
   product collector only through `marmot_observability::wiring`, consent lock before state lock), `projection.rs` (legacy account
@@ -1455,7 +1479,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   worker's running Welcome waves and the `Drain`s and pending-deliveries reads that wait for them, mdk#3466; `account_worker/tests/welcome_wave_tests.rs`
   owns what the worker decides of a wave), `account_worker/sign_in_reads.rs` (the worker's sign-in slot read and the
   host check that keeps its place behind it, mdk#3466; `account_worker/tests/sign_in_read_tests.rs` owns what the
-  worker decides of a read), `conversation_window.rs`, `chat_list_window.rs`,
+  worker decides of a read), `account_worker/welcome_route_lookups.rs` (the worker's inbox lookups of route-less
+  invitees, mdk#2261; `account_worker/tests/welcome_route_lookup_tests.rs`), `conversation_window.rs`, `chat_list_window.rs`,
   `presentation.rs`, `presented_chat_list.rs`, `account_attention.rs` (presentation windows and account-switcher
   attention), `chat_list_selection.rs` (select-all IDs and revalidation), `user_blocks.rs`, `moderation.rs` (reports, admin labels and operator moderation reports),
   `local_submissions.rs`,
@@ -1474,7 +1499,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   epoch-gap evidence: feeding the detector, arming and escalating backfill, retiring a terminal group's recovery)
   and `history_recovery/history_notices.rs`),
   `invite_recovery.rs` (durable invitation recovery), `welcome_waves.rs` (Welcome waves: prepare on the writer, run
-  beside it, settle back on it, mdk#3466), `delivery_spill.rs` (worker side of the durable delivery spill),
+  beside it, settle back on it, mdk#3466), `welcome_route_lookups.rs` (a route-less invitee's inbox lookup, begun and
+  finished on the writer and run beside it, mdk#2261), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/native_ingress.rs` (ordered native replay
   admission).
 - The shared relay plane is the [`transport-nostr`](../transport-nostr/AGENTS.md) crate; name its items as

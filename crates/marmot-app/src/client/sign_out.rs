@@ -29,7 +29,7 @@
 //! stored, still held back, and the next pairing drive unlinks the device.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -301,9 +301,9 @@ impl AppClient {
     pub(crate) fn hold_removed_sign_out_publishing(&self) -> Result<bool, AppError> {
         let removed = self.removed_while_signing_out()?;
         if removed {
-            self.app
-                .account_publish_stop(&hex::encode(self.adapter.account_id().as_slice()))
-                .store(true, Ordering::Release);
+            self.app.stop_unlinked_account_publishing(&hex::encode(
+                self.adapter.account_id().as_slice(),
+            ));
         }
         Ok(removed)
     }
@@ -439,12 +439,13 @@ impl AppClient {
             }
             Err(error) => return Err(error),
         };
-        // No device removes an entry without its tag signature key, so a
-        // device whose link is not made yet signs out on its own.
+        // A device whose link is not made yet signs out on its own: its
+        // approver undoes the link.
+        let made = self.runtime.made_device_links(&group_id, &roster)?;
         let Some(own) = roster
             .devices
             .get(&own_slot)
-            .filter(|entry| entry.tag_signature_key.is_some())
+            .filter(|_| made.contains(&own_slot))
         else {
             return Ok(SiblingSignOut::OnItsOwn);
         };
@@ -599,13 +600,14 @@ impl AppClient {
             return Ok(());
         }
         let own_slot = self.own_slot()?;
+        let made = self.runtime.made_device_links(&group_id, &roster)?;
         let leaving = roster
             .devices
             .iter()
             .filter(|(slot, entry)| {
                 **slot != own_slot
                     && entry.status == DeviceStatusV1::Leaving
-                    && entry.tag_signature_key.is_some()
+                    && made.contains(*slot)
             })
             .map(|(slot, _)| *slot)
             .collect::<HashSet<_>>();

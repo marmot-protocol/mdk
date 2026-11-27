@@ -5241,6 +5241,57 @@ fn retention_scan_lets_imported_rows_expire_on_time() {
     }
 }
 
+#[test]
+fn groups_with_expiring_app_events_discovers_hidden_and_expired_groups_only() {
+    let store = setup_store();
+    let app = store.app_storage();
+
+    // Visible chat-list group with an expired row (expires at 100 + 50 = 150).
+    let visible_expired = live("visible-expired", 0, 100);
+    app.record_app_event_with_retention(
+        &visible_expired,
+        Some(AppMessageRetentionDecision::new(100, 50)),
+    )
+    .unwrap();
+
+    // Non-chat-list/hidden group (no account_groups or chat_list_rows row) with an expired row.
+    let mut hidden_expired = live("hidden-expired", 0, 100);
+    hidden_expired.group_id_hex = "01".repeat(16);
+    app.record_app_event_with_retention(
+        &hidden_expired,
+        Some(AppMessageRetentionDecision::new(100, 50)),
+    )
+    .unwrap();
+
+    // Group with only a future-expiring row (expires at 100 + 500 = 600).
+    let mut future_only = live("future-only", 0, 100);
+    future_only.group_id_hex = "02".repeat(16);
+    app.record_app_event_with_retention(
+        &future_only,
+        Some(AppMessageRetentionDecision::new(100, 500)),
+    )
+    .unwrap();
+
+    // Group with only a non-expiring (NULL) row.
+    let mut non_expiring = live("non-expiring", 0, 100);
+    non_expiring.group_id_hex = "03".repeat(16);
+    app.record_app_event(&non_expiring).unwrap();
+
+    assert_eq!(
+        app.groups_with_expiring_app_events(149).unwrap(),
+        Vec::<String>::new()
+    );
+    let mut expected = vec!["01".repeat(16), GROUP.to_owned()];
+    expected.sort();
+    assert_eq!(app.groups_with_expiring_app_events(150).unwrap(), expected);
+    let mut expected_at_600 = vec!["01".repeat(16), "02".repeat(16), GROUP.to_owned()];
+    expected_at_600.sort();
+    assert_eq!(
+        app.groups_with_expiring_app_events(600).unwrap(),
+        expected_at_600
+    );
+}
+
 /// mdk#3580: a device that stores a chat after it began (a sibling's copy,
 /// a restore) anchors its creation at that moment, after all the history it
 /// then imports. Creation orders only a chat with no activity; one with

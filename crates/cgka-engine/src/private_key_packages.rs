@@ -21,7 +21,9 @@ use crate::engine::Engine;
 use crate::key_package::{
     KeyPackageMetadata, key_package_device_tag_claim, key_package_metadata, key_package_ref,
 };
-use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceTagClaim};
+use cgka_traits::app_components::{
+    DeviceRosterV1, DeviceSlotId, DeviceTagClaim, NOSTR_ROUTING_MAX_RELAYS,
+};
 use cgka_traits::engine::{ForwardedInvitation, KeyPackage};
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
@@ -285,9 +287,9 @@ impl SiblingWelcome {
     /// 1, 2 (with its fixed inherited generation) or 3 (with something
     /// forwarded, a presence byte of 0 or 1 before each optional field, and
     /// no confirmation beside a generation), a ref of 1 to 64 bytes,
-    /// one `mls_welcome` MLSMessage, relay URLs of
-    /// 1 to 512 bytes of UTF-8, and nothing left over. The Welcome itself is
-    /// not processed here.
+    /// one `mls_welcome` MLSMessage, at most [`NOSTR_ROUTING_MAX_RELAYS`] relay
+    /// URLs of 1 to 512 bytes of UTF-8, and nothing left over. The Welcome
+    /// itself is not processed here.
     pub fn decode(bytes: &[u8]) -> Result<Self, EngineError> {
         let invalid = || EngineError::Serialize("invalid sibling Welcome".into());
         let (&version, mut rest) = bytes.split_first().ok_or_else(invalid)?;
@@ -338,6 +340,9 @@ impl SiblingWelcome {
         let mut remaining = list.as_slice();
         let mut relays = Vec::new();
         while !remaining.is_empty() {
+            if relays.len() >= NOSTR_ROUTING_MAX_RELAYS {
+                return Err(invalid());
+            }
             let relay = VLBytes::tls_deserialize(&mut remaining).map_err(|_| invalid())?;
             if !(1..=MAX_SIBLING_WELCOME_RELAY_LEN).contains(&relay.as_slice().len()) {
                 return Err(invalid());
@@ -635,7 +640,7 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Every private KeyPackage this device issued, oldest first.
     pub fn issued_private_key_packages(&self) -> Result<Vec<IssuedPrivateKeyPackage>, EngineError> {
-        Ok(private_storage(&self.storage)?.list_issued_private_key_packages()?)
+        Ok(private_storage(self.storage.as_ref())?.list_issued_private_key_packages()?)
     }
 
     /// Record whether the hand-offs of `references` are queued: before they
@@ -697,7 +702,7 @@ impl<S: StorageProvider> Engine<S> {
     /// When the earliest issued private KeyPackage expires, so maintenance
     /// can wake to discard it (mdk#3265). `None` with none issued.
     pub fn private_key_packages_next_expiry(&self) -> Result<Option<u64>, EngineError> {
-        Ok(private_storage(&self.storage)?
+        Ok(private_storage(self.storage.as_ref())?
             .list_issued_private_key_packages()?
             .iter()
             .map(|record| record.not_after)
@@ -717,7 +722,7 @@ impl<S: StorageProvider> Engine<S> {
         let discards = |record: &IssuedPrivateKeyPackage| {
             record.not_after <= now || recipient == Some(&record.recipient_slot)
         };
-        if !private_storage(&self.storage)?
+        if !private_storage(self.storage.as_ref())?
             .list_issued_private_key_packages()?
             .iter()
             .any(discards)

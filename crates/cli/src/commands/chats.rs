@@ -10,9 +10,9 @@ use marmot_app::{
 use serde_json::{Value, json};
 
 use crate::{
-    ChatsCommand, CommandOutput, WnError, chat_json, ensure_local_signing, group_json,
-    group_list_plain, group_show_output, insert_chat_projection, normalize_group_id_hex,
-    npub_for_account_id, resolve_account,
+    ChatsCommand, CommandOutput, WnError, chat_json, ensure_signing_capable, ensure_signing_ready,
+    group_json, group_list_plain, group_show_output, insert_chat_projection,
+    normalize_group_id_hex, npub_for_account_id, resolve_account,
 };
 
 pub(crate) async fn chats_command(
@@ -40,7 +40,7 @@ pub(crate) async fn chats_command_with_runtime(
     match command {
         ChatsCommand::List { include_archived } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_capable(&account)?;
             app.status(&account.label)?;
             let chats = if include_archived {
                 app.groups(&account.label)?
@@ -61,23 +61,23 @@ pub(crate) async fn chats_command_with_runtime(
         }
         ChatsCommand::Show { group } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_capable(&account)?;
             group_show_output(app, account, group, None)
         }
         ChatsCommand::Subscribe => Err(WnError::ChatsSubscribeRequiresDaemon),
         ChatsCommand::Archive { group } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             group_archive_output(runtime, account, group, true).await
         }
         ChatsCommand::Unarchive { group } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             group_archive_output(runtime, account, group, false).await
         }
         ChatsCommand::ListArchived => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_capable(&account)?;
             app.status(&account.label)?;
             let chats = app
                 .groups(&account.label)?
@@ -98,7 +98,7 @@ pub(crate) async fn chats_command_with_runtime(
         ChatsCommand::SubscribeArchived => Err(WnError::ChatsSubscribeRequiresDaemon),
         ChatsCommand::Mute { group, duration } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             let group_id = normalize_group_id_hex(&group)?;
             let muted_until_ms = parse_mute_duration(&duration)?;
             let settings = runtime.set_chat_muted(&account.label, &group_id, muted_until_ms)?;
@@ -109,7 +109,7 @@ pub(crate) async fn chats_command_with_runtime(
         }
         ChatsCommand::Unmute { group } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             let group_id = normalize_group_id_hex(&group)?;
             let settings = runtime.clear_chat_muted(&account.label, &group_id)?;
             Ok(CommandOutput {
@@ -119,7 +119,7 @@ pub(crate) async fn chats_command_with_runtime(
         }
         ChatsCommand::MarkRead { group, message_id } => {
             let account = resolve_account(account_home, account_flag)?;
-            ensure_local_signing(&account)?;
+            ensure_signing_ready(runtime, &account).await?;
             let group_id = normalize_group_id_hex(&group)?;
             // An explicit message id marks the chat read up to that message; the
             // runtime's read marker is a forward-only high-water mark, so a

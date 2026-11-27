@@ -2497,3 +2497,63 @@ async fn distinct_mls_messages_are_not_collapsed_by_content_dedup() {
         "both distinct messages must be delivered; got {delivered:?}"
     );
 }
+
+/// Draining an oversized backlog (> RETAINED_EVENT_CAPACITY) hands the buffer
+/// off to the caller while preserving ordered, once-only delivery and leaving
+/// the engine able to ingest and drain subsequent messages.
+#[tokio::test]
+async fn oversized_drain_preserves_order_and_continues_delivering() {
+    let (mut alice, mut bob, group_id) = alice_bob_in_group().await;
+    const BACKLOG: usize = 256;
+
+    for i in 0..=BACKLOG {
+        let body = format!("m{i}");
+        let SendResult::ApplicationMessage { msg, .. } = alice
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&alice, body.as_bytes()),
+                expected_epoch: None,
+                only_to_members: None,
+            })
+            .await
+            .unwrap()
+        else {
+            unreachable!();
+        };
+        let routed = TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        };
+        assert!(matches!(
+            bob.ingest(routed).await.unwrap(),
+            IngestOutcome::Processed
+        ));
+        if i == BACKLOG - 1 {
+            let drained: Vec<Vec<u8>> = bob
+                .drain_events()
+                .into_iter()
+                .filter_map(|e| match e {
+                    GroupEvent::MessageReceived { payload, .. } => Some(app_content(&payload)),
+                    _ => None,
+                })
+                .collect();
+            let expected: Vec<Vec<u8>> =
+                (0..BACKLOG).map(|n| format!("m{n}").into_bytes()).collect();
+            assert_eq!(drained, expected);
+            assert!(bob.drain_events().is_empty());
+        }
+    }
+
+    let after: Vec<Vec<u8>> = bob
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            GroupEvent::MessageReceived { payload, .. } => Some(app_content(&payload)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(after, vec![format!("m{BACKLOG}").into_bytes()]);
+    assert!(bob.drain_events().is_empty());
+}

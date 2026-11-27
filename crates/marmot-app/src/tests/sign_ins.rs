@@ -850,7 +850,7 @@ async fn a_link_dropped_before_the_next_pass_asks_again() {
     assert_eq!(laptop.trusted_device_group().unwrap(), Some(group.clone()));
 
     let mut tablet = account.open(2).await;
-    published_key_package(&mut tablet, relay).await;
+    let tablet_key_package = published_key_package(&mut tablet, relay).await;
     let tablet_slot = own_slot(&tablet);
     let tablet_slot_id: [u8; 32] = hex::decode(&tablet_slot).unwrap().try_into().unwrap();
     phone.check_sign_ins().await.unwrap();
@@ -866,18 +866,45 @@ async fn a_link_dropped_before_the_next_pass_asks_again() {
     commit_roster(
         &mut laptop,
         &group,
-        vec![
-            DeviceRosterOperationV1::SetDevice(tablet_slot_id, DeviceEntryV1::default()),
-            DeviceRosterOperationV1::RemoveRejectedSlot(tablet_slot_id),
-        ],
+        vec![DeviceRosterOperationV1::RemoveRejectedSlot(tablet_slot_id)],
     )
     .await;
-    commit_roster(
-        &mut laptop,
-        &group,
-        vec![DeviceRosterOperationV1::RemoveDevice(tablet_slot_id)],
-    )
-    .await;
+    let metadata = marmot_session::key_package_metadata(&tablet_key_package).unwrap();
+    let effects = laptop
+        .runtime
+        .send(SendIntent::LinkDevice {
+            group_id: group.clone(),
+            key_package: tablet_key_package,
+            roster_update: encode_device_roster_update_v1(
+                &DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(
+                    tablet_slot_id,
+                    DeviceEntryV1 {
+                        announced_key_package: Some(
+                            hex::decode(&metadata.key_package_ref_hex).unwrap(),
+                        ),
+                        tag_signature_key: Some(metadata.leaf_signature_key.clone()),
+                        ..DeviceEntryV1::default()
+                    },
+                )])
+                .unwrap(),
+            )
+            .unwrap(),
+            deliver_until: cgka_traits::Timestamp(u64::MAX),
+        })
+        .await
+        .unwrap();
+    laptop
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    laptop
+        .unlink_device_from_group(
+            &group,
+            metadata.leaf_signature_key,
+            vec![DeviceRosterOperationV1::RemoveDevice(tablet_slot_id)],
+        )
+        .await
+        .unwrap();
     deliver_new(&mut phone, relay, &mut phone_cursor).await;
     phone.sync().await.unwrap();
     let record = account.apps[0]
@@ -996,7 +1023,7 @@ async fn a_rejected_slot_write_never_replaces_a_roster_entry() {
     let removed_record = RejectedSlotV1 {
         reason: RejectedSlotReasonV1::Removed,
         rejected_at: now,
-        tag_signature_key: Some(vec![7; 32]),
+        tag_signature_key: None,
     };
     let mut phone_cursor = relay.published_events.lock().unwrap().len();
     commit_roster(

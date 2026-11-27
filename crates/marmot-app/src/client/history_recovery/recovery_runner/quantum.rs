@@ -183,7 +183,7 @@ impl SweepRelay for Metered<'_> {
         match &reply {
             SliceReply::Answered { events, .. } => self.read(events, false),
             SliceReply::Closed(reason) => self.read(&[], is_rate_limit(reason)),
-            SliceReply::Unreachable(_) => self.read(&[], false),
+            SliceReply::Unreachable(_) | SliceReply::Busy => self.read(&[], false),
         }
         reply
     }
@@ -193,9 +193,10 @@ impl SweepRelay for Metered<'_> {
         match &reply {
             SecondReply::Complete(events) => self.read(events, false),
             SecondReply::Closed(reason) => self.read(&[], is_rate_limit(reason)),
-            SecondReply::Unproven | SecondReply::Inconclusive | SecondReply::Unreachable(_) => {
-                self.read(&[], false)
-            }
+            SecondReply::Unproven
+            | SecondReply::Inconclusive
+            | SecondReply::Unreachable(_)
+            | SecondReply::Busy => self.read(&[], false),
         }
         reply
     }
@@ -473,7 +474,7 @@ pub(super) fn classify(
         // `settle` reads as unanswered once it sees the mark moved).
         SweepEnd::Finished if still_owed => Outcome::NoProgress,
         SweepEnd::Finished => Outcome::NothingOwed,
-        SweepEnd::Cancelled => Outcome::Unanswered,
+        SweepEnd::Cancelled | SweepEnd::LocalBusy => Outcome::Unanswered,
         // The quantum ran out waiting out a rate limit no answer followed:
         // rate limited and never cleared.
         SweepEnd::DeadlineReached if rate_limited => Outcome::RateLimited,
@@ -597,6 +598,7 @@ pub(super) fn end_label(end: SweepEnd) -> &'static str {
         SweepEnd::RateLimited => "rate_limited",
         SweepEnd::Refused(_) => "refused",
         SweepEnd::Unreachable(_) => "unreachable",
+        SweepEnd::LocalBusy => "local_busy",
         SweepEnd::SinkFailed => "sink_failed",
         SweepEnd::StoreFailed => "store_failed",
     }

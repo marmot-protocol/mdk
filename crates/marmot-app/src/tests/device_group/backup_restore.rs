@@ -20,10 +20,10 @@ async fn restore(client: &mut AppClient, words: &Words) -> crate::BackupRestoreS
 /// The first relay completes empty while the pointer-holding relay does
 /// not finish. Positive views expose real signed publications from that
 /// relay's retained prefix; this fixture supplies no restore/import result.
-struct PartialPointerView {
-    relay: Arc<ScriptedPushRelayClient>,
-    visible: bool,
-    any_completed: bool,
+pub(super) struct PartialPointerView {
+    pub(super) relay: Arc<ScriptedPushRelayClient>,
+    pub(super) visible: bool,
+    pub(super) any_completed: bool,
 }
 
 #[async_trait]

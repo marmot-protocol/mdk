@@ -233,7 +233,7 @@ impl AppClient {
         for (slot, entry) in &exchange.roster.devices {
             let slot_hex = hex::encode(slot);
             if !exchange.is_sibling(slot)
-                || entry.tag_signature_key.is_none()
+                || !exchange.link_made(slot)
                 || removing.contains(&slot_hex)
             {
                 continue;

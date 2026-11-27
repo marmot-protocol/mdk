@@ -1026,6 +1026,7 @@ impl<S: StorageProvider> Engine<S> {
 
     pub(crate) async fn do_send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
         let group_id = self.validate_send_acceptance(&intent)?;
+        self.resume_unfinished_staging_cleanup(&group_id)?;
         // Disband is an intent-persistence operation, not a Commit-preparation
         // operation. It remains acceptable while another staged Commit owns
         // the group and while Unrecoverable is paused.
@@ -1199,6 +1200,19 @@ impl<S: StorageProvider> Engine<S> {
                     to: crate::audit_helpers::send_intent_kind_str(intent),
                     reason: "Disbanded is terminal",
                 },
+            ));
+        }
+        // Caller UpdateAppComponents must not mutate the engine-owned lifecycle
+        // component (0x800c); refuse before queueing as well as on direct send.
+        if let SendIntent::UpdateAppComponents { updates, .. } = intent
+            && updates.iter().any(|update| {
+                update.component_id == cgka_traits::app_components::GROUP_LIFECYCLE_COMPONENT_ID
+            })
+        {
+            return Err(EngineError::Other(
+                "group lifecycle component cannot be updated through UpdateAppComponents; \
+                 use EnableDisbanding or Disband"
+                    .into(),
             ));
         }
         // Disband has its own durable acceptance gates and intentionally
@@ -1380,6 +1394,7 @@ impl<S: StorageProvider> Engine<S> {
         if !self.prepare_convergence_input_advance(group_id)? {
             return Ok(Vec::new());
         }
+        self.resume_unfinished_staging_cleanup(group_id)?;
 
         // This entry point belongs to background recovery even when output is
         // queued. Borrowing a send's four-row preflight allowance here makes
@@ -2299,7 +2314,10 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(|e| EngineError::Backend(format!("load convergence policy: {e}")))?;
         let rewind = policy.convergence.max_rewind_commits;
         Ok((
-            group.epoch.0.saturating_sub(rewind),
+            crate::openmls_projection::effective_retained_anchor_epoch(
+                group,
+                group.epoch.0.saturating_sub(rewind),
+            ),
             group.epoch.0.saturating_add(rewind),
         ))
     }
@@ -2337,15 +2355,15 @@ impl<S: StorageProvider> Engine<S> {
                 skipped_non_resolvable += 1;
                 continue;
             };
-            // Beyond the future horizon: unreachable from the current tip, so
-            // not gating work (see the ceiling rationale above).
-            if projection.source_epoch.is_some_and(|epoch| epoch > ceiling) {
-                continue;
-            }
+            // Beyond the convergence horizon on either side: unreachable from
+            // the current copy's history or tip, so not gating work.
             let Some(source_epoch) = projection.source_epoch else {
                 skipped_non_resolvable += 1;
                 continue;
             };
+            if source_epoch < anchor || source_epoch > ceiling {
+                continue;
+            }
             let Some(input) = ClassifiedConvergenceInput::from_projection(
                 projection.kind,
                 source_epoch,
@@ -3039,7 +3057,9 @@ impl<S: StorageProvider> Engine<S> {
                 .map(Arc::clone);
             let before_enumeration = past_contexts
                 .as_ref()
-                .map(|_| ingest::PastPeelContextCache::replay_state(&self.storage, group_id))
+                .map(|_| {
+                    ingest::PastPeelContextCache::replay_state(self.storage.as_ref(), group_id)
+                })
                 .transpose()?
                 .flatten();
             let enumerated =
@@ -3049,7 +3069,7 @@ impl<S: StorageProvider> Engine<S> {
             self.quarantine_failed_rewinds();
             if let Some(contexts) = past_contexts {
                 let after_enumeration = if matches!(&enumerated, Ok(Some(_))) {
-                    ingest::PastPeelContextCache::replay_state(&self.storage, group_id)?
+                    ingest::PastPeelContextCache::replay_state(self.storage.as_ref(), group_id)?
                 } else {
                     None
                 };
@@ -3403,10 +3423,13 @@ impl<S: StorageProvider> Engine<S> {
         let policy = self
             .convergence_policy_for_group_ungated(group_id)
             .map_err(|error| EngineError::Backend(format!("load convergence policy: {error}")))?;
-        let floor = group
-            .epoch
-            .0
-            .saturating_sub(policy.convergence.max_rewind_commits);
+        let floor = crate::openmls_projection::effective_retained_anchor_epoch(
+            &group,
+            group
+                .epoch
+                .0
+                .saturating_sub(policy.convergence.max_rewind_commits),
+        );
         let contested = crate::openmls_projection::commit_edges_are_contested(
             self.stored_convergence_commit_edges(group_id)?
                 .into_iter()
@@ -3442,7 +3465,7 @@ impl<S: StorageProvider> Engine<S> {
             })?;
         let max_rewind_commits = policy.convergence.max_rewind_commits;
         crate::openmls_projection::candidate_branch_peel(
-            &self.storage,
+            self.storage.as_ref(),
             &self.rewinds,
             group_id,
             group.epoch.0.saturating_sub(max_rewind_commits),
@@ -3486,7 +3509,7 @@ impl<S: StorageProvider> Engine<S> {
         let max_rewind = policy.convergence.max_rewind_commits;
         let mut continuation = self.peel_replays.remove(group_id);
         let result = crate::openmls_projection::candidate_peel_slice(
-            &self.storage,
+            self.storage.as_ref(),
             &self.rewinds,
             group_id,
             group.epoch.0.saturating_sub(max_rewind),

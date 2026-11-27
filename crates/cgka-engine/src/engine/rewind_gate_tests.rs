@@ -6,7 +6,9 @@
 //! engine moves it into quarantine, the move announces it once and drops its
 //! pending publication, and nothing this session clears it or commits on it.
 
-use crate::account_identity_proof::{AccountIdentityProofRequest, AccountIdentityProofSigner};
+use super::test_support::{
+    PassthroughPeeler, SeedProofSigner, carried as shared_carried, signing_key,
+};
 use crate::canonicalization::CanonicalizationPolicy;
 use crate::openmls_projection::OpenMlsProjectionError;
 use crate::{Engine, EngineBuilder};
@@ -14,94 +16,17 @@ use cgka_traits::engine::{
     AutoPublish, CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason,
     SendIntent, SendResult,
 };
-use cgka_traits::error::{EngineError, PeelerError};
-use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{PeeledContent, PeeledMessage};
-use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::error::EngineError;
 use cgka_traits::storage::{OutboundIntentStorage, StorageProvider};
-use cgka_traits::transport::{
-    EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
-};
-use cgka_traits::types::MessageId;
-use k256::schnorr::{SigningKey, signature::hazmat::PrehashSigner};
-use sha2::{Digest, Sha256};
+use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use std::sync::Arc;
 use storage_sqlite::SqliteAccountStorage;
 
-fn signing_key(seed: &[u8]) -> SigningKey {
-    for counter in 0u64.. {
-        let mut hasher = Sha256::new();
-        hasher.update(b"cgka-engine-test-identity-v1");
-        hasher.update(seed);
-        hasher.update(counter.to_be_bytes());
-        if let Ok(key) = SigningKey::from_slice(&hasher.finalize()) {
-            return key;
-        }
-    }
-    unreachable!("a signing key is found within u64 counters")
-}
-
-struct SeedProofSigner(SigningKey);
-
-impl AccountIdentityProofSigner for SeedProofSigner {
-    fn sign_account_identity_proof(
-        &self,
-        request: &AccountIdentityProofRequest,
-    ) -> Result<[u8; 64], String> {
-        Ok(self
-            .0
-            .sign_prehash(&request.proof_event_id()?)
-            .map_err(|e| e.to_string())?
-            .to_bytes())
-    }
-}
-
-/// Carries every message verbatim.
-struct PassthroughPeeler;
-
 fn carried(payload: &[u8], envelope: TransportEnvelope) -> TransportMessage {
-    TransportMessage {
-        id: MessageId::new(Sha256::digest(payload).to_vec()),
-        payload: payload.to_vec(),
-        timestamp: Timestamp(0),
-        causal_deps: vec![],
-        source: TransportSource("rewind-gate-test".into()),
-        envelope,
-    }
+    shared_carried("rewind-gate-test", payload, envelope)
 }
 
-impl TransportPeeler for PassthroughPeeler {
-    fn peel_group_message(
-        &self,
-        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
-        _ctx: &GroupContextSnapshot,
-    ) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.message.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::MlsMessage {
-                bytes: msg.message.payload.clone(),
-            },
-            origin: msg.message.clone(),
-        })
-    }
-
-    fn wrap_group_message(
-        &self,
-        payload: &EncryptedPayload,
-        _ctx: &GroupContextSnapshot,
-    ) -> Result<TransportMessage, PeelerError> {
-        Ok(carried(
-            &payload.ciphertext,
-            TransportEnvelope::GroupMessage {
-                transport_group_id: vec![],
-            },
-        ))
-    }
-}
-
-fn client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+pub(super) fn client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let key = signing_key(seed);
     let engine = EngineBuilder::new(storage.clone())

@@ -85,18 +85,10 @@ fn convergence_run_context(run_id: &str, phase: ConvergencePhase) -> AuditEventC
     }
 }
 
+use crate::openmls_projection::engine_projection_error;
+
 fn storage_projection_error(error: StorageError) -> OpenMlsProjectionError {
     OpenMlsProjectionError::Storage(format!("{error:?}"))
-}
-
-/// A gated record read's refusal in this layer's terms: a quarantined group
-/// is a missing one (mdk#364, mdk#3272).
-fn engine_projection_error(error: EngineError) -> OpenMlsProjectionError {
-    match error {
-        EngineError::UnknownGroup(_) => OpenMlsProjectionError::MissingGroup,
-        EngineError::Storage(error) => storage_projection_error(error),
-        other => OpenMlsProjectionError::Storage(format!("{other:?}")),
-    }
 }
 
 /// Delay before the second attempt at a frozen batch that failed (mdk#2684).
@@ -638,7 +630,7 @@ impl<S: StorageProvider> Engine<S> {
                 )),
             })?;
         retain_current_group_epoch_snapshot(
-            &self.storage,
+            self.storage.as_ref(),
             group_id,
             policy.convergence.max_rewind_commits,
         )
@@ -846,10 +838,7 @@ impl<S: StorageProvider> Engine<S> {
         let Some(candidate) = self.convergence_pass_candidate(message_id)? else {
             return Ok((ConvergenceAdmissionOutcome::Retained, opened));
         };
-        let floor = pass
-            .base_epoch
-            .0
-            .saturating_sub(policy.convergence.max_rewind_commits);
+        let floor = self.effective_convergence_floor(group_id, pass.base_epoch, &policy)?;
         let ceiling = pass
             .base_epoch
             .0
@@ -1156,10 +1145,7 @@ impl<S: StorageProvider> Engine<S> {
         if pass.retry.is_none() {
             return Ok(false);
         }
-        let floor = pass
-            .base_epoch
-            .0
-            .saturating_sub(policy.convergence.max_rewind_commits);
+        let floor = self.effective_convergence_floor(&pass.group_id, pass.base_epoch, policy)?;
         let ceiling = pass
             .base_epoch
             .0
@@ -1211,16 +1197,14 @@ impl<S: StorageProvider> Engine<S> {
             None => self.storage.delete_convergence_pass(&pass.group_id),
         }
         .map_err(storage_projection_error)?;
+        let retained_anchor_horizon =
+            self.effective_convergence_floor(&pass.group_id, pass.base_epoch, policy)?;
         self.audit_group(
             &pass.group_id,
             marmot_forensics::AuditEventKind::ConvergenceRunState {
                 phase: ConvergencePhase::Waiting,
                 current_tip_epoch: Some(pass.base_epoch.0),
-                retained_anchor_horizon: Some(
-                    pass.base_epoch
-                        .0
-                        .saturating_sub(policy.convergence.max_rewind_commits),
-                ),
+                retained_anchor_horizon: Some(retained_anchor_horizon),
                 reason: Some("pass_reopened:new_input".to_string()),
                 error_kind: None,
             },
@@ -1234,20 +1218,37 @@ impl<S: StorageProvider> Engine<S> {
         Ok(FailedPassCheck::Reopened(reopened))
     }
 
+    fn effective_convergence_floor(
+        &self,
+        group_id: &GroupId,
+        base_epoch: EpochId,
+        policy: &CanonicalizationPolicy,
+    ) -> Result<u64, OpenMlsProjectionError> {
+        let policy_floor = base_epoch
+            .0
+            .saturating_sub(policy.convergence.max_rewind_commits);
+        match self.live_group_record(group_id) {
+            Ok(group) => Ok(crate::openmls_projection::effective_retained_anchor_epoch(
+                &group,
+                policy_floor,
+            )),
+            Err(EngineError::Storage(StorageError::NotFound)) => Ok(policy_floor),
+            Err(error) => Err(engine_projection_error(error)),
+        }
+    }
+
     fn seed_convergence_pass_members(
         &self,
         group_id: &GroupId,
         base_epoch: EpochId,
         policy: &CanonicalizationPolicy,
     ) -> Result<(Vec<ConvergencePassMember>, bool), OpenMlsProjectionError> {
-        let floor = base_epoch
-            .0
-            .saturating_sub(policy.convergence.max_rewind_commits);
+        let floor = self.effective_convergence_floor(group_id, base_epoch, policy)?;
         let ceiling = base_epoch
             .0
             .saturating_add(policy.convergence.max_rewind_commits);
         for (message_id, source_epoch) in
-            retire_stale_convergence_deferred_commits(&self.storage, group_id, floor)?
+            retire_stale_convergence_deferred_commits(self.storage.as_ref(), group_id, floor)?
         {
             self.audit_group(
                 group_id,
@@ -1781,6 +1782,8 @@ impl<S: StorageProvider> Engine<S> {
             );
             return Ok(unrecoverable_result(epoch));
         }
+        self.resume_unfinished_staging_cleanup(group_id)
+            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
 
         // A deferred-peel generation buffers recovered evidence
         // durably but must not adjudicate a prefix. The sweep clears this
@@ -1813,9 +1816,8 @@ impl<S: StorageProvider> Engine<S> {
             // Preserve the observable no-op convergence run used by diagnostics
             // and manual repair tooling. With no eligible input there is no
             // mutable candidate set to freeze.
-            let retained_anchor_epoch = previous_tip
-                .0
-                .saturating_sub(policy.convergence.max_rewind_commits);
+            let retained_anchor_epoch =
+                self.effective_convergence_floor(group_id, previous_tip, &policy)?;
             let run_id = convergence_run_id(group_id, previous_tip.0);
             self.audit_group_with_context(
                 group_id,
@@ -1906,9 +1908,8 @@ impl<S: StorageProvider> Engine<S> {
         {
             return Ok(waiting_result(previous_tip.0));
         }
-        let retained_anchor_epoch = previous_tip
-            .0
-            .saturating_sub(policy.convergence.max_rewind_commits);
+        let retained_anchor_epoch =
+            self.effective_convergence_floor(group_id, previous_tip, &policy)?;
         let run_id = convergence_run_id(group_id, previous_tip.0);
         let resolution = self.resolve_frozen_convergence_pass(
             group_id,
@@ -2179,7 +2180,7 @@ impl<S: StorageProvider> Engine<S> {
         let result = if let Some(deadline) = deadline {
             let mut continuation = self.canonical_replays.remove(group_id);
             let result = crate::openmls_projection::canonicalize_stored_slice(
-                &self.storage,
+                self.storage.as_ref(),
                 &self.rewinds,
                 group_id,
                 state,
@@ -2208,7 +2209,7 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             self.canonical_replays.remove(group_id);
             canonicalize_stored_openmls_messages_with_profile_policy(
-                &self.storage,
+                self.storage.as_ref(),
                 &self.rewinds,
                 group_id,
                 state,
@@ -3190,7 +3191,7 @@ fn quarantined_result(current_tip: u64) -> CanonicalizationResult {
 fn message_id_from_hex(encoded: &str) -> Result<MessageId, OpenMlsProjectionError> {
     hex::decode(encoded)
         .map(MessageId::new)
-        .map_err(|e| OpenMlsProjectionError::Decode(format!("message id {encoded}: {e:?}")))
+        .map_err(|e| OpenMlsProjectionError::Decode(format!("invalid message id hex: {e:?}")))
 }
 
 fn app_invalidation_reason(reason: InvalidatedAppMessageReason) -> AppMessageInvalidationReason {

@@ -18,12 +18,18 @@ use media_store::{
 use rusqlite::{Connection, OptionalExtension, params};
 use zeroize::Zeroizing;
 
+use crate::base::connection::retry_on_busy;
 use crate::{SqliteAppStorage, SqliteResultExt, u64_to_i64};
 
 const STATE_PENDING: i64 = 0;
 const STATE_READY: i64 = 1;
 const STATE_LOST: i64 = 2;
 pub(crate) const STATE_STAGED: i64 = 3;
+/// Exact `CatalogError::Backend` detail matched by `media_storage_error` and
+/// `outgoing_media::storage_from_catalog` to preserve `StorageError::Busy`
+/// without breaking `media-store`'s public error enum. Guarded by
+/// `media_catalog_tests::catalog_operations_retry_on_busy_and_preserve_busy_classification`.
+pub(crate) const CATALOG_BUSY_DETAIL: &str = "media catalog is busy";
 
 fn category_sql(category: Category) -> i64 {
     match category {
@@ -46,6 +52,7 @@ pub(crate) fn catalog_error(error: StorageError) -> CatalogError {
     match error {
         StorageError::Closed(_) => CatalogError::Closed,
         StorageError::Capacity(_) => CatalogError::Capacity,
+        StorageError::Busy(_) => CatalogError::Backend(CATALOG_BUSY_DETAIL.into()),
         _ => CatalogError::Backend("media catalog storage failed".into()),
     }
 }
@@ -58,6 +65,7 @@ pub fn media_storage_error(error: media_store::MediaError) -> StorageError {
         MediaError::Capacity => StorageError::Capacity("media store is full".into()),
         MediaError::InvalidBody(reason) => StorageError::InvalidAttachmentBody(reason),
         MediaError::Corruption(reason) => StorageError::Corruption(reason.into()),
+        MediaError::Catalog(detail) if detail == CATALOG_BUSY_DETAIL => StorageError::Busy(detail),
         other => StorageError::Backend(other.to_string()),
     }
 }
@@ -65,6 +73,22 @@ pub fn media_storage_error(error: media_store::MediaError) -> StorageError {
 fn id_from_sql(bytes: Vec<u8>) -> StorageResult<FileId> {
     FileId::from_slice(&bytes)
         .ok_or_else(|| StorageError::Corruption("invalid media file id".into()))
+}
+
+fn run_retrying_busy<T>(
+    storage: &SqliteAppStorage,
+    mut f: impl FnMut(&Connection) -> StorageResult<T>,
+) -> CatalogResult<T> {
+    let mut execute = || {
+        let conn = storage.lock()?;
+        f(&conn)
+    };
+    let result = if storage.connection.is_current_thread_transaction_owner() {
+        execute()
+    } else {
+        retry_on_busy(execute)
+    };
+    result.map_err(catalog_error)
 }
 
 /// `media_files` on one account database.
@@ -83,9 +107,8 @@ impl SqliteMediaCatalog {
         &self.storage
     }
 
-    fn run<T>(&self, f: impl FnOnce(&Connection) -> StorageResult<T>) -> CatalogResult<T> {
-        let conn = self.storage.lock().map_err(catalog_error)?;
-        f(&conn).map_err(catalog_error)
+    fn run<T>(&self, f: impl FnMut(&Connection) -> StorageResult<T>) -> CatalogResult<T> {
+        run_retrying_busy(&self.storage, f)
     }
 }
 
@@ -182,11 +205,12 @@ impl MediaCatalog for SqliteMediaCatalog {
     fn page(&self, after: Option<FileId>, limit: usize) -> CatalogResult<Vec<(FileId, FileState)>> {
         self.run(|conn| {
             let after = after.map(|id| id.as_bytes().to_vec()).unwrap_or_default();
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
             let mut statement = conn
                 .prepare("SELECT id,state FROM media_files WHERE id>?1 ORDER BY id LIMIT ?2")
                 .storage()?;
             let rows = statement
-                .query_map(params![after, limit as i64], |row| {
+                .query_map(params![after, limit], |row| {
                     Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
                 })
                 .storage()?
@@ -373,8 +397,7 @@ impl SlotPublication {
 
 impl PublishTarget for SlotPublication {
     fn superseded(&self) -> CatalogResult<bool> {
-        let conn = self.storage.lock().map_err(catalog_error)?;
-        self.slot_gone(&conn).map_err(catalog_error)
+        run_retrying_busy(&self.storage, |conn| self.slot_gone(conn))
     }
 
     fn commit_existing(

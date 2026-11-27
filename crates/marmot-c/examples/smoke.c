@@ -50,6 +50,8 @@ _Static_assert(MARMOT_COMPROMISE_WARNING_REASON_FOREIGN_OWN_SLOT_KEY_PACKAGE == 
 
 _Static_assert(MARMOT_BACKGROUND_BACKUP_OUTCOME_NOT_STARTED == 0, "backup not-started ABI value");
 _Static_assert(MARMOT_BACKGROUND_BACKUP_OUTCOME_FINISHED_ATTEMPT == 1, "backup attempt ABI value");
+_Static_assert(MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST == 1, "auto-inbox onboarding flag ABI value");
+_Static_assert(MARMOT_ONBOARDING_PASS_DEVICE_NOTICE_WHEN_NONE_FOUND == 2, "device-notice onboarding flag ABI value");
 
 static int failures = 0;
 
@@ -210,6 +212,12 @@ int main(int argc, char **argv) {
     check(marmot_client_new_with_experimental_device_groups(NULL, NULL, 0, NULL, NULL, NULL) ==
               MARMOT_STATUS_NULL_POINTER,
           "experimental constructor symbol and output preflight");
+    MarmotOnboardingSnapshot *onboarding = (MarmotOnboardingSnapshot *)0x1;
+    check(marmot_begin_onboarding_with_options(
+              NULL, NULL, NULL, 0, NULL, 0, NULL, 0, 4, &onboarding) ==
+                  MARMOT_STATUS_INVALID_ARGUMENT &&
+              onboarding == NULL,
+          "begin onboarding with options rejects unknown flags and clears output");
 
     /* ---- construct + lifecycle ---------------------------------------- */
     const char *relays[] = {"wss://relay.example.org"};

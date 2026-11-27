@@ -211,6 +211,8 @@ pub(super) fn opening_tx(
     query: ConversationOpenQuery,
     before_anchor: Option<usize>,
 ) -> Result<ConversationOpenSnapshot, ConversationOpenError> {
+    let group = canonical_group_id_hex(group);
+    let group = group.as_ref();
     let pending_confirmation: bool = conn
         .query_row_cached(
             "SELECT pending_confirmation FROM account_groups WHERE group_id_hex = ?1",

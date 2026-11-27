@@ -2,71 +2,45 @@ name: wn-agent Binaries
 
 on:
   pull_request:
+    # Keep pre-merge plugin coverage for Hermes/OpenClaw and their shared
+    # agent-control contract without running native binary release builds on PRs.
     paths:
       - .github/workflows/wn-agent-binaries.yml
-      - .github/actions/setup-odin/**
-      - scripts/install-odin.sh
+      - .github/workflows/ci.yml
+      - .cargo/config.toml
+      - .config/nextest.toml
+      - Cargo.toml
+      - Cargo.lock
+      - Justfile
+      - rust-toolchain.toml
       - scripts/classify_ci_changes.py
       - scripts/test_classify_ci_changes.py
-      - .cargo/config.toml
+      - crates/agent-control/**
+      - crates/agent-connector/**
+      - fixtures/agent-control-*.json
       - scripts/install-hermes-marmot.sh
       - scripts/hermes_marmot_configure_gateway.py
       - scripts/hermes_marmot_dev_setup.sh
       - scripts/hermes_marmot_verify_persisted_config.sh
+      - scripts/hermes_marmot_deterministic_e2e.sh
       - integrations/hermes/marmot/**
       - integrations/hermes/tests/marmot/**
       - scripts/install-openclaw-marmot.sh
       - integrations/openclaw/marmot/**
-      - scripts/install-claude-marmot.sh
-      - integrations/claude/marmot/**
-      - scripts/install-codex-marmot.sh
-      - integrations/codex/marmot/**
-      - scripts/install-opencode-marmot.sh
-      - integrations/opencode/marmot/**
-      - scripts/install-pi-marmot.sh
-      - scripts/install-terminal-harness-marmot.sh
-      - scripts/package-binary-bundle.sh
-      - integrations/pi/marmot/**
-      - scripts/install-goose-marmot.sh
-      - integrations/goose/marmot/**
-      - scripts/install-wn-agent.sh
-      - integrations/terminal-harness/**
-      - Cargo.toml
-      - Cargo.lock
-      - rust-toolchain.toml
-      - crates/agent-connector/**
-      - crates/agent-control/**
-      - crates/cgka-engine/**
-      - crates/fs-private/**
-      - crates/marmot-account/**
-      - crates/marmot-app/**
-      - crates/marmot-forensics/**
-      - crates/marmot-markdown/**
-      - crates/marmot-observability/**
-      - crates/marmot-markdown-ast/**
-      - crates/marmot-session/**
-      - crates/media-store/**
-      - crates/nostr-directory/**
-      - crates/storage-sqlite/**
-      - crates/traits/**
-      - crates/transport-nostr/**
-      - crates/transport-nostr-adapter/**
-      - crates/transport-nostr-peeler/**
       - '!*.md'
       - '!**/*.md'
       - integrations/openclaw/marmot/README.md
   push:
-    branches:
-      - master
     tags:
       - wn-agent-v*
-      # Nightly tags are created by nightly-releases.yml, which calls this workflow itself.
+      # RC and legacy nightly tags are created by rc-releases.yml, which calls this workflow itself.
       - "!wn-agent-v*-nightly.*"
+      - "!wn-agent-v*-rc.*"
   workflow_dispatch:
   workflow_call:
     inputs:
       source_sha:
-        description: Full 40-character source SHA on master
+        description: Full 40-character source SHA on master (or verified metadata-only release commit)
         required: true
         type: string
       build_only:
@@ -74,8 +48,8 @@ on:
         required: false
         default: false
         type: boolean
-      nightly_version:
-        description: Nightly version X.Y.Z-nightly.YYYYMMDD[.N]; stages a draft for nightly-releases.yml to publish
+      release_version:
+        description: SemVer RC (X.Y.Z-rc.N) or promoted Stable (X.Y.Z); stages a draft for rc-releases.yml or promote-release.yml to publish
         required: true
         type: string
 
@@ -120,16 +94,15 @@ jobs:
       - name: Classify changed paths
         id: classify
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           EVENT_NAME: ${{ github.event_name }}
-          NIGHTLY_VERSION: ${{ inputs.nightly_version }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
         run: |
           set -euo pipefail
           if [[ "$GITHUB_REF_TYPE" == "tag" \
-            || -n "$NIGHTLY_VERSION" \
+            || -n "$RELEASE_VERSION" \
             || "$EVENT_NAME" == "workflow_dispatch" \
-            || -z "$BASE_SHA" \
-            || "$BASE_SHA" =~ ^0+$ ]] \
+            || -z "$BASE_SHA" ]] \
             || ! git cat-file -e "${BASE_SHA}^{commit}"; then
             python3 scripts/classify_ci_changes.py --all --github-output "$GITHUB_OUTPUT" </dev/null
           else
@@ -139,13 +112,10 @@ jobs:
               | python3 scripts/classify_ci_changes.py --github-output "$GITHUB_OUTPUT"
           fi
 
-      # The organization shares five macOS runners across every repository.
-      # Pull requests build the Linux targets only; master pushes, tags, and
-      # manual runs also build and smoke-test both darwin targets.
+      # Tags, nightlies, and manual runs build and smoke-test all four targets.
+      # Pull requests skip `build` and run plugin checks only.
       - name: Select build targets
         id: targets
-        env:
-          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           targets='[
@@ -154,14 +124,11 @@ jobs:
             {"runner": "macos-latest", "target": "darwin-aarch64", "rust_target": "aarch64-apple-darwin"},
             {"runner": "macos-15", "target": "darwin-x86_64", "rust_target": "x86_64-apple-darwin"}
           ]'
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            targets="$(jq 'map(select(.target | startswith("darwin-") | not))' <<<"$targets")"
-          fi
           echo "build_targets=$(jq -c . <<<"$targets")" >> "$GITHUB_OUTPUT"
 
   build:
     needs: changes
-    if: needs.changes.outputs.run_binaries == 'true'
+    if: needs.changes.outputs.run_binaries == 'true' && github.event_name != 'pull_request'
     name: Build wn-agent and terminal harnesses (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -198,7 +165,7 @@ jobs:
       # publish these binaries, so they build cold too rather than from a
       # restorable (poisonable) cache.
       - name: Cache Cargo artifacts
-        if: runner.os == 'macOS' && !startsWith(github.ref, 'refs/tags/') && !inputs.nightly_version
+        if: runner.os == 'macOS' && !startsWith(github.ref, 'refs/tags/') && !inputs.release_version
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -223,15 +190,27 @@ jobs:
             "./target/${{ matrix.rust_target }}/release/$binary" --help
           done
 
+      - name: Check out workflow packaging scripts
+        if: ${{ !!inputs.release_version }}
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: builder
+
       - name: Package binary bundles
         shell: bash
         env:
-          NIGHTLY_VERSION: ${{ inputs.nightly_version }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
           RELEASE_SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
+          packager="./scripts/package-binary-bundle.sh"
+          if [[ -n "${RELEASE_VERSION:-}" ]]; then
+            packager="builder/scripts/package-binary-bundle.sh"
+          fi
           for binary in wn-agent wn-claude wn-codex wn-opencode wn-pi wn-goose; do
-            ./scripts/package-binary-bundle.sh \
+            "$packager" \
               "$binary" \
               "${{ matrix.target }}" \
               "${{ matrix.rust_target }}"
@@ -282,7 +261,6 @@ jobs:
   darwin-intel-smoke:
     name: Smoke test packaged binaries (darwin-x86_64)
     needs: build
-    if: github.event_name != 'pull_request'
     runs-on: macos-15-intel
     timeout-minutes: 5
 
@@ -321,10 +299,18 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.source_sha }}
 
+      - name: Check out workflow verification scripts
+        if: ${{ !!inputs.release_version }}
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: builder
+
       - name: Package Hermes Marmot plugin bundle
         shell: bash
         env:
-          NIGHTLY_VERSION: ${{ inputs.nightly_version }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
           SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
         run: |
           set -euo pipefail
@@ -332,14 +318,12 @@ jobs:
           workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           release_tag=""
           artifact_version="$sha_short"
-          if [ -n "$NIGHTLY_VERSION" ]; then
-            if [[ ! "$NIGHTLY_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-nightly\.[0-9]{8}(\.[1-9][0-9]{0,2})?$ ]] \
-              || [ "${BASH_REMATCH[1]}-dev" != "$workspace_version" ]; then
-              echo "error: nightly $NIGHTLY_VERSION does not match workspace version $workspace_version" >&2
-              exit 1
-            fi
-            release_tag="wn-agent-v$NIGHTLY_VERSION"
-            artifact_version="$NIGHTLY_VERSION"
+          if [ -n "$RELEASE_VERSION" ]; then
+            python3 builder/scripts/rc_release.py check-version \
+              --release-version "$RELEASE_VERSION" \
+              --workspace-version "$workspace_version" >/dev/null
+            release_tag="wn-agent-v$RELEASE_VERSION"
+            artifact_version="$RELEASE_VERSION"
           elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
             release_tag="$GITHUB_REF_NAME"
             if [[ ! "$release_tag" =~ ^wn-agent-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
@@ -536,6 +520,14 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.source_sha }}
 
+      - name: Check out workflow verification scripts
+        if: ${{ !!inputs.release_version }}
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: builder
+
       - name: Install OpenClaw Node runtime
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -549,7 +541,7 @@ jobs:
       - name: Package OpenClaw Marmot plugin tarball
         shell: bash
         env:
-          NIGHTLY_VERSION: ${{ inputs.nightly_version }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
           SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
         run: |
           set -euo pipefail
@@ -557,14 +549,12 @@ jobs:
           workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           artifact_version="$sha_short"
           release_tag=""
-          if [ -n "$NIGHTLY_VERSION" ]; then
-            if [[ ! "$NIGHTLY_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-nightly\.[0-9]{8}(\.[1-9][0-9]{0,2})?$ ]] \
-              || [ "${BASH_REMATCH[1]}-dev" != "$workspace_version" ]; then
-              echo "error: nightly $NIGHTLY_VERSION does not match workspace version $workspace_version" >&2
-              exit 1
-            fi
-            release_tag="wn-agent-v$NIGHTLY_VERSION"
-            artifact_version="$NIGHTLY_VERSION"
+          if [ -n "$RELEASE_VERSION" ]; then
+            python3 builder/scripts/rc_release.py check-version \
+              --release-version "$RELEASE_VERSION" \
+              --workspace-version "$workspace_version" >/dev/null
+            release_tag="wn-agent-v$RELEASE_VERSION"
+            artifact_version="$RELEASE_VERSION"
           elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
             release_tag="$GITHUB_REF_NAME"
             if [[ ! "$release_tag" =~ ^wn-agent-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
@@ -600,9 +590,9 @@ jobs:
             "workspace_version": "$workspace_version"
           }
           EOF
-          # On a release tag or nightly, sync the tarball's package version to the
-          # cohort (wn-agent / workspace version). Other validation runs keep 0.1.0.
-          if [ "$GITHUB_REF_TYPE" = "tag" ] || [ -n "$NIGHTLY_VERSION" ]; then
+          # On a release tag, RC, or promoted release, sync the tarball's package
+          # version to the cohort version. Other validation runs keep 0.1.0.
+          if [ "$GITHUB_REF_TYPE" = "tag" ] || [ -n "$RELEASE_VERSION" ]; then
             ( cd integrations/openclaw/marmot && npm pkg set version="$artifact_version" )
           fi
           ( cd integrations/openclaw/marmot && pnpm pack --pack-destination "$packed_dir" )
@@ -743,40 +733,7 @@ jobs:
             exit 1
           fi
 
-          mkdir -p dist/install
-          sed \
-            -e "s/^MARMOT_RELEASE_TAG_DEFAULT=.*/MARMOT_RELEASE_TAG_DEFAULT=\"${tag}\"/" \
-            -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
-            scripts/install-hermes-marmot.sh > dist/install/install-hermes-marmot.sh
-          chmod 0755 dist/install/install-hermes-marmot.sh
-          sed \
-            -e "s/^MARMOT_RELEASE_TAG_DEFAULT=.*/MARMOT_RELEASE_TAG_DEFAULT=\"${tag}\"/" \
-            -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
-            scripts/install-openclaw-marmot.sh > dist/install/install-openclaw-marmot.sh
-          chmod 0755 dist/install/install-openclaw-marmot.sh
-          for harness in claude codex opencode pi goose; do
-            awk -v harness="$harness" \
-              'NR == 1 { print; print "export MARMOT_TERMINAL_HARNESS=" harness; next } { print }' \
-              scripts/install-terminal-harness-marmot.sh | \
-              sed \
-                -e "s/^MARMOT_RELEASE_TAG_DEFAULT=.*/MARMOT_RELEASE_TAG_DEFAULT=\"${tag}\"/" \
-                -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
-                > "dist/install/install-$harness-marmot.sh"
-            chmod 0755 "dist/install/install-$harness-marmot.sh"
-          done
-          # Connector-only mode of the same installer, for custom agent-control clients.
-          awk 'NR == 1 { print; print "export MARMOT_TERMINAL_HARNESS=none"; next } { print }' \
-            scripts/install-terminal-harness-marmot.sh | \
-            sed \
-              -e "s/^MARMOT_RELEASE_TAG_DEFAULT=.*/MARMOT_RELEASE_TAG_DEFAULT=\"${tag}\"/" \
-              -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
-              > dist/install/install-wn-agent.sh
-          chmod 0755 dist/install/install-wn-agent.sh
-          for installer in dist/install/install-*.sh; do
-            shasum -a 256 "$installer" | \
-              awk -v name="$(basename "$installer")" '{print $1 "  " name}' \
-              > "$installer.sha256"
-          done
+          ./scripts/prepare-wn-agent-installers.sh "$tag" "$version" "." "dist/install"
 
       - name: Create or update wn-agent release
         shell: bash
@@ -927,7 +884,11 @@ jobs:
             dist/install/install-wn-agent.sh.sha256
           )
 
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if release_state="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            if [[ "$release_state" == "false" ]]; then
+              echo "Release $tag is already published; skipping tag-push upload"
+              exit 0
+            fi
             gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
             gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "v$version - wn-agent" --notes-file "$notes" --prerelease
           else
@@ -939,9 +900,9 @@ jobs:
               --prerelease
           fi
 
-  nightly-stage:
-    name: Stage wn-agent nightly
-    if: ${{ success() && !!inputs.nightly_version && !inputs.build_only }}
+  stage-release:
+    name: Stage wn-agent RC or promoted release
+    if: ${{ success() && !!inputs.release_version && !inputs.build_only }}
     runs-on: ubuntu-latest
     needs:
       - build
@@ -959,10 +920,18 @@ jobs:
       - name: Check out workflow scripts
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.sha }}
 
-      - name: Download nightly bundles
+      - name: Check out source for installer generation
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+          path: release-source
+
+      - name: Download release bundles
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -973,17 +942,48 @@ jobs:
             --pattern 'wn-*-linux-*' --pattern 'wn-*-darwin-*' \
             --pattern hermes-marmot-plugin --pattern openclaw-marmot-plugin
 
-      # Nightlies are downloaded by hand: binaries and plugins only, no installers.
-      - name: Verify bundles and stage nightly draft
+      - name: Verify bundles and stage release draft
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NIGHTLY_VERSION: ${{ inputs.nightly_version }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          version="$NIGHTLY_VERSION"
+          if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+            echo "error: RC/promoted staging must run with the workflow from refs/heads/master" >&2
+            exit 1
+          fi
+          version="$RELEASE_VERSION"
           tag="wn-agent-v$version"
+          is_rc=false
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rc\.[1-9][0-9]*$ ]]; then
+            is_rc=true
+          elif [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "error: invalid release_version $version" >&2
+            exit 1
+          fi
+
+          # Verify source ancestry (or metadata-only promoted commit on top of origin/master).
+          git fetch --no-tags origin master
+          git fetch --no-tags origin "$SOURCE_SHA" || true
+          if [[ "$is_rc" == "true" ]]; then
+            if ! git merge-base --is-ancestor "$SOURCE_SHA" origin/master; then
+              echo "error: RC SHA $SOURCE_SHA must be reachable from origin/master" >&2
+              exit 1
+            fi
+          else
+            if ! git merge-base --is-ancestor "$SOURCE_SHA" origin/master; then
+              parent_sha="$(git rev-parse "${SOURCE_SHA}^1")"
+              if ! git merge-base --is-ancestor "$parent_sha" origin/master; then
+                echo "error: promoted release parent $parent_sha is not reachable from origin/master" >&2
+                exit 1
+              fi
+              python3 scripts/promote_release.py verify-metadata-diff \
+                --root . --base "$parent_sha" --head "$SOURCE_SHA"
+            fi
+          fi
+
           bundles=()
           for binary in wn-agent wn-claude wn-codex wn-opencode wn-pi wn-goose; do
             for target in linux-x86_64 linux-aarch64 darwin-aarch64 darwin-x86_64; do
@@ -1008,22 +1008,23 @@ jobs:
             tar -xzOf "$path" "$manifest_path" | python3 -c '
           import json, os, sys
           manifest = json.load(sys.stdin)
-          expected = {"artifact_version": os.environ["NIGHTLY_VERSION"],
-                      "release_tag": "wn-agent-v" + os.environ["NIGHTLY_VERSION"],
+          expected = {"artifact_version": os.environ["RELEASE_VERSION"],
+                      "release_tag": "wn-agent-v" + os.environ["RELEASE_VERSION"],
                       "source_sha": os.environ["SOURCE_SHA"]}
           wrong = {key: manifest.get(key) for key, value in expected.items() if manifest.get(key) != value}
           if wrong:
-              sys.exit(f"error: {sys.argv[1]} manifest does not match the nightly: {wrong}")
+              sys.exit(f"error: {sys.argv[1]} manifest does not match release: {wrong}")
           ' "$name"
             assets+=("$path" "$path.sha256")
           done
 
-          nightly_notes="$RUNNER_TEMP/nightly-notes.md"
-          cat > "$nightly_notes" <<NOTES
-          Nightly build for testing only. Pin a formal \`wn-agent-v<version>\` release for anything you ship.
-          Nightlies are deleted after 30 days, and going back to an older nightly is not supported.
+          stage_notes="$RUNNER_TEMP/stage-notes.md"
+          if [[ "$is_rc" == "true" ]]; then
+            # RCs carry binaries and plugins only; formal installers ship on Stable promotion.
+            cat > "$stage_notes" <<NOTES
+          SemVer Release Candidate for staging and testing. Pin a formal \`wn-agent-v<version>\` release for production.
 
-          WN Agent \`$version\` from exact MDK commit \`$SOURCE_SHA\`. Nightlies carry no installers:
+          WN Agent \`$version\` from exact MDK commit \`$SOURCE_SHA\`. RCs carry no installers:
           download a bundle by hand, check it against its sibling \`.sha256\` file, and unpack it.
 
           Assets:
@@ -1032,12 +1033,91 @@ jobs:
           - \`hermes-marmot-plugin-$version.tar.gz\`: Hermes platform plugin directory bundle.
           - \`openclaw-marmot-plugin-$version.tgz\`: OpenClaw channel plugin npm tarball.
 
-          Platforms: \`linux-x86_64\`, \`linux-aarch64\`, \`darwin-aarch64\`, \`darwin-x86_64\`. Each bundle's
-          \`manifest.json\` records the nightly version and source commit.
+          Platforms: \`linux-x86_64\`, \`linux-aarch64\`, \`darwin-aarch64\`, \`darwin-x86_64\`.
           NOTES
-          python3 scripts/nightly_release.py stage-draft \
+            stage_args=()
+          else
+            # Promoted Stable release: generate versioned installers pinned to this exact tag
+            # and emit the same verified-install notes as the formal tag release job.
+            ./scripts/prepare-wn-agent-installers.sh "$tag" "$version" "release-source" "dist/install"
+            for installer in dist/install/install-*.sh; do
+              assets+=("$installer" "$installer.sha256")
+            done
+            cat > "$stage_notes" <<NOTES
+          WN Agent \`$version\` from MDK commit \`$SOURCE_SHA\`.
+
+          Install this exact WN Agent release with:
+
+          \`\`\`sh
+          set -eu
+          base_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$tag"
+
+          install_verified() (
+            set -eu
+            installer_url="\$1"
+            checksum_url="\$2"
+            shift 2
+            installer_script="\${installer_url##*/}"
+            tmpdir="\$(mktemp -d)"
+            trap 'rm -rf "\$tmpdir"' 0 HUP INT TERM
+            curl -fsSL "\$installer_url" -o "\$tmpdir/\$installer_script"
+            curl -fsSL "\$checksum_url" -o "\$tmpdir/\$installer_script.sha256"
+            if command -v shasum >/dev/null 2>&1; then
+              (cd "\$tmpdir" && shasum -a 256 -c "\$installer_script.sha256")
+            elif command -v sha256sum >/dev/null 2>&1; then
+              (cd "\$tmpdir" && sha256sum -c "\$installer_script.sha256")
+            else
+              echo "error: need shasum or sha256sum to verify the installer" >&2
+              exit 1
+            fi
+            bash "\$tmpdir/\$installer_script" "\$@"
+          )
+
+          # Hermes gateway
+          install_verified "\$base_url/install-hermes-marmot.sh" "\$base_url/install-hermes-marmot.sh.sha256"
+          # OpenClaw gateway
+          install_verified "\$base_url/install-openclaw-marmot.sh" "\$base_url/install-openclaw-marmot.sh.sha256"
+          # Claude Code terminal harness
+          install_verified "\$base_url/install-claude-marmot.sh" "\$base_url/install-claude-marmot.sh.sha256"
+          # Codex terminal harness
+          install_verified "\$base_url/install-codex-marmot.sh" "\$base_url/install-codex-marmot.sh.sha256"
+          # OpenCode terminal harness
+          install_verified "\$base_url/install-opencode-marmot.sh" "\$base_url/install-opencode-marmot.sh.sha256"
+          # Pi terminal harness
+          install_verified "\$base_url/install-pi-marmot.sh" "\$base_url/install-pi-marmot.sh.sha256"
+          # Goose terminal harness
+          install_verified "\$base_url/install-goose-marmot.sh" "\$base_url/install-goose-marmot.sh.sha256"
+          # wn-agent only, for your own agent-control client
+          install_verified "\$base_url/install-wn-agent.sh" "\$base_url/install-wn-agent.sh.sha256"
+          \`\`\`
+
+          Assets:
+          - \`wn-agent-<platform>-$version.tar.gz\`: versioned binary bundle.
+          - \`wn-claude-<platform>-$version.tar.gz\`: Claude Code harness binary bundle.
+          - \`wn-codex-<platform>-$version.tar.gz\`: Codex harness binary bundle.
+          - \`wn-opencode-<platform>-$version.tar.gz\`: OpenCode harness binary bundle.
+          - \`wn-pi-<platform>-$version.tar.gz\`: Pi harness binary bundle.
+          - \`wn-goose-<platform>-$version.tar.gz\`: Goose harness binary bundle.
+          - \`hermes-marmot-plugin-$version.tar.gz\`: Hermes platform plugin directory bundle.
+          - \`openclaw-marmot-plugin-$version.tgz\`: OpenClaw channel plugin npm tarball.
+          - \`install-hermes-marmot.sh\`: installer for testers with Hermes already installed.
+          - \`install-openclaw-marmot.sh\`: installer for testers with OpenClaw already installed.
+          - \`install-claude-marmot.sh\`: installer for testers with Claude Code already installed.
+          - \`install-codex-marmot.sh\`: installer for testers with Codex already installed.
+          - \`install-opencode-marmot.sh\`: installer for testers with OpenCode already installed.
+          - \`install-pi-marmot.sh\`: installer for testers with Pi already installed.
+          - \`install-goose-marmot.sh\`: installer for testers with Goose already installed.
+          - \`install-wn-agent.sh\`: connector-only installer for your own agent-control client; installs no harness.
+
+          Verify downloads with the accompanying \`.sha256\` files.
+          NOTES
+            stage_args=(--stable --prerelease)
+          fi
+
+          python3 scripts/rc_release.py stage-draft \
             --tag "$tag" \
             --title "v$version - wn-agent" \
             --target "$SOURCE_SHA" \
-            --notes-file "$nightly_notes" \
+            --notes-file "$stage_notes" \
+            "${stage_args[@]}" \
             "${assets[@]}"

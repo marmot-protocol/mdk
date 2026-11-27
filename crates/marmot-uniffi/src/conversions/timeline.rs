@@ -240,6 +240,8 @@ pub struct TimelineReplyPreviewFfi {
     pub invalidation_status: Option<String>,
     /// Where the previewed message sits in a NIP-22 thread.
     pub thread: Option<TimelineThreadRefFfi>,
+    pub retention_seconds: Option<u64>,
+    pub retention_expires_at: Option<u64>,
 }
 
 /// A row's place in a NIP-22 thread: set for every thread message (kind
@@ -281,6 +283,8 @@ impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
             deleted: value.deleted,
             deletion_source: value.deletion_source.into(),
             invalidation_status: value.invalidation_status,
+            retention_seconds: value.retention_seconds,
+            retention_expires_at: value.retention_expires_at,
             thread: value.thread.map(Into::into),
         }
     }
@@ -509,8 +513,9 @@ pub struct TimelineMessageRecordFfi {
     /// unreadable agent item.
     pub agent_item: Option<AgentItemFfi>,
     /// True for an agent item whose first event this device does not hold,
-    /// such as one that began before this member joined: the row is its
-    /// earliest edit, at that edit's place, showing the latest version. Say
+    /// such as one that began before this member joined: the row is the
+    /// first edit of it this device received, at that edit's place, showing
+    /// the latest version. Say
     /// the item started earlier. False once the first event arrives.
     pub agent_item_first_event_missing: bool,
     pub reactions: TimelineReactionSummaryFfi,
@@ -1295,6 +1300,8 @@ mod tests {
             // The previewed (target) message lives in its own epoch, distinct
             // from the replying message's epoch.
             source_epoch: Some(3),
+            retention_seconds: None,
+            retention_expires_at: None,
             media: Some(imeta_metadata(&[imeta_tag(0x22, "video/mp4", "clip.mp4")])),
             deleted: false,
             deletion_source: Default::default(),
@@ -1331,6 +1338,8 @@ mod tests {
             kind,
             tags,
             source_epoch: Some(3),
+            retention_seconds: None,
+            retention_expires_at: None,
             media: None,
             deleted,
             deletion_source: Default::default(),

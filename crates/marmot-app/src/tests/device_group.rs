@@ -59,6 +59,63 @@ fn device_group_app_on(
 
 /// Alice's phone and laptop, each with a published KeyPackage, and the link
 /// confirming the laptop's under `device_group_id`.
+/// Link a fresh device of `client`'s account into `group` at `slot` with
+/// `entry`, standing in for another device's link. The Add binds the new
+/// leaf's key to its entry, as every roster Commit that adds a leaf must
+/// (marmot#521). Returns the device's directory and its leaf's key.
+pub(in crate::tests) async fn link_fresh_device(
+    client: &mut AppClient,
+    relay: &Arc<ScriptedPushRelayClient>,
+    group: &GroupId,
+    slot: [u8; 32],
+    entry: DeviceEntryV1,
+) -> (tempfile::TempDir, Vec<u8>) {
+    let dir = tempfile::tempdir().unwrap();
+    let label = client.state.label.clone();
+    let home = client.app.account_home();
+    let secret = home
+        .load_signing_keys(&label)
+        .unwrap()
+        .secret_key()
+        .to_secret_hex();
+    let account_id_hex = home.account(&label).unwrap().account_id_hex;
+    AccountHome::open(dir.path())
+        .import_account(&label, &secret)
+        .unwrap();
+    let app = device_group_app_at(&dir, relay.clone());
+    remember_test_member_inbox(&app, &account_id_hex, "wss://relay.example");
+    let mut device = boxed(|| app.client(&label)).await.unwrap();
+    let key_package = boxed(|| published_key_package(&mut device, relay)).await;
+    let metadata = marmot_session::key_package_metadata(&key_package).unwrap();
+    let roster_update = encode_device_roster_update_v1(
+        &DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(
+            slot,
+            DeviceEntryV1 {
+                announced_key_package: Some(hex::decode(&metadata.key_package_ref_hex).unwrap()),
+                tag_signature_key: Some(metadata.leaf_signature_key.clone()),
+                ..entry
+            },
+        )])
+        .unwrap(),
+    )
+    .unwrap();
+    let effects = boxed(|| {
+        client.runtime.send(SendIntent::LinkDevice {
+            group_id: group.clone(),
+            key_package,
+            roster_update,
+            deliver_until: cgka_traits::Timestamp(u64::MAX),
+        })
+    })
+    .await
+    .unwrap();
+    client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    (dir, metadata.leaf_signature_key)
+}
+
 pub(super) struct Devices {
     pub(super) _dirs: [tempfile::TempDir; 2],
     pub(super) relay: Arc<ScriptedPushRelayClient>,
@@ -188,6 +245,16 @@ fn roster(client: &AppClient, group: &GroupId) -> DeviceRosterV1 {
     decode_device_roster_v1(&bytes).unwrap()
 }
 
+/// Whether `client` reads the link of `slot` in `group` as made: its leaf
+/// there tags as `slot` and has committed since its Add (marmot#521).
+fn link_made(client: &AppClient, group: &GroupId, slot: &[u8; 32]) -> bool {
+    client
+        .runtime
+        .made_device_links(group, &roster(client, group))
+        .unwrap()
+        .contains(slot)
+}
+
 fn roster_devices(client: &AppClient, group: &GroupId) -> usize {
     roster(client, group).devices.len()
 }
@@ -266,14 +333,22 @@ async fn a_confirmed_link_creates_a_hidden_device_group_both_devices_trust() {
     // The creating device draws the tag key at random, and the laptop holds the
     // same one.
     let leaf_tag_key = roster(&phone, &group).leaf_tag_key;
-    assert_ne!(leaf_tag_key, [0; 32]);
+    assert_ne!(*leaf_tag_key, [0; 32]);
     assert_eq!(roster(&laptop, &group).leaf_tag_key, leaf_tag_key);
 
     // A roster update reaches the laptop and is never projected either.
+    let laptop_slot = roster(&laptop, &group)
+        .devices
+        .into_iter()
+        .find(|(_, entry)| entry.linked_by.is_some())
+        .expect("the laptop's entry");
     let update = encode_device_roster_update_v1(
         &DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(
-            [9; 32],
-            DeviceEntryV1::default(),
+            laptop_slot.0,
+            DeviceEntryV1 {
+                label: "Renamed".into(),
+                ..laptop_slot.1
+            },
         )])
         .unwrap(),
     )
@@ -297,7 +372,11 @@ async fn a_confirmed_link_creates_a_hidden_device_group_both_devices_trust() {
     laptop.sync().await.unwrap();
     for (app, client) in [(&phone_app, &phone), (&laptop_app, &laptop)] {
         assert_eq!(roster(client, &group).leaf_tag_key, leaf_tag_key);
-        assert_eq!(roster_devices(client, &group), 3);
+        assert_eq!(roster_devices(client, &group), 2);
+        assert_eq!(
+            roster(client, &group).devices[&laptop_slot.0].label,
+            "Renamed"
+        );
         assert_hidden(app, client, &group);
     }
 
@@ -968,6 +1047,49 @@ async fn a_device_group_welcome_stays_out_of_host_redelivery() {
     relay.fail_publishes_of_kind(1059);
     let group = phone.dev_create_device_group(link).await.unwrap();
     let group_hex = hex::encode(group.as_slice());
+    let pending = phone_app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .list_pending_welcome_deliveries()
+        .unwrap();
+    let device_welcome = pending
+        .iter()
+        .find(|record| record.group_id_hex == group_hex)
+        .expect("the Welcome stays queued");
+    assert!(phone.pending_welcome_deliveries().unwrap().is_empty());
+    assert!(phone.take_pending_welcome_delivery_events().is_empty());
+
+    relay.allow_all_publish_kinds();
+    let published_before = relay.published_event_ids();
+    let error = phone
+        .redeliver_welcome(&device_welcome.message_id_hex)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.as_engine_error(),
+            Some(cgka_traits::EngineError::Storage(
+                cgka_traits::storage::StorageError::NotFound
+            ))
+        ),
+        "host redeliver_welcome must reject the device group's Welcome as engine Storage::NotFound, got {error:?}"
+    );
+    let missing_error = phone.redeliver_welcome(&"ff".repeat(32)).await.unwrap_err();
+    assert!(
+        matches!(
+            missing_error.as_engine_error(),
+            Some(cgka_traits::EngineError::Storage(
+                cgka_traits::storage::StorageError::NotFound
+            ))
+        ),
+        "host redeliver_welcome must report an unknown Welcome as engine Storage::NotFound, got {missing_error:?}"
+    );
+    assert_eq!(
+        relay.published_event_ids(),
+        published_before,
+        "rejected device-group Welcome must not be published"
+    );
     assert!(
         phone_app
             .account_storage("alice")
@@ -976,11 +1098,9 @@ async fn a_device_group_welcome_stays_out_of_host_redelivery() {
             .list_pending_welcome_deliveries()
             .unwrap()
             .iter()
-            .any(|record| record.group_id_hex == group_hex),
-        "the Welcome stays queued"
+            .any(|record| record.message_id_hex == device_welcome.message_id_hex),
+        "rejected host redelivery must leave the internal pending Welcome queued"
     );
-    assert!(phone.pending_welcome_deliveries().unwrap().is_empty());
-    assert!(phone.take_pending_welcome_delivery_events().is_empty());
 }
 
 /// The host never learns of the device group through a surface built from
@@ -1209,53 +1329,40 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         tag_signature_key: Some(label.as_bytes().to_vec()),
         history_key: Some(vec![8; 32]),
     };
-    let update = encode_device_roster_update_v1(
-        &DeviceRosterUpdateV1::new(vec![
-            DeviceRosterOperationV1::SetDevice(
-                [9; 32],
-                entry(
-                    "Tablet",
-                    1,
-                    DeviceStatusV1::Inactive,
-                    DeviceSettingsV1 {
-                        add_to_all_chats: true,
-                        bring_history: true,
-                        keep_while_inactive: false,
-                    },
-                ),
-            ),
-            DeviceRosterOperationV1::SetDevice(
-                [8; 32],
-                entry(
-                    "Desk",
-                    2,
-                    DeviceStatusV1::Leaving,
-                    DeviceSettingsV1 {
-                        add_to_all_chats: false,
-                        bring_history: true,
-                        keep_while_inactive: true,
-                    },
-                ),
-            ),
-        ])
-        .unwrap(),
+    let (_tablet_dir, _) = link_fresh_device(
+        &mut phone,
+        &relay,
+        &group,
+        [9; 32],
+        entry(
+            "Tablet",
+            1,
+            DeviceStatusV1::Inactive,
+            DeviceSettingsV1 {
+                add_to_all_chats: true,
+                bring_history: true,
+                keep_while_inactive: false,
+            },
+        ),
     )
-    .unwrap();
-    let effects = phone
-        .runtime
-        .send(SendIntent::UpdateAppComponents {
-            group_id: group.clone(),
-            updates: vec![cgka_traits::app_components::AppComponentData {
-                component_id: DEVICE_ROSTER_COMPONENT_ID,
-                data: update,
-            }],
-        })
-        .await
-        .unwrap();
-    phone
-        .observe_drained_session_events(&effects)
-        .await
-        .unwrap();
+    .await;
+    let (_desk_dir, _) = link_fresh_device(
+        &mut phone,
+        &relay,
+        &group,
+        [8; 32],
+        entry(
+            "Desk",
+            2,
+            DeviceStatusV1::Leaving,
+            DeviceSettingsV1 {
+                add_to_all_chats: false,
+                bring_history: true,
+                keep_while_inactive: true,
+            },
+        ),
+    )
+    .await;
     deliver_new(&mut laptop, &relay, &mut cursor).await;
     laptop.sync().await.unwrap();
     assert!(laptop.take_linked_devices_changed());
@@ -2253,8 +2360,9 @@ fn key_package_claim(client: &AppClient, roster: &DeviceRosterV1) -> DeviceTagCl
 
 /// Each device tags from the device group it trusts (mdk#2628 3.1d). The
 /// founder's founding entry carries its tag signature key, so its leaf reads
-/// as its slot from the start. The laptop sets its own key on its next
-/// maintenance pass, in a roster commit whose own leaf already carries the
+/// as its slot from the start. The Add that linked the laptop set its key
+/// (marmot#521), but its link is not made until its own first commit there:
+/// its next maintenance pass makes that commit, whose own leaf carries the
 /// tag, before it stages anything; the same pass then announces and
 /// publishes a tagged KeyPackage. The phone's next pass replaces its
 /// untagged one.
@@ -2276,7 +2384,11 @@ async fn each_device_tags_from_the_device_group_it_trusts() {
         founding.devices[&phone_slot].tag_signature_key,
         Some(phone.runtime.own_signature_key())
     );
-    assert_eq!(founding.devices[&laptop_slot].tag_signature_key, None);
+    assert_eq!(
+        founding.devices[&laptop_slot].tag_signature_key,
+        Some(laptop.runtime.own_signature_key())
+    );
+    assert!(!link_made(&laptop, &group, &laptop_slot));
     assert_eq!(
         leaf_claim(&laptop, &group, &phone, &founding),
         Some(DeviceTagClaim::Device(phone_slot))
@@ -2314,6 +2426,7 @@ async fn each_device_tags_from_the_device_group_it_trusts() {
             leaf_claim(reader, &group, &laptop, &roster),
             Some(DeviceTagClaim::Device(laptop_slot))
         );
+        assert!(link_made(reader, &group, &laptop_slot));
     }
     assert_eq!(
         key_package_claim(&laptop, &roster(&laptop, &group)),
@@ -2396,7 +2509,7 @@ async fn each_device_keeps_its_history_key_in_its_own_entry() {
         .unwrap();
     assert_eq!(
         laptop.runtime.open_history(context, &sealed).unwrap(),
-        Some(b"bundle".to_vec())
+        Some(cgka_traits::SecretBytes::new(b"bundle".to_vec()))
     );
     assert_eq!(phone.runtime.open_history(context, &sealed).unwrap(), None);
 
@@ -2429,12 +2542,12 @@ async fn each_device_keeps_its_history_key_in_its_own_entry() {
     }
 }
 
-/// A KeyPackage staged while this device's tag signature key is due would go
-/// out untagged once the key is set (mdk#2628 3.1d), so nothing is staged
-/// until the merged roster carries it. When the relay refuses the roster
-/// commit, neither maintenance nor a host publication stages or publishes a
-/// KeyPackage. Once it accepts, one host rotation sets the key, then
-/// announces and publishes a tagged KeyPackage.
+/// A KeyPackage staged while this device's first device-group commit is due
+/// would go out untagged once that commit makes its link (mdk#2628 3.1d,
+/// marmot#521), so nothing is staged until the link is made. When the relay
+/// refuses that commit, neither maintenance nor a host publication stages or
+/// publishes a KeyPackage. Once it accepts, one host rotation makes the
+/// commit, then announces and publishes a tagged KeyPackage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_key_package_waits_for_the_tag_signature_key() {
     let (
@@ -2461,16 +2574,10 @@ async fn a_key_package_waits_for_the_tag_signature_key() {
     let status = laptop.key_package_maintenance_status().unwrap().unwrap();
     assert!(status.pending_replacement.is_none(), "nothing is staged");
     assert_eq!(current_ref(&laptop), current);
-    assert_eq!(
-        roster(&laptop, &group).devices[&laptop_slot].tag_signature_key,
-        None
-    );
+    assert!(!link_made(&laptop, &group, &laptop_slot));
 
     laptop.rotate_key_package().await.unwrap();
-    assert_eq!(
-        roster(&laptop, &group).devices[&laptop_slot].tag_signature_key,
-        Some(laptop.runtime.own_signature_key())
-    );
+    assert!(link_made(&laptop, &group, &laptop_slot));
     assert_ne!(current_ref(&laptop), current);
     assert_eq!(announced(&laptop, &group, &laptop), current_ref(&laptop));
     assert_eq!(
@@ -2522,10 +2629,11 @@ async fn an_untagged_staged_key_package_is_replaced_once_the_device_tags() {
     );
 }
 
-/// A refresh waiting for this device's tag signature key (mdk#2628 3.1d) is
-/// held back like one waiting for its announcement: once the slot's
-/// publication is a week old it is overdue, though the current KeyPackage is
-/// announced. It clears once the key is set and a tagged KeyPackage publishes.
+/// A refresh waiting for this device's first device-group commit (mdk#2628
+/// 3.1d, marmot#521) is held back like one waiting for its announcement: once
+/// the slot's publication is a week old it is overdue, though the current
+/// KeyPackage is announced. It clears once that commit makes the link and a
+/// tagged KeyPackage publishes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refresh_waiting_for_the_tag_signature_key_is_overdue_after_a_week() {
     let (
@@ -2544,10 +2652,7 @@ async fn a_refresh_waiting_for_the_tag_signature_key_is_overdue_after_a_week() {
     assert_eq!(announced(&laptop, &group, &laptop), current_ref(&laptop));
     relay.reject_next_publish();
     laptop.run_due_maintenance().await.unwrap();
-    assert_eq!(
-        roster(&laptop, &group).devices[&laptop_slot].tag_signature_key,
-        None
-    );
+    assert!(!link_made(&laptop, &group, &laptop_slot));
     assert!(laptop.key_package_refresh_overdue().unwrap());
     assert!(laptop.take_key_package_refresh_overdue_changed());
 
@@ -2558,73 +2663,6 @@ async fn a_refresh_waiting_for_the_tag_signature_key_is_overdue_after_a_week() {
     );
     assert!(!laptop.key_package_refresh_overdue().unwrap());
     assert!(laptop.take_key_package_refresh_overdue_changed());
-}
-
-/// While another device's entry carries this device's tag signature key, this
-/// device cannot set the key in its own entry, since a roster gives each key
-/// one device (mdk#2628 3.1d). The engine tags only from this device's own
-/// entry, so maintenance does not hold the refresh back: it announces and
-/// publishes an untagged KeyPackage, never one that reads as that device's.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_key_held_by_another_device_leaves_key_packages_untagged() {
-    let (
-        Devices {
-            _dirs,
-            relay,
-            mut phone,
-            mut laptop,
-            ..
-        },
-        group,
-    ) = linked_devices().await;
-    let laptop_slot = slot_of(&laptop);
-    let update = encode_device_roster_update_v1(
-        &DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(
-            [9; 32],
-            DeviceEntryV1 {
-                tag_signature_key: Some(laptop.runtime.own_signature_key()),
-                ..DeviceEntryV1::default()
-            },
-        )])
-        .unwrap(),
-    )
-    .unwrap();
-    let mut laptop_cursor = relay.published_events.lock().unwrap().len();
-    let effects = phone
-        .runtime
-        .send(SendIntent::UpdateAppComponents {
-            group_id: group.clone(),
-            updates: vec![cgka_traits::app_components::AppComponentData {
-                component_id: DEVICE_ROSTER_COMPONENT_ID,
-                data: update,
-            }],
-        })
-        .await
-        .unwrap();
-    phone
-        .observe_drained_session_events(&effects)
-        .await
-        .unwrap();
-    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
-    laptop.sync().await.unwrap();
-    let current = current_ref(&laptop);
-
-    let before = relay.published_events.lock().unwrap().len();
-    laptop.run_due_maintenance().await.unwrap();
-    assert_ne!(current_ref(&laptop), current);
-    assert_eq!(announced(&laptop, &group, &laptop), current_ref(&laptop));
-    assert_eq!(
-        key_package_claim(&laptop, &roster(&laptop, &group)),
-        DeviceTagClaim::Unclaimed
-    );
-    assert_eq!(
-        published_kinds(&relay, before),
-        vec![transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE, 30443]
-    );
-    assert_eq!(
-        roster(&laptop, &group).devices[&laptop_slot].tag_signature_key,
-        None
-    );
 }
 
 /// An eager open names the device group to tag from before it returns; a
@@ -2693,11 +2731,11 @@ async fn a_removed_device_record_is_dropped_after_30_days() {
         &DeviceRosterUpdateV1::new(vec![
             DeviceRosterOperationV1::SetRejectedSlot(
                 expired,
-                rejected(RejectedSlotReasonV1::Removed, 31, Some(vec![7; 32])),
+                rejected(RejectedSlotReasonV1::Removed, 31, None),
             ),
             DeviceRosterOperationV1::SetRejectedSlot(
                 young,
-                rejected(RejectedSlotReasonV1::Removed, 29, Some(vec![8; 32])),
+                rejected(RejectedSlotReasonV1::Removed, 29, None),
             ),
             DeviceRosterOperationV1::SetRejectedSlot(
                 not_me,

@@ -552,6 +552,8 @@ mod tests {
                 kind: 9,
                 tags: Vec::new(),
                 source_epoch: None,
+                retention_seconds: None,
+                retention_expires_at: None,
                 media: None,
                 deleted: false,
                 deletion_source: Default::default(),

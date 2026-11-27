@@ -258,9 +258,9 @@ pub(crate) fn daemon_account_ref(defaults: &DaemonDefaults, cli: &Cli) -> Result
         .map_err(|err| err.to_string())?;
     let account = crate::resolve_account(&account_home, cli.account.clone())
         .map_err(|err| err.to_string())?;
-    if !account.local_signing {
+    if !account.can_sign() {
         return Err(format!(
-            "account {} is not a local signing account",
+            "account {} is not a signing-capable account",
             account.account_id_hex
         ));
     }

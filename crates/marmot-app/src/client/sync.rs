@@ -3447,7 +3447,7 @@ impl AppClient {
         let telemetry = client.runtime_telemetry.clone();
         let ingest_observation = telemetry.as_ref().map(|t| t.observe(RuntimeOp::Ingest));
         if let Some(slot) = &client.audit_v5_peel_slot {
-            let mut slot = slot.lock().unwrap();
+            let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let _ = slot.take();
             if let Some(receive) = probe_receive.clone() {
                 slot.arm(&delivery.message, receive);
@@ -3476,7 +3476,10 @@ impl AppClient {
             })
             .await;
         let private_control = if let Some(slot) = &client.audit_v5_peel_slot {
-            let (private_control, completion) = slot.lock().unwrap().take();
+            let (private_control, completion) = slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
             if let (Some(probe), Some(completion)) = (&mut client.audit_v5_probe, completion) {
                 probe.unwrapped(completion);
             }
@@ -4043,7 +4046,10 @@ impl AppClient {
                         if let Some(update) = update {
                             match &on_update {
                                 Some(on_update) => on_update(update),
-                                None => progress_updates.lock().unwrap().push(update),
+                                None => progress_updates
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .push(update),
                             }
                         }
                     }
@@ -7448,6 +7454,7 @@ mod tests {
                 event_kind: None,
                 event_created_at: None,
                 follows: Vec::new(),
+                follows_created_at: 0,
             })
             .unwrap();
         assert!(
@@ -8415,6 +8422,7 @@ mod tests {
                 event_kind: None,
                 event_created_at: None,
                 follows: Vec::new(),
+                follows_created_at: 0,
             })
             .unwrap();
         assert!(

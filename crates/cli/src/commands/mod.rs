@@ -8,6 +8,7 @@ pub(crate) mod groups;
 pub(crate) mod key_package;
 pub(crate) mod media;
 pub(crate) mod messages;
+pub(crate) mod nip46;
 pub(crate) mod notifications;
 pub(crate) mod profile;
 pub(crate) mod relay_stats;

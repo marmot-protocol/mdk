@@ -85,8 +85,9 @@ impl SqliteAppStorage {
 
     /// The earliest second history dispatch has work: an owed history
     /// upload's or a parked fetch's retry, and with `backups` the next backup
-    /// pass (at once when none was scheduled) or a condemned backup blob's
-    /// next delete. Without a recovery key no backup pass or delete runs, so
+    /// pass (at once when none was scheduled) or, while no backup pass is in
+    /// failure backoff (`failed_passes = 0`), a condemned backup blob's next
+    /// delete. Without a recovery key no backup pass or delete runs, so
     /// those deadlines count only when backups are configured. The delivery
     /// columns have no index; their tables hold one row per group and sibling
     /// at most. An index may be needed once device groups ship.
@@ -101,8 +102,9 @@ impl SqliteAppStorage {
                                WHERE fetch_due_at IS NOT NULL), 9223372036854775807),
                      CASE WHEN ?1 THEN coalesce((SELECT next_pass_at FROM backup_schedule WHERE id = 1), 0)
                           ELSE 9223372036854775807 END,
-                     CASE WHEN ?1 THEN coalesce((SELECT min(next_try_at) FROM backup_condemned_blobs),
-                                                9223372036854775807)
+                     CASE WHEN ?1 AND coalesce((SELECT failed_passes FROM backup_schedule WHERE id = 1), 0) = 0
+                          THEN coalesce((SELECT min(next_try_at) FROM backup_condemned_blobs),
+                                        9223372036854775807)
                           ELSE 9223372036854775807 END)",
                 [backups],
                 |row| row.get(0),
@@ -129,5 +131,36 @@ mod tests {
         assert!(!app.push_gossip_timing_pending().unwrap());
         assert_eq!(app.history_dispatch_next_at(true).unwrap(), Some(0));
         assert_eq!(app.history_dispatch_next_at(false).unwrap(), None);
+    }
+
+    #[test]
+    fn history_dispatch_next_at_honors_failed_backup_pass_backoff_over_due_deletes() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
+        let hash = format!("{:064x}", 1_u8);
+        app.condemn_backup_blobs(
+            b"recovery-key",
+            &[0xaa; 16],
+            &[(hash, "https://blossom.example".to_owned())],
+            50,
+            100,
+        )
+        .unwrap();
+
+        // Normal schedule (failed_passes == 0): due deletes still wake early.
+        app.schedule_backup_pass(crate::BackupSchedule {
+            next_pass_at: 2_000,
+            failed_passes: 0,
+        })
+        .unwrap();
+        assert_eq!(app.history_dispatch_next_at(true).unwrap(), Some(100));
+
+        // Backoff after a failed pass: due deletes must not bypass next_pass_at.
+        app.schedule_backup_pass(crate::BackupSchedule {
+            next_pass_at: 2_000,
+            failed_passes: 1,
+        })
+        .unwrap();
+        assert_eq!(app.history_dispatch_next_at(true).unwrap(), Some(2_000));
     }
 }

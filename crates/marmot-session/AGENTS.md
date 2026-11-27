@@ -63,11 +63,14 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     (`AccountEntryChanged` and `AccountEntryUnsettled` map to `Busy`).
     `send_device_roster_update` carries rejected-slot operations only.
   - `runtime/device_tag_key.rs` — this device's tag signature key (mdk#2628 3.1d): the host names the device group to
-    tag from (`set_device_tag_group`). Maintenance, and the host before each KeyPackage publication
-    (`set_device_tag_key_holding`), set this device's MLS signature key in its own roster entry when the entry lacks
-    it, through `edit_device_roster_entry` like the announcement. No KeyPackage is staged, announced or published
-    while the key is due and not in the merged roster, and a staged one that no longer advertises what this device
-    would build is replaced. The engine tags only from the entry at this device's slot. A refresh held back this way
+    tag from (`set_device_tag_group`). The Add that linked this device set its MLS signature key in its entry
+    (marmot#521). Maintenance, and the host before each KeyPackage publication (`set_device_tag_key_holding`), make
+    this device's first commit there while `made_device_links` does not list its slot: through
+    `edit_device_roster_entry` like the announcement, writing its history key, or a self-update when the entry needs
+    no change. It never writes a key: no Commit changes one ("Key binding"), so an entry with no key or another key
+    leaves this device untagged (`entry_key_not_own`). No KeyPackage is staged, announced or
+    published while that commit is due, and a staged one that no longer advertises what this device would build is
+    replaced. The engine tags only from the entry at this device's slot. A refresh held back this way
     counts toward `key_package_refresh_overdue` like one held back by its announcement.
   - `runtime/removed_slot_expiry.rs` — maintenance drops `removed` slot records 30 days after their `rejected_at`, by
     this device's clock (device-roster-v1.md), in one roster update after the KeyPackage steps. `not_me` records stay.
@@ -162,8 +165,13 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     maintenance leaves its owed Welcomes alone until then; explicit publishes are not held, and each retry asks the
     routing policy again. A held pass writes nothing, the Welcome's delivery record included, so that record counts
     one route failure per paced attempt. The policy's `MissingInboxRouteCause` maps to the v5 `welcome_publish_not_started` reason
-    (`no_eligible_route` for an empty or unusable list, `route_resolution_failed` for none known); add no reason for
-    it. Route discovery stays with the host.
+    (`no_eligible_route` for an empty or unusable list, `route_resolution_failed` for none known or after a failed
+    lookup); add no reason for it. Route discovery stays with the host: each paced attempt that finds no route owes it
+    one lookup of the recipient, which `plan_welcome_route_lookups` starts only while an owed Welcome is addressed to
+    them and stops once none is. The host reports each outcome (`finish_welcome_route_lookup`): a route releases the
+    retry so the next pass sends it; otherwise the pacing stays, the outcome is kept with it, and each route-less owed
+    Welcome's record shows it at once (`InboxLookupFailed` after a failed lookup, else `NoInboxRelays`), with no
+    attempt counted.
   - `runtime/private_key_packages.rs` — issue, list, mark and discard private KeyPackages (mdk#2628 3.4b), and join a
     chat from a sibling Welcome the app admitted (3.5b); like a confirmed rejoin, that join's events wait for the
     caller's drain. It also lists the sibling Welcomes this device owes and records a carrier's outcome on one

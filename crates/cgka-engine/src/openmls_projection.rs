@@ -424,23 +424,18 @@ impl std::fmt::Display for OpenMlsProjectionError {
             OpenMlsProjectionError::MissingGroup => write!(f, "MLS group not found"),
             OpenMlsProjectionError::Snapshot(e) => write!(f, "snapshot failed: {e}"),
             OpenMlsProjectionError::Replay(e) => write!(f, "OpenMLS replay failed: {e}"),
-            OpenMlsProjectionError::RejectedProposal {
-                message_id,
-                category,
-            } => {
+            OpenMlsProjectionError::RejectedProposal { category, .. } => {
                 write!(
                     f,
-                    "rejected proposal {message_id}: {}",
+                    "rejected proposal: {}",
                     crate::app_components::proposal_rejection_category_tag(*category)
                 )
             }
-            OpenMlsProjectionError::UnauthorizedCommit { message_id } => {
-                write!(f, "unauthorized admin-gated commit: {message_id}")
+            OpenMlsProjectionError::UnauthorizedCommit { .. } => {
+                write!(f, "unauthorized admin-gated commit")
             }
-            OpenMlsProjectionError::InvalidCommit {
-                message_id, reason, ..
-            } => {
-                write!(f, "invalid commit {message_id}: {reason}")
+            OpenMlsProjectionError::InvalidCommit { reason, .. } => {
+                write!(f, "invalid commit: {reason}")
             }
             OpenMlsProjectionError::Serialize(e) => write!(f, "serialize failed: {e}"),
             OpenMlsProjectionError::Storage(e) => write!(f, "storage failed: {e}"),
@@ -1362,13 +1357,17 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
         own_commits,
         stale_commit_drops,
         current_epoch,
+        effective_floor,
         replay_start_epoch,
     } = seed_stored_openmls_graph_inputs(
         storage,
+        rewinds,
         group_id,
         state.retained_anchor_epoch,
         options.admitted_message_ids,
     )?;
+    let mut state = state;
+    state.retained_anchor_epoch = effective_floor;
 
     if replay_start_epoch < current_epoch {
         let mut result = canonicalize_stored_openmls_messages_from_retained_anchor(
@@ -1469,23 +1468,242 @@ struct StoredOpenMlsGraphInputs {
     /// Commits below the retained-anchor horizon, to be reported dropped.
     stale_commit_drops: Vec<DroppedMessage>,
     current_epoch: u64,
+    /// Effective retained-anchor floor after applying this copy's history floor.
+    effective_floor: u64,
     /// Where replay must start: the oldest unresolved commit's source epoch,
     /// or the live tip when every unresolved commit forks from it.
     replay_start_epoch: u64,
+}
+
+/// Earliest epoch this local group copy can ever rewind to: the higher of
+/// `join_epoch` (first membership) and `local_copy_install_epoch` (current copy
+/// installation). `0` means no recorded floor (group creators and pre-column
+/// legacy databases).
+pub(crate) fn copy_history_floor(group: &cgka_traits::group::Group) -> u64 {
+    group.join_epoch.0.max(group.local_copy_install_epoch.0)
+}
+
+/// Effective convergence history floor combining the policy's retained-anchor
+/// horizon with this local copy's history floor.
+pub(crate) fn effective_retained_anchor_epoch(
+    group: &cgka_traits::group::Group,
+    retained_anchor_epoch: u64,
+) -> u64 {
+    retained_anchor_epoch.max(copy_history_floor(group))
+}
+
+struct ProcessedCommitLineageEvidence {
+    confirmation_tag: Option<openmls::messages::ConfirmationTag>,
+    own_resulting_epoch_authenticator: Option<String>,
+}
+
+fn decode_processed_commit_lineage_evidence(
+    group_id: &GroupId,
+    payload: &[u8],
+) -> Option<(u64, ProcessedCommitLineageEvidence)> {
+    let stored = StoredMessagePayload::decode(payload).ok()?;
+    let own_resulting_epoch_authenticator = stored
+        .own_commit_stamp()
+        .and_then(|stamp| stamp.resulting_epoch_authenticator.clone());
+    let wire = stored.as_openmls_wire()?;
+    let msg = MlsMessageIn::tls_deserialize_exact(&wire.payload).ok()?;
+    match msg.extract() {
+        MlsMessageBodyIn::PublicMessage(public)
+            if public.content_type() == ContentType::Commit
+                && public.group_id().as_slice() == group_id.as_slice() =>
+        {
+            Some((
+                public.epoch().as_u64(),
+                ProcessedCommitLineageEvidence {
+                    confirmation_tag: public.confirmation_tag().cloned(),
+                    own_resulting_epoch_authenticator,
+                },
+            ))
+        }
+        MlsMessageBodyIn::PrivateMessage(private)
+            if private.content_type() == ContentType::Commit
+                && private.group_id().as_slice() == group_id.as_slice() =>
+        {
+            Some((
+                private.epoch().as_u64(),
+                ProcessedCommitLineageEvidence {
+                    confirmation_tag: None,
+                    own_resulting_epoch_authenticator,
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn state_matches_processed_commit_evidence(
+    mls_group: &MlsGroup,
+    commits: &[ProcessedCommitLineageEvidence],
+) -> bool {
+    let group_tag = mls_group.confirmation_tag();
+    let mut group_authenticator: Option<String> = None;
+    commits.iter().any(|evidence| {
+        evidence.confirmation_tag.as_ref() == Some(group_tag)
+            || evidence
+                .own_resulting_epoch_authenticator
+                .as_deref()
+                .is_some_and(|expected| {
+                    let actual = group_authenticator.get_or_insert_with(|| {
+                        own_commit_post_merge_epoch_authenticator(mls_group)
+                    });
+                    actual == expected
+                })
+    })
+}
+
+/// Map an engine-layer error into this projection layer's error classes:
+/// a quarantined or unknown group is a missing group (mdk#364, mdk#3272),
+/// and storage/backend failures stay in `Storage` for uniform pass-failure
+/// diagnostics.
+pub(crate) fn engine_projection_error(error: EngineError) -> OpenMlsProjectionError {
+    match error {
+        EngineError::UnknownGroup(_) => OpenMlsProjectionError::MissingGroup,
+        EngineError::Storage(error) => OpenMlsProjectionError::Storage(format!("{error:?}")),
+        other => OpenMlsProjectionError::Storage(format!("{other:?}")),
+    }
+}
+
+/// Whether authenticated local state proves this currently installed local copy
+/// actually held `epoch` (`epoch < group.epoch`), so an absent
+/// `openmls-retained-anchor-{epoch}` represents a genuine local anchor gap
+/// rather than an unverified wire epoch this copy never held.
+///
+/// - When `copy_history_floor(group) > 0` (Welcome-installed copies), install
+///   and every canonical advance atomically retain anchors from the floor
+///   onward, so any epoch at or above the floor is proven local history.
+/// - When `copy_history_floor(group) == 0` (group creators and pre-column
+///   upgraded databases, including pre-#1843 automatic/fork rejoins that kept
+///   pre-removal retained anchors or discarded-branch `Processed` commits),
+///   an older retained anchor alone proves nothing about the installed copy.
+///   Instead, require an unbroken backward chain of `MessageState::Processed`
+///   commits covering `epoch..group.epoch` cryptographically anchored at the
+///   installed live `MlsGroup` (`confirmation_tag` / own-commit
+///   `resulting_epoch_authenticator`) and at every active intermediate retained
+///   anchor in `(epoch + 1)..group.epoch`.
+pub(crate) fn missing_anchor_is_proven_local_history_with_anchored_epochs<S: StorageProvider>(
+    storage: &S,
+    rewinds: &Rewinds,
+    crypto: &RustCrypto,
+    group: &cgka_traits::group::Group,
+    epoch: u64,
+    anchored_epochs: &BTreeSet<u64>,
+) -> Result<bool, EngineError> {
+    if epoch >= group.epoch.0 {
+        return Ok(false);
+    }
+    let copy_floor = copy_history_floor(group);
+    if copy_floor > 0 {
+        return Ok(epoch >= copy_floor);
+    }
+
+    let span = group.epoch.0 - epoch;
+    let intermediate_needed = span - 1;
+    if intermediate_needed > 0
+        && (anchored_epochs.range((epoch + 1)..group.epoch.0).count() as u64) < intermediate_needed
+    {
+        return Ok(false);
+    }
+
+    let processed_commits = storage.list_openmls_messages_in_states(
+        &group.id,
+        &[MessageState::Processed],
+        EpochId(epoch),
+        cgka_traits::storage::OpenMlsContentFilter::Commits,
+    )?;
+    let mut commits_by_epoch: BTreeMap<u64, Vec<ProcessedCommitLineageEvidence>> = BTreeMap::new();
+    for record in processed_commits {
+        let Some((source_epoch, evidence)) =
+            decode_processed_commit_lineage_evidence(&group.id, &record.payload)
+        else {
+            continue;
+        };
+        if source_epoch >= epoch && source_epoch < group.epoch.0 {
+            commits_by_epoch
+                .entry(source_epoch)
+                .or_default()
+                .push(evidence);
+        }
+    }
+    if (commits_by_epoch.len() as u64) < span {
+        return Ok(false);
+    }
+
+    // Callers (`ingest_group_message` and `seed_stored_openmls_graph_inputs`)
+    // run behind their failed-rewind quarantine gates (see clippy.toml).
+    let provider = EngineOpenMlsProvider::<S>::new(crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group.id.as_slice());
+    #[allow(clippy::disallowed_methods)]
+    let Some(live_group) = MlsGroup::load(provider.storage(), &mls_gid).map_err(|error| {
+        EngineError::Backend(format!("load group for history lineage proof: {error:?}"))
+    })?
+    else {
+        return Ok(false);
+    };
+    if live_group.epoch().as_u64() != group.epoch.0 {
+        return Ok(false);
+    }
+    let Some(tip_commits) = commits_by_epoch.get(&(group.epoch.0 - 1)) else {
+        return Ok(false);
+    };
+    if !state_matches_processed_commit_evidence(&live_group, tip_commits) {
+        return Ok(false);
+    }
+
+    for state_epoch in ((epoch + 1)..group.epoch.0).rev() {
+        let Some(step_commits) = commits_by_epoch.get(&(state_epoch - 1)) else {
+            return Ok(false);
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-engine-history-lineage-proof/v1");
+        hasher.update(group.id.as_slice());
+        hasher.update(epoch.to_be_bytes());
+        hasher.update(state_epoch.to_be_bytes());
+        let suffix = hex::encode(&hasher.finalize()[..8]);
+        let verified = with_retained_anchor_group(
+            storage,
+            rewinds,
+            crypto,
+            &group.id,
+            EpochId(state_epoch),
+            RewindSite::HistoryLineageProof,
+            &suffix,
+            |historical_group, _| {
+                Ok(Some(
+                    historical_group.is_active()
+                        && state_matches_processed_commit_evidence(historical_group, step_commits),
+                ))
+            },
+        )?;
+        if verified != Some(true) {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 // Seeds the pass, which runs only behind its quarantine gate (see clippy.toml).
 #[allow(clippy::disallowed_methods)]
 fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
     storage: &S,
+    rewinds: &Rewinds,
     group_id: &GroupId,
     retained_anchor_epoch: u64,
     admitted_message_ids: Option<&[MessageId]>,
 ) -> Result<StoredOpenMlsGraphInputs, OpenMlsProjectionError> {
-    // Keep the group epoch and message records in the same read snapshot.
-    let (current_epoch, records) = storage
+    // Keep the group record and message records in the same read snapshot.
+    // Any `copy_floor == 0` unanchored-root lineage proof runs afterwards under
+    // the engine's single-writer model because its contained anchor rewinds
+    // cannot nest inside this read transaction.
+    let (group, effective_floor, records) = storage
         .with_transaction(|storage| {
-            let current_epoch = storage.get_group(group_id)?.epoch.0;
+            let group = storage.get_group(group_id)?;
+            let effective_floor = effective_retained_anchor_epoch(&group, retained_anchor_epoch);
             if let Some(ids) = admitted_message_ids {
                 // Frozen membership already names the complete batch. Do not
                 // load unrelated history just to intersect it with these ids.
@@ -1493,14 +1711,14 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
                     .iter()
                     .map(|id| storage.get_message(id))
                     .collect::<Result<Vec<_>, _>>()?;
-                return Ok((current_epoch, records));
+                return Ok((group, effective_floor, records));
             }
             let mut records = Vec::new();
             for state in OPENMLS_GRAPH_INPUT_STATES {
                 // Processed rows only witness the retained window. Unresolved
                 // rows below it must still receive their stale-commit verdict.
                 let floor = if state == MessageState::Processed {
-                    retained_anchor_epoch
+                    effective_floor
                 } else {
                     0
                 };
@@ -1510,10 +1728,12 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
                     EpochId(floor),
                 )?);
             }
-            Ok::<_, StorageError>((current_epoch, records))
+            Ok::<_, StorageError>((group, effective_floor, records))
         })
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-    let mut commit_messages = Vec::new();
+    let current_epoch = group.epoch.0;
+    let copy_floor = copy_history_floor(&group);
+    let mut candidate_commits = Vec::new();
     let mut pending_messages = Vec::new();
     let mut already_delivered_app_ids = BTreeSet::new();
     let mut stale_commit_drops = Vec::new();
@@ -1546,7 +1766,7 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
                 let Some(source_epoch) = source_epoch else {
                     continue;
                 };
-                if source_epoch < retained_anchor_epoch {
+                if source_epoch < effective_floor {
                     if unresolved_commit_state(record.state) {
                         stale_commit_drops.push(DroppedMessage {
                             message_id: hex::encode(message.id.as_slice()),
@@ -1557,22 +1777,21 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
                     }
                     continue;
                 }
-                // Confirmed own commits remain prevalidated while canonical or
-                // parked for convergence. Terminal states must not regain
-                // checkpoint-based eligibility.
-                if matches!(
+                let retained_own_stamp = matches!(
                     record.state,
                     MessageState::Processed | MessageState::ConvergenceDeferred
-                ) && let Some(stamp) = own_commit_stamp
-                {
-                    own_commits.insert_stamped(projection.message_digest, stamp);
-                }
-                commit_messages.push(StoredCommitMessage {
-                    message,
-                    source_epoch,
-                    digest: projection.message_digest,
-                    state: record.state,
-                });
+                )
+                .then_some(own_commit_stamp)
+                .flatten();
+                candidate_commits.push((
+                    StoredCommitMessage {
+                        message,
+                        source_epoch,
+                        digest: projection.message_digest,
+                        state: record.state,
+                    },
+                    retained_own_stamp,
+                ));
             }
             // A proposal consumed by this device's locally confirmed commit
             // is `Processed`, but it is still a prerequisite for replaying a
@@ -1584,7 +1803,7 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
             // witnesses; canonical apply skips one already consumed by an
             // accepted prefix using its authenticated source epoch.
             OpenMlsContentKind::Proposal
-                if source_epoch.is_some_and(|epoch| epoch >= retained_anchor_epoch) =>
+                if source_epoch.is_some_and(|epoch| epoch >= effective_floor) =>
             {
                 pending_messages.push(message)
             }
@@ -1598,7 +1817,7 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
             // convergence contract requires order-independence).
             OpenMlsContentKind::Application
                 if record_state_can_contribute_to_openmls_graph(record.state)
-                    && source_epoch.is_some_and(|epoch| epoch >= retained_anchor_epoch) =>
+                    && source_epoch.is_some_and(|epoch| epoch >= effective_floor) =>
             {
                 if let Some(stamp) = own_application_stamp {
                     own_commits.insert_application(message.id.clone(), stamp);
@@ -1610,6 +1829,93 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
             }
             OpenMlsContentKind::Welcome | OpenMlsContentKind::Other => {}
             OpenMlsContentKind::Proposal | OpenMlsContentKind::Application => {}
+        }
+    }
+
+    let mut commit_messages = Vec::with_capacity(candidate_commits.len());
+    let needs_unanchored_root_gate = copy_floor == 0
+        && candidate_commits.iter().any(|(commit, _)| {
+            unresolved_commit_state(commit.state) && commit.source_epoch < current_epoch
+        });
+    if needs_unanchored_root_gate {
+        let anchored_epochs: BTreeSet<u64> = storage
+            .list_group_snapshots(group_id)
+            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
+            .into_iter()
+            .filter_map(|name| retained_anchor_epoch_from_snapshot_name(&name))
+            .collect();
+        // When the pass already holds an unresolved commit at an anchored
+        // epoch strictly below an unanchored past commit, candidate replay
+        // starts at that anchored root and authenticates descendants without
+        // needing an anchor at the descendant's own epoch (matching
+        // `active_pass_has_anchored_commit_below`). Gate only unanchored
+        // commits that have no earlier anchored unresolved root in this pass.
+        let min_anchored_unresolved_epoch = candidate_commits
+            .iter()
+            .filter(|(commit, _)| {
+                unresolved_commit_state(commit.state)
+                    && commit.source_epoch < current_epoch
+                    && anchored_epochs.contains(&commit.source_epoch)
+            })
+            .map(|(commit, _)| commit.source_epoch)
+            .min();
+        let mut proven_missing_anchor_epochs: BTreeMap<u64, bool> = BTreeMap::new();
+        let mut crypto: Option<RustCrypto> = None;
+
+        for (commit, own_stamp) in candidate_commits {
+            if unresolved_commit_state(commit.state)
+                && commit.source_epoch < current_epoch
+                && !anchored_epochs.contains(&commit.source_epoch)
+                && !min_anchored_unresolved_epoch.is_some_and(|root| root < commit.source_epoch)
+            {
+                let proven = match proven_missing_anchor_epochs
+                    .get(&commit.source_epoch)
+                    .copied()
+                {
+                    Some(proven) => proven,
+                    None => {
+                        let crypto = crypto.get_or_insert_with(RustCrypto::default);
+                        // Propagate storage/rewind faults intentionally so a
+                        // transient backend failure retries under pass backoff
+                        // rather than misclassifying a genuine anchor gap as
+                        // terminal `BeyondAnchor`.
+                        let proven = missing_anchor_is_proven_local_history_with_anchored_epochs(
+                            storage,
+                            rewinds,
+                            crypto,
+                            &group,
+                            commit.source_epoch,
+                            &anchored_epochs,
+                        )
+                        .map_err(engine_projection_error)?;
+                        proven_missing_anchor_epochs.insert(commit.source_epoch, proven);
+                        proven
+                    }
+                };
+                if !proven {
+                    stale_commit_drops.push(DroppedMessage {
+                        message_id: hex::encode(commit.message.id.as_slice()),
+                        kind: MessageKind::Commit,
+                        reason: DroppedMessageReason::BeyondAnchor,
+                        rejection_category: None,
+                    });
+                    continue;
+                }
+            }
+            // Confirmed own commits remain prevalidated while canonical or
+            // parked for convergence. Terminal states must not regain
+            // checkpoint-based eligibility.
+            if let Some(stamp) = own_stamp {
+                own_commits.insert_stamped(commit.digest, stamp);
+            }
+            commit_messages.push(commit);
+        }
+    } else {
+        for (commit, own_stamp) in candidate_commits {
+            if let Some(stamp) = own_stamp {
+                own_commits.insert_stamped(commit.digest, stamp);
+            }
+            commit_messages.push(commit);
         }
     }
 
@@ -1631,6 +1937,7 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
         own_commits,
         stale_commit_drops,
         current_epoch,
+        effective_floor,
         replay_start_epoch,
     })
 }
@@ -2149,8 +2456,9 @@ pub(crate) fn candidate_branch_peel<S: StorageProvider>(
 ) -> Result<CandidateBranchPeel, CandidateBranchPeelFailure> {
     use crate::snapshot_guard::SnapshotRollbackGuard;
 
-    let inputs = seed_stored_openmls_graph_inputs(storage, group_id, retained_anchor_epoch, None)
-        .map_err(|error| CandidateBranchPeelFailure::new(error, 0))?;
+    let inputs =
+        seed_stored_openmls_graph_inputs(storage, rewinds, group_id, retained_anchor_epoch, None)
+            .map_err(|error| CandidateBranchPeelFailure::new(error, 0))?;
     // Cheap contested-graph gate ahead of any replay: competing branches exist
     // only where two commits share a source epoch. An uncontested graph pays
     // the seeding scan and nothing more. This is also the ONLY answer to
@@ -3409,10 +3717,9 @@ fn replay_messages_for_canonicalization_result<S: StorageProvider>(
         let payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))?;
         let Some(message) = payload.as_openmls_wire().cloned() else {
-            return Err(OpenMlsProjectionError::Decode(format!(
-                "accepted message {} is not a stored OpenMLS wire payload",
-                hex_message_id
-            )));
+            return Err(OpenMlsProjectionError::Decode(
+                "accepted message is not a stored OpenMLS wire payload".to_owned(),
+            ));
         };
         let projection = project_mls_message(&message.payload)?;
         if projection.kind == OpenMlsContentKind::Commit
@@ -3671,7 +3978,7 @@ fn message_state_for_invalidated_reason(
 fn message_id_from_hex(encoded: &str) -> Result<MessageId, OpenMlsProjectionError> {
     hex::decode(encoded)
         .map(MessageId::new)
-        .map_err(|e| OpenMlsProjectionError::Decode(format!("message id {encoded}: {e:?}")))
+        .map_err(|e| OpenMlsProjectionError::Decode(format!("invalid message id hex: {e:?}")))
 }
 
 fn candidate_paths_with_pending_replay_messages(

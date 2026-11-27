@@ -334,10 +334,11 @@ impl SqliteAppStorage {
 /// one. The trigger on `message_drafts` moves it when a row goes; a
 /// composer with no row yet is moved here.
 pub(super) fn end_composition_tx(conn: &Connection, group: &str) -> StorageResult<()> {
+    let group = canonical_group_id_hex(group);
     let deleted = conn
         .execute_cached(
             "DELETE FROM message_drafts WHERE group_id_hex = ?1",
-            [group],
+            [group.as_ref()],
         )
         .storage()?;
     if deleted == 0 {
@@ -350,7 +351,7 @@ pub(super) fn end_composition_tx(conn: &Connection, group: &str) -> StorageResul
             "UPDATE message_draft_revisions
                 SET composition = (SELECT revision FROM message_draft_revision_clock)
               WHERE group_id_hex = ?1",
-            [group],
+            [group.as_ref()],
         )
         .storage()?;
     }
@@ -362,9 +363,10 @@ pub(super) fn end_composition_tx(conn: &Connection, group: &str) -> StorageResul
 /// draft row), so no two compositions, of one group or its recreation, share
 /// it.
 pub(super) fn composition_tx(conn: &Connection, group: &str) -> StorageResult<i64> {
+    let group = canonical_group_id_hex(group);
     conn.query_row_cached(
         "SELECT composition FROM message_draft_revisions WHERE group_id_hex = ?1",
-        [group],
+        [group.as_ref()],
         |row| row.get(0),
     )
     .optional()
@@ -373,14 +375,15 @@ pub(super) fn composition_tx(conn: &Connection, group: &str) -> StorageResult<i6
 }
 
 pub(super) fn revision_tx(conn: &Connection, group: &str) -> StorageResult<MessageDraftRevision> {
+    let group = canonical_group_id_hex(group);
     conn.query_row_cached(
         "SELECT m.store_epoch, r.revision FROM message_draft_revisions r
          CROSS JOIN chat_presentation_meta m WHERE r.group_id_hex = ?1 AND m.id = 1",
-        [group],
+        [group.as_ref()],
         |row| {
             Ok(MessageDraftRevision {
                 store_epoch: row.get(0)?,
-                group_id_hex: group.to_owned(),
+                group_id_hex: group.as_ref().to_owned(),
                 revision: row.get(1)?,
             })
         },
@@ -397,17 +400,18 @@ pub(crate) fn chat_list_version_tx(
     group: &str,
     store_epoch: &[u8],
 ) -> StorageResult<Option<ChatListDraftVersion>> {
+    let group = canonical_group_id_hex(group);
     let revision = conn
         .query_row_cached(
             "SELECT revision FROM message_draft_revisions WHERE group_id_hex = ?1",
-            [group],
+            [group.as_ref()],
             |row| row.get::<_, i64>(0),
         )
         .optional()
         .storage()?;
     Ok(revision.map(|revision| ChatListDraftVersion {
         store_epoch: store_epoch.to_vec(),
-        group_id_hex: group.to_owned(),
+        group_id_hex: group.into_owned(),
         revision,
     }))
 }
@@ -423,15 +427,16 @@ pub(super) fn check_revision_tx(
 }
 
 pub(crate) fn selected_tx(conn: &Connection, group: &str) -> StorageResult<SelectedMessageDraft> {
-    let revision = revision_tx(conn, group)?;
+    let group = canonical_group_id_hex(group);
+    let revision = revision_tx(conn, &group)?;
     let mut draft = conn
         .query_row_cached(
             "SELECT content, reply_to_message_id_hex, created_at_ms, updated_at_ms
          FROM message_drafts WHERE group_id_hex = ?1",
-            [group],
+            [group.as_ref()],
             |row| {
                 Ok(SelectedMessageDraftContent {
-                    group_id_hex: group.to_owned(),
+                    group_id_hex: group.as_ref().to_owned(),
                     content: row.get(0)?,
                     reply_to_message_id_hex: row.get(1)?,
                     created_at_ms: row.get(2)?,
@@ -443,7 +448,7 @@ pub(crate) fn selected_tx(conn: &Connection, group: &str) -> StorageResult<Selec
         .optional()
         .storage()?;
     if let Some(draft) = &mut draft {
-        draft.media_attachments = selected_attachments_tx(conn, group)?;
+        draft.media_attachments = selected_attachments_tx(conn, &group)?;
     }
     Ok(SelectedMessageDraft { revision, draft })
 }
@@ -516,6 +521,7 @@ pub(crate) fn accept_submission_tx(
     group: &str,
     accepted: DraftAcceptance<'_>,
 ) -> StorageResult<bool> {
+    let group = canonical_group_id_hex(group);
     use sha2::{Digest, Sha256};
     let (field, value) = match accepted {
         DraftAcceptance::Payload(payload) => (
@@ -530,7 +536,7 @@ pub(crate) fn accept_submission_tx(
                 "SELECT revision FROM message_draft_submissions
                   WHERE group_id_hex = ?1 AND {field} = ?2"
             ),
-            params![group, value],
+            params![group.as_ref(), value],
             |row| row.get(0),
         )
         .optional()
@@ -541,11 +547,11 @@ pub(crate) fn accept_submission_tx(
     let changed = conn.execute_cached(
         "DELETE FROM message_drafts WHERE group_id_hex = ?1
          AND EXISTS(SELECT 1 FROM message_draft_revisions WHERE group_id_hex = ?1 AND revision = ?2)",
-        params![group, revision],
+        params![group.as_ref(), revision],
     ).storage()? > 0;
     conn.execute_cached(
         "DELETE FROM message_draft_submissions WHERE group_id_hex = ?1 AND revision = ?2",
-        params![group, revision],
+        params![group.as_ref(), revision],
     )
     .storage()?;
     Ok(changed)

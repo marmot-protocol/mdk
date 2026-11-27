@@ -1,7 +1,8 @@
 //! Per-connection accept loop, authorization, and control-request dispatch.
 
 use agent_control::{
-    AgentControlEnvelope, AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
+    AGENT_CONTROL_PROTOCOL_V2, AgentControlEnvelope, AgentControlError, AgentControlRequest,
+    AgentControlResponse, decode_envelope, read_frame_bytes, write_frame,
 };
 use serde::Serialize;
 use tokio::io::{AsyncWrite, BufReader};
@@ -59,20 +60,200 @@ where
     Ok(())
 }
 
+/// Longest request `id` a rejection echoes. Real ids are short; this keeps a
+/// rejection of an oversized frame well inside the frame limit.
+const MAX_ECHOED_REQUEST_ID_BYTES: usize = 256;
+
+/// Why the first frame on a connection could not become a request, as the
+/// `error` response reports it. A message never quotes a value from the frame;
+/// it names at most a field of the request schema.
+#[derive(Debug, PartialEq, Eq)]
+struct RejectedFrame {
+    id: Option<String>,
+    code: &'static str,
+    message: String,
+}
+
+impl RejectedFrame {
+    fn invalid(id: Option<String>, message: impl Into<String>) -> Self {
+        Self {
+            id,
+            code: "invalid_request",
+            message: message.into(),
+        }
+    }
+
+    /// The frame could not be read as one line: empty or oversized.
+    fn unreadable(err: &AgentControlError) -> Self {
+        Self::invalid(
+            None,
+            match err {
+                AgentControlError::FrameTooLarge(_) => "control frame exceeds the size limit",
+                AgentControlError::EmptyFrame => "control frame is empty",
+                _ => "control frame is not valid JSON",
+            },
+        )
+    }
+
+    /// Explain why the typed decode refused `frame` with `err`. This never
+    /// admits a request: it only chooses the error the client gets.
+    fn explain(raw: &[u8], err: &AgentControlError) -> Self {
+        let frame: serde_json::Value = match agent_control::decode_frame(raw) {
+            Ok(frame) => frame,
+            Err(err) => return Self::unreadable(&err),
+        };
+        let duplicate = schema_field(err, "duplicate field");
+        // With a repeated `id` no single value is the client's id, whichever
+        // duplicate the typed decode happened to report.
+        let id = (top_level_key_count(raw, "id") == 1)
+            .then(|| frame.get("id").and_then(serde_json::Value::as_str))
+            .flatten()
+            .filter(|id| id.len() <= MAX_ECHOED_REQUEST_ID_BYTES)
+            .map(str::to_owned);
+        let Some(fields) = frame.as_object() else {
+            return Self::invalid(id, "control frame is not a JSON object");
+        };
+        if let Some(field) = duplicate {
+            return Self::invalid(id, format!("duplicate field `{field}`"));
+        }
+        if fields
+            .get("marmot_agent_control")
+            .and_then(serde_json::Value::as_str)
+            != Some(AGENT_CONTROL_PROTOCOL_V2)
+        {
+            return Self {
+                id,
+                code: "unsupported_protocol",
+                message: "marmot_agent_control must be \"marmot.agent-control.v2\"".to_owned(),
+            };
+        }
+        match fields.get("type") {
+            None => return Self::invalid(id, "missing field `type`"),
+            Some(kind) if !kind.is_string() => return Self::invalid(id, "`type` must be a string"),
+            Some(_) => {}
+        }
+        // Decode the `type` on its own, so a known type with a bad field value
+        // (which serde also reports as an unknown variant) stays invalid.
+        let type_only = serde_json::json!({ "type": fields["type"] });
+        if serde_json::from_value::<AgentControlRequest>(type_only)
+            .is_err_and(|err| err.to_string().starts_with("unknown variant"))
+        {
+            return Self {
+                id,
+                code: "unknown_request",
+                message: "unknown request type".to_owned(),
+            };
+        }
+        match schema_field(err, "missing field") {
+            Some(field) => Self::invalid(id, format!("missing field `{field}`")),
+            None => Self::invalid(id, "a field has a value its request type does not accept"),
+        }
+    }
+}
+
+/// How many times `key` appears among the top-level keys of the JSON object in
+/// `raw`. A `serde_json::Value` keeps only the last of repeated keys, so the
+/// keys are counted as the object is read.
+fn top_level_key_count(raw: &[u8], key: &str) -> usize {
+    struct Count<'a>(&'a str);
+
+    impl<'de> serde::de::DeserializeSeed<'de> for Count<'_> {
+        type Value = usize;
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<usize, D::Error> {
+            deserializer.deserialize_map(self)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for Count<'_> {
+        type Value = usize;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<usize, A::Error> {
+            let mut count = 0;
+            while let Some(name) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                count += usize::from(name == self.0);
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(count)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(raw);
+    serde::de::DeserializeSeed::deserialize(Count(key), &mut deserializer).unwrap_or(0)
+}
+
+/// The field named in a serde error such as "missing field `account_id_hex`",
+/// when it reads as a schema field name. serde names schema fields in missing
+/// and duplicate field errors, never request values.
+fn schema_field(err: &AgentControlError, kind: &str) -> Option<String> {
+    let AgentControlError::Json(err) = err else {
+        return None;
+    };
+    let text = err.to_string();
+    let name = text
+        .strip_prefix(kind)?
+        .strip_prefix(" `")?
+        .split('`')
+        .next()?;
+    (!name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'))
+    .then(|| name.to_owned())
+}
+
 impl AgentConnector {
     pub(crate) async fn handle_connection(&self, stream: UnixStream) -> Result<(), ConnectorError> {
         let peer_uid = stream.peer_cred()?.uid();
         let peer_authorized_by_uid = peer_uid == current_effective_uid();
         let (read_half, mut write_half) = tokio::io::split(stream);
         let mut reader = BufReader::new(read_half);
-        let Some(request): Option<AgentControlEnvelope<AgentControlRequest>> =
-            with_control_operation_timeout(
-                "initial_control_frame_read",
-                read_envelope(&mut reader),
-            )
-            .await??
-        else {
-            return Ok(());
+        let frame = match with_control_operation_timeout(
+            "initial_control_frame_read",
+            read_frame_bytes(&mut reader),
+        )
+        .await?
+        {
+            Ok(Some(frame)) => Ok(frame),
+            Ok(None) => return Ok(()),
+            Err(AgentControlError::Io(err)) => return Err(AgentControlError::Io(err).into()),
+            Err(err) => Err(RejectedFrame::unreadable(&err)),
+        };
+        // Only the typed decode decides what runs. A frame it refuses is read
+        // again, loosely, only to explain the refusal.
+        let request = match frame.and_then(|frame| {
+            decode_envelope::<AgentControlRequest>(&frame)
+                .map_err(|err| RejectedFrame::explain(&frame, &err))
+        }) {
+            Ok(request) => request,
+            Err(rejected) => {
+                // Answer a request that cannot be served instead of closing
+                // silently, so a client can tell it from a crash (#2242).
+                tracing::debug!(
+                    target: "agent_connector",
+                    method = "handle_connection",
+                    error_code = rejected.code,
+                    "rejected control frame"
+                );
+                let response = AgentControlEnvelope::new(
+                    rejected.id,
+                    AgentControlResponse::Error {
+                        code: rejected.code.to_owned(),
+                        message: rejected.message,
+                        retryable: false,
+                    },
+                );
+                write_control_frame(&mut write_half, &response).await?;
+                return Ok(());
+            }
         };
         if let Err(err) =
             self.authorize_control_request(peer_authorized_by_uid, request.auth_token.as_deref())

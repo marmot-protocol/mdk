@@ -275,6 +275,7 @@ fn combined_options_validate_before_transferring_store_ownership() {
     let relay = CString::new("ws://127.0.0.1:1").unwrap();
     let relays = [relay.as_ptr()];
     let mut options = marmot_c::MarmotClientOptions {
+        disable_public_avatar_acquisition: 0,
         attachment_acquisition_mode: 0,
         relay_policy: 2,
         cursor_persistence: 1,
@@ -319,6 +320,7 @@ fn combined_options_validate_before_transferring_store_ownership() {
         !destroyed.load(Ordering::SeqCst),
         "failed construction leaves the store with its owner"
     );
+    options.disable_public_avatar_acquisition = 2;
     let mut client = std::ptr::null_mut();
     let status = unsafe {
         marmot_c::marmot_client_new_with_configuration(
@@ -357,6 +359,7 @@ fn a_deployment_constructor_opens_with_a_host_store() {
     let relay = CString::new("ws://127.0.0.1:1").unwrap();
     let relays = [relay.as_ptr()];
     let options = marmot_c::MarmotClientOptions {
+        disable_public_avatar_acquisition: 0,
         attachment_acquisition_mode: 0,
         relay_policy: 2,
         cursor_persistence: 0,
@@ -533,6 +536,7 @@ mod experimental_host {
 
     fn options(store: &MarmotSecretStore) -> marmot_c::MarmotClientOptions {
         marmot_c::MarmotClientOptions {
+            disable_public_avatar_acquisition: 0,
             attachment_acquisition_mode: 0,
             relay_policy: 1,
             cursor_persistence: 0,

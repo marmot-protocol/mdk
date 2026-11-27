@@ -1,13 +1,14 @@
 name: CI
 
-# The merge queue is the merge gate and runs the full matrix, stopping at the
-# first failed job so the queue ejects that PR at once. Pull requests run a
-# fast pre-check (format, static gates, audit, clippy, WASM build, and the
-# workspace tests that finish quickly) unless labelled `ci:full`. The queue
-# fast-forwards master to the commit it tested, so
-# master pushes only refresh the Rust caches pull requests and merge groups
-# restore: GitHub scopes a cache saved by a merge-group run to its temporary
-# branch. Those pushes run only when an input of the rust-cache key changes.
+# Team pull requests run a fast static gate (~1 minute, zero Rust compile):
+# verified commit signatures, formatting, static/contract gates, cargo-audit,
+# and commit-trailer checks (advisory except the `just dependents-nextest`
+# record). External/fork pull requests, `ci:full`
+# pull requests, `workflow_dispatch`, and `workflow_call` runs execute the full
+# CI matrix (`.github/CODEOWNERS` protects `.github/` so fork PRs cannot edit
+# this workflow without owner review). Post-merge verification runs
+# continuously on `master` (advancing `canary`). Master pushes refresh Rust
+# caches only when a rust-cache input changes.
 #
 # GitHub evicts the least recently used caches once a repository passes 10 GB,
 # so that budget holds only the caches saved here and the wn-agent darwin
@@ -30,20 +31,33 @@ on:
       - .github/workflows/ci.yml
       - .github/actions/setup-odin/**
       - scripts/install-odin.sh
-  merge_group:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact commit SHA to check out (defaults to the triggering ref)
+        type: string
+        default: ""
+      rust_test_shards:
+        description: Number of workspace nextest shards (6 for async Canary, 14 for full PR/manual runs)
+        type: number
+        default: 14
   workflow_dispatch:
     inputs:
       archive_layout_experiment:
         description: Compare full and binary-local test archives
         type: boolean
         default: false
+      rust_test_shards:
+        description: Number of workspace nextest shards (6 or 14)
+        type: number
+        default: 14
 
 permissions:
   contents: read
 
 concurrency:
   # Pull requests and cache-refresh pushes supersede their own older runs. A
-  # unique group protects merge-group and manual runs: GitHub otherwise
+  # unique group protects manual and Canary runs: GitHub otherwise
   # replaces older pending runs even when cancel-in-progress is false.
   group: ci-${{ github.workflow }}-${{ (github.event_name == 'pull_request' || github.event_name == 'push') && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
@@ -54,6 +68,7 @@ env:
   # Match cargo build/check dependencies to the existing test profile.
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
+  ANDROID_NDK_VERSION: 27.2.12479018
   # The workspace test jobs leave out the suites that have their own jobs:
   # `wn-cli::cli` (cli-e2e) and `marmot-app::relay_runtime` (relay-runtime).
   WORKSPACE_FILTER: not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))
@@ -77,6 +92,9 @@ jobs:
     timeout-minutes: 5
     outputs:
       ci_mode: ${{ steps.mode.outputs.ci_mode }}
+      is_team_pr: ${{ steps.trust.outputs.is_team_pr }}
+      rust_test_shards: ${{ steps.mode.outputs.rust_test_shards }}
+      rust_test_partitions: ${{ steps.mode.outputs.rust_test_partitions }}
       run_full: ${{ steps.classify.outputs.run_full }}
       run_c: ${{ steps.classify.outputs.run_c }}
       run_conformance: ${{ steps.classify.outputs.run_conformance }}
@@ -85,6 +103,9 @@ jobs:
       run_hermes: ${{ steps.classify.outputs.run_hermes }}
       run_installers: ${{ steps.classify.outputs.run_installers }}
       apple_opt_in: ${{ steps.labels.outputs.apple_opt_in }}
+      tree_fix_opt_in: ${{ steps.labels.outputs.tree_fix_opt_in }}
+      tree_state: ${{ steps.tree_state.outputs.tree_state }}
+      tree_state_reason: ${{ steps.tree_state.outputs.tree_state_reason }}
     permissions:
       contents: read
       pull-requests: read
@@ -95,9 +116,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       # Read labels live so adding ci:full or ci:apple followed by "Re-run all
-      # jobs" selects the requested coverage without a new source commit.
+      # jobs" takes effect without a new source commit.
       - name: Check CI opt-in labels
         id: labels
         env:
@@ -112,24 +134,140 @@ jobs:
           fi
           echo "full_ci=$(jq 'index("ci:full") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
           echo "apple_opt_in=$(jq 'index("ci:apple") != null or index("ci:full") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
+          echo "tree_fix_opt_in=$(jq 'index("tree-fix") != null or index("revert") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
 
-      # precheck: pull requests without `ci:full` run the fast gates and the
-      # quick workspace tests.
-      # full: merge groups, manual runs and `ci:full` run every job.
+      # Read the protected `tree-state` orphan branch (update-locked to mdk-bot
+      # and Admins via Ruleset #28160615). This is a check-time Meltdown gate:
+      # when `state == "red"`, Required CI fails PRs checked during the freeze
+      # unless labelled `tree-fix` or `revert` (already-green PRs are also
+      # checked manually/by agents at merge time per AGENTS.md). A genuinely
+      # absent branch on a standalone fork (`git ls-remote` exit 2) defaults to
+      # `green`; on the canonical repository (`marmot-protocol/mdk`, where the
+      # protected `tree-state` branch is already provisioned), a missing branch,
+      # remote/fetch error, or malformed `state.json` all fail closed to `red`.
+      - name: Read tree state
+        id: tree_state
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          state=green
+          reason=""
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            ls_rc=0
+            git ls-remote --exit-code origin refs/heads/tree-state >/dev/null 2>&1 || ls_rc=$?
+            if [[ "$ls_rc" -eq 2 ]]; then
+              if [[ "${REPO:-}" == "marmot-protocol/mdk" ]]; then
+                state=red
+                reason="canonical origin/tree-state branch is missing (git ls-remote exit 2)"
+              else
+                state=green
+              fi
+            elif [[ "$ls_rc" -ne 0 ]]; then
+              state=red
+              reason="unable to verify origin/tree-state (git ls-remote exit $ls_rc)"
+            elif git fetch --no-tags --depth=1 origin refs/heads/tree-state >/dev/null 2>&1; then
+              if doc="$(git show FETCH_HEAD:state.json 2>/dev/null)" && parsed_state="$(jq -er '.state | select(type == "string")' <<<"$doc" 2>/dev/null)"; then
+                if [[ "$parsed_state" == "green" ]]; then
+                  state=green
+                else
+                  state=red
+                  reason="$(jq -r '.reason // "master is frozen"' <<<"$doc" 2>/dev/null || echo "master is frozen")"
+                fi
+              else
+                state=red
+                reason="malformed or missing state.json on tree-state branch"
+              fi
+            else
+              state=red
+              reason="unable to fetch origin/tree-state"
+            fi
+          fi
+          {
+            echo "tree_state=$state"
+            echo "tree_state_reason=$(tr '\r\n' '  ' <<<"$reason")"
+          } >> "$GITHUB_OUTPUT"
+
+      # Only branches pushed directly to this repository (non-fork) by an author
+      # with authoritative write, maintain, or admin repository permission
+      # qualify for the fast static PR gate. External/fork PRs, read-only org
+      # members, and unavailable permission checks all fail closed into full CI.
+      # `.github/CODEOWNERS` requires owner review for any change to `.github/`.
+      - name: Classify PR trust
+        id: trust
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          is_team_pr=false
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$HEAD_REPO" && "$HEAD_REPO" == "$REPO" && "$HEAD_FORK" != "true" && -n "$PR_AUTHOR" ]]; then
+            permission="$(gh api "repos/$REPO/collaborators/$PR_AUTHOR/permission" --jq '.permission // ""' 2>/dev/null || true)"
+            case "$permission" in
+              write|maintain|admin) is_team_pr=true ;;
+            esac
+          fi
+          echo "is_team_pr=$is_team_pr" >> "$GITHUB_OUTPUT"
+
+      # fast: team pull requests without `ci:full` run signatures, formatting,
+      # static gates, cargo-audit, and trailer checks (zero compile).
+      # full: external/fork PRs, `ci:full` PRs, `workflow_call`, and manual runs
+      # execute every CI job.
       # warm: master pushes run only the jobs that save a Rust cache.
       - name: Select CI mode
         id: mode
         env:
           EVENT_NAME: ${{ github.event_name }}
           FULL_CI: ${{ steps.labels.outputs.full_ci }}
+          IS_TEAM_PR: ${{ steps.trust.outputs.is_team_pr }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUESTED_SHARDS: ${{ inputs.rust_test_shards }}
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
-            pull_request) if [[ "$FULL_CI" == true ]]; then mode=full; else mode=precheck; fi ;;
+            pull_request)
+              if [[ "$FULL_CI" == true ]]; then
+                mode=full
+              elif [[ "$IS_TEAM_PR" == true ]]; then
+                mode=fast
+              else
+                mode=full
+              fi
+              ;;
             push) mode=warm ;;
             *) mode=full ;;
           esac
+          if [[ -n "${SOURCE_SHA:-}" ]]; then
+            if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "error: source_sha must be a 40-character lowercase hex commit SHA" >&2
+              exit 1
+            fi
+            checked_out="$(git rev-parse 'HEAD^{commit}')"
+            if [[ "$checked_out" != "$SOURCE_SHA" ]]; then
+              echo "error: checkout resolved $checked_out, expected $SOURCE_SHA" >&2
+              exit 1
+            fi
+          fi
+          shards="${REQUESTED_SHARDS:-14}"
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            shards=14
+          fi
+          case "$shards" in
+            6) partitions='[1,2,3,4,5,6]' ;;
+            14) partitions='[1,2,3,4,5,6,7,8,9,10,11,12,13,14]' ;;
+            *)
+              echo "error: unsupported rust_test_shards '$shards' (expected 6 or 14)" >&2
+              exit 1
+              ;;
+          esac
           echo "ci_mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "rust_test_shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "rust_test_partitions=$partitions" >> "$GITHUB_OUTPUT"
 
       - name: Classify changed paths
         id: classify
@@ -142,7 +280,7 @@ jobs:
           paths="$RUNNER_TEMP/ci-changes"
           : > "$paths"
           flags=()
-          if [[ "$CI_MODE" != precheck || -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] \
+          if [[ "$CI_MODE" != fast || -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] \
             || ! git cat-file -e "${BASE_SHA}^{commit}"; then
             flags=(--all)
           else
@@ -150,6 +288,25 @@ jobs:
             git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" > "$paths"
           fi
           python3 scripts/classify_ci_changes.py "${flags[@]}" --github-output "$GITHUB_OUTPUT" < "$paths"
+
+      - name: PR commit trailers
+        # Advisory, except on team PRs (fast mode, no compile here) a Rust crate
+        # change must record `just dependents-nextest` in `Local-Checks:`.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_MODE: ${{ steps.mode.outputs.ci_mode }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$BASE_SHA" && -n "$HEAD_SHA" ]]; then
+            # Never empty: bash 3.2 (macOS) rejects an empty "${array[@]}" under `set -u`.
+            args=(--advisory --base "$BASE_SHA" --head "$HEAD_SHA")
+            if [[ "$CI_MODE" == fast ]]; then
+              args+=(--enforce-dependents)
+            fi
+            python3 scripts/check_pr_trailers.py "${args[@]}"
+          fi
 
   rust-format:
     name: Rust format
@@ -162,6 +319,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Install Rust toolchain
         run: |
@@ -196,6 +354,15 @@ jobs:
           python3 scripts/changelog.py check
           python3 scripts/test_changelog.py
 
+      - name: PR commit trailers contract
+        run: python3 scripts/test_check_pr_trailers.py
+
+      - name: Bisect agent contract
+        run: python3 scripts/test_bisect_agent.py
+
+      - name: SemVer RC and promotion contract
+        run: python3 scripts/test_rc_release.py
+
       - name: Binding build phase contracts
         run: |
           python3 crates/marmot-uniffi/test-build-phases.py
@@ -229,6 +396,7 @@ jobs:
           python3 scripts/test_check_cargo_audit_ci.py
           python3 scripts/test_classify_ci_changes.py
           python3 scripts/test_ci_workflow_policy.py
+          python3 scripts/test_dependents_nextest.py
           python3 scripts/test_flake_report.py
 
       - name: Test timing ratchet
@@ -247,6 +415,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Install Rust toolchain
         run: |
@@ -279,6 +448,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Test Claude Code, Codex, Pi, OpenCode, and Goose installers
         run: |
@@ -295,7 +465,7 @@ jobs:
   rust-wasm-check:
     name: Rust WASM check
     needs: changes
-    if: needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -304,6 +474,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Prepare runner disk
         env:
@@ -349,12 +520,12 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-  rust-clippy:
-    name: Rust check and clippy
-    env:
-      RUSTFLAGS: -D warnings
+  # Compile-only Android arm64-v8a cross-check for marmot-uniffi. Runs without
+  # `ci_runner.py prepare` so the runner's preinstalled Android SDK stays intact.
+  rust-android-check:
+    name: Rust Android check
     needs: changes
-    if: needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -363,6 +534,83 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+
+      - name: Install pinned Odin
+        uses: ./.github/actions/setup-odin
+
+      - name: Install Rust toolchain and Android target
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustup target add aarch64-linux-android
+          rustc --version
+          cargo --version
+
+      - name: Install just
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # just
+        with:
+          tool: just
+
+      - name: Configure Android NDK
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [[ -z "$sdk_root" ]]; then
+            echo "error: ANDROID_SDK_ROOT or ANDROID_HOME must be set on the runner" >&2
+            exit 1
+          fi
+          ndk_dir="$sdk_root/ndk/$ANDROID_NDK_VERSION"
+          if [[ ! -d "$ndk_dir/toolchains/llvm/prebuilt/linux-x86_64/bin" ]]; then
+            sdkmanager_bin=""
+            for candidate in \
+              "$sdk_root/cmdline-tools/latest/bin/sdkmanager" \
+              "$sdk_root/cmdline-tools/bin/sdkmanager" \
+              "$sdk_root/tools/bin/sdkmanager"; do
+              if [[ -x "$candidate" ]]; then
+                sdkmanager_bin="$candidate"
+                break
+              fi
+            done
+            if [[ -z "$sdkmanager_bin" ]] && command -v sdkmanager >/dev/null 2>&1; then
+              sdkmanager_bin="$(command -v sdkmanager)"
+            fi
+            if [[ -z "$sdkmanager_bin" ]]; then
+              echo "error: sdkmanager not found under $sdk_root" >&2
+              exit 1
+            fi
+            set +o pipefail
+            yes | "$sdkmanager_bin" --licenses >/dev/null
+            set -o pipefail
+            "$sdkmanager_bin" "ndk;$ANDROID_NDK_VERSION"
+          fi
+          echo "ANDROID_NDK_HOME=$ndk_dir" >> "$GITHUB_ENV"
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Check marmot-uniffi for Android arm64-v8a
+        run: just android-check
+
+  rust-clippy:
+    name: Rust check and clippy
+    env:
+      RUSTFLAGS: -D warnings
+    needs: changes
+    if: needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_full == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Prepare runner disk
         env:
@@ -403,7 +651,7 @@ jobs:
   c-smoke:
     name: C bindings smoke
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck' && needs.changes.outputs.run_c == 'true'
+    if: needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_c == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -412,6 +660,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Prepare runner disk
         env:
@@ -464,13 +713,13 @@ jobs:
           if-no-files-found: warn
 
   # Pull requests run this and marmotkit-native-host only with the `ci:apple`
-  # or `ci:full` label; merge groups always run them, so they gate merging.
+  # or `ci:full` label; hourly Canary and full runs always execute them.
   ios-account-clippy:
     name: iOS keychain and Swift cancellation
     needs: changes
     if: >-
-      needs.changes.outputs.run_ios == 'true'
-      && (needs.changes.outputs.ci_mode != 'precheck' || needs.changes.outputs.apple_opt_in == 'true')
+      needs.changes.outputs.apple_opt_in == 'true'
+      || (needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_ios == 'true')
     runs-on: macos-latest
     # The cancellation smoke builds the shipped release profile (thin LTO, one
     # codegen unit), which grows with marmot-app. Queue runs took 16-27
@@ -483,6 +732,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Install pinned Odin
         uses: ./.github/actions/setup-odin
@@ -520,8 +770,8 @@ jobs:
     name: MarmotKit native host lifecycle
     needs: changes
     if: >-
-      needs.changes.outputs.run_ios == 'true'
-      && (needs.changes.outputs.ci_mode != 'precheck' || needs.changes.outputs.apple_opt_in == 'true')
+      needs.changes.outputs.apple_opt_in == 'true'
+      || (needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_ios == 'true')
     runs-on: macos-latest
     # The smoke took 6-9 minutes as a step of ios-account-clippy.
     timeout-minutes: 20
@@ -531,6 +781,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Install pinned Odin
         uses: ./.github/actions/setup-odin
@@ -554,7 +805,7 @@ jobs:
   convergence-policy-pin:
     name: Convergence policy pin (release assertions)
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck' && needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -563,6 +814,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Prepare runner disk
         env:
@@ -596,13 +848,13 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-  # Pre-checks build the workspace tests here and run the quick ones in place.
-  # Full runs archive them for the test shards. Master pushes build them only
-  # to save the Rust caches; the jobs that run them need the full mode.
+  # Full runs archive the workspace tests for the test shards. Master pushes
+  # build them only to save the Rust caches; the jobs that run them need the
+  # full mode.
   rust-test-build:
     name: Build workspace tests
     needs: changes
-    if: needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -611,6 +863,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Prepare runner disk
         env:
@@ -639,20 +892,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
           shared-key: rust-test
 
-      # Every test runs, but the `precheck` profile stops each one after half
-      # a second and counts it as passed (TIMEOUT-PASS): this catches a test
-      # that fails quickly, and the merge queue still runs every test to the
-      # end. About two thirds of the workspace tests finish inside that window.
-      - name: Run quick workspace tests
-        if: needs.changes.outputs.ci_mode == 'precheck'
-        run: python3 scripts/ci_runner.py run rust-test-build -- cargo nextest run --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile precheck -E "$WORKSPACE_FILTER"
-
       - name: Verify workspace shard coverage
-        if: needs.changes.outputs.ci_mode != 'precheck'
-        run: python3 scripts/ci_runner.py run workspace-build -- bash scripts/check_ci_partitions.sh slice:14 --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --timings --profile ci -E "$WORKSPACE_FILTER"
+        run: python3 scripts/ci_runner.py run workspace-build -- bash scripts/check_ci_partitions.sh "slice:${{ needs.changes.outputs.rust_test_shards }}" --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --timings --profile ci -E "$WORKSPACE_FILTER"
 
       - name: Upload workspace compiler timings
-        if: always() && needs.changes.outputs.ci_mode != 'precheck'
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: workspace-compiler-timings
@@ -661,11 +905,9 @@ jobs:
           retention-days: 7
 
       - name: Archive workspace tests
-        if: needs.changes.outputs.ci_mode != 'precheck'
         run: python3 scripts/ci_runner.py run rust-test-build -- cargo nextest archive --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile ci -E "$WORKSPACE_FILTER" --archive-file tests.tar.zst
 
       - name: Verify and describe test archive
-        if: needs.changes.outputs.ci_mode != 'precheck'
         run: python3 scripts/ci_runner.py manifest tests.tar.zst
 
       - name: Upload test archive
@@ -701,24 +943,26 @@ jobs:
   # taken up to 20 minutes on central and western ones (#2568), and has also
   # stalled until timeout (#3465). A 5-minute first attempt cuts a stalled
   # connection short and retries once with the full 25-minute budget so slow
-  # runners still finish, keeping download and test budgets separate inside 65
-  # minutes.
+  # runners still finish. Async Canary runs consolidate to 6 shards (~30-40 min
+  # test runtime), so download (5 + 25 min) and test (50 min) budgets stay
+  # separate inside 85 minutes.
   rust-test:
-    name: Rust tests (${{ matrix.partition }}/14)
+    name: Rust tests (${{ matrix.partition }}/${{ needs.changes.outputs.rust_test_shards }})
     needs: [changes, rust-test-build]
     if: needs.changes.outputs.ci_mode == 'full'
     runs-on: ubuntu-latest
-    timeout-minutes: 65
+    timeout-minutes: 85
     strategy:
       fail-fast: false
       matrix:
-        partition: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        partition: ${{ fromJSON(needs.changes.outputs.rust_test_partitions) }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Prepare runner disk
         env:
@@ -758,11 +1002,11 @@ jobs:
         run: python3 scripts/ci_runner.py extract tests.tar.zst
 
       - name: Run workspace tests
-        timeout-minutes: 30
+        timeout-minutes: 50
         # The subprocess-heavy `wn-cli::cli` suite runs in its own
         # `cli-e2e` job so its fan-out never starves these fast unit tests
         # (issue #103). `relay_runtime` keeps its own serial job.
-        run: python3 scripts/ci_runner.py run rust-test -- cargo nextest run --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" --partition slice:${{ matrix.partition }}/14 --no-tests=pass --profile ci -E "$WORKSPACE_FILTER"
+        run: python3 scripts/ci_runner.py run rust-test -- cargo nextest run --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" --partition "slice:${{ matrix.partition }}/${{ needs.changes.outputs.rust_test_shards }}" --no-tests=pass --profile ci -E "$WORKSPACE_FILTER"
 
       - name: Upload runner diagnostics
         if: always()
@@ -776,7 +1020,7 @@ jobs:
   rust-test-extras:
     name: Doctests and diagnostic exporters
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck' && needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -785,6 +1029,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Prepare runner disk
         env:
@@ -842,7 +1087,7 @@ jobs:
   cli-e2e-build:
     name: Build CLI tests
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck'
+    if: needs.changes.outputs.ci_mode != 'fast'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -851,6 +1096,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Prepare runner disk
         env:
@@ -891,7 +1137,6 @@ jobs:
         run: python3 scripts/ci_runner.py run cli-e2e-build -- cargo nextest archive -p wn-cli --test cli --features test-policy-overrides --locked --profile ci --archive-file tests.tar.zst
 
       - name: Verify and describe test archive
-        if: needs.changes.outputs.ci_mode != 'precheck'
         run: python3 scripts/ci_runner.py manifest tests.tar.zst
 
       - name: Upload test archive
@@ -932,6 +1177,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Prepare runner disk
         env:
@@ -989,7 +1235,7 @@ jobs:
   relay-runtime-build:
     name: Build relay runtime tests
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck'
+    if: needs.changes.outputs.ci_mode != 'fast'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -998,6 +1244,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Prepare runner disk
         env:
@@ -1033,7 +1280,6 @@ jobs:
         run: python3 scripts/ci_runner.py run relay-runtime-build -- cargo nextest archive -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --profile ci --archive-file tests.tar.zst
 
       - name: Verify and describe test archive
-        if: needs.changes.outputs.ci_mode != 'precheck'
         run: python3 scripts/ci_runner.py manifest tests.tar.zst
 
       - name: Upload test archive
@@ -1074,6 +1320,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Prepare runner disk
         env:
@@ -1146,6 +1393,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Prepare runner disk
         env:
@@ -1217,7 +1465,7 @@ jobs:
   conformance-build:
     name: Build simulator tests
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck'
+    if: needs.changes.outputs.ci_mode != 'fast'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -1226,6 +1474,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Prepare runner disk
         env:
@@ -1266,7 +1515,6 @@ jobs:
         run: python3 scripts/ci_runner.py run conformance-build -- cargo nextest archive -p cgka-conformance-simulator --locked --profile ci --archive-file simulator.tar.zst
 
       - name: Verify and describe test archive
-        if: needs.changes.outputs.ci_mode != 'precheck'
         run: python3 scripts/ci_runner.py manifest simulator.tar.zst
 
       - name: Upload simulator test archive
@@ -1315,6 +1563,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Prepare runner disk
         env:
@@ -1415,7 +1664,7 @@ jobs:
   conformance-extras:
     name: Convergence gates and simulator doctests
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck'
+    if: needs.changes.outputs.ci_mode != 'fast'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -1423,6 +1672,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Prepare runner disk
         env:
@@ -1491,6 +1741,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Install Maude
         run: |
@@ -1563,6 +1814,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Install system dependencies
         timeout-minutes: 15
@@ -1658,7 +1910,7 @@ jobs:
   windows-filesystem:
     name: Windows filesystem contracts
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'precheck'
+    if: needs.changes.outputs.ci_mode != 'fast'
     runs-on: windows-latest
     timeout-minutes: 60
 
@@ -1667,6 +1919,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
       - name: Install pinned Odin
         uses: ./.github/actions/setup-odin
@@ -1722,98 +1975,10 @@ jobs:
           cargo nextest run --locked -p marmot-app --lib
           -E 'test(root_runtime_lease)'
 
-  # A merge-group run stops at its first failed job. `Required CI` waits for
-  # every job, so without this one failure would hold the PR, and every group
-  # built on top of it, in the queue until the slowest job finished. Cancelling
-  # the run cancels the jobs still running; `Required CI` still runs, sees
-  # them cancelled and fails, and the queue ejects the PR. The run also stops
-  # once the queue drops its group, for example to rebuild it after a group
-  # ahead failed; GitHub leaves that run going, holding runners the rebuilt
-  # groups need, and its `Required CI` reports on a commit the queue no longer
-  # tracks. This is the only job with `actions: write` and runs no repository
-  # code. It is not one of `Required CI`'s needs, since it waits for that job
-  # to appear, and it must never fail a run whose required jobs passed.
-  merge-group-fail-fast:
-    name: Merge-group fail-fast
-    if: github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
-    timeout-minutes: 160
-    continue-on-error: true
-    permissions:
-      actions: write
-      checks: read
-      contents: read
-
-    steps:
-      - name: Cancel the run when a job fails
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-          HEAD_REF: ${{ github.ref }}
-          HEAD_SHA: ${{ github.sha }}
-        run: |
-          set -uo pipefail
-          # Stop watching before the job timeout. Two requests a minute keep
-          # a run to about 80 of the token's hourly budget.
-          deadline=$((SECONDS + 150 * 60))
-          # Look up the group's branch only when the event names one;
-          # otherwise watch for failed jobs alone.
-          if [[ "$HEAD_REF" != refs/heads/?* || ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            HEAD_REF=""
-          fi
-          dropped=0
-          while (( SECONDS < deadline )); do
-            # One line per job: name, status, conclusion, check URL. Retry a
-            # failed request on the next poll.
-            if jobs="$(gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/jobs?per_page=100" \
-                --jq '.jobs[] | [.name, .status, .conclusion // "", .check_run_url // ""] | @tsv')"; then
-              # Required CI starts only once every other job has finished.
-              if awk -F '\t' '$1 == "Required CI" { found = 1 } END { exit !found }' <<<"$jobs"; then
-                exit 0
-              fi
-              # Merge groups accept only success, so any other conclusion
-              # already fails Required CI.
-              failed="$(awk -F '\t' '$2 == "completed" && $3 != "success" && $3 != "skipped"' <<<"$jobs")"
-              if [[ -n "$failed" ]]; then
-                printf 'Cancelling the run after:\n%s\n' "$failed"
-                # A dead runner may never upload logs or artifacts. Preserve
-                # its server-side failure annotations on this healthy runner
-                # before cancellation; unavailable annotations never block it.
-                while IFS=$'\t' read -r name _status _conclusion check; do
-                  if [[ -n "$check" ]]; then
-                    printf 'Failure annotations for %s:\n' "$name"
-                    gh api "$check/annotations" \
-                      --jq '.[] | select(.annotation_level == "failure") | .message' || true
-                  fi
-                done <<<"$failed"
-                gh run cancel "$RUN_ID" && exit 0
-              elif [[ -n "$HEAD_REF" ]]; then
-                # The queue deletes a dropped group's branch and may give its
-                # name to a later group on the same base. A passed group's
-                # branch is deleted only after Required CI has run, so the
-                # check above exits first. Cancel only once two lookups in a
-                # row, a minute apart, succeed without finding this commit; a
-                # failed lookup proves nothing.
-                if sha="$(gh api "repos/$GH_REPO/git/matching-refs/${HEAD_REF#refs/}" \
-                    --jq '.[] | select(.ref == env.HEAD_REF) | .object.sha')" && [[ "$sha" != "$HEAD_SHA" ]]; then
-                  dropped=$((dropped + 1))
-                else
-                  dropped=0
-                fi
-                if (( dropped >= 2 )); then
-                  printf 'Cancelling the run: the merge queue dropped %s at %s\n' "$HEAD_REF" "$HEAD_SHA"
-                  gh run cancel "$RUN_ID" && exit 0
-                fi
-              fi
-            fi
-            sleep 60
-          done
-
   required-ci:
     name: Required CI
-    # `always()`, not `!cancelled()`: this must also run, and fail, after
-    # merge-group-fail-fast cancels the run.
+    # `always()`, not `!cancelled()`: this must also run, and fail, when a run
+    # or upstream job is cancelled.
     if: always()
     needs:
       - signatures
@@ -1822,6 +1987,7 @@ jobs:
       - rust-audit
       - terminal-harness-installers
       - rust-wasm-check
+      - rust-android-check
       - rust-clippy
       - c-smoke
       - ios-account-clippy
@@ -1846,20 +2012,53 @@ jobs:
 
     steps:
       # A full run selects every job, so a skip there means a broken condition
-      # rather than an unaffected lane. Merge groups must be full runs, and a
-      # job cancelled by merge-group-fail-fast fails them like a failure.
+      # rather than an unaffected lane. External/fork PRs and `ci:full` PRs must
+      # be full runs; team PRs in fast mode must still pass signatures, changes,
+      # rust-format, and rust-audit.
       - name: Require every selected core CI job to succeed
         env:
           NEEDS: ${{ toJSON(needs) }}
           EVENT_NAME: ${{ github.event_name }}
           CI_MODE: ${{ needs.changes.outputs.ci_mode }}
+          IS_TEAM_PR: ${{ needs.changes.outputs.is_team_pr }}
+          APPLE_OPT_IN: ${{ needs.changes.outputs.apple_opt_in }}
+          TREE_STATE: ${{ needs.changes.outputs.tree_state }}
+          TREE_STATE_REASON: ${{ needs.changes.outputs.tree_state_reason }}
+          TREE_FIX_OPT_IN: ${{ needs.changes.outputs.tree_fix_opt_in }}
         run: |
           set -euo pipefail
           jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
-          if [[ "$EVENT_NAME" == merge_group && "$CI_MODE" != full ]]; then
-            echo "error: merge group selected CI mode '$CI_MODE', not full" >&2
+          if [[ "$EVENT_NAME" == pull_request && "${TREE_STATE:-green}" == red && "${TREE_FIX_OPT_IN:-false}" != true ]]; then
+            echo "error: master is frozen in Meltdown Mode (tree-state=red: ${TREE_STATE_REASON:-Canary failure}). Only PRs labelled 'tree-fix' or 'revert' may merge until Canary turns green." >&2
             exit 1
           fi
-          accepted='["success", "skipped"]'
-          if [[ "$CI_MODE" == full ]]; then accepted='["success"]'; fi
-          jq --exit-status --argjson accepted "$accepted" '.signatures.result == "success" and all(.[]; .result | IN($accepted[]))' <<<"$NEEDS"
+          if [[ "$EVENT_NAME" == pull_request && "$IS_TEAM_PR" != true && "$CI_MODE" != full ]]; then
+            echo "error: non-team pull request selected CI mode '$CI_MODE', not full" >&2
+            exit 1
+          fi
+          case "$CI_MODE" in
+            full)
+              jq --exit-status 'all(.[]; .result == "success")' <<<"$NEEDS"
+              ;;
+            fast)
+              jq --exit-status --arg apple "$APPLE_OPT_IN" '
+                .signatures.result == "success"
+                and .changes.result == "success"
+                and .["rust-format"].result == "success"
+                and .["rust-audit"].result == "success"
+                and ($apple != "true" or (.["ios-account-clippy"].result == "success" and .["marmotkit-native-host"].result == "success"))
+                and all(.[]; .result | IN("success", "skipped"))
+              ' <<<"$NEEDS"
+              ;;
+            warm)
+              jq --exit-status '
+                .signatures.result == "success"
+                and .changes.result == "success"
+                and all(.[]; .result | IN("success", "skipped"))
+              ' <<<"$NEEDS"
+              ;;
+            *)
+              echo "error: unrecognized or missing CI mode '$CI_MODE'" >&2
+              exit 1
+              ;;
+          esac

@@ -1,0 +1,335 @@
+name: RC Releases
+
+# Daily SemVer Release Candidates (MarmotKit, Marmot C, and WN Agent) built
+# strictly from the verified `origin/canary` tip and gated on
+# `simulator-nightly`, `convergence-hardening`, and all three artifact tracks.
+# See release.md#daily-release-candidates.
+
+on:
+  schedule:
+    # GitHub can start scheduled runs hours late; RC numbering is monotonic per
+    # classified SemVer base (`0.X.(Y+1)-rc.N` vs `0.(X+1).0-rc.N`).
+    - cron: "17 0 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Plan only. Run the 3-layer Patch/Minor classifier, emit signature delta and skip decision; build nothing
+        required: false
+        default: false
+        type: boolean
+      build_only:
+        description: Build and validate all three artifact tracks without running hardening gates or publishing
+        required: false
+        default: false
+        type: boolean
+      force:
+        description: Build even if origin/canary is unchanged since the previous published RC
+        required: false
+        default: false
+        type: boolean
+      override_impact:
+        description: Optional Patch/Minor override (default auto uses the 3-layer classifier)
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rc-releases
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan SemVer RC
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      skip: ${{ steps.plan.outputs.skip }}
+      source_sha: ${{ steps.plan.outputs.source_sha }}
+      baseline_tag: ${{ steps.plan.outputs.baseline_tag }}
+      impact: ${{ steps.plan.outputs.impact }}
+      base_version: ${{ steps.plan.outputs.base_version }}
+      version: ${{ steps.plan.outputs.version }}
+
+    steps:
+      - name: Check out workflow
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Require master for publishing
+        if: github.event_name == 'workflow_dispatch' && !inputs.dry_run && !inputs.build_only
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+            echo "error: publishing RCs must run the workflow from refs/heads/master" >&2
+            exit 1
+          fi
+
+      - name: Select canary commit, classify impact, and pick RC version
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force || inputs.build_only }}
+          OVERRIDE_IMPACT: ${{ inputs.override_impact }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin master canary 'refs/tags/v*:refs/tags/v*'
+          args=(
+            plan
+            --master-ref origin/master
+            --canary-ref origin/canary
+            --artifacts-dir "$RUNNER_TEMP/rc-plan"
+          )
+          if [[ "$FORCE" == "true" ]]; then
+            args+=(--force)
+          fi
+          if [[ "$OVERRIDE_IMPACT" == "patch" || "$OVERRIDE_IMPACT" == "minor" ]]; then
+            args+=(--override-impact "$OVERRIDE_IMPACT")
+          fi
+          python3 scripts/rc_release.py "${args[@]}"
+
+      - name: Upload RC plan and signature delta
+        if: success() && (steps.plan.outputs.version != '' || inputs.dry_run)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rc-plan-${{ steps.plan.outputs.version || steps.plan.outputs.source_sha || github.run_id }}
+          path: ${{ runner.temp }}/rc-plan/*
+          if-no-files-found: ${{ steps.plan.outputs.version != '' && 'error' || 'ignore' }}
+          retention-days: 30
+
+  simulator-nightly:
+    name: Simulator Nightly gate
+    needs: [plan]
+    if: success() && needs.plan.outputs.skip != 'true' && !inputs.dry_run && !inputs.build_only
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/simulator-nightly.yml
+    with:
+      source_sha: ${{ needs.plan.outputs.source_sha }}
+      report_failure: ${{ github.event_name == 'schedule' }}
+
+  convergence-hardening:
+    name: Convergence Hardening gate
+    needs: [plan]
+    if: success() && needs.plan.outputs.skip != 'true' && !inputs.dry_run && !inputs.build_only
+    permissions:
+      contents: read
+    uses: ./.github/workflows/convergence-hardening.yml
+    with:
+      source_sha: ${{ needs.plan.outputs.source_sha }}
+      lane: weekly_manual
+
+  lane:
+    name: Wait for release lane
+    needs: [plan, simulator-nightly, convergence-hardening]
+    if: >-
+      always() && !inputs.dry_run &&
+      needs.plan.result == 'success' && needs.plan.outputs.skip != 'true' &&
+      (inputs.build_only || (needs.simulator-nightly.result == 'success' && needs.convergence-hardening.result == 'success'))
+    runs-on: ubuntu-latest
+    # Formal releases, promotions, and snapshots wait for an RC only after this job succeeds
+    # and only while packaging track jobs are active (never during the verification gates above).
+    timeout-minutes: 200
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      lane_free: ${{ steps.wait.outputs.lane_free }}
+
+    steps:
+      - name: Check out workflow
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Wait for releases and snapshots to finish
+        id: wait
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/rc_release.py wait-lane --timeout-minutes 180
+
+  marmotkit:
+    name: MarmotKit
+    needs: [plan, lane]
+    if: success() && needs.lane.outputs.lane_free == 'true'
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bindings.yaml
+    with:
+      source_sha: ${{ needs.plan.outputs.source_sha }}
+      build_only: ${{ inputs.build_only == true }}
+      release_version: ${{ needs.plan.outputs.version }}
+
+  marmotc:
+    name: Marmot C
+    needs: [plan, lane]
+    if: success() && needs.lane.outputs.lane_free == 'true'
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/c-bindings.yml
+    with:
+      source_sha: ${{ needs.plan.outputs.source_sha }}
+      build_only: ${{ inputs.build_only == true }}
+      release_version: ${{ needs.plan.outputs.version }}
+
+  wn-agent:
+    name: wn-agent
+    needs: [plan, lane]
+    if: success() && needs.lane.outputs.lane_free == 'true'
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/wn-agent-binaries.yml
+    with:
+      source_sha: ${{ needs.plan.outputs.source_sha }}
+      build_only: ${{ inputs.build_only == true }}
+      release_version: ${{ needs.plan.outputs.version }}
+
+  publish:
+    name: Publish SemVer RC and rc-meta
+    needs: [plan, lane, simulator-nightly, convergence-hardening, marmotkit, marmotc, wn-agent]
+    # Runs ONLY when simulator-nightly, convergence-hardening, AND all three track builds succeeded.
+    if: >-
+      success() && !inputs.build_only && !inputs.dry_run &&
+      needs.lane.outputs.lane_free == 'true' &&
+      needs.simulator-nightly.result == 'success' &&
+      needs.convergence-hardening.result == 'success' &&
+      needs.marmotkit.result == 'success' &&
+      needs.marmotc.result == 'success' &&
+      needs.wn-agent.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Check out workflow
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Download RC plan and signature delta
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: rc-plan-${{ needs.plan.outputs.version }}
+          path: ${{ runner.temp }}/rc-plan
+
+      - name: Publish the three RC pre-releases and update rc-meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+        run: |
+          python3 scripts/rc_release.py publish \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --impact-report "$RUNNER_TEMP/rc-plan/impact_report.json" \
+            --signature-delta "$RUNNER_TEMP/rc-plan/signature_delta.json" \
+            --integration-notes "$RUNNER_TEMP/rc-plan/integration-notes.md"
+
+  cleanup-drafts:
+    name: Drop unpublished RC drafts on failure
+    needs: [plan, lane, simulator-nightly, convergence-hardening, marmotkit, marmotc, wn-agent, publish]
+    # Run ONLY when publish was skipped (build or gate failed before publish started).
+    # If publish itself started and failed mid-way, preserve remaining drafts so re-running
+    # publish resumes atomically without rebuilding.
+    if: >-
+      always() && !inputs.build_only && !inputs.dry_run &&
+      needs.plan.outputs.version != '' &&
+      needs.publish.result == 'skipped' &&
+      (failure() || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out workflow
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Remove unpublished RC drafts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: python3 scripts/rc_release.py cleanup-drafts --version "$VERSION"
+
+  retention:
+    name: Expire RCs and legacy nightlies older than 30 days
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out workflow
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Delete expired pre-release drafts, releases, and tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run || inputs.build_only }}
+          ON_MASTER: ${{ github.ref == 'refs/heads/master' }}
+        run: |
+          set -euo pipefail
+          args=(retention)
+          if [[ "$DRY_RUN" == "true" || "$ON_MASTER" != "true" ]]; then
+            args+=(--dry-run)
+          fi
+          python3 scripts/rc_release.py "${args[@]}"
+
+  report:
+    name: Report scheduled RC failure
+    needs: [plan, simulator-nightly, convergence-hardening, lane, marmotkit, marmotc, wn-agent, publish, cleanup-drafts, retention]
+    # Skipped days (unchanged canary tip, non-dev version, busy lane) exit 0, so only real
+    # failures get here. Cancelled runs report nothing; timed-out jobs report as cancelled.
+    if: github.event_name == 'schedule' && !cancelled() && (failure() || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+
+    steps:
+      - name: Open or update the RC failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha || github.sha }}
+          RC_VERSION: ${{ needs.plan.outputs.version || 'unplanned' }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          title="RC release failed"
+          failed="$(jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled")
+            | if .value.result == "cancelled" then "\(.key) (cancelled)" else .key end] | join(", ")' <<<"$NEEDS")"
+          body="The scheduled RC (${RC_VERSION}) failed for ${SOURCE_SHA} (failed jobs: ${failed}). Run: ${RUN_URL}"
+          existing="$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number,title \
+            --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi

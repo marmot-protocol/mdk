@@ -180,7 +180,7 @@ async fn parked_commands_are_bounded_and_the_worker_still_retries() {
         .map(|_| account_read(&runtime))
         .collect::<Vec<_>>();
     until("the host channel fills at the bound", || {
-        lane.commands.capacity() == 0
+        lane.commands.account_capacity() == 0
     })
     .await;
 
@@ -194,7 +194,7 @@ async fn parked_commands_are_bounded_and_the_worker_still_retries() {
     .await;
     // The worker has turned since the channel filled, and took no host
     // command from it.
-    assert_eq!(lane.commands.capacity(), 0);
+    assert_eq!(lane.commands.account_capacity(), 0);
     none_answered(&parked, "a waiting host check at its bound");
     assert!(!check.is_finished());
 
@@ -425,4 +425,44 @@ async fn a_nudge_during_a_read_brings_the_next_check_forward() {
         reads.is_running(),
         "the nudge brought the next check forward"
     );
+}
+
+/// While a host sign-in check holds `PARKED_LIMIT` account-wide commands and
+/// fills the account-wide channel, group-scoped commands must still proceed
+/// promptly without head-of-line blocking (mdk#3801).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn group_commands_proceed_when_parked_limit_is_reached_during_sign_in_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let HeldRead {
+        runtime,
+        group,
+        release,
+        ..
+    } = held_scheduled_read(&dir).await;
+    let check = host_check(&runtime, &group).await;
+    let lane = runtime.accounts().worker_lane("alice").await.unwrap();
+    let parked = (0..sign_in_reads::PARKED_LIMIT + lane.commands.max_capacity() + 4)
+        .map(|_| account_read(&runtime))
+        .collect::<Vec<_>>();
+    // Wait until the worker has parked PARKED_LIMIT account commands and the
+    // account channel has filled behind them.
+    until("the account channel fills at PARKED_LIMIT", || {
+        lane.commands.account_capacity() == 0
+    })
+    .await;
+
+    // A group-scoped command must still succeed promptly even while account
+    // admissions are paused at PARKED_LIMIT.
+    timeout(Duration::from_secs(5), send(&runtime, &group))
+        .await
+        .expect("group send must not starve when PARKED_LIMIT is reached")
+        .unwrap()
+        .unwrap();
+    none_answered(&parked, "parked account commands stay behind CheckSignIns");
+    assert!(!check.is_finished());
+
+    release.notify_one();
+    timeout(SETTLE, check).await.unwrap().unwrap().unwrap();
+    all_answered(parked).await;
+    runtime.shutdown_and_close().await.unwrap();
 }

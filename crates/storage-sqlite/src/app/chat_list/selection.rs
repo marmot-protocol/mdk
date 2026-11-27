@@ -5,7 +5,7 @@ use crate::base::connection::CachedSql;
 use crate::{SqliteAppStorage, SqliteResultExt};
 use cgka_traits::storage::StorageError;
 use rusqlite::{Connection, params_from_iter};
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChatListSelectionError {
@@ -53,12 +53,21 @@ impl SqliteAppStorage {
     ) -> Result<Vec<String>, ChatListSelectionError> {
         let query = query.into();
         self.connection.with_deferred_read(|conn| {
-            let mut eligible: HashSet<String> =
-                eligible_ids(conn, &query, now_ms)?.into_iter().collect();
+            let mut eligible: HashMap<String, String> = eligible_ids(conn, &query, now_ms)?
+                .into_iter()
+                .map(|stored| {
+                    (
+                        crate::base::connection::canonical_group_id_hex(&stored).into_owned(),
+                        stored,
+                    )
+                })
+                .collect();
             Ok(group_ids
                 .iter()
-                .filter(|id| eligible.remove(id.as_str()))
-                .cloned()
+                .filter_map(|id| {
+                    let canonical = crate::base::connection::canonical_group_id_hex(id);
+                    eligible.remove(canonical.as_ref())
+                })
                 .collect())
         })
     }

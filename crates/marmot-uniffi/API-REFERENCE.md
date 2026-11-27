@@ -3610,7 +3610,7 @@ Observe onboarding snapshots for one account.
 pub async fn set_onboarding_discovery_relays( &self, account_ref: String, discovery_relays: Vec<String>, ) -> Result<OnboardingSnapshotFfi, MarmotKitError>
 ```
 
-Change discovery sources for the workflow without publishing them as account relay lists.
+Change discovery sources for the workflow without modifying existing published account relay lists. When `OnboardingOptionsFfi.create_missing_inbox_list` is enabled, a complete lookup that confirms no kind-10050 inbox list exists can trigger automatic creation of the recommended inbox list.
 
 [Source](src/commands/onboarding.rs#L166)
 
@@ -3985,7 +3985,7 @@ pub fn telemetry_install_id(&self) -> Result<String, MarmotKitError>
 
 Consent-bound random OTLP identifier, stable until revocation. Requires a current combined grant; never use this value in product events.
 
-[Source](src/commands/relay.rs#L113)
+[Source](src/commands/relay.rs#L135)
 
 ### `Marmot::set_relay_telemetry_runtime_config`
 
@@ -3997,7 +3997,7 @@ pub async fn set_relay_telemetry_runtime_config( &self, config: RelayTelemetryRu
 
 Supply non-persisted OTLP runtime metadata: optional metrics URL override, bearer token from the host app's build-time secret, and resource attributes from the platform shell.
 
-[Source](src/commands/relay.rs#L120)
+[Source](src/commands/relay.rs#L142)
 
 ### `Marmot::set_relay_telemetry_settings`
 
@@ -4009,7 +4009,7 @@ pub async fn set_relay_telemetry_settings( &self, settings: RelayTelemetrySettin
 
 Deprecated consent control. Use `set_usage_diagnostics_consent` instead. Enable requires a combined grant; disable revokes both exporters. This compatibility setter still updates the telemetry interval.
 
-[Source](src/commands/relay.rs#L132)
+[Source](src/commands/relay.rs#L154)
 
 </details>
 
@@ -4761,7 +4761,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
-[Source](src/lib.rs#L327)
+[Source](src/lib.rs#L333)
 
 ### `Marmot::new_with_experimental_device_groups`
 
@@ -4771,7 +4771,7 @@ pub fn new_with_experimental_device_groups( root_path: String, relay_urls: Vec<S
 
 The same open as `new_with_configuration`: every constructor opens with [device groups](README.md#device-groups) on. Kept so existing hosts keep compiling.
 
-[Source](src/lib.rs#L340)
+[Source](src/lib.rs#L346)
 
 ### `Marmot::new_with_options`
 
@@ -4783,7 +4783,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L351)
+[Source](src/lib.rs#L357)
 
 ### `Marmot::new`
 
@@ -4795,7 +4795,7 @@ pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploy
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L380)
+[Source](src/lib.rs#L386)
 
 ### `Marmot::new_with_secret_store`
 
@@ -4807,7 +4807,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L406)
+[Source](src/lib.rs#L412)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -4819,7 +4819,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L437)
+[Source](src/lib.rs#L443)
 
 ### `Marmot::new_with_client_name`
 
@@ -4831,7 +4831,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L458)
+[Source](src/lib.rs#L464)
 
 ### `Marmot::start`
 
@@ -4843,7 +4843,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L496)
+[Source](src/lib.rs#L502)
 
 ### `Marmot::shutdown`
 
@@ -4855,7 +4855,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L508)
+[Source](src/lib.rs#L514)
 
 ### `Marmot::shutdown_and_close`
 
@@ -4867,7 +4867,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L544)
+[Source](src/lib.rs#L550)
 
 ### `Marmot::storage_is_closed`
 
@@ -4879,7 +4879,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L552)
+[Source](src/lib.rs#L558)
 
 ### `Marmot::is_stopping`
 
@@ -4891,7 +4891,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L559)
+[Source](src/lib.rs#L565)
 
 </details>
 
@@ -6039,7 +6039,7 @@ socket roles and ownership. New manual connections follow configured membership,
 After dispatch, wait up to five seconds for the next observed attempt state, which may be `Connecting` rather than a successful
 connection. Use the liveness subscription for the eventual outcome; this does not establish message delivery.
 
-[Source](src/commands/relay.rs#L99)
+[Source](src/commands/relay.rs#L121)
 
 ### `Marmot::subscribe_relay_liveness`
 
@@ -6051,7 +6051,7 @@ Open an account-scoped observer before reading its initial snapshot. Take `snaps
 `next()` list as a complete replacement. Updates follow socket, account-pool, and configured-list changes without
 polling and may coalesce intermediate states. Close the observer when leaving the settings screen.
 
-[Source](src/commands/relay.rs#L89)
+[Source](src/commands/relay.rs#L111)
 
 ### `RelayLivenessSubscription::cancel`
 
@@ -6095,13 +6095,31 @@ without configured relay entries. This method does not consume a later update or
 pub async fn account_relay_health( &self, account_ref: String, ) -> Result<conversions::AccountRelayHealthFfi, MarmotKitError>
 ```
 
-Read the account's relay health from its cached inbox and NIP-65 lists and the dial policy: one row per relay with its
+Read the account's relay health from its cached inbox and NIP-65 lists, the dial policy and this process's inbox checks: one row per relay with its
 roles, state, policy fault and liveness, and warnings about invitations sent through the published inbox list, each
 with a severity, the relays it concerns and the actions that would fix it. Never dials. An inbox list MDK does not hold reads as
 `inbox_list: Unknown` and raises no warning. Re-read on `RelayHealthChanged`. See the
 [conditions for each warning](README.md#account-relay-health); keep a default branch over its enums.
 
 [Source](src/commands/relay.rs#L77)
+
+### `Marmot::check_account_relays`
+
+```rust
+pub async fn check_account_relays( &self, account_ref: String, ) -> Result<conversions::AccountRelayHealthFfi, MarmotKitError>
+```
+
+Ask the account's worker to check whether its inbox relays serve the account's inbox, then return
+`account_relay_health` as it reads after the check. The worker gives each allowed inbox relay (the first 16 by URL) one
+bounded read of the account's gift wraps (kind 1059 addressed to it) on a connection of its own, answered with the
+signer it holds, within 15 seconds; a relay the policy refuses is never dialed. A remote or host signer may be asked to
+sign a relay's authentication challenge, so call it from a user action for such an account. While a check of the
+account runs it is refused at once with `RelayCheckRunning`; without a running account worker it fails as the account
+not being active and dials nothing. A check in which no relay answered changes nothing. The returned health is the
+answer; `RelayHealthChanged` follows a changed answer from the worker. See
+[what each state means](README.md#account-relay-health).
+
+[Source](src/commands/relay.rs#L99)
 
 <details>
 <summary>nip46.rs</summary>

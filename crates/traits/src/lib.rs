@@ -56,8 +56,8 @@ pub use app_event::{
     AppMessageRetentionDecision, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_GROUP_DISBANDED,
     GROUP_SYSTEM_TYPE_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
     MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
-    MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent, MarmotAppEventError, QUOTE_REF_TAG,
-    canonical_event_id, group_system_canonical_id, group_system_event_material,
+    MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent, MarmotAppEventError, MarmotAppEventJsonError,
+    QUOTE_REF_TAG, canonical_event_id, group_system_canonical_id, group_system_event_material,
 };
 pub use capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, GroupCapabilities, RequirementLevel,

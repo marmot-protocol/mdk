@@ -185,10 +185,10 @@ fn an_edit_that_arrives_before_its_item_is_held_and_applied() {
 
 /// A member added after an item began never gets its first event, only its
 /// later edits, each carrying the whole item (marmot-agents D-124). The
-/// item's row is then its earliest edit, at that edit's place, holding the
-/// highest version and saying its first event is missing. Only that edit's
-/// sender's versions count, an edit naming another message too is no
-/// version, and a rebuild agrees. The first event, should it arrive, takes
+/// item's row is then the first edit this device received, at that edit's
+/// place, holding the highest version and saying its first event is missing.
+/// Only that edit's sender's versions count, an edit naming another message
+/// too is no version, and a rebuild agrees. The first event, should it arrive, takes
 /// the row back to its own place.
 #[test]
 fn an_item_whose_first_event_never_arrives_is_shown_from_its_edits() {
@@ -219,8 +219,19 @@ fn an_item_whose_first_event_never_arrives_is_shown_from_its_edits() {
         ))
         .unwrap();
 
+    store
+        .record_app_event(&event(
+            "reply",
+            "member",
+            60,
+            MARMOT_APP_EVENT_KIND_CHAT,
+            vec![tag(&["e", ITEM]), tag(&["q", ITEM])],
+            "What happened?",
+        ))
+        .unwrap();
+
     for _ in 0..2 {
-        assert_eq!(rows(&store), [ITEM]);
+        assert_eq!(rows(&store), [ITEM, "reply"]);
         let held = row(&store, ITEM);
         assert!(held.agent_item_first_event_missing);
         assert_eq!(held.sender, "agent");
@@ -232,6 +243,9 @@ fn an_item_whose_first_event_never_arrives_is_shown_from_its_edits() {
         assert_eq!(held.edit, None);
         assert_eq!(held.retention_seconds, Some(3600));
         assert_eq!(held.retention_expires_at, Some(3630));
+        let preview = row(&store, "reply").reply_preview.unwrap();
+        assert_eq!(preview.retention_seconds, Some(3600));
+        assert_eq!(preview.retention_expires_at, Some(3630));
         store.rebuild_message_timeline_for_group(GROUP).unwrap();
     }
 
@@ -242,6 +256,31 @@ fn an_item_whose_first_event_never_arrives_is_shown_from_its_edits() {
     assert!(!first.agent_item_first_event_missing);
     assert_eq!(first.timeline_at, 10);
     assert_eq!(first.plaintext, "v4 waiting");
+    let preview = row(&store, "reply").reply_preview.unwrap();
+    assert_eq!(preview.retention_seconds, None);
+    assert_eq!(preview.retention_expires_at, None);
+}
+
+/// Any member can send an edit naming an item, and an edit's `created_at` is
+/// the sender's to choose. The row of an item whose first event this device
+/// lacks is built from the first such edit this device received, so a
+/// backdated one that arrives later cannot take the item from its agent.
+#[test]
+fn a_backdated_edit_received_later_cannot_take_an_item_shown_from_its_edits() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .record_app_event(&item_edit("edit-5", ITEM, 30, 5, "waiting"))
+        .unwrap();
+    let mut forged = item_edit("forged", ITEM, 1, 9, "done");
+    forged.sender = "someone".to_owned();
+    store.record_app_event(&forged).unwrap();
+    for _ in 0..2 {
+        let held = row(&store, ITEM);
+        assert_eq!(held.sender, "agent");
+        assert_eq!(held.plaintext, "v5 waiting");
+        assert_eq!(held.timeline_at, 30);
+        store.rebuild_message_timeline_for_group(GROUP).unwrap();
+    }
 }
 
 /// The agent deleting an item it never sent this device removes the row

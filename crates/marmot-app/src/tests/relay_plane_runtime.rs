@@ -1073,9 +1073,10 @@ async fn relay_liveness_account_watch() {
 }
 
 /// `RelayHealthChanged` follows the account's relay health, not its relays'
-/// connections: it fires once when the worker starts and once for a list
-/// change that changes a warning, and never for a relay that fails to connect
-/// or reconnects, nor for a directory change that leaves the answer as it was.
+/// connections: it fires once when the worker starts, once when the worker's
+/// inbox check settles its relays, and once for a list change that changes a
+/// warning, and never for a relay that fails to connect or reconnects, nor for
+/// a directory change that leaves the answer as it was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_health_changed_follows_lists_not_liveness() {
     async fn next_health_change(
@@ -1145,6 +1146,9 @@ async fn relay_health_changed_follows_lists_not_liveness() {
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();
+    next_health_change(&mut events, &account.account_id_hex).await;
+    // The worker's inbox check starts after that first answer and changes
+    // it: the live relay is healthy, the dead one suspected.
     next_health_change(&mut events, &account.account_id_hex).await;
     crate::worker_fences::worker_startup_finished(&runtime, &account.label)
         .await

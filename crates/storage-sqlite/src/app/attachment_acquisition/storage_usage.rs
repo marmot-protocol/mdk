@@ -159,6 +159,8 @@ pub(super) fn remove_slot(
     index: u32,
     reason: RemovalReason,
 ) -> StorageResult<Option<Vec<FileId>>> {
+    let group = canonical_group_id_hex(group);
+    let group = group.as_ref();
     let exists: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM attachment_history
@@ -286,10 +288,11 @@ impl SqliteAppStorage {
         limit: usize,
     ) -> StorageResult<Vec<ChatAttachmentUsage>> {
         let limit = page_limit(limit)?;
+        let after_group = after.map(|cursor| canonical_group_id_hex(&cursor.group_id_hex));
         let (bytes, group) = after.map_or((i64::MAX, ""), |cursor| {
             (
                 i64::try_from(cursor.bytes).unwrap_or(i64::MAX),
-                cursor.group_id_hex.as_str(),
+                after_group.as_deref().unwrap_or(""),
             )
         });
         let conn = self.lock()?;
@@ -336,11 +339,13 @@ impl SqliteAppStorage {
         limit: usize,
     ) -> StorageResult<Vec<RetainedAttachmentEntry>> {
         let limit = page_limit(limit)?;
+        let group = canonical_group_id_hex_opt(group);
+        let after_group = after.map(|cursor| canonical_group_id_hex(&cursor.group_id_hex));
         let (bytes, cursor_group, cursor_message, cursor_index) =
             after.map_or((i64::MAX, "", "", -1i64), |cursor| {
                 (
                     i64::try_from(cursor.byte_count).unwrap_or(i64::MAX),
-                    cursor.group_id_hex.as_str(),
+                    after_group.as_deref().unwrap_or(""),
                     cursor.message_id_hex.as_str(),
                     i64::from(cursor.attachment_index),
                 )
@@ -364,7 +369,7 @@ impl SqliteAppStorage {
         stmt.query_map(
             params![
                 u64_to_i64(now)?,
-                group,
+                group.as_deref(),
                 bytes,
                 cursor_group,
                 cursor_message,
@@ -398,6 +403,7 @@ impl SqliteAppStorage {
         group: Option<&str>,
         received_before: Option<u64>,
     ) -> StorageResult<AttachmentRemoval> {
+        let group = canonical_group_id_hex_opt(group);
         // A bound past SQLite's integer range is later than every stored
         // received time, so it filters nothing.
         let before = received_before.and_then(|before| i64::try_from(before).ok());
@@ -412,7 +418,7 @@ impl SqliteAppStorage {
                    AND h.received_at<?3))",
                 retained("?1")
             ),
-            params![group, before],
+            params![group.as_deref(), before],
             RemovalReason::ByYou,
         )
     }

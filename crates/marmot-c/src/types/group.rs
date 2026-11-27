@@ -112,7 +112,10 @@ c_mirror! {
 
 c_enum! {
     /// Why an invite has not reached a relay (mdk#1706). `TooLarge` and
-    /// `KeyPackageRetired` are not produced yet.
+    /// `KeyPackageRetired` are not produced yet. `InboxLookupFailed`: no
+    /// usable inbox relay is known for the recipient and MDK's latest lookup
+    /// of their inbox relay list failed; MDK looks it up again at its next
+    /// retry.
     MarmotInviteDeliveryProblem from marmot_uniffi::conversions::InviteDeliveryProblemFfi {
         NoInboxRelays,
         RefusedByRelays,
@@ -120,6 +123,7 @@ c_enum! {
         Mixed,
         TooLarge,
         KeyPackageRetired,
+        InboxLookupFailed,
     }
 }
 

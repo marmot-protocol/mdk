@@ -36,16 +36,15 @@
 //! engine reads its own tree for the leaf: the Commit removes it only if the
 //! tree still has it, and removes the roster entry either way. Removing a
 //! linked device (3.6b) is the same Commit, whose update also records the
-//! slot as `removed` with the tag signature key its entry had, or with the
-//! signature key of the leaf it removes once that leaf has committed: a
-//! device can rewrite or clear its own entry's key while its leaf keeps the
-//! key it tags with (mdk#3679). A leaf still built from its Add's KeyPackage
-//! is a pending link, never recorded as `removed`, whatever key the record
-//! keeps. Receivers check neither, so these rules bind only the sender.
+//! slot as `removed` with the tag signature key its entry had. That key is
+//! the one the Add bound and no Commit changes, so the leaf removed is the
+//! one signing with it ("Key binding", marmot#521). A leaf still built from
+//! its Add's KeyPackage is a pending link, never recorded as `removed`,
+//! unless its device founded the group (mdk#3679). Receivers hold every
+//! device-group Commit to the same key-binding rules.
 
 use crate::engine::Engine;
 use crate::message_processor::route_wrapped_group_message;
-use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceRosterOperationV1, RejectedSlotReasonV1,
@@ -99,8 +98,7 @@ impl<S: StorageProvider> Engine<S> {
         validate_link_roster_update(&roster_update)?;
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
-        let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+        let pending_commit_guard = self.arm_pending_commit_guard(group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let roster_proposal = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
@@ -147,7 +145,7 @@ impl<S: StorageProvider> Engine<S> {
         )?;
         let parsed_kps = vec![parsed_kp];
         crate::capability_manager::check_key_package_profiles(
-            &self.storage,
+            self.storage.as_ref(),
             &group_id,
             &parsed_kps,
         )?;
@@ -185,6 +183,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let mut group_record = existing;
         group_record.members = projected_members;
+        let prepared_pending = self.prepare_device_group_commit(&group_id, pre_commit_epoch)?;
         let (welcomes, content_id) = self.storage.with_transaction(|storage| {
             let content_id = self.persist_sent_openmls_message_with_application_stamp(
                 &commit_msg,
@@ -206,8 +205,7 @@ impl<S: StorageProvider> Engine<S> {
         self.sent_message_ids.insert(commit_msg.id.clone());
         self.sent_message_ids.insert(content_id);
 
-        let pending_ref =
-            self.begin_device_group_commit(&group_id, pre_commit_epoch, &commit_msg)?;
+        let pending_ref = self.commit_device_group_commit(prepared_pending, &commit_msg);
         pending_commit_guard.disarm();
 
         Ok(SendResult::GroupEvolution {
@@ -259,24 +257,19 @@ impl<S: StorageProvider> Engine<S> {
             Vec::new()
         };
         let removed_leaf = match removed.first() {
-            Some(index) => {
-                let leaf = mls_group
+            Some(index) => Some(
+                mls_group
                     .public_group()
                     .leaf(*index)
-                    .ok_or_else(|| EngineError::Other("removed leaf unavailable".into()))?;
-                if crate::engine::add_leaf_lifetime(leaf)?.is_some() {
-                    RemovedLeaf::FromKeyPackage
-                } else {
-                    RemovedLeaf::Committed(leaf_signature_key.as_slice())
-                }
-            }
-            None => RemovedLeaf::Gone,
+                    .ok_or_else(|| EngineError::Other("removed leaf unavailable".into()))?
+                    .clone(),
+            ),
+            None => None,
         };
-        validate_unlink_roster_update(&mls_group, &roster_update, removed_leaf)?;
+        validate_unlink_roster_update(&mls_group, &roster_update, removed_leaf.as_ref())?;
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
-        let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+        let pending_commit_guard = self.arm_pending_commit_guard(group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let roster_proposal = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
@@ -351,6 +344,7 @@ impl<S: StorageProvider> Engine<S> {
         group_record
             .members
             .retain(|member| member.credential != leaf_signature_key);
+        let prepared_pending = self.prepare_device_group_commit(&group_id, pre_commit_epoch)?;
         self.record_sent_openmls_message_with_group(
             &commit_msg,
             commit_bytes.as_slice(),
@@ -358,8 +352,7 @@ impl<S: StorageProvider> Engine<S> {
             pre_commit_epoch,
         )?;
 
-        let pending_ref =
-            self.begin_device_group_commit(&group_id, pre_commit_epoch, &commit_msg)?;
+        let pending_ref = self.commit_device_group_commit(prepared_pending, &commit_msg);
         pending_commit_guard.disarm();
 
         Ok(SendResult::GroupEvolution {
@@ -369,27 +362,38 @@ impl<S: StorageProvider> Engine<S> {
         })
     }
 
-    /// Put the device group's staged link or unlink Commit pending publish.
-    fn begin_device_group_commit(
+    /// Validate and allocate the device group's pending-publish transition
+    /// before durable rows are committed.
+    fn prepare_device_group_commit(
         &mut self,
         group_id: &GroupId,
         pre_commit_epoch: EpochId,
-        commit_msg: &cgka_traits::transport::TransportMessage,
-    ) -> Result<PendingStateRef, EngineError> {
+    ) -> Result<crate::epoch_manager::PreparedPendingPublish, EngineError> {
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
-        let pending_ref = self.epoch_manager.next_pending_ref()?;
-        self.invalidate_deferred_peel_candidate_cache(group_id);
-        self.epoch_manager.begin_pending(
+        self.epoch_manager.prepare_pending(
             group_id.clone(),
             pre_commit_epoch,
             new_epoch,
             StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
-            pending_ref,
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
-        )?;
+        )
+    }
+
+    /// Infallibly install the device group's staged link or unlink Commit
+    /// once its durable rows have committed.
+    fn commit_device_group_commit(
+        &mut self,
+        prepared: crate::epoch_manager::PreparedPendingPublish,
+        commit_msg: &cgka_traits::transport::TransportMessage,
+    ) -> PendingStateRef {
+        let group_id = prepared.group_id().clone();
+        let new_epoch = prepared.new_epoch();
+        let pending_ref = prepared.pending_ref();
+        self.invalidate_deferred_peel_candidate_cache(&group_id);
+        self.epoch_manager.commit_pending(prepared);
         self.audit_group(
-            group_id,
+            &group_id,
             crate::audit_helpers::epoch_state_changed_event(
                 Some("stable"),
                 "pending_publish",
@@ -402,7 +406,7 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         self.track_pending_origin_commit(pending_ref, commit_msg.id.clone());
-        Ok(pending_ref)
+        pending_ref
     }
 
     /// Parse the KeyPackage to link: this account's, on the group's profile,
@@ -467,31 +471,18 @@ pub(crate) fn validate_link_roster_update(roster_update: &[u8]) -> Result<(), En
     Ok(())
 }
 
-/// The leaf an unlink's Commit removes, as its roster update is checked.
-#[derive(Clone, Copy)]
-enum RemovedLeaf<'a> {
-    /// The tree no longer has it; the Commit removes the entry alone.
-    Gone,
-    /// Still the leaf its Add built from a KeyPackage: a link whose device
-    /// has not committed, which may still fail and be undone.
-    FromKeyPackage,
-    /// A leaf that has committed since its Add, by its signature key.
-    Committed(&'a [u8]),
-}
-
 /// The unlink's roster update removes exactly one device entry, of a slot the
 /// roster lists. A removal (3.6b) also records that slot as `removed`,
 /// keeping the `tag_signature_key` its entry had so the removed device's tags
-/// still read as its slot, or, when the Commit removes a leaf of the device
-/// that has committed, that leaf's signature key, which a device whose entry
-/// no longer carries its key still tags with (mdk#3679). A leaf still built
-/// from its Add's KeyPackage is a link not made yet, never recorded as
-/// `removed`, whatever key the record would keep; a failed link removes the
-/// entry alone.
+/// still read as its slot, and no other key ("Key binding"). `removed_leaf` is
+/// the leaf the Commit removes, if the tree still has it. A leaf still built
+/// from its Add's KeyPackage, other than the founder's, is a link not made
+/// yet, never recorded as `removed`, whatever key the record would keep; a
+/// failed link removes the entry alone.
 fn validate_unlink_roster_update(
     mls_group: &MlsGroup,
     roster_update: &[u8],
-    removed_leaf: RemovedLeaf<'_>,
+    removed_leaf: Option<&openmls::prelude::LeafNode>,
 ) -> Result<(), EngineError> {
     let update = decode_device_roster_update_v1(roster_update).map_err(|error| {
         EngineError::Serialize(format!("invalid device roster update: {error}"))
@@ -524,28 +515,25 @@ fn validate_unlink_roster_update(
             "invalid unlink roster update: the roster lists no such device".into(),
         ));
     };
-    // A removal names a device whose link is made: the record keeps a key
-    // the device's tags read by, its entry's tag signature key or the
-    // signature key of the committed leaf this Commit removes, and a leaf
-    // still built from its KeyPackage is never recorded. Undoing a failed
-    // link removes the entry alone.
+    // A removal names a device whose link is made: the record keeps the
+    // entry's tag signature key, which its tags read by, and a leaf still
+    // built from its KeyPackage is never recorded, unless it founded the
+    // group. Undoing a failed link removes the entry alone.
     if let Some(record) = record {
         let kept = record.tag_signature_key.as_deref();
-        let committed_leaf = match removed_leaf {
-            RemovedLeaf::Committed(key) => Some(key),
-            RemovedLeaf::Gone | RemovedLeaf::FromKeyPackage => None,
-        };
         if record.reason != RejectedSlotReasonV1::Removed
             || kept.is_none()
-            || (kept != entry.tag_signature_key.as_deref() && kept != committed_leaf)
+            || kept != entry.tag_signature_key.as_deref()
         {
             return Err(EngineError::Other(
                 "invalid unlink roster update: the slot's record has reason removed and keeps the \
-                 entry's tag signature key or the removed committed leaf's signature key"
+                 entry's tag signature key"
                     .into(),
             ));
         }
-        if matches!(removed_leaf, RemovedLeaf::FromKeyPackage) {
+        if removed_leaf
+            .is_some_and(|leaf| !crate::device_tag::committed_or_founded(leaf, &roster, slot))
+        {
             return Err(EngineError::Other(
                 "invalid unlink roster update: the removed leaf is still its link's KeyPackage \
                  leaf, so the slot is not recorded as removed"

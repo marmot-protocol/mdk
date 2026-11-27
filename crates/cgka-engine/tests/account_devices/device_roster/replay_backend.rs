@@ -69,7 +69,9 @@ async fn roster_departure_backend_read_failure_retains_public_apply_for_retry() 
     );
     let gid = found_device_group(
         &mut phone,
-        &roster(&[(1, "Phone"), (2, "Laptop")]),
+        // Slot 2 is an entry with no key and no device, which departs
+        // without a leaf.
+        &roster(&[(1, "Phone"), (2, "Watch"), (3, "Laptop")]),
         &mut [&mut laptop],
     )
     .await;

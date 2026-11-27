@@ -143,15 +143,11 @@ fn claimant_is_eligible(exchange: &Exchange, slot: &DeviceSlotId) -> bool {
 }
 
 /// Whether a claim to add `slot` is kept: the roster lists it as linked
-/// and tagged. A local admission hold, such as this device's own link of it
-/// still pending, does not drop a sibling's claim; it holds only this
-/// device's own Adds and claims.
-fn claim_target_is_valid(roster: &DeviceRosterV1, slot: &DeviceSlotId) -> bool {
-    linked_device(roster, slot)
-        && roster
-            .devices
-            .get(slot)
-            .is_some_and(|entry| entry.tag_signature_key.is_some())
+/// and its link is made. A local admission hold, such as this device's own
+/// link of it still pending, does not drop a sibling's claim; it holds only
+/// this device's own Adds and claims.
+fn claim_target_is_valid(exchange: &Exchange, slot: &DeviceSlotId) -> bool {
+    linked_device(&exchange.roster, slot) && exchange.link_made(slot)
 }
 
 /// Whether the roster lists `slot` as active or inactive: linked, neither
@@ -589,7 +585,7 @@ impl AppClient {
                     DeviceStatusV1::Active | DeviceStatusV1::Inactive
                 )
                 && entry.settings.add_to_all_chats
-                && entry.tag_signature_key.is_some()
+                && exchange.link_made(slot)
             {
                 siblings.eligible.push(*slot);
                 match self
@@ -742,7 +738,7 @@ impl AppClient {
         };
         if claim.from == exchange.own_slot
             || !claimant_is_eligible(&exchange, &claim.from)
-            || !claim_target_is_valid(&exchange.roster, &claim.to)
+            || !claim_target_is_valid(&exchange, &claim.to)
             || !self.sibling_commit_chats().contains(&claim.chat)
         {
             return Ok(());
@@ -826,7 +822,7 @@ impl AppClient {
             self.sibling_chat_gaps.due.clear();
             self.sibling_chat_gaps
                 .claims
-                .retain(|(_, target), _| claim_target_is_valid(&exchange.roster, target));
+                .retain(|(_, target), _| claim_target_is_valid(&exchange, target));
             self.sibling_chat_gaps.waiting_for_stock.clear();
             self.sibling_chat_gaps.unused_adds.clear();
             self.sibling_chat_gaps.approver_holds.clear();
@@ -885,7 +881,7 @@ impl AppClient {
             .retain(|(chat, target), claims| {
                 claims.retain(|slot, _| claimant_is_eligible(&exchange, slot));
                 known.contains(chat)
-                    && claim_target_is_valid(&exchange.roster, target)
+                    && claim_target_is_valid(&exchange, target)
                     && !claims.is_empty()
             });
         self.sibling_chat_gaps

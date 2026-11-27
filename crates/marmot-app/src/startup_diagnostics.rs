@@ -213,16 +213,11 @@ impl NativeStartupProbe {
 
     /// Move to a non-migration phase, clearing the previous migration number and restarting its timer.
     pub(crate) fn phase(&self, stage: NativeStartupStage) {
-        self.progress(stage, None, false);
+        self.progress(stage, None, 0);
     }
     /// Publish fixed progress only while this scope belongs to the enabled capture generation.
-    /// `completed` counts a successful migration; failed migrations retain their version at retirement.
-    pub(crate) fn progress(
-        &self,
-        stage: NativeStartupStage,
-        version: Option<u32>,
-        completed: bool,
-    ) {
+    /// `completed` counts committed migration entries; failed migrations retain their version at retirement.
+    pub(crate) fn progress(&self, stage: NativeStartupStage, version: Option<u32>, completed: u32) {
         let Some(owner) = &self.owner else {
             return;
         };
@@ -240,10 +235,10 @@ impl NativeStartupProbe {
         active.observation.stage = stage;
         active.stage_started = Instant::now();
         active.observation.migration_version = version;
-        if completed {
-            active.observation.migrations_completed =
-                active.observation.migrations_completed.saturating_add(1);
-        }
+        active.observation.migrations_completed = active
+            .observation
+            .migrations_completed
+            .saturating_add(completed);
         let observation = active.history.then(|| active.snapshot());
         if let Some(observation) = observation {
             state.event(observation);
@@ -406,7 +401,7 @@ mod tests {
         let first_open = app
             .startup_diagnostics
             .observe(NativeStartupStage::MigrationApply);
-        first_open.progress(NativeStartupStage::MigrationApply, Some(104), true);
+        first_open.progress(NativeStartupStage::MigrationApply, Some(104), 1);
         first_open.finish(true);
         let before = app.startup_diagnostics_snapshot();
         for _ in 0..128 {
@@ -432,7 +427,8 @@ mod tests {
             NativeStartupStage::AccountStorageCache
         );
         miss.record_history();
-        miss.progress(NativeStartupStage::MigrationApply, Some(105), true);
+        miss.progress(NativeStartupStage::MigrationInspection, Some(104), 100);
+        miss.progress(NativeStartupStage::MigrationApply, Some(105), 0);
         miss.finish(true);
         let completed = recorder.snapshot();
         assert_eq!(
@@ -447,6 +443,7 @@ mod tests {
             completed.events.last().unwrap().migration_version,
             Some(105)
         );
+        assert_eq!(completed.events.last().unwrap().migrations_completed, 100);
 
         recorder
             .observe_pending_open(NativeStartupStage::AccountStorageCache)

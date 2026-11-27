@@ -625,8 +625,16 @@ Imported identities can use the durable preflight API instead of `login`:
 1. Call `begin_onboarding(nsec, options)` or
    `begin_external_signer_onboarding(public_key, signer, options)`. Supply the
    same `default_relays` (and optional `inbox_relays`) as new-account creation
-   and a separate set of trusted `discovery_relays`. These methods return a
-   persisted account and snapshot before fetching or publishing Nostr records.
+   and a separate set of trusted `discovery_relays`. Two opt-in flags on
+   `OnboardingOptionsFfi` default to `false`: `create_missing_inbox_list` lets
+   MDK automatically publish the recommended kind-10050 inbox list after
+   complete discovery (including the recommended inbox relay) confirms no
+   signed kind-10050 exists, reporting the accepted list in
+   `snapshot.created_inbox_list`; `pass_device_notice_when_none_found` lets
+   `SingleDevice` pass automatically when complete discovery returns
+   `NoneFound`, while still populating `snapshot.single_device_notice`. These
+   methods return a persisted account and snapshot before fetching or
+   publishing Nostr records.
 2. Display the snapshot steps in their returned order (profile, follows, general
    relays, inbox relays, sign-in chat/history notice (`SingleDevice`), KeyPackage). Use step identities,
    not enum discriminants, as positions. Subscribe with `subscribe_onboarding`, read its initial
@@ -687,15 +695,29 @@ Imported identities can use the durable preflight API instead of `login`:
    not answer, and the declared relays may work for other clients. Its approval goes
    past failed sources, but at least one source that counts must answer, and the
    proposal's record must still be the newest any answering source holds. Otherwise it
-   fails with `RecordChanged` or the source failures, as before. Cancelling a relay
+   fails with `RecordChanged` or the source failures, as before. When a non-inconclusive
+   relay proposal hits a partial lookup failure during approval while an authoritative
+   source still confirms its basis is newest, MDK renews the proposal in place with
+   `inconclusive` set and a bumped snapshot revision without signing so the host can
+   show the confirmation instead of discarding the edit. If publishing an approved
+   repair fails because every target definitively refused the event (`RateLimited`,
+   `AuthenticationRequired`, `AccessRestricted`, or other non-ambiguous refusals),
+   MDK records per-relay refusal findings and offers `CancelRepair` (and `EditRelays`
+   on relay steps) alongside `Retry`. Cancelling a relay
    proposal keeps the step's status.
+   When initial `KeyPackage` publication fails because the declared write relays
+   refused the write, `KeyPackage` surfaces per-relay refusal findings and offers
+   `EditRelays` so the host can open the general-relay editor (`OnboardingStep::Relays`)
+   and retry once the write relays are updated.
    Profile fields left unset preserve their current values; an
    explicit empty string clears a field. Display the proposed edits, then pass the returned
    snapshot revision to `approve_onboarding_repair`. For an inbox proposal use
    `read_relays` and an empty `write_relays`. `cancel_onboarding_repair` dismisses
    a proposal until approval has been recorded.
 5. `retry_onboarding_step` requires an offered `Retry` action; `set_onboarding_discovery_relays`
-   retries with explicitly chosen discovery sources without publishing them.
+   retries with explicitly chosen discovery sources without changing existing
+   published declarations (when `create_missing_inbox_list` is enabled, a
+   complete empty lookup can trigger automatic inbox creation).
    After process restart, read `onboarding_snapshot`, register the external
    signer again if applicable, and run/resume or retry the indicated step.
 6. Enter the normal app only when `snapshot.ready` is true. Normal worker
@@ -760,6 +782,8 @@ endpoint roles keep their original tag occurrences, order and extension fields,
 even when selected with equivalent URL spelling; unrelated tags and content remain unchanged. An unchanged selection returns
 `ManualReview` without an approval action. These manual previews use checkpoint
 version 7 because version 6 readers can only revalidate automatic minimal repairs.
+In-flight automatic missing-inbox creation uses checkpoint version 8 so earlier
+readers cannot discard persisted signed bytes or bypass pre-send freshness checks.
 No binding signature changes are required. Downgrading once any of these formats
 is used is unsupported; use a build that supports
 the checkpoint version. Do not relabel versions or delete checkpoints to
@@ -768,7 +792,12 @@ unsupported evidence with this API.
 
 ### Single-device notice
 
-The historical `SingleDevice` step still pauses before initial KeyPackage publication.
+The historical `SingleDevice` step pauses before initial KeyPackage publication
+by default. When `OnboardingOptionsFfi.pass_device_notice_when_none_found` is
+enabled and complete discovery returns `NoneFound`, the step passes
+automatically while keeping `snapshot.single_device_notice` populated so hosts
+can still display the notice; incomplete discovery, malformed packages, or
+`OtherInstallationPossible` still pause for explicit acknowledgment.
 It explains what signing in alone restores, rather than declaring all multi-device
 use unsupported. Suggested localized copy:
 
@@ -1037,16 +1066,17 @@ Direct-chat creation remains atomic. A peer that cannot resolve produces an erro
 ## Account relay health
 
 `account_relay_health(account_ref)` says what MDK already holds about invitations sent through the account's published
-inbox list: the account's cached inbox (kind 10050) and NIP-65 lists and the relay policy that
-`classify_relay_endpoints` exposes. It never dials, waits on a relay or stores anything. A sender on another install
+inbox list: the account's cached inbox (kind 10050) and NIP-65 lists, the relay policy that
+`classify_relay_endpoints` exposes, and what this process's inbox checks found (below). It never dials, waits on a
+relay or stores anything. A sender on another install
 sends an invitation (Welcome) to the relays of the published inbox list; an MDK sender finds no route when that list is
 empty or the policy allows none of it, and never falls back to defaults. This device's inbox route is the entries of the
 list the policy allows, or the configured defaults when it allows none. A sender on this same install (another local
 account, or this account linking a new device) resolves the route through the same fallback to the defaults and may
 still get through. The answer describes the route MDK builds from the held lists: a running device takes a changed route
 at its next routing refresh, so a warning that clears says the lists are fixed, not yet that this device listens on
-them. It says nothing about whether an allowed relay is up or accepts invitations; `liveness` is only the connection
-state.
+them. Without a check it says nothing about whether an allowed relay is up or serves invitations; `liveness` is only
+the connection state.
 
 `AccountRelayHealthFfi` holds:
 
@@ -1055,11 +1085,12 @@ state.
   a read found none, so it cannot tell them apart, and raises no warning for it.
 - `rows`: one `RelayHealthRowFfi` per relay the inbox and NIP-65 lists name, ordered by `url`. `url` is the canonical
   URL that `account_relay_liveness` rows use; an entry that does not parse appears as published. `roles` lists `Inbox`,
-  `Write` (NIP-65 write or unmarked) and `Read` (NIP-65 read or unmarked), in that order. `state` is `Unchecked`
-  (allowed, not checked) or `NotAllowed` (the policy refuses it; this device never dials it), and `fault` says why for
-  `NotAllowed` only: `Retired`, `Invalid` or `Unsafe` (plaintext, a private address, localhost or onion). `liveness` is
-  the row's `account_relay_liveness` status. The states `Healthy`, `Suspected` and `Failing` are defined but not
-  produced yet; they are reserved for relay checks.
+  `Write` (NIP-65 write or unmarked) and `Read` (NIP-65 read or unmarked), in that order. `state` is `NotAllowed` (the
+  policy refuses it; this device never dials it), `Unchecked` (allowed, and no check established anything), or one of
+  the check states below. `fault` says why for `NotAllowed` (`Retired`, `Invalid` or `Unsafe`: plaintext, a private
+  address, localhost or onion), `Failing` and `Suspected`, and is `None` otherwise. `liveness` is the row's
+  `account_relay_liveness` status. `checked_at_unix` is when the check that decided `state` asked the relay, and
+  `checking` says a check of it is running.
 - `warnings`, ordered from the most severe, and `highest_severity`, the first one's (`None` without warnings).
 - `falls_back_to_defaults`: no inbox relay MDK holds is allowed, so the inbox route MDK builds is the configured
   defaults. It is also true while `inbox_list` is `Unknown`, when the real list may name those same relays, so on its
@@ -1071,11 +1102,14 @@ kind needs `inbox_list == Published`; "allowed" means the policy allows it, coun
 | Kind | Severity | Condition | `relays` | `actions` |
 | --- | --- | --- | --- | --- |
 | `InboxListEmpty` | `Critical` | The published inbox list names no relay: an invitation sent through it has nowhere to go | none | `AddInboxRelay` |
-| `NoAllowedInboxRelay` | `Critical` | It names relays and none is allowed: this device never listens on them, so an invitation sent through the list cannot reach it | the entries not allowed | `RemoveInboxRelay`, `AddInboxRelay` |
-| `InboxRelaysNotAllowed` | `Warning` | Some entries are not allowed, beside at least one that is: an invitation sent only to those does not reach this device | the entries not allowed | `RemoveInboxRelay` |
-| `SingleInboxRelay` | `Notice` | Exactly one entry is allowed: an invitation sent through the list reaches this device only there | that relay | `AddInboxRelay` |
+| `NoAllowedInboxRelay` | `Critical` | It names relays and each is not allowed or `Failing`: this device never listens on a refused one, and each failing one refused to serve this account's inbox when checked | every entry | `RemoveInboxRelay`, `AddInboxRelay` |
+| `InboxRelaysNotAllowed` | `Warning` | Some entries are not allowed, beside at least one allowed entry that is not `Failing`: an invitation sent only to those does not reach this device | the entries not allowed | `RemoveInboxRelay` |
+| `InboxRelayFailing` | `Warning` | Some entries are `Failing`, beside at least one allowed entry that is not: each refused to serve this account's inbox when checked (see its `checked_at_unix`) | the failing entries | `RemoveInboxRelay` |
+| `SingleInboxRelay` | `Notice` | Exactly one entry is allowed and not `Failing`: an invitation sent through the list reaches this device at most there | that relay | `AddInboxRelay` |
 
-A list with one allowed entry and some refused ones raises both `InboxRelaysNotAllowed` and `SingleInboxRelay`. The two
+`Unchecked` and `Suspected` entries count as usable: only a refusal a check established takes an entry out, so neither
+ever raises a `Critical`. A list with one usable entry and some refused or failing ones raises the matching `Warning`
+and `SingleInboxRelay`. The two
 `Critical` kinds are about senders that use the published list; a sender on this same install (another local account, or
 this account linking a new device) resolves the route through the same fallback to the defaults and may still get
 through. Severity is for presentation: for example a blocking banner for `Critical`, a dismissible one for `Warning` and
@@ -1085,10 +1119,39 @@ removing every entry first would save an empty inbox list, which that call rejec
 warning: when none is allowed, this device publishes its KeyPackages to its defaults, and an MDK sender that allows none
 reads them from its own defaults, so what MDK holds cannot say that invitations will not arrive.
 
+### Inbox checks
+
+An inbox check asks each allowed inbox relay (the first 16 by URL) once for this account's gift wraps (kind 1059
+addressed to it), on a connection of its own, never the live pool's, answered with the signer the account worker holds,
+and keeps no event. It proves whether the relay served that read when asked, not what any sender will experience. The
+account worker runs it beside its loop. `check_account_relays(account_ref)` asks it for a check and returns
+`account_relay_health` as it reads afterwards; that return value is the answer, and `RelayHealthChanged` follows a
+changed answer from the worker. Without a running account worker the call fails as the account not being active and
+dials nothing. Each relay gets at most 15 seconds; a relay the policy refuses is never dialed. One check runs per account
+at a time: a call while one runs is refused at once with `MarmotKitError.RelayCheckRunning` (nothing was checked; ask
+again once no row says `checking`). The worker also checks once each time it starts or reconnects, only when the
+account's own key signs: a remote or host signer (NIP-46, Amber) is asked to sign a relay's authentication challenge only
+when the host calls `check_account_relays`, so call it from a user action for such an account. Results belong to the
+worker's client and go with it: they last while the account runs, nothing is stored, and a reconnected, restarted or
+re-imported account starts `Unchecked`.
+
+| State | When |
+| --- | --- |
+| `Healthy` | The relay ended the read with EOSE, retried after authenticating when it asked for that. An EOSE carrying NIP-67 `auth` (the relay may withhold events until authentication) still counts: the check proves the relay answered, not that it held nothing back |
+| `Failing` | The account's own key signs and the relay gave an explicit policy answer about this account: it required authentication and then refused the AUTH as `restricted:`, `blocked:` or `payment-required:` (`AuthenticationRequired`), or it closed the read as `payment-required:` (`PaymentRequired`), `restricted:` or `blocked:` (`Restricted`). A refusal like that does not change by asking again |
+| `Suspected` | The same refusals under a remote or host signer, which may not have answered the challenge; an authentication that ended any other way (accepted and still refused, refused for an unexplained or `error:` reason, no reply, a dropped notification, or a signer still signing at the deadline); no connection (`Unreachable`) or no answer in 15 seconds (`TimedOut`) while another relay of the same check answered; or a close that names no refusal (`Unexplained`). Render it as "could not verify" |
+
+A check in which no relay answered establishes nothing and changes no row: the device may be offline. A relay that
+answers `rate-limited:`, to the read or to its authentication, keeps its previous state, and a failed connection never
+makes a relay `Failing`. The worker's own check runs once per start; when the device is offline then, it establishes
+nothing until the next start or a check command. A later check replaces a relay's state with what it establishes.
+
 `RelayHealthChanged { account_id_hex, account_label }` says to read the query again. It fires when the answer, apart
-from each row's `liveness`, differs from the one last announced, which only a change to the account's held relay lists
-causes, and once each time the account's worker starts. A relay connecting or disconnecting never fires it;
-`subscribe_relay_liveness` reports those. Only a running account worker sends it: a list that changes while none runs
+from each row's `liveness`, `checked_at_unix` and `checking`, differs from the one last announced, which a change to the
+account's held relay lists or a state an inbox check established causes, and once each time the account's worker
+starts. It follows the relay lists and check results, not connects and disconnects: connection changes come from
+`subscribe_relay_liveness`. A check that confirms every state, or one starting, fires nothing; the check commands
+return their answer. Only a running account worker sends it: a list that changes while none runs
 (an external-signer account whose signer is not registered, say) announces nothing, so read the query when the account
 starts and when the relay screen opens. It carries no relays, and a missed, late or repeated event is harmless because
 the query is the source of truth.
@@ -1236,12 +1299,18 @@ FFI scheduling, and Swift/Kotlin decoding and rendering.
 
 ## Durable avatar access
 
+Set `disablePublicAvatarAcquisition` on `MarmotOptions` when the host manages permissions for public
+avatar URLs. The avatar worker skips public profile URLs and unencrypted group avatar URLs. Encrypted
+group images remain eligible for acquisition.
+
 Chat rows and conversation header/identity records include `avatarAsset` metadata. For visible content, batch its
-opaque `target` values into `requestAvatarAssets`, then pass returned `reference` values to `readAvatarAssets`. Both
-accept at most 16 items; byte reads additionally require a 1-byte to 16-MiB aggregate budget. A `deferred` result means
-that complete image did not fit the remaining budget. Ready/stale images can render offline; decode and render on the
+opaque `target` values into `requestAvatarAssets`, then pass returned `reference` values to `readAvatarAssets`.
+Explicit `requestAvatarAssets` calls can still queue public avatars with the option set. The worker fetches them
+only when public acquisition is enabled. Both methods accept at most 16 items. Byte reads additionally require a
+1-byte to 16-MiB aggregate budget. A `deferred` result means that the complete image did not fit the remaining
+budget. Ready or stale images can render offline. Decode and render on the
 host, caching decoded images by reference plus content revision. Screen subscriptions update metadata when acquisition
-completes. `clearAvatarCache` clears durable bytes and demand; later visible requests can acquire again.
+completes. `clearAvatarCache` clears durable bytes and demand. Later visible requests can acquire eligible avatars again.
 
 Keep host persistent caches until migration and device validation are complete. See
 [the avatar contract](../../docs/marmot-architecture/further-context/avatar-cache-storage.md)
@@ -1439,7 +1508,9 @@ its delivery deadline, and stays visible through `pending_welcome_deliveries` an
 and `accepted` those that stored it. Of the rest, by the latest attempt, `refused` counts relays that answered and
 said no for any reason (including rate-limited and auth-required), `unreachable` relays that gave no answer, and
 `untried` relays it did not try. `last_problem` says why the latest attempt fell short: `NoInboxRelays`,
-`RefusedByRelays` (every relay tried said no, possibly only for now), `RelaysUnreachable` or `Mixed`. `Sending` can briefly show an accepted relay: MDK saves a relay's acceptance before it marks the
+`InboxLookupFailed` (no usable inbox relay is known and MDK's latest lookup of the recipient's inbox relay list
+failed; MDK looks it up again at its next retry), `RefusedByRelays` (every relay tried said no, possibly only for now),
+`RelaysUnreachable` or `Mixed`. `Sending` can briefly show an accepted relay: MDK saves a relay's acceptance before it marks the
 Welcome delivered, and until that mark lands (in the same pass, or on the next maintenance pass if it failed) MDK may
 still send it; the state then becomes `RelayAccepted` and an `InviteDeliveryChanged` follows.
 
@@ -2435,21 +2506,13 @@ Changing crate types to enable effective LTO also requires revisiting the
 incompatible `embed-bitcode=no` flag and revalidating native Apple artifacts.
 The latest recorded comparison is in [release-profile-measurements.md](release-profile-measurements.md).
 
-The automatic `MarmotKit Release Profile` workflow (`bindings-profile.yml`) is an exact-head packaging
-check, not a comparison benchmark. It builds Kotlin/Swift generation and every
+The `MarmotKit Release Profile` workflow (`bindings-profile.yml`) is an on-demand (`workflow_dispatch`)
+exact-head packaging check, not a comparison benchmark. It builds Kotlin/Swift generation and every
 Android or Apple native target once in parallel, transfers those inputs only
 within the current workflow run, verifies their source, builder, toolchain,
 profile, feature and run provenance, then assembles and validates the Android,
-iOS and macOS candidate packages. Full packaging is opt-in on pull requests:
-`ci:android` selects Kotlin generation and all four Android ABIs, `ci:apple`
-selects the Apple inputs and packages, and `ci:full` selects both platforms.
-After adding a packaging label, re-run all candidate-workflow jobs or push a
-new commit; the workflow reads the current labels. Ordinary PRs retain Rust compilation/API and
-packaging-contract checks without building complete candidate bundles.
-Android target compilation, NDK checks and native linking are deferred unless
-explicitly selected, including for changes to the UniFFI crate.
-Matching `master` pushes always build the complete matrix and open an issue
-when it fails; later pushes do not cancel running or queued candidate builds.
+iOS and macOS candidate packages. It does not trigger automatically on pull requests or `master` pushes;
+run `gh workflow run bindings-profile.yml --ref <branch>` to validate a branch's full candidate bundles.
 Candidate builds use no Cargo cache, so
 every run compiles from a clean target directory.
 The workflow has no schedule of its own. The
@@ -2457,8 +2520,7 @@ The workflow has no schedule of its own. The
 same Android and Apple packages from `master`, but only on nights it does not
 skip: it skips when master has no new green commit or is not on an
 `X.Y.Z-dev` version, and when releases or snapshots keep the macOS runners busy
-for three hours. It does not run `test-native-archive.py`; matching `master`
-pushes do.
+for three hours. It does not run `test-native-archive.py`; `bindings-profile.yml` runs do.
 
 Baseline-versus-candidate measurements are intentionally manual. Run the
 `MarmotKit Release Profile Measurements` workflow from `master` with the full

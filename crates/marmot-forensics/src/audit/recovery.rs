@@ -211,9 +211,8 @@ pub enum TransportCursorTrigger {
     NoticeRetired,
 }
 
-/// Why one relay failed a recovery pass's comparison:
-/// `transport_nostr_adapter::NostrReconciliationFailure`, one to one. Each
-/// names the stage that failed the relay.
+/// Why one relay failed a recovery pass's comparison. Each variant names the
+/// stage that failed the relay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryRelayFailure {

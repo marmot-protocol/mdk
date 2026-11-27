@@ -153,7 +153,9 @@ pub(crate) enum Command {
         about = "Create a new local signing identity"
     )]
     CreateIdentity,
-    #[command(about = "Import an nsec from stdin or add a public npub identity")]
+    #[command(
+        about = "Import an nsec from stdin, pair a NIP-46 remote signer, or add a public npub identity"
+    )]
     Login {
         #[arg(
             value_name = "NPUB_OR_HEX",
@@ -163,12 +165,31 @@ pub(crate) enum Command {
         #[serde(default)]
         #[arg(long, help = "Read an nsec private key from stdin instead of argv")]
         nsec_stdin: bool,
+        #[serde(flatten)]
+        #[command(flatten)]
+        nip46: Nip46PairArgs,
         #[arg(
             long,
             value_name = "URL",
             help = "Command-local relay used for account setup"
         )]
         relay: Option<String>,
+        #[serde(default)]
+        #[arg(
+            long,
+            value_name = "URLS",
+            value_delimiter = ',',
+            help = "Comma-separated account relay list to publish when missing (NIP-46 login)"
+        )]
+        default_relays: Vec<String>,
+        #[serde(default)]
+        #[arg(
+            long,
+            value_name = "URLS",
+            value_delimiter = ',',
+            help = "Comma-separated bootstrap relays used to find account records (NIP-46 login)"
+        )]
+        bootstrap_relays: Vec<String>,
     },
     #[command(about = "Show current account identities")]
     Whoami,
@@ -369,6 +390,107 @@ pub(crate) enum AccountCommand {
             help = "Comma-separated relays to use for relay-list discovery"
         )]
         bootstrap_relays: Vec<String>,
+    },
+    #[command(about = "Manage NIP-46 remote-signing sessions")]
+    Nip46 {
+        #[command(subcommand)]
+        command: Nip46Command,
+    },
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, clap::Args)]
+pub(crate) struct Nip46PairArgs {
+    #[serde(default)]
+    #[arg(long, help = "Read a NIP-46 bunker:// URI from stdin instead of argv")]
+    pub(crate) bunker_stdin: bool,
+    #[serde(default)]
+    #[arg(long, help = "Start client-initiated NIP-46 nostrconnect:// pairing")]
+    pub(crate) nostrconnect: bool,
+    #[serde(default)]
+    #[arg(
+        long,
+        value_name = "URLS",
+        value_delimiter = ',',
+        help = "Comma-separated NIP-46 signer relay URLs for --nostrconnect pairing"
+    )]
+    pub(crate) signer_relays: Vec<String>,
+    #[serde(default)]
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Client display name sent to the NIP-46 remote signer"
+    )]
+    pub(crate) client_name: Option<String>,
+    #[serde(default)]
+    #[arg(
+        long,
+        help = "Explicitly approve the required NIP-46 permissions without an interactive prompt"
+    )]
+    pub(crate) approve_permissions: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+pub(crate) enum Nip46Command {
+    #[command(
+        about = "Log in with a NIP-46 remote signer (bunker:// via stdin or nostrconnect:// pairing)"
+    )]
+    Login {
+        #[serde(flatten)]
+        #[command(flatten)]
+        pair: Nip46PairArgs,
+        #[arg(
+            long,
+            value_name = "URL",
+            help = "Command-local relay used for account setup"
+        )]
+        relay: Option<String>,
+        #[serde(default)]
+        #[arg(
+            long,
+            value_name = "URLS",
+            value_delimiter = ',',
+            help = "Comma-separated account relay list to publish when missing"
+        )]
+        default_relays: Vec<String>,
+        #[serde(default)]
+        #[arg(
+            long,
+            value_name = "URLS",
+            value_delimiter = ',',
+            help = "Comma-separated bootstrap relays used to find account records"
+        )]
+        bootstrap_relays: Vec<String>,
+    },
+    #[command(
+        about = "Re-register or rebind a NIP-46 remote-signing session for an existing external account"
+    )]
+    Register {
+        #[arg(
+            value_name = "NPUB_OR_HEX",
+            help = "Account to rebind; defaults to the selected account"
+        )]
+        account: Option<String>,
+        #[serde(flatten)]
+        #[command(flatten)]
+        pair: Nip46PairArgs,
+    },
+    #[command(about = "Show persisted NIP-46 session and signing-mode status for an account")]
+    Status {
+        #[arg(
+            value_name = "NPUB_OR_HEX",
+            help = "Account to inspect; defaults to the selected account"
+        )]
+        account: Option<String>,
+    },
+    #[command(
+        about = "Disconnect and remove local NIP-46 pairing credentials while keeping encrypted history"
+    )]
+    Remove {
+        #[arg(
+            value_name = "NPUB_OR_HEX",
+            help = "Account whose NIP-46 session should be removed; defaults to the selected account"
+        )]
+        account: Option<String>,
     },
 }
 

@@ -194,6 +194,8 @@ c_mirror! {
         opt_rec thread: MarmotTimelineThreadRef,
         /// The previewed message's own reply target. Nullable.
         opt_str reply_to_message_id_hex,
+        opt_copy has_retention_seconds/retention_seconds: u64,
+        opt_copy has_retention_expires_at/retention_expires_at: u64,
     }
 }
 
@@ -345,7 +347,7 @@ c_mirror! {
         opt_rec agent_item: MarmotAgentItem,
         /// True for an agent item whose first event this device does not
         /// hold, such as one that began before this member joined: the row
-        /// is its earliest edit, showing the latest version.
+        /// is the first edit this device received, with the latest version.
         copy agent_item_first_event_missing: bool,
         rec reactions: MarmotTimelineReactionSummary,
         opt_rec edit: MarmotTimelineEditSummary,

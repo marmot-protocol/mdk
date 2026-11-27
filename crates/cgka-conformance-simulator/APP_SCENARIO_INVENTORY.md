@@ -110,8 +110,8 @@ Use fresh evidence roots and the saved generated input for reproduction.
 
 ## CI placement
 
-The merge queue runs `just simulator-smoke` (ordinary simulator tests and four selected process regressions)
-and the Python campaign-contract tests. It does **not** execute the full 72-case app catalog.
+Canary and full CI run `just simulator-smoke` (ordinary simulator tests and four selected process regressions)
+and the Python campaign-contract tests. They do **not** execute the full 72-case app catalog.
 The nightly workflow runs the broader simulator lane and two separate production-policy
 1,024-message app recovery journeys. The weekly hardening lane runs broader engine/container
 campaigns. Its separate app-catalog job runs the generated canary selection followed by all 72
@@ -119,7 +119,7 @@ seed-7 catalog cases with eight-way participant catch-up, one family at a time, 
 It uses `--generated-only` to exclude fixed journeys and the separately classified invite/rename
 diagnostic. It runs weekly or by manual workflow dispatch, never on PR events.
 
-Focused saved-input regressions and harness tests remain the merge-queue gate for timing fixes. Weekly
+Focused saved-input regressions and harness tests remain the Canary and full-CI gate for timing fixes. Weekly
 workflow execution is a separate result from the verified local catalog run.
 
 ## Recorded validation and remaining gates
@@ -164,7 +164,7 @@ requires repeated activity and recovery in the same long-lived participant proce
 See [the first-increment generator and campaign guide](APP_RECOVERY_EXPANSION.md).
 `public-app-invite-profile-recovery/v1`, `public-app-longevity/v1` and
 `public-app-retained-traffic/v1` add six opt-in selections per seed: invite/profile generator version 2,
-pressure version 3 and longevity version 1. The 48-cycle `public-app-longevity-extended/v1` is separately selected.
+pressure version 4 and longevity version 2. The 48-cycle `public-app-longevity-extended/v1` is separately selected.
 The existing default 72-case campaign is unchanged; use `--catalog expansion`.
 `app_recovery_expansion.rs` checks replay, prefix stability, structural diversity,
 required interactions and rejection of missing/refused recovery evidence.

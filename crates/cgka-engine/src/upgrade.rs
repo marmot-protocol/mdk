@@ -7,7 +7,6 @@
 //! updates to `do_confirm_published`.
 
 use crate::engine::Engine;
-use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::engine::SendResult;
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
@@ -26,6 +25,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
     ) -> Result<SendResult, EngineError> {
         self.epoch_manager.ensure_pending_space()?;
+        self.resume_unfinished_staging_cleanup(group_id)?;
         // Must be Stable to upgrade.
         if let Some(state) = self.epoch_manager.state(group_id)
             && !matches!(state, EpochState::Stable { .. })
@@ -135,8 +135,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
-        let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+        let pending_commit_guard = self.arm_pending_commit_guard(group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
@@ -248,13 +247,6 @@ impl<S: StorageProvider> Engine<S> {
             },
             ..wrapped
         };
-        self.record_sent_openmls_message(
-            &wrapped,
-            commit_bytes.as_slice(),
-            group_id,
-            pre_commit_epoch,
-        )?;
-
         // State: PendingPublish at the projected post-merge epoch (+1).
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
         if mls_group.pending_commit().is_none() {
@@ -262,18 +254,24 @@ impl<S: StorageProvider> Engine<S> {
                 "upgrade produced no pending commit".into(),
             ));
         }
-        let pending_ref = self.epoch_manager.next_pending_ref()?;
         let staged = StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
-        self.invalidate_deferred_peel_candidate_cache(group_id);
-        self.epoch_manager.begin_pending(
+        let prepared_pending = self.epoch_manager.prepare_pending(
             group_id.clone(),
             pre_commit_epoch,
             new_epoch,
             staged,
-            pending_ref,
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
         )?;
+        let pending_ref = prepared_pending.pending_ref();
+        self.record_sent_openmls_message(
+            &wrapped,
+            commit_bytes.as_slice(),
+            group_id,
+            pre_commit_epoch,
+        )?;
+        self.invalidate_deferred_peel_candidate_cache(group_id);
+        self.epoch_manager.commit_pending(prepared_pending);
         self.audit_group(
             group_id,
             crate::audit_helpers::epoch_state_changed_event(

@@ -45,6 +45,8 @@ impl SqliteAppStorage {
         group: &str,
         query: ConversationWindowQuery,
     ) -> Result<ConversationAccountSnapshot, ConversationOpenError> {
+        let group = canonical_group_id_hex(group);
+        let group = group.as_ref();
         opening::validate_window_query(&query)?;
         let group_bytes = hex::decode(group)
             .map_err(|_| StorageError::Serialization("invalid conversation group id".into()))?;

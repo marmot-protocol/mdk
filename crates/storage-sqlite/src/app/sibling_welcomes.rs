@@ -1,7 +1,7 @@
 //! The sibling Welcomes this device admitted from its trusted device group and
 //! has not joined from yet (mdk#2628 item 3.5b). See migration 0160.
 
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex, canonical_group_id_hex_opt};
 use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::StorageResult;
 use rusqlite::params;
@@ -59,6 +59,7 @@ impl SqliteAppStorage {
                 return Ok(false);
             }
         }
+        let held_group_id_hex = canonical_group_id_hex_opt(welcome.held_group_id_hex.as_deref());
         let inserted = tx
             .execute_cached(
                 "INSERT INTO sibling_welcomes_received
@@ -69,7 +70,7 @@ impl SqliteAppStorage {
                     welcome.content,
                     u64_to_i64(welcome.created_at)?,
                     u64_to_i64(welcome.received_at)?,
-                    welcome.held_group_id_hex
+                    held_group_id_hex.as_deref()
                 ],
             )
             .storage()?;
@@ -121,11 +122,12 @@ impl SqliteAppStorage {
         message_id_hex: &str,
         group_id_hex: &str,
     ) -> StorageResult<()> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         self.lock()?
             .execute_cached(
                 "UPDATE sibling_welcomes_received SET held_group_id_hex = ?2
                  WHERE message_id_hex = ?1",
-                params![message_id_hex, group_id_hex],
+                params![message_id_hex, group_id_hex.as_ref()],
             )
             .storage()?;
         Ok(())

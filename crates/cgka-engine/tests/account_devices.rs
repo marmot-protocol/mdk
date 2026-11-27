@@ -60,6 +60,7 @@ use cgka_traits::transport::{
 };
 use cgka_traits::types::{GroupId, MemberId, MessageId};
 use openmls::component::ComponentData;
+use openmls::credentials::NewSignerBundle;
 use openmls::extensions::{
     AppDataDictionary, AppDataDictionaryExtension, Extension, ExtensionValidator, Extensions,
 };
@@ -317,7 +318,7 @@ fn a_stored_history_key_from_another_suite_is_refused_without_replacement() {
             b"history offer",
             &sealed,
         ),
-        Some(b"bundle key".to_vec()),
+        Some(cgka_traits::SecretBytes::new(b"bundle key".to_vec())),
         "the stored pair and ciphertext are valid under their own suite"
     );
     let wrong_suite = |error: EngineError| {
@@ -799,6 +800,9 @@ struct Parts {
     /// place of its update's bytes, as a client that resolves the update its
     /// own way would.
     app_data_state: Vec<(u16, Vec<u8>)>,
+    /// A new signature key for the committer's leaf, carried in its update
+    /// path with `leaf_extensions`, as [`rotated_leaf`] builds them.
+    new_signer: Option<SignatureKeyPair>,
 }
 
 /// A Commit `sender` builds with raw OpenMLS, bypassing the engine's send
@@ -828,7 +832,7 @@ fn crafted_welcome(
     group_info_extensions: Vec<Extension>,
     recipient: &Device,
 ) -> TransportMessage {
-    let (_, bundle) = craft_bundle(
+    crafted_welcome_of(
         sender,
         gid,
         Parts {
@@ -837,7 +841,19 @@ fn crafted_welcome(
             group_info_extensions,
             ..Parts::default()
         },
-    );
+        recipient,
+    )
+}
+
+/// The Welcome of the Commit `sender` builds from `parts` as [`craft_bundle`]
+/// does, for `recipient`'s account.
+fn crafted_welcome_of(
+    sender: &Device,
+    gid: &GroupId,
+    parts: Parts,
+    recipient: &Device,
+) -> TransportMessage {
+    let (_, bundle) = craft_bundle(sender, gid, parts);
     let payload = bundle
         .into_welcome_msg()
         .expect("a Commit that adds members has a Welcome")
@@ -935,16 +951,24 @@ fn craft_bundle(
         updater.set(ComponentData::from_parts(component_id, state.into()));
     }
     builder.with_app_data_dictionary_updates(updater.changes());
-    let bundle = builder
-        .build(
+    let bundle = match &parts.new_signer {
+        None => builder.build(
             provider.rand(),
             provider.crypto(),
             &device_signer(sender),
             |_| true,
-        )
-        .expect("raw OpenMLS builds the commit")
-        .stage_commit(&provider)
-        .expect("raw OpenMLS stages the commit");
+        ),
+        Some(new_signer) => builder.build_with_new_signer(
+            provider.rand(),
+            provider.crypto(),
+            &device_signer(sender),
+            new_signer_bundle(sender, gid, new_signer),
+            |_| true,
+        ),
+    }
+    .expect("raw OpenMLS builds the commit")
+    .stage_commit(&provider)
+    .expect("raw OpenMLS stages the commit");
     let verdict = authorize_staged_commit(
         &group,
         gid,
@@ -1000,6 +1024,24 @@ fn standalone_app_data_update(
         .propose_app_data_update(&provider, &device_signer(sender), component_id, operation)
         .expect("raw OpenMLS builds the proposal");
     group_transport(message, gid, "standalone-app-data-update")
+}
+
+fn new_signer_bundle<'a>(
+    sender: &Device,
+    gid: &GroupId,
+    signer: &'a SignatureKeyPair,
+) -> NewSignerBundle<'a, SignatureKeyPair> {
+    NewSignerBundle {
+        signer,
+        credential_with_key: CredentialWithKey {
+            credential: load_group(sender, gid)
+                .own_leaf_node()
+                .unwrap()
+                .credential()
+                .clone(),
+            signature_key: signer.public().into(),
+        },
+    }
 }
 
 /// A standalone GroupContextExtensions proposal that keeps every extension

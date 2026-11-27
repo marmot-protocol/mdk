@@ -351,10 +351,9 @@ id of one, and deliver with `ingest_raw` / `join_raw`, which finish an `InboxSea
     `LinkDeviceUnsettled` instead of a queued link while convergence is unsettled, an own Commit is in flight, or an
     intent waits in the queue. Its undo, `UnlinkDevice` (D40): one privileged Commit removing the linked leaf and its
     entry, which the removed device sees as its removal; refused for another leaf than one other leaf of the account,
-    an update that doesn't remove exactly one listed entry, a `removed` record that keeps neither the entry's tag
-    signature key nor the signature key of a removed leaf that has committed, any `removed` record while the removed
-    leaf is still its link's KeyPackage leaf, so a pending link is never recorded as `removed` (sender rules only;
-    receivers accept either, mdk#3679), or
+    an update that doesn't remove exactly one listed entry, a `removed` record that keeps another key than the entry's
+    tag signature key, any `removed` record while the removed leaf is still its link's KeyPackage leaf and did not
+    found the group, so a pending link is never recorded as `removed` (mdk#3679) while the founder is, or
     while an own Commit is in flight or an intent waits in the queue. A device it removed that forgot its copy joins again through the next link's Welcome, which no forget
     cutoff dates.
 
@@ -379,9 +378,10 @@ id of one, and deliver with `ingest_raw` / `join_raw`, which finish an `InboxSea
     tag that doesn't open never invalidates a Commit; another account's leaf is unclaimed; a Commit, standalone
     proposal or Welcome that requires 0x800f is rejected; a GroupContext entry under it is unknown data the engine
     never writes. Producing them:
-    a device that sets its own key in a roster update tags that Commit's UpdatePath; every KeyPackage it then builds
-    carries a fresh tag, and an untagged or no longer matching one is stale; only the entry at its own slot tags, so
-    another entry carrying its key tags nothing and an entry moved off its slot stops it tagging; a founder tags its
+    a joined device tags the UpdatePath of its first device-group Commit after its Add, whose entry the Add already
+    keyed; every KeyPackage it then builds carries a fresh tag, and an untagged or no longer matching one is stale;
+    only the entry at its own slot tags, so a device holding another slot, whose entry carries another key, tags
+    nothing; a founder tags its
     founding leaf from the roster it founds, from its own entry only; each kind of own Commit tags a leaf that needs a
     tag, and the members accept it; a leaf whose tag reads as its own keeps it; without a named device group nothing is
     tagged; naming a seeded group hydrates it, and a quarantined one tags nothing while a tagged KeyPackage stays

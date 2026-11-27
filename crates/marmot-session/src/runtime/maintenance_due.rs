@@ -218,14 +218,19 @@ where
     }
 
     fn key_package_due(&self, now: Timestamp, due: &mut MaintenanceDue) -> AccountResult<()> {
+        let current_endpoints = self.routing.key_package_endpoints();
         let Some(lifecycle) = self.session.key_package_lifecycle()? else {
-            // Paused maintenance prepares no new KeyPackage.
-            if !self.key_package_slot_withdrawn && !self.maintenance_paused {
+            // Paused maintenance prepares no new KeyPackage, and no KeyPackage
+            // can be staged or published while zero publication endpoints are configured.
+            if !self.key_package_slot_withdrawn
+                && !self.maintenance_paused
+                && !current_endpoints.is_empty()
+            {
                 due.owed();
             }
             return Ok(());
         };
-        // Private material expires whether or not maintenance is paused.
+        // Private material expires whether or not maintenance is paused or routes exist.
         due.at_opt(lifecycle.current_not_after);
         due.at_opt(
             lifecycle
@@ -236,20 +241,27 @@ where
         for material in &lifecycle.retained_private_material {
             due.at(material.delete_at());
         }
-        if self.key_package_slot_withdrawn {
+        if self.key_package_slot_withdrawn || current_endpoints.is_empty() {
             return Ok(());
         }
         // The current publication's unacknowledged relays, at their backoff.
         if self.key_package_has_pending_fanout()? {
             for target in &lifecycle.publication_targets {
-                due.at_opt(target_retry_at(target));
+                if !current_endpoints.contains(&target.endpoint) {
+                    continue;
+                }
+                if target.state == TransportFanoutAttemptState::PolicyProhibited {
+                    due.owed();
+                } else {
+                    due.at_opt(target_retry_at(target));
+                }
             }
         }
         // Paused maintenance finishes publishing what is prepared and
         // prepares nothing new, as the run does.
         match lifecycle.pending_replacement.as_ref() {
             Some(pending)
-                if self.pending_replacement_obsolete(&lifecycle, pending)
+                if self.pending_replacement_obsolete(&lifecycle, pending, now)
                     || pending.signed_event.is_none() =>
             {
                 if !self.maintenance_paused {
@@ -257,8 +269,14 @@ where
                 }
             }
             Some(pending) => {
-                for target in &pending.targets {
-                    due.at_opt(target_retry_at(target));
+                if has_newly_authorized_pending_target(&pending.targets, &current_endpoints) {
+                    due.owed();
+                } else {
+                    for target in &pending.targets {
+                        if current_endpoints.contains(&target.endpoint) {
+                            due.at_opt(target_retry_at(target));
+                        }
+                    }
                 }
             }
             None if self.maintenance_paused => {}

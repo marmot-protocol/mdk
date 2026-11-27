@@ -6,7 +6,7 @@ mod selection;
 mod small_state;
 mod window;
 use crate::app::account_projection::chat_mute_is_effective;
-use crate::base::connection::CachedSql;
+use crate::base::connection::{CachedSql, canonical_group_id_hex};
 use crate::cross::views::{
     disband_requests_by_group_hex_tx, disbanding_group_ids_hex_tx,
     disbanding_group_ids_hex_with_requests_tx, pending_leave_requests_by_group_hex_tx,
@@ -543,6 +543,30 @@ impl SqliteAppStorage {
         )
     }
 
+    /// Distinct groups in `app_events` holding at least one row whose pinned
+    /// source-epoch retention expiry has reached `now_seconds`, sorted by
+    /// group id. Scans the partial index
+    /// `idx_app_events_group_retention_expiry` (only rows with
+    /// `retention_expires_at IS NOT NULL`, keyed by `(group_id_hex,
+    /// retention_expires_at)`) so groups whose current policy is `0` or that
+    /// are absent from `chat_list_rows` are still discovered.
+    pub fn groups_with_expiring_app_events(&self, now_seconds: u64) -> StorageResult<Vec<String>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT DISTINCT group_id_hex
+                 FROM app_events
+                 WHERE retention_expires_at IS NOT NULL
+                   AND retention_expires_at <= ?1
+                 ORDER BY group_id_hex ASC",
+            )
+            .storage()?;
+        stmt.query_map([u64_to_i64(now_seconds)?], |row| row.get(0))
+            .storage()?
+            .collect::<Result<Vec<String>, _>>()
+            .storage()
+    }
+
     /// Direct-conversation candidates for a peer-keyed reuse lookup.
     ///
     /// Returns only rows whose durable projection is currently classified as
@@ -610,6 +634,8 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         pinned: bool,
     ) -> Result<ChatPinState, ChatPinError> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
+        let group_id_hex = group_id_hex.as_ref();
         self.connection.with_transaction(|| {
             let mut conn = self.lock()?;
             let archived = conn
@@ -656,9 +682,13 @@ impl SqliteAppStorage {
         &self,
         ordered_group_ids: &[String],
     ) -> Result<ChatPinState, ChatPinError> {
+        let ordered_group_ids = ordered_group_ids
+            .iter()
+            .map(|id| canonical_group_id_hex(id).into_owned())
+            .collect::<Vec<_>>();
         self.connection.with_transaction(|| {
             let mut conn = self.lock()?;
-            for group_id_hex in ordered_group_ids {
+            for group_id_hex in &ordered_group_ids {
                 let exists = conn
                     .query_row_cached(
                         "SELECT EXISTS(
@@ -687,11 +717,9 @@ impl SqliteAppStorage {
                 ));
             }
             if current != ordered_group_ids {
-                rewrite_pinned_chat_order_tx(&mut conn, ordered_group_ids)?;
+                rewrite_pinned_chat_order_tx(&mut conn, &ordered_group_ids)?;
             }
-            Ok(ChatPinState {
-                ordered_group_ids: ordered_group_ids.to_vec(),
-            })
+            Ok(ChatPinState { ordered_group_ids })
         })
     }
 
@@ -785,6 +813,8 @@ impl SqliteAppStorage {
         message_ids_hex: &[String],
         mention_classifier: &MentionClassifier<'_>,
     ) -> StorageResult<(Option<ChatListRow>, bool)> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
+        let group_id_hex = group_id_hex.as_ref();
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let before: Option<(String, String, i64, i64)> = conn.query_row_cached(
@@ -855,6 +885,8 @@ impl SqliteAppStorage {
         group_id_hex: &str,
         mention_classifier: &MentionClassifier<'_>,
     ) -> StorageResult<Option<ChatListRow>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
+        let group_id_hex = group_id_hex.as_ref();
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let Some(group) = account_group_tx(&conn, group_id_hex)? else {
@@ -882,6 +914,8 @@ impl SqliteAppStorage {
         manually_unread: bool,
         mention_classifier: &MentionClassifier<'_>,
     ) -> StorageResult<Option<ChatListRow>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
+        let group_id_hex = group_id_hex.as_ref();
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let Some(group) = account_group_tx(&conn, group_id_hex)? else {
@@ -919,6 +953,8 @@ impl SqliteAppStorage {
         message_id_hex: &str,
         mention_classifier: &MentionClassifier<'_>,
     ) -> StorageResult<Option<ChatListRow>> {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
+        let group_id_hex = group_id_hex.as_ref();
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             if let Some(target) =
@@ -1035,16 +1071,17 @@ fn rewrite_pinned_chat_order_tx(
     tx.execute_cached("DELETE FROM chat_pin_positions", [])
         .storage()?;
     for (ordinal, group_id_hex) in ordered_group_ids.iter().enumerate() {
+        let group_id_hex = canonical_group_id_hex(group_id_hex);
         let ordinal = i64::try_from(ordinal)
             .map_err(|_| ChatPinError::InvalidOrder("too many pinned chats".to_owned()))?;
         tx.execute_cached(
             "INSERT INTO chat_pin_positions (group_id_hex, ordinal) VALUES (?1, ?2)",
-            params![group_id_hex, ordinal],
+            params![group_id_hex.as_ref(), ordinal],
         )
         .storage()?;
         tx.execute_cached(
             "UPDATE chat_list_rows SET list_pin_ordinal = ?2, list_pin_position = ?2 WHERE group_id_hex = ?1",
-            params![group_id_hex, ordinal],
+            params![group_id_hex.as_ref(), ordinal],
         ).storage()?;
     }
     tx.execute_cached(
@@ -1089,6 +1126,8 @@ fn refresh_chat_list_row_tx(
     group_id_hex: &str,
     mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<Option<ChatListRow>> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
+    let group_id_hex = group_id_hex.as_ref();
     let Some(group) = account_group_tx(tx, group_id_hex)? else {
         tx.execute_cached(
             "DELETE FROM chat_list_rows WHERE group_id_hex = ?1",
@@ -1108,6 +1147,8 @@ fn refresh_chat_list_row_for_messages_tx(
     message_ids_hex: &[String],
     mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<Option<ChatListRow>> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
+    let group_id_hex = group_id_hex.as_ref();
     let Some(group) = account_group_tx(tx, group_id_hex)? else {
         tx.execute_cached(
             "DELETE FROM chat_list_rows WHERE group_id_hex = ?1",
@@ -2187,6 +2228,8 @@ fn retention_expiry_scan_tx(
     now_seconds: u64,
     skew_now_seconds: u64,
 ) -> StorageResult<RetentionExpiryScan> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
+    let group_id_hex = group_id_hex.as_ref();
     let group = rusqlite::types::Value::Text(group_id_hex.to_owned());
     let now = rusqlite::types::Value::Integer(u64_to_i64(now_seconds)?);
     let skew_now = rusqlite::types::Value::Integer(u64_to_i64(skew_now_seconds)?);
@@ -2268,6 +2311,8 @@ pub(crate) fn refresh_chat_list_unread_after_secure_prune_tx(
     group_id_hex: &str,
     mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<()> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
+    let group_id_hex = group_id_hex.as_ref();
     let read_state = read_state_tx(tx, group_id_hex)?;
     let unread = rebuild_unread_membership_tx(
         tx,
@@ -2330,6 +2375,7 @@ fn account_groups_tx(tx: &Connection) -> StorageResult<Vec<AccountGroupRow>> {
 }
 
 fn account_group_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option<AccountGroupRow>> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
     tx.query_row_cached(
         "SELECT ag.group_id_hex, ag.archived, ag.pending_confirmation, ag.profile_name,
                 image_hash_hex, image_key_hex, image_nonce_hex,
@@ -2340,7 +2386,7 @@ fn account_group_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option
             ON avatar_url.group_id_hex = ag.group_id_hex
            AND avatar_url.component_id = ?2
          WHERE ag.group_id_hex = ?1",
-        params![group_id_hex, GROUP_AVATAR_URL_COMPONENT_ID],
+        params![group_id_hex.as_ref(), GROUP_AVATAR_URL_COMPONENT_ID],
         account_group_from_row,
     )
     .optional()
@@ -2573,6 +2619,7 @@ fn read_state_tx(
     tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<Option<ConversationReadState>> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
     tx.query_row_cached(
         "SELECT last_read_message_id_hex, last_read_timeline_at,
                 last_read_order_class, last_read_order_primary,
@@ -2580,7 +2627,7 @@ fn read_state_tx(
                 initialized_at, manually_marked_unread
          FROM conversation_read_state
          WHERE group_id_hex = ?1",
-        params![group_id_hex],
+        params![group_id_hex.as_ref()],
         |row| {
             Ok(ConversationReadState {
                 last_read_message_id_hex: row.get(0)?,
@@ -2715,13 +2762,14 @@ pub(crate) fn chat_list_row_tx(
     tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<Option<ChatListRow>> {
+    let group_id_hex = canonical_group_id_hex(group_id_hex);
     let now_ms = unix_now_ms();
     let sql = format!(
         "{CHAT_LIST_ROW_SELECT_LIST} {CHAT_PIN_POSITION_SQL} AS pinned_position
          {CHAT_LIST_ROW_JOINS} {CHAT_PIN_JOIN}
          WHERE row.group_id_hex = ?1"
     );
-    tx.query_row_cached(&sql, params![group_id_hex], |row| {
+    tx.query_row_cached(&sql, params![group_id_hex.as_ref()], |row| {
         chat_list_row_from_row(row, now_ms)
     })
     .optional()

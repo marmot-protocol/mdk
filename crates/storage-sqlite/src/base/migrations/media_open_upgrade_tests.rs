@@ -402,18 +402,36 @@ fn observer_faults_do_not_change_storage_results_and_progress_names_the_migratio
         &observer,
     )
     .unwrap();
-    assert!(
-        progress
-            .borrow()
-            .contains(&crate::StorageOpenProgress::MigrationStarted(105))
-    );
-    assert!(
-        progress
-            .borrow()
-            .contains(&crate::StorageOpenProgress::MigrationFinished {
-                version: 105,
-                success: true
-            })
+    // A fresh database starts from the migration baseline: the only migration
+    // progress through its last version is that one version, started and finished.
+    let baseline = crate::base::migrations::BASELINE_VERSION as u32;
+    let covered_count = crate::base::migrations::MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= i64::from(baseline))
+        .count() as u32;
+    let covered = progress
+        .borrow()
+        .iter()
+        .filter(|value| match value {
+            crate::StorageOpenProgress::MigrationStarted(version)
+            | crate::StorageOpenProgress::MigrationFinished { version, .. }
+            | crate::StorageOpenProgress::MigrationBatchFinished { version, .. } => {
+                *version <= baseline
+            }
+            crate::StorageOpenProgress::Phase(_) => false,
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        covered,
+        vec![
+            crate::StorageOpenProgress::MigrationStarted(baseline),
+            crate::StorageOpenProgress::MigrationBatchFinished {
+                version: baseline,
+                success: true,
+                migrations_completed: covered_count,
+            },
+        ]
     );
     drop(store);
     let failed_observer = |_| panic!("synthetic observer fault");

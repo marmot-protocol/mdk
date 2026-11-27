@@ -49,7 +49,8 @@ use marmot_session::{
     KeyPackageSlotWithdrawal, MaintenanceTiming, MonotonicClock, NoopKeyPackagePublisher,
     PendingCommit, PendingCommitState, PendingResolution, PublishWork, PublishedApplicationMessage,
     SessionConfig, SessionError, StaticTransportRouting, TransportRoutingError,
-    TransportRoutingPolicy, WallClock, WelcomeWithdrawal,
+    TransportRoutingPolicy, WallClock, WelcomeRouteLookup, WelcomeRouteLookupPlan,
+    WelcomeWithdrawal,
 };
 use nostr::prelude::FinalizeEvent;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
@@ -8646,7 +8647,8 @@ async fn owed_work_has_no_due_time_and_a_pause_owes_no_new_key_package() {
     let mut runtime = AccountDeviceRuntime::new(
         session(dir.path().join("alice.sqlite"), &key, b"alice"),
         RecordingAdapter::default(),
-        StaticTransportRouting::new(vec![]),
+        StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
         RecordingKeyPackages::default(),
     );
     let due = runtime.maintenance_due(&[]).unwrap();

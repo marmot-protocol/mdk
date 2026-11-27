@@ -76,6 +76,12 @@ in one `marmot_set_account_inbox_relays` call, since an empty inbox list is reje
 `MarmotRelayWarningKind`, `MarmotRelayHealthFault`, `MarmotRelayRepairAction`, `MarmotRelayRole` and
 `MarmotRelayHealthState`: keep a default case.
 
+`marmot_check_account_relays` runs the shared [inbox check](../marmot-uniffi/README.md#inbox-checks) and writes the
+account's relay health after it, freed with `marmot_account_relay_health_free`. It blocks the calling thread for up to
+about 15 seconds, so keep it off the UI thread. While a check of the account runs it returns
+`MARMOT_STATUS_RELAY_CHECK_RUNNING` at once; without a running account worker it fails and dials nothing. Read a row's `checked_at_unix` only when `has_checked_at_unix` is true; `checking` says a check
+of it is running.
+
 
 ## Direct-follow availability
 
@@ -222,8 +228,14 @@ context retain nonblocking cleanup to avoid deadlock and are not a process-teard
 
 `MarmotOnboardingFinding` includes typed context, check purpose and outcome,
 declared capability, an owned `actions`/`actions_len` array, and optional
-`has_observed_revision`/`observed_revision`. Free all nested findings and actions
-through `marmot_onboarding_snapshot_free`; do not free the arrays separately.
+`has_observed_revision`/`observed_revision`. Free all nested findings, actions,
+and any `created_inbox_list` through `marmot_onboarding_snapshot_free`; do not
+free nested fields separately. Use `marmot_begin_onboarding_with_options` with
+`MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST` (`1`) and/or
+`MARMOT_ONBOARDING_PASS_DEVICE_NOTICE_WHEN_NONE_FOUND` (`2`) to opt in to
+automatic missing-inbox creation or passing the `SingleDevice` step on complete
+`NoneFound` discovery (`marmot_begin_onboarding` passes `0`, and unknown flag
+bits return `MARMOT_STATUS_INVALID_ARGUMENT`).
 See the shared [diagnostic evidence limits](../marmot-uniffi/README.md#interactive-account-onboarding)
 before interpreting query success as relay capability or publication evidence.
 

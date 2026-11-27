@@ -12,13 +12,15 @@
 //! again. A direct send's refusal comes before anything is written; so does a
 //! queued one's, checked before the queue, and the drain checks it again.
 
-use super::device_roster::{clocked_roster_device, key_package_ref, roster_device, slot};
+use super::device_roster::{
+    clocked_roster_device, key_package_ref, roster_device, roster_of, roster_update, slot,
+};
 use super::device_tag::hold_slot;
 use super::send_intents::Untouched;
 use super::tagged_siblings::*;
 use super::*;
 use cgka_engine::private_key_packages::SiblingWelcome;
-use cgka_traits::app_components::DEVICE_ROSTER_COMPONENT_ID;
+use cgka_traits::app_components::{DEVICE_ROSTER_COMPONENT_ID, DeviceRosterOperationV1};
 use cgka_traits::engine::KeyPackageSource;
 use cgka_traits::error::SiblingAddRefusal;
 use cgka_traits::message::{MessageRecord, MessageState};
@@ -86,28 +88,9 @@ async fn an_applied_sibling_self_remove_holds_private_adds() {
     let replacement = handed(&mut laptop, slot(2), slot(1));
     let tablet_replacement = handed(&mut laptop, slot(2), slot(3));
     // A readable trusted roster can recognize the departing sibling while
-    // this observer's own tag key is not ready. This is a valid non-user edit,
-    // preserving its entry and user marker, not a corrupt roster fixture.
-    let original_entry =
-        super::device_roster::roster_of(&phone, &device_group).devices[&slot(1)].clone();
-    let mut unready = original_entry.clone();
-    unready.tag_signature_key = None;
-    let edit = super::device_roster::roster_update(
-        &device_group,
-        vec![cgka_traits::app_components::DeviceRosterOperationV1::SetDevice(slot(1), unready)],
-    );
-    let edit = send_commit(&mut phone, edit, &device_group).await;
-    for receiver in [&mut laptop, &mut tablet] {
-        assert_accepted(receiver, &edit, &device_group).await;
-    }
-    let roster = super::device_roster::roster_of(&phone, &device_group);
-    assert_eq!(
-        cgka_engine::device_tag::device_tag_claim(
-            load_group(&phone, &gid).own_leaf_node().unwrap(),
-            &roster
-        ),
-        cgka_traits::app_components::DeviceTagClaim::Unclaimed
-    );
+    // this observer's own tag is not ready: it holds a slot the roster does
+    // not list, so it has no entry of its own to tag from.
+    super::device_tag::hold_slot(&phone, slot(9));
 
     let SendResult::Proposal { msg } = laptop
         .engine
@@ -234,19 +217,7 @@ async fn an_applied_sibling_self_remove_holds_private_adds() {
             .contains(&slot(2)),
         "a recognized sibling departure is independent of observer tag readiness"
     );
-    let restore = super::device_roster::roster_update(
-        &device_group,
-        vec![
-            cgka_traits::app_components::DeviceRosterOperationV1::SetDevice(
-                slot(1),
-                original_entry,
-            ),
-        ],
-    );
-    let restore = send_commit(&mut phone, restore, &device_group).await;
-    for receiver in [&mut laptop, &mut tablet] {
-        assert_accepted(receiver, &restore, &device_group).await;
-    }
+    super::device_tag::hold_slot(&phone, slot(1));
     assert_eq!(
         phone
             .engine
@@ -2136,6 +2107,65 @@ async fn a_queued_sibling_add_is_checked_before_the_queue_and_at_drain() {
     assert!(owed(&m.bob).is_empty());
 }
 
+/// A sibling's private KeyPackage verifies against the roster before its
+/// link is made: the Add that linked it set its key (marmot#521). Here
+/// bob holds the laptop's KeyPackage while the laptop's first commit in the
+/// device group has not reached him, as when a branch drops that commit
+/// after the KeyPackage arrived. Admission, shared by every send and queue
+/// drain, refuses the Add as `LinkPending` until that commit lands.
+#[tokio::test]
+async fn a_sibling_whose_link_is_not_made_is_not_added() {
+    let mut bob = roster_device(b"bob");
+    let mut laptop = roster_device(b"bob");
+    let device_gid = super::device_roster::found_device_group(
+        &mut bob,
+        &super::device_roster::roster(&[(1, "Phone"), (2, "Laptop")]),
+        &mut [&mut laptop],
+    )
+    .await;
+    for (device, own) in [(&mut bob, slot(1)), (&mut laptop, slot(2))] {
+        hold_slot(device, own);
+        device
+            .engine
+            .set_device_tag_group(Some(device_gid.clone()))
+            .unwrap();
+    }
+    super::device_tag::set_own_key(&mut bob, slot(1), &device_gid, &mut [&mut laptop]).await;
+    let laptop_entry = roster_of(&laptop, &device_gid).devices[&slot(2)].clone();
+    let first_commit = send_commit(
+        &mut laptop,
+        roster_update(
+            &device_gid,
+            vec![DeviceRosterOperationV1::SetDevice(slot(2), laptop_entry)],
+        ),
+        &device_gid,
+    )
+    .await;
+    let sibling = handed(&mut laptop, slot(2), slot(1));
+    let mut m = routed_members(chat_device(b"alice"), bob).await;
+    let gid = m.gid.clone();
+
+    assert_eq!(
+        m.bob.engine.sibling_add_refusal(&gid, &sibling).unwrap(),
+        Some(SiblingAddRefusal::LinkPending)
+    );
+    let before = (Untouched::of(&m.bob, &gid), rows(&m.bob, &gid));
+    assert_refused(
+        m.bob
+            .engine
+            .send(add_own_devices(&gid, vec![sibling.clone()]))
+            .await,
+        "the sibling's link is not made yet",
+    );
+    assert_eq!((Untouched::of(&m.bob, &gid), rows(&m.bob, &gid)), before);
+
+    assert_accepted(&mut m.bob, &first_commit, &device_gid).await;
+    assert_eq!(
+        m.bob.engine.sibling_add_refusal(&gid, &sibling).unwrap(),
+        None
+    );
+}
+
 /// Creation's one canonical founding Add retains a sibling's private
 /// Welcome separately from the ordinary invitee's transport Welcome. Both
 /// receivers join the same epoch, and the private key is consumed only by
@@ -2388,9 +2418,7 @@ async fn delivered_sibling_welcome_repair_uses_target_participation_not_the_adds
         let original_entry = roster.devices[&slot(2)].clone();
         let mut leaving = original_entry.clone();
         leaving.status = DeviceStatusV1::Leaving;
-        let mut untagged = original_entry.clone();
-        untagged.tag_signature_key = None;
-        for entry in [leaving, untagged] {
+        for entry in [leaving] {
             let update = super::device_roster::roster_update(
                 &device_group,
                 vec![DeviceRosterOperationV1::SetDevice(slot(2), entry.clone())],
@@ -2600,10 +2628,14 @@ async fn delivered_sibling_welcome_repair_uses_target_participation_not_the_adds
             "update_proposal={target_uses_update_proposal}"
         );
         assert!(owed(&phone).is_empty());
-        let remove = super::device_roster::roster_update(
-            &device_group,
-            vec![DeviceRosterOperationV1::RemoveDevice(slot(2))],
-        );
+        // A keyed entry goes with its leaf ("Key binding").
+        let remove = SendIntent::UnlinkDevice {
+            group_id: device_group.clone(),
+            leaf_signature_key: laptop.engine.own_signature_key(),
+            roster_update: super::device_roster::update_bytes(vec![
+                DeviceRosterOperationV1::RemoveDevice(slot(2)),
+            ]),
+        };
         send_commit(&mut phone, remove, &device_group).await;
         let absent_roster = super::device_roster::roster_of(&phone, &device_group);
         assert!(!absent_roster.devices.contains_key(&slot(2)));

@@ -5,7 +5,6 @@
 //! bounded convergence gate have completed.
 
 use crate::engine::Engine;
-use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
     APP_COMPONENTS_COMPONENT_ID, AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID,
@@ -74,7 +73,8 @@ impl<S: StorageProvider> Engine<S> {
                 data: encode_group_lifecycle_v1(GroupLifecycleV1::Active),
             });
         }
-        self.do_send_update_app_components(group_id, updates).await
+        self.do_send_enable_disbanding_updates(group_id, updates)
+            .await
     }
 
     /// Persist the irreversible product intent and install its durable send
@@ -252,6 +252,7 @@ impl<S: StorageProvider> Engine<S> {
         if !matches!(state, EpochState::Stable { .. }) {
             return Ok(None);
         }
+        self.resume_unfinished_staging_cleanup(group_id)?;
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let Some(mut mls_group) = self.load_mls_group_in(provider.storage(), group_id)? else {
@@ -305,7 +306,7 @@ impl<S: StorageProvider> Engine<S> {
         ];
 
         self.epoch_manager.ensure_pending_space()?;
-        let guard = PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+        let guard = self.arm_pending_commit_guard(group_id.clone());
         let context = crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let commit = self
             .stage_commit_with_app_data_updates(
@@ -360,7 +361,16 @@ impl<S: StorageProvider> Engine<S> {
             former_members,
         };
         request.last_prepared_epoch = Some(source_epoch);
-        let pending = self.epoch_manager.next_pending_ref()?;
+        let target_epoch = EpochId(source_epoch.0.saturating_add(1));
+        let prepared_pending = self.epoch_manager.prepare_pending(
+            group_id.clone(),
+            source_epoch,
+            target_epoch,
+            StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
+            crate::epoch_manager::PendingKind::Disband,
+            self.current_audit_context.clone(),
+        )?;
+        let pending = prepared_pending.pending_ref();
         // Keep the earlier irreversible Pending request on failure, while
         // publishing no candidate or sent artifact from this failed attempt.
         let content_id = self.storage.with_transaction(|storage| {
@@ -376,17 +386,8 @@ impl<S: StorageProvider> Engine<S> {
             Ok::<_, EngineError>(content_id)
         })?;
 
-        let target_epoch = EpochId(source_epoch.0.saturating_add(1));
         self.invalidate_deferred_peel_candidate_cache(group_id);
-        self.epoch_manager.begin_pending(
-            group_id.clone(),
-            source_epoch,
-            target_epoch,
-            StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
-            pending,
-            crate::epoch_manager::PendingKind::Disband,
-            self.current_audit_context.clone(),
-        )?;
+        self.epoch_manager.commit_pending(prepared_pending);
         self.track_pending_origin_commit(pending, wrapped.id.clone());
         self.sent_message_ids.insert(wrapped.id.clone());
         self.sent_message_ids.insert(content_id);

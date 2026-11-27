@@ -43,7 +43,7 @@ use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerStorage, ConvergencePassStorage, GroupStorage, MessageStorage,
-    StorageProvider,
+    StorageProvider, WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -4405,4 +4405,1421 @@ async fn a_welcome_retired_with_its_lost_commit_reads_as_superseded() {
         status(&withdrawn.id, 0),
         OutboundWelcomeStatus::Settled(WelcomeSettlement::Withdrawn)
     );
+}
+
+/// Rewrite the fixed-width `u64` epoch inside an MLS `PublicMessage` commit
+/// whose `FramedContent.group_id` is a 16-byte OpenMLS group id.
+fn rewrite_commit_claimed_epoch(
+    mls_bytes: &[u8],
+    expected_epoch: u64,
+    claimed_epoch: u64,
+) -> Vec<u8> {
+    const EPOCH_OFFSET: usize = 2 + 2 + 1 + 16;
+    assert_eq!(
+        &mls_bytes[EPOCH_OFFSET..EPOCH_OFFSET + 8],
+        &expected_epoch.to_be_bytes(),
+        "expected FramedContent epoch at computed offset"
+    );
+    let mut forged = mls_bytes.to_vec();
+    forged[EPOCH_OFFSET..EPOCH_OFFSET + 8].copy_from_slice(&claimed_epoch.to_be_bytes());
+    assert_eq!(claimed_mls_epoch(&forged), EpochId(claimed_epoch));
+    forged
+}
+
+fn build_current_client_with_storage(
+    id: &[u8],
+) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let engine = EngineBuilder::new(storage.clone())
+        .protocol_profile(ProtocolProfile::Current)
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    (engine, storage)
+}
+
+/// A healthy Current-profile multi-member creator merges its founding Add
+/// `0 -> 1` atomically with `join_epoch = 0` and `local_copy_install_epoch = 0`
+/// and never creates `openmls-retained-anchor-0`. An unverified commit claiming
+/// epoch `0` must be rejected as stale both outside and during an active
+/// convergence pass — never triggering `MissingRetainedAnchor` / `Unrecoverable`.
+#[tokio::test]
+async fn current_profile_creator_rejects_unverified_epoch_zero_commit_without_halting() {
+    let (mut alice, alice_storage) = build_current_client_with_storage(b"cur-creator-alice");
+    let (mut bob, bob_storage) = build_current_client_with_storage(b"cur-creator-bob");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "current-creator-epoch0".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let bob_welcome = match create {
+        SendResult::FoundingGroupCreated { welcomes } => {
+            seal_and_bind(&mut alice, &welcomes).remove(0)
+        }
+        other => panic!("expected FoundingGroupCreated, got {other:?}"),
+    };
+    join_raw(&mut bob, bob_welcome).await.unwrap();
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(
+        alice_storage.get_group(&group_id).unwrap().join_epoch,
+        EpochId(0)
+    );
+    assert_eq!(
+        alice_storage
+            .get_group(&group_id)
+            .unwrap()
+            .local_copy_install_epoch,
+        EpochId(0)
+    );
+    assert!(
+        alice_storage
+            .list_group_snapshots(&group_id)
+            .unwrap()
+            .contains(&"openmls-retained-anchor-1".to_string()),
+        "founding create must atomically retain the canonical epoch-1 anchor"
+    );
+    assert!(
+        !alice_storage
+            .list_group_snapshots(&group_id)
+            .unwrap()
+            .contains(&"openmls-retained-anchor-0".to_string()),
+        "precondition: Current-profile founding create never has an epoch-0 anchor"
+    );
+
+    // Forge an unverified commit claiming epoch 0 by rewriting a real epoch-1 commit.
+    let base_commit = raw_self_update_commit(&bob_storage, &bob.self_id(), &group_id);
+    let forged_epoch0 = forged_rival_envelope(
+        rewrite_commit_claimed_epoch(&base_commit.payload, 1, 0),
+        &group_id,
+    );
+
+    // (1) Normal ingest (no active pass): must reject as stale, never halt.
+    let outcome = alice.ingest(forged_epoch0).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::AlreadyAtEpoch {
+                    current: EpochId(1),
+                    msg_epoch: EpochId(0),
+                }
+            }
+        ),
+        "epoch-0 claim on Current creator must be stale, not buffered for MissingRetainedAnchor; got {outcome:?}"
+    );
+    let pass_after_normal = alice
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert!(pass_after_normal.errors.is_empty());
+    assert!(!alice_storage.get_group(&group_id).unwrap().unrecoverable);
+
+    // (2) Active convergence pass open at epoch 1: another forged epoch-0
+    // commit must not enter or poison the active pass.
+    let real_commit = match bob
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            bob.confirm_published(pending).await.unwrap();
+            TransportMessage {
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: group_id.as_slice().to_vec(),
+                },
+                ..msg
+            }
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    let buffered = alice.ingest(real_commit).await.unwrap();
+    assert!(matches!(buffered, IngestOutcome::Buffered { .. }));
+    assert!(
+        alice_storage
+            .convergence_pass(&group_id)
+            .unwrap()
+            .is_some_and(|pass| pass.is_active()),
+        "precondition: an active convergence pass is open"
+    );
+
+    let mut forged_epoch0_b_bytes = rewrite_commit_claimed_epoch(&base_commit.payload, 1, 0);
+    let last = forged_epoch0_b_bytes.len() - 1;
+    forged_epoch0_b_bytes[last] ^= 0x01;
+    let forged_epoch0_b = forged_rival_envelope(forged_epoch0_b_bytes, &group_id);
+
+    let outcome_during_pass = alice.ingest(forged_epoch0_b).await.unwrap();
+    assert!(
+        matches!(
+            outcome_during_pass,
+            IngestOutcome::Stale {
+                reason: StaleReason::AlreadyAtEpoch {
+                    current: EpochId(1),
+                    msg_epoch: EpochId(0),
+                }
+            }
+        ),
+        "active pass must not admit an unanchored epoch-0 claim; got {outcome_during_pass:?}"
+    );
+
+    let settled = alice
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert!(
+        settled.errors.is_empty(),
+        "active pass must settle without MissingRetainedAnchor; got {:?}",
+        settled.errors
+    );
+    assert_eq!(settled.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(2));
+    assert!(!alice_storage.get_group(&group_id).unwrap().unrecoverable);
+    assert!(
+        !alice.drain_events().iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupUnrecoverable { group_id: halted } if halted == &group_id
+        )),
+        "healthy creator must never emit GroupUnrecoverable"
+    );
+}
+
+/// A healthy upgraded legacy database (`join_epoch == 0` and
+/// `local_copy_install_epoch == 0`) that joined at epoch 2 and advanced to
+/// epoch 3 holds anchors `{2, 3}` and no anchors `{0, 1}`. An unverified commit
+/// claiming epoch 0 or 1 must never halt the group during normal ingest, during
+/// an active pass, or when already stored in the convergence queue.
+#[tokio::test]
+async fn legacy_unrecorded_floor_group_rejects_unanchored_past_epoch_during_normal_and_active_pass()
+{
+    let (mut alice, _alice_storage) = build_client_with_storage(b"legacy-floor-alice");
+    let (mut bob, bob_storage) = build_client_with_storage(b"legacy-floor-bob");
+    let (mut carol, carol_storage) = build_client_with_storage(b"legacy-floor-carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "legacy-zero-floor".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let bob_welcome = match create {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
+            alice.confirm_published(pending).await.unwrap();
+            welcome
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    join_raw(&mut bob, bob_welcome).await.unwrap();
+
+    // Carol joins at epoch 2, then advances to epoch 3 (anchors `{2, 3}`).
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (invite_commit, carol_welcome) = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            msg,
+            pending,
+            welcomes,
+        } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
+            alice.confirm_published(pending).await.unwrap();
+            (msg, welcome)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    join_raw(&mut carol, carol_welcome).await.unwrap();
+    bob.ingest(TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..invite_commit
+    })
+    .await
+    .unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+
+    let epoch2_to_3 = match alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            TransportMessage {
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: group_id.as_slice().to_vec(),
+                },
+                ..msg
+            }
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    carol.ingest(epoch2_to_3.clone()).await.unwrap();
+    carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    bob.ingest(epoch2_to_3).await.unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+
+    // Simulate a pre-column upgraded DB: both floor columns read 0 while
+    // anchors `{2, 3}` are intact.
+    let mut legacy_record = carol_storage.get_group(&group_id).unwrap();
+    legacy_record.join_epoch = EpochId(0);
+    legacy_record.local_copy_install_epoch = EpochId(0);
+    carol_storage.put_group(&legacy_record).unwrap();
+
+    let base_commit = raw_self_update_commit(&bob_storage, &bob.self_id(), &group_id);
+
+    // (1) Normal ingest of an unverified commit claiming unanchored epoch 1.
+    let forged_epoch1 = forged_rival_envelope(
+        rewrite_commit_claimed_epoch(&base_commit.payload, 3, 1),
+        &group_id,
+    );
+    let outcome = carol.ingest(forged_epoch1).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::AlreadyAtEpoch {
+                    current: EpochId(3),
+                    msg_epoch: EpochId(1),
+                }
+            }
+        ),
+        "unanchored pre-history claim on legacy DB must be stale; got {outcome:?}"
+    );
+    assert!(
+        carol
+            .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+            .unwrap()
+            .errors
+            .is_empty()
+    );
+    assert!(!carol_storage.get_group(&group_id).unwrap().unrecoverable);
+
+    // (2) Active pass open at epoch 3: forged commit claiming unanchored epoch 0
+    // must not enter or poison the pass.
+    let epoch3_to_4 = match alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            TransportMessage {
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: group_id.as_slice().to_vec(),
+                },
+                ..msg
+            }
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    assert!(matches!(
+        carol.ingest(epoch3_to_4).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    let forged_epoch0 = forged_rival_envelope(
+        rewrite_commit_claimed_epoch(&base_commit.payload, 3, 0),
+        &group_id,
+    );
+    let active_outcome = carol.ingest(forged_epoch0).await.unwrap();
+    assert!(
+        matches!(
+            active_outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::AlreadyAtEpoch {
+                    current: EpochId(3),
+                    msg_epoch: EpochId(0),
+                }
+            }
+        ),
+        "active pass must reject unanchored non-history claim; got {active_outcome:?}"
+    );
+    let settled = carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert!(settled.errors.is_empty(), "got {:?}", settled.errors);
+    assert_eq!(settled.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(4));
+    assert!(!carol_storage.get_group(&group_id).unwrap().unrecoverable);
+
+    // (3) Defense-in-depth: even if an unanchored non-history commit row was
+    // buffered directly into convergence storage, graph seeding drops it as
+    // BeyondAnchor without triggering MissingRetainedAnchor or Unrecoverable.
+    let mut forged_stored_bytes = rewrite_commit_claimed_epoch(&base_commit.payload, 3, 1);
+    let last = forged_stored_bytes.len() - 1;
+    forged_stored_bytes[last] ^= 0x02;
+    let forged_stored = forged_rival_envelope(forged_stored_bytes, &group_id);
+    let forged_stored_id = forged_stored.id.clone();
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, forged_stored, 1_000)
+        .unwrap();
+    let seeded_result = carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+    // CandidateStateUnavailable is the non-blocking empty-candidate verdict
+    // when the sole buffered commit drops as BeyondAnchor.
+    assert_eq!(
+        seeded_result.errors,
+        vec![CanonicalizationError::CandidateStateUnavailable],
+        "stored non-history unanchored commit must drop without MissingRetainedAnchor; got {:?}",
+        seeded_result.errors
+    );
+    assert_eq!(seeded_result.convergence_status, ConvergenceStatus::Settled);
+    assert!(
+        seeded_result.dropped_messages.iter().any(|dropped| {
+            dropped.message_id == hex::encode(forged_stored_id.as_slice())
+                && dropped.reason
+                    == cgka_engine::canonicalization::DroppedMessageReason::BeyondAnchor
+        }),
+        "stored non-history unanchored commit must be dropped BeyondAnchor; got {:?}",
+        seeded_result.dropped_messages
+    );
+    assert!(!carol_storage.get_group(&group_id).unwrap().unrecoverable);
+    assert_eq!(
+        carol_storage.get_message(&forged_stored_id).unwrap().state,
+        MessageState::EpochInvalidated
+    );
+    assert!(
+        !carol.drain_events().iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupUnrecoverable { group_id: halted } if halted == &group_id
+        )),
+        "healthy legacy DB group must never emit GroupUnrecoverable"
+    );
+}
+
+/// `seed_stored_openmls_graph_inputs` and pass seeding must enforce
+/// `local_copy_install_epoch` even when `join_epoch == 0` (replacement Welcome
+/// shape) and `retained_anchor_epoch == 0`.
+#[tokio::test]
+async fn seed_enforces_local_copy_install_epoch_when_join_epoch_is_zero() {
+    let (mut alice, _alice_storage) = build_client_with_storage(b"seed-install-alice");
+    let (mut bob, bob_storage) = build_client_with_storage(b"seed-install-bob");
+    let (mut carol, carol_storage) = build_client_with_storage(b"seed-install-carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "seed-install-floor".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let bob_welcome = match create {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
+            alice.confirm_published(pending).await.unwrap();
+            welcome
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    join_raw(&mut bob, bob_welcome).await.unwrap();
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (invite_commit, carol_welcome) = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            msg,
+            pending,
+            welcomes,
+        } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
+            alice.confirm_published(pending).await.unwrap();
+            (msg, welcome)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    join_raw(&mut carol, carol_welcome).await.unwrap();
+    bob.ingest(TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..invite_commit
+    })
+    .await
+    .unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+
+    // Advance Carol to epoch 3, then set replacement-Welcome shape:
+    // `join_epoch = 0`, `local_copy_install_epoch = 2`.
+    let epoch2_to_3 = match alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            TransportMessage {
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: group_id.as_slice().to_vec(),
+                },
+                ..msg
+            }
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    carol.ingest(epoch2_to_3.clone()).await.unwrap();
+    carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    bob.ingest(epoch2_to_3).await.unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+
+    let mut replaced = carol_storage.get_group(&group_id).unwrap();
+    replaced.join_epoch = EpochId(0);
+    replaced.local_copy_install_epoch = EpochId(2);
+    carol_storage.put_group(&replaced).unwrap();
+
+    let base_commit = raw_self_update_commit(&bob_storage, &bob.self_id(), &group_id);
+    let below_install = forged_rival_envelope(
+        rewrite_commit_claimed_epoch(&base_commit.payload, 3, 1),
+        &group_id,
+    );
+    let below_install_id = below_install.id.clone();
+
+    // Buffer directly (bypassing ingest) so `seed_stored_openmls_graph_inputs`
+    // and pass seeding must independently enforce `local_copy_install_epoch`.
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, below_install, 1_000)
+        .unwrap();
+
+    let direct_canonical = canonicalize_stored_openmls_messages(
+        &carol_storage,
+        &group_id,
+        CanonicalizationState {
+            current_tip_epoch: 3,
+            retained_anchor_epoch: 0,
+            last_convergence_relevant_input_ms: 0,
+            seen_message_ids: BTreeSet::new(),
+        },
+        vec![],
+        CanonicalizationPolicy::default(),
+        1_000_000,
+    )
+    .unwrap();
+    // CandidateStateUnavailable is the non-blocking empty-candidate verdict
+    // when the sole buffered commit drops as BeyondAnchor.
+    assert_eq!(
+        direct_canonical.errors,
+        vec![CanonicalizationError::CandidateStateUnavailable],
+        "direct graph seeding must drop below-install commits instead of reporting MissingRetainedAnchor; got {:?}",
+        direct_canonical.errors
+    );
+    assert_eq!(
+        direct_canonical.convergence_status,
+        ConvergenceStatus::Settled
+    );
+    assert!(
+        direct_canonical.dropped_messages.iter().any(|dropped| {
+            dropped.message_id == hex::encode(below_install_id.as_slice())
+                && dropped.reason
+                    == cgka_engine::canonicalization::DroppedMessageReason::BeyondAnchor
+        }),
+        "below-install commit must be reported BeyondAnchor; got {:?}",
+        direct_canonical.dropped_messages
+    );
+
+    let pass = carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+    assert!(pass.errors.is_empty(), "got {:?}", pass.errors);
+    assert!(!carol_storage.get_group(&group_id).unwrap().unrecoverable);
+    assert!(
+        !carol.drain_events().iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupUnrecoverable { group_id: halted } if halted == &group_id
+        )),
+        "rejoined copy must not emit GroupUnrecoverable for a below-install commit"
+    );
+}
+
+/// Regression for PR #3817 review blocker: a pre-#1843 automatic rejoin reset
+/// `join_epoch = 0` (and upgraded with `local_copy_install_epoch = 0`) while
+/// keeping retained anchors from the membership interval before removal.
+/// A retained old anchor must never satisfy the missing-anchor local-history
+/// proof for an epoch in the removal-to-rejoin gap; only epochs proven on the
+/// installed copy's own lineage may trigger `MissingRetainedAnchor`.
+#[tokio::test]
+async fn upgraded_automatic_rejoin_with_retained_old_anchors_rejects_gap_commit_without_halting() {
+    let (mut alice, _alice_storage) = build_client_with_storage(b"rejoin-gap-alice");
+    let (mut bob, bob_storage) = build_client_with_storage(b"rejoin-gap-bob");
+    let (mut carol, carol_storage) = build_client_with_storage(b"rejoin-gap-carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "rejoin-gap-anchors".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (bob_welcome, carol_welcome) = match create {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let mut welcomes = seal_and_bind(&mut alice, &welcomes);
+            alice.confirm_published(pending).await.unwrap();
+            let carol_welcome = welcomes.remove(1);
+            (welcomes.remove(0), carol_welcome)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    join_raw(&mut bob, bob_welcome).await.unwrap();
+    join_raw(&mut carol, carol_welcome).await.unwrap();
+
+    let route = |msg: TransportMessage| TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    };
+
+    // Interval 1: advance 1 -> 2, then Alice removes Carol at 2 -> 3.
+    let epoch1_to_2 = match alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            route(msg)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    bob.ingest(epoch1_to_2.clone()).await.unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    carol.ingest(epoch1_to_2).await.unwrap();
+    carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+
+    let remove_carol = match alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![carol.self_id()],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            route(msg)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    bob.ingest(remove_carol.clone()).await.unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    carol.ingest(remove_carol).await.unwrap();
+    carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert!(carol_storage.get_group(&group_id).unwrap().removed);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+
+    // Gap while Carol is removed: Alice advances 3 -> 4, Bob captures a real
+    // commit from epoch 4, then Alice re-invites Carol at 4 -> 5.
+    let epoch3_to_4 = match alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            route(msg)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    bob.ingest(epoch3_to_4).await.unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(4));
+    let gap_commit_epoch4 = raw_self_update_commit(&bob_storage, &bob.self_id(), &group_id);
+
+    let carol_rejoin_kp = carol.fresh_key_package().await.unwrap();
+    let (reinvite_commit, carol_rejoin_welcome) = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_rejoin_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            msg,
+            pending,
+            welcomes,
+        } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
+            alice.confirm_published(pending).await.unwrap();
+            (route(msg), welcome)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    bob.ingest(reinvite_commit).await.unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+
+    // Automatic rejoin after removal keeps old anchors from Interval 1.
+    join_raw(&mut carol, carol_rejoin_welcome).await.unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(5));
+
+    // Simulate pre-#1843 upgraded DB: both floor columns read 0 while anchors
+    // from before removal (`1`, `2`, `3`) and after rejoin (`5`) coexist.
+    let mut upgraded = carol_storage.get_group(&group_id).unwrap();
+    upgraded.join_epoch = EpochId(0);
+    upgraded.local_copy_install_epoch = EpochId(0);
+    carol_storage.put_group(&upgraded).unwrap();
+
+    let snapshots = carol_storage.list_group_snapshots(&group_id).unwrap();
+    assert!(
+        snapshots.iter().any(|s| s == "openmls-retained-anchor-1")
+            && snapshots.iter().any(|s| s == "openmls-retained-anchor-2")
+            && snapshots.iter().any(|s| s == "openmls-retained-anchor-5")
+            && !snapshots.iter().any(|s| s == "openmls-retained-anchor-4"),
+        "fixture must hold pre-removal anchors alongside rejoin anchor with gap at 4; got {snapshots:?}"
+    );
+
+    // (a) Delayed commit from gap epoch 4 at tip epoch 5 must be rejected as
+    // stale rather than buffered for MissingRetainedAnchor.
+    let outcome = carol.ingest(gap_commit_epoch4.clone()).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::AlreadyAtEpoch {
+                    current: EpochId(5),
+                    msg_epoch: EpochId(4),
+                }
+            }
+        ),
+        "delayed gap commit must be rejected as stale despite older retained anchors; got {outcome:?}"
+    );
+    assert!(
+        carol
+            .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+            .unwrap()
+            .errors
+            .is_empty()
+    );
+    assert!(!carol_storage.get_group(&group_id).unwrap().unrecoverable);
+
+    // (b) Advance installed copy 5 -> 6 and verify a gap epoch-4 commit still
+    // rejects cleanly (both on live ingest and if buffered into storage).
+    let epoch5_to_6 = match alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            route(msg)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    let bob_rival_epoch5 = raw_self_update_commit(&bob_storage, &bob.self_id(), &group_id);
+    carol.ingest(epoch5_to_6.clone()).await.unwrap();
+    carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(6));
+
+    let mut gap_bytes_2 = gap_commit_epoch4.payload.clone();
+    let last = gap_bytes_2.len() - 1;
+    gap_bytes_2[last] ^= 0x01;
+    let gap_commit_epoch4_at_6 = forged_rival_envelope(gap_bytes_2, &group_id);
+    let outcome_at_6 = carol.ingest(gap_commit_epoch4_at_6).await.unwrap();
+    assert!(
+        matches!(
+            outcome_at_6,
+            IngestOutcome::Stale {
+                reason: StaleReason::AlreadyAtEpoch {
+                    current: EpochId(6),
+                    msg_epoch: EpochId(4),
+                }
+            }
+        ),
+        "gap commit after post-rejoin advance must still be stale; got {outcome_at_6:?}"
+    );
+    assert!(!carol_storage.get_group(&group_id).unwrap().unrecoverable);
+
+    let mut gap_bytes_3 = gap_commit_epoch4.payload.clone();
+    let last = gap_bytes_3.len() - 1;
+    gap_bytes_3[last] ^= 0x02;
+    let buffered_gap = forged_rival_envelope(gap_bytes_3, &group_id);
+    let buffered_gap_id = buffered_gap.id.clone();
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, buffered_gap, 1_000)
+        .unwrap();
+    let seeded = carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+    // CandidateStateUnavailable is the non-blocking empty-candidate verdict
+    // after dropping the sole buffered commit as BeyondAnchor.
+    assert_eq!(
+        seeded.errors,
+        vec![CanonicalizationError::CandidateStateUnavailable],
+        "buffered gap commit must drop as BeyondAnchor without MissingRetainedAnchor; got {:?}",
+        seeded.errors
+    );
+    assert_eq!(seeded.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        carol_storage.get_message(&buffered_gap_id).unwrap().state,
+        MessageState::EpochInvalidated
+    );
+    assert!(!carol_storage.get_group(&group_id).unwrap().unrecoverable);
+
+    // (c) Positive control (2-step lineage through an intermediate anchor):
+    // advance the installed copy 6 -> 7 (keeping anchor 6), then lose epoch 5's
+    // anchor. Authenticated lineage 7 <- C6 <- anchor(6) <- C5 proves epoch 5
+    // belongs to this installed copy, so Bob's epoch-5 rival still fails closed.
+    let epoch6_to_7 = match alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            route(msg)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    carol.ingest(epoch6_to_7).await.unwrap();
+    carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(7));
+
+    carol_storage
+        .release_group_snapshot(&group_id, "openmls-retained-anchor-5")
+        .unwrap();
+    let rival_outcome = carol.ingest(bob_rival_epoch5).await.unwrap();
+    assert!(
+        matches!(
+            rival_outcome,
+            IngestOutcome::Buffered {
+                epoch: EpochId(5),
+                ..
+            }
+        ),
+        "genuine missing anchor on the installed copy must still buffer for MissingRetainedAnchor; got {rival_outcome:?}"
+    );
+    let halted = carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert_eq!(
+        halted.errors,
+        vec![CanonicalizationError::MissingRetainedAnchor]
+    );
+    assert!(carol_storage.get_group(&group_id).unwrap().unrecoverable);
+}
+
+/// A pre-#1843 fork rejoin left `Processed` commits from the discarded branch
+/// in `cgka_messages` alongside `join_epoch = 0, local_copy_install_epoch = 0`.
+/// Even when the reinstalled branch later advances so `Processed` commit epoch
+/// numbers appear contiguous across the rejoin boundary, confirmation-tag
+/// verification against the installed copy's live state and retained anchors
+/// must prevent a discarded-branch `Processed` commit from proving local
+/// history for the installed copy.
+#[tokio::test]
+async fn upgraded_fork_rejoin_does_not_chain_discarded_branch_processed_commits() {
+    let (mut alice, _alice_storage) = build_client_with_storage(b"fork-rejoin-alice");
+    let (mut bob, bob_storage) = build_client_with_storage(b"fork-rejoin-bob");
+    let (mut carol, carol_storage) = build_client_with_storage(b"fork-rejoin-carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "fork-rejoin-lineage".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (bob_welcome, carol_welcome) = match create {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let mut welcomes = seal_and_bind(&mut alice, &welcomes);
+            alice.confirm_published(pending).await.unwrap();
+            let carol_welcome = welcomes.remove(1);
+            (welcomes.remove(0), carol_welcome)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    join_raw(&mut bob, bob_welcome).await.unwrap();
+    join_raw(&mut carol, carol_welcome).await.unwrap();
+
+    let route = |msg: TransportMessage| TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    };
+
+    // Branch A (Bob + Carol): advance 1 -> 2 -> 3 -> 4 so Carol persists
+    // `Processed` commits at source epochs 1, 2, 3 on Branch A.
+    let mut branch_a_epoch2_commit = None;
+    for step in 0..3 {
+        let commit = match bob
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            SendResult::GroupEvolution { msg, pending, .. } => {
+                bob.confirm_published(pending).await.unwrap();
+                route(msg)
+            }
+            other => panic!("expected GroupEvolution, got {other:?}"),
+        };
+        if step == 1 {
+            branch_a_epoch2_commit = Some(commit.clone());
+        }
+        carol.ingest(commit).await.unwrap();
+        carol
+            .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+            .unwrap();
+    }
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(4));
+    let base_epoch2_commit = branch_a_epoch2_commit.unwrap();
+
+    // Branch B (Alice): remove Carol at 1 -> 2, then re-invite Carol at 2 -> 3
+    // so Carol receives a replacement Welcome on Branch B at epoch 3.
+    match alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![carol.self_id()],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    }
+    let carol_rejoin_kp = carol.fresh_key_package().await.unwrap();
+    let carol_branch_b_welcome = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_rejoin_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            pending, welcomes, ..
+        } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
+            alice.confirm_published(pending).await.unwrap();
+            welcome
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+
+    // Carol offers and explicitly confirms the Branch B rejoin at epoch 3,
+    // releasing Branch A's anchors while leaving Branch A's `Processed`
+    // commits at source epochs 1, 2, 3 in `cgka_messages`.
+    let offer_err = join_raw(&mut carol, carol_branch_b_welcome).await;
+    assert!(
+        offer_err.is_err(),
+        "active fork rejoin must require consent"
+    );
+    let offer = carol_storage
+        .list_welcomes()
+        .unwrap()
+        .into_iter()
+        .find(|w| w.group_id == group_id && w.rejoin.is_some())
+        .expect("rejoin offer stored");
+    let token = offer.rejoin.unwrap().local_state_token;
+    carol
+        .confirm_group_rejoin(&offer.message_id, &token)
+        .await
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+
+    // Simulate pre-#1843 upgrade (`join_epoch = 0, local_copy_install_epoch = 0`).
+    let mut upgraded = carol_storage.get_group(&group_id).unwrap();
+    upgraded.join_epoch = EpochId(0);
+    upgraded.local_copy_install_epoch = EpochId(0);
+    carol_storage.put_group(&upgraded).unwrap();
+
+    // (a) At epoch 3 on Branch B: Branch A's `Processed` commit at epoch 2 must
+    // not match live Branch B epoch 3's confirmation tag.
+    let mut epoch2_claim_1 = base_epoch2_commit.payload.clone();
+    let last = epoch2_claim_1.len() - 1;
+    epoch2_claim_1[last] ^= 0x11;
+    let outcome_at_3 = carol
+        .ingest(forged_rival_envelope(epoch2_claim_1, &group_id))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome_at_3,
+            IngestOutcome::Stale {
+                reason: StaleReason::AlreadyAtEpoch {
+                    current: EpochId(3),
+                    msg_epoch: EpochId(2),
+                }
+            }
+        ),
+        "discarded-branch Processed commit must not prove history at rejoin tip; got {outcome_at_3:?}"
+    );
+    assert!(!carol_storage.get_group(&group_id).unwrap().unrecoverable);
+
+    // (b) Advance Branch B 3 -> 4 so `Processed` commit epoch numbers {2, 3}
+    // look contiguous up to tip 4, while anchor 3 belongs to Branch B.
+    let branch_b_3_to_4 = match alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            route(msg)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    carol.ingest(branch_b_3_to_4).await.unwrap();
+    carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(4));
+
+    let mut epoch2_claim_2 = base_epoch2_commit.payload.clone();
+    let last = epoch2_claim_2.len() - 1;
+    epoch2_claim_2[last] ^= 0x22;
+    let outcome_at_4 = carol
+        .ingest(forged_rival_envelope(epoch2_claim_2, &group_id))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome_at_4,
+            IngestOutcome::Stale {
+                reason: StaleReason::AlreadyAtEpoch {
+                    current: EpochId(4),
+                    msg_epoch: EpochId(2),
+                }
+            }
+        ),
+        "discarded-branch Processed commit must not chain through Branch B's anchor 3; got {outcome_at_4:?}"
+    );
+    assert!(!carol_storage.get_group(&group_id).unwrap().unrecoverable);
+
+    // (c) Defense-in-depth direct buffering of epoch-2 claim drops BeyondAnchor.
+    let mut epoch2_claim_3 = base_epoch2_commit.payload.clone();
+    let last = epoch2_claim_3.len() - 1;
+    epoch2_claim_3[last] ^= 0x33;
+    let buffered_epoch2 = forged_rival_envelope(epoch2_claim_3, &group_id);
+    let buffered_epoch2_id = buffered_epoch2.id.clone();
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, buffered_epoch2, 1_000)
+        .unwrap();
+    let seeded = carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+    assert_eq!(
+        seeded.errors,
+        vec![CanonicalizationError::CandidateStateUnavailable]
+    );
+    assert_eq!(
+        carol_storage
+            .get_message(&buffered_epoch2_id)
+            .unwrap()
+            .state,
+        MessageState::EpochInvalidated
+    );
+    assert!(!carol_storage.get_group(&group_id).unwrap().unrecoverable);
+
+    // (d) Positive control: losing Branch B's own epoch-3 anchor still fails
+    // closed when a commit claiming epoch 3 arrives.
+    carol_storage
+        .release_group_snapshot(&group_id, "openmls-retained-anchor-3")
+        .unwrap();
+    let bob_base = raw_self_update_commit(&bob_storage, &bob.self_id(), &group_id);
+    let epoch3_rival = forged_rival_envelope(
+        rewrite_commit_claimed_epoch(&bob_base.payload, 4, 3),
+        &group_id,
+    );
+    let rival_outcome = carol.ingest(epoch3_rival).await.unwrap();
+    assert!(
+        matches!(
+            rival_outcome,
+            IngestOutcome::Buffered {
+                epoch: EpochId(3),
+                ..
+            }
+        ),
+        "genuine missing Branch B anchor must still buffer; got {rival_outcome:?}"
+    );
+    let halted = carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert_eq!(
+        halted.errors,
+        vec![CanonicalizationError::MissingRetainedAnchor]
+    );
+    assert!(carol_storage.get_group(&group_id).unwrap().unrecoverable);
+}
+
+/// Regression for Codex PR #3817 review finding: when a collecting pass holds
+/// an unresolved commit at an anchored epoch strictly below an unanchored past
+/// commit (admitted by `active_pass_has_anchored_commit_below`), graph seeding
+/// must preserve the descendant commit so candidate replay from the anchored
+/// root can authenticate the full chain instead of dropping the descendant as
+/// `BeyondAnchor` / `EpochInvalidated`.
+#[tokio::test]
+async fn collecting_pass_preserves_unanchored_descendant_commit_above_anchored_root() {
+    let (mut alice, _alice_storage) = build_client_with_storage(b"descendant-chain-alice");
+    let (mut bob, _bob_storage) = build_client_with_storage(b"descendant-chain-bob");
+    let (mut carol, carol_storage) = build_client_with_storage(b"descendant-chain-carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "descendant-chain".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (bob_welcome, carol_welcome) = match create {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let mut welcomes = seal_and_bind(&mut alice, &welcomes);
+            alice.confirm_published(pending).await.unwrap();
+            let carol_welcome = welcomes.remove(1);
+            (welcomes.remove(0), carol_welcome)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    join_raw(&mut bob, bob_welcome).await.unwrap();
+    join_raw(&mut carol, carol_welcome).await.unwrap();
+
+    let route = |msg: TransportMessage| TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    };
+
+    // Shared epoch 2 across Alice, Bob, and Carol (Carol retains anchor 2).
+    let epoch1_to_2 = match alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            route(msg)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    bob.ingest(epoch1_to_2.clone()).await.unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    carol.ingest(epoch1_to_2).await.unwrap();
+    carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+
+    // Bob's rival branch from epoch 2 keeps Carol and advances 2 -> 3 -> 4 -> 5 -> 6.
+    let mut bob_chain = Vec::new();
+    for _ in 0..4 {
+        let commit = match bob
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            SendResult::GroupEvolution { msg, pending, .. } => {
+                bob.confirm_published(pending).await.unwrap();
+                route(msg)
+            }
+            other => panic!("expected GroupEvolution, got {other:?}"),
+        };
+        bob_chain.push(commit);
+    }
+    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(6));
+    let bob_epoch4_id = MessageId::new(Sha256::digest(&bob_chain[2].payload).to_vec());
+
+    // Alice's branch removes Carol at 2 -> 3, advances 3 -> 4, and re-invites
+    // Carol at 4 -> 5. Carol automatically rejoins at epoch 5, retaining old
+    // anchor 2 while holding no anchor 4.
+    let remove_carol = match alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![carol.self_id()],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            route(msg)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    carol.ingest(remove_carol).await.unwrap();
+    carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    match alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    }
+    let carol_rejoin_kp = carol.fresh_key_package().await.unwrap();
+    let carol_rejoin_welcome = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_rejoin_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            pending, welcomes, ..
+        } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
+            alice.confirm_published(pending).await.unwrap();
+            welcome
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    join_raw(&mut carol, carol_rejoin_welcome).await.unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(5));
+
+    // Simulate pre-#1843 upgrade (`join_epoch = 0, local_copy_install_epoch = 0`).
+    let mut upgraded = carol_storage.get_group(&group_id).unwrap();
+    upgraded.join_epoch = EpochId(0);
+    upgraded.local_copy_install_epoch = EpochId(0);
+    carol_storage.put_group(&upgraded).unwrap();
+
+    let snapshots = carol_storage.list_group_snapshots(&group_id).unwrap();
+    assert!(
+        snapshots.iter().any(|s| s == "openmls-retained-anchor-2")
+            && !snapshots.iter().any(|s| s == "openmls-retained-anchor-4"),
+        "fixture must keep anchor 2 and lack anchor 4; got {snapshots:?}"
+    );
+
+    // Ingest Bob's rival chain 2 -> 3 -> 4 -> 5 -> 6 into one collecting pass.
+    for (idx, commit) in bob_chain.into_iter().enumerate() {
+        let outcome = carol.ingest(commit).await.unwrap();
+        assert!(
+            matches!(outcome, IngestOutcome::Buffered { .. }),
+            "bob_chain[{idx}] must buffer into the collecting pass; got {outcome:?}"
+        );
+    }
+
+    let settled = carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert!(
+        settled.errors.is_empty(),
+        "valid rival chain spanning unanchored epoch 4 must converge cleanly from anchored root 2; got {:?}",
+        settled.errors
+    );
+    assert_eq!(settled.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        carol.epoch(&group_id).unwrap(),
+        EpochId(6),
+        "Carol must adopt Bob's deeper winning chain through epoch 6 instead of truncating at unanchored epoch 4"
+    );
+    assert_eq!(
+        carol_storage.get_message(&bob_epoch4_id).unwrap().state,
+        MessageState::Processed,
+        "epoch-4 descendant commit must authenticate and process rather than landing in EpochInvalidated"
+    );
+    assert!(!carol_storage.get_group(&group_id).unwrap().unrecoverable);
+}
+
+/// Positive control for a real group creator (whose `join_epoch == 0` and
+/// `local_copy_install_epoch == 0` without any synthetic floor mutation):
+/// losing a retained anchor for an epoch advanced by the creator's own commit
+/// must still prove local history via the own-commit `Processed` row and fail
+/// closed with `MissingRetainedAnchor` / `Unrecoverable`.
+#[tokio::test]
+async fn creator_losing_own_commit_anchor_still_halts_through_convergence() {
+    let (mut alice, alice_storage) = build_client_with_storage(b"creator-own-anchor-alice");
+    let (mut bob, bob_storage) = build_client_with_storage(b"creator-own-anchor-bob");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "creator-own-commit-lineage".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let bob_welcome = match create {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
+            alice.confirm_published(pending).await.unwrap();
+            welcome
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    join_raw(&mut bob, bob_welcome).await.unwrap();
+
+    let route = |msg: TransportMessage| TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    };
+
+    // Alice (real creator, floors naturally 0) advances 1 -> 2 with an own
+    // commit and brings Bob to epoch 2, where Bob creates a rival commit.
+    let alice_1_to_2 = match alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            route(msg)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    bob.ingest(alice_1_to_2).await.unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(2));
+    let bob_epoch2_rival = raw_self_update_commit(&bob_storage, &bob.self_id(), &group_id);
+
+    // Alice advances 2 -> 3 -> 4 with her own commits (proving both live tip
+    // and intermediate-anchor own-commit lineage matching).
+    for _ in 0..2 {
+        match alice
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            SendResult::GroupEvolution { pending, .. } => {
+                alice.confirm_published(pending).await.unwrap();
+            }
+            other => panic!("expected GroupEvolution, got {other:?}"),
+        }
+    }
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(4));
+    let record = alice_storage.get_group(&group_id).unwrap();
+    assert_eq!(record.join_epoch, EpochId(0));
+    assert_eq!(record.local_copy_install_epoch, EpochId(0));
+
+    // Release Alice's epoch-2 anchor while keeping anchor 3.
+    alice_storage
+        .release_group_snapshot(&group_id, "openmls-retained-anchor-2")
+        .unwrap();
+
+    let outcome = alice.ingest(bob_epoch2_rival).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Buffered {
+                epoch: EpochId(2),
+                ..
+            }
+        ),
+        "creator missing its own commit's source anchor must buffer for MissingRetainedAnchor; got {outcome:?}"
+    );
+    let halted = alice
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert_eq!(
+        halted.errors,
+        vec![CanonicalizationError::MissingRetainedAnchor]
+    );
+    assert!(alice_storage.get_group(&group_id).unwrap().unrecoverable);
 }

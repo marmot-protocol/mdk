@@ -415,6 +415,10 @@ impl WelcomeDeliveryState {
 pub enum WelcomeDeliveryProblem {
     /// No usable inbox relay was known for the recipient.
     NoInboxRelays,
+    /// No usable inbox relay was known for the recipient, and the latest
+    /// lookup of their inbox relay list failed: no relay answered in full or
+    /// in time.
+    InboxLookupFailed,
     /// Every relay that answered refused it.
     RefusedByRelays,
     /// No relay tried acknowledged it: unreachable, timed out or no answer.

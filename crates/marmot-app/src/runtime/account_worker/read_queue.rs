@@ -15,12 +15,13 @@
 //! budget for its kind. Recording only observes: nothing here changes when or
 //! how the worker serves a command.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use marmot_observability::{Observation, Outcome as TelemetryOutcome, PerformanceRecorder};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc, oneshot};
 
 use super::AccountWorkerCommand;
 use crate::RuntimePerformanceOperation as RuntimeOp;
@@ -368,6 +369,7 @@ impl Drop for WorkerUnitGuard<'_> {
 pub(crate) struct QueuedCommand {
     command: AccountWorkerCommand,
     wait: QueueWait,
+    seq: u64,
 }
 
 /// The wait half of a [`QueuedCommand`], apart from its command while the
@@ -389,6 +391,7 @@ impl QueuedCommand {
         Self {
             command,
             wait: QueueWait(None),
+            seq: 0,
         }
     }
 
@@ -401,7 +404,11 @@ impl QueuedCommand {
     }
 
     pub(crate) fn from_parts(command: AccountWorkerCommand, wait: QueueWait) -> Self {
-        Self { command, wait }
+        Self {
+            command,
+            wait,
+            seq: 0,
+        }
     }
 
     /// The worker takes the command up to run it: its wait ends here, before
@@ -417,9 +424,9 @@ impl QueuedCommand {
         self,
         serve: impl FnOnce(AccountWorkerCommand) -> Option<AccountWorkerCommand>,
     ) -> Option<Self> {
-        let Self { command, wait } = self;
+        let Self { command, wait, seq } = self;
         match serve(command) {
-            Some(command) => Some(Self { command, wait }),
+            Some(command) => Some(Self { command, wait, seq }),
             None => {
                 wait.take_up();
                 None
@@ -428,58 +435,343 @@ impl QueuedCommand {
     }
 }
 
-/// What an account worker receives: the host's commands, and the commands
-/// its own timers send (its push and subscription retries) on a channel of
-/// their own. Its own come first, and only the host's can be held back, so
-/// a worker that takes no more host commands still runs its own retries
-/// (mdk#3466).
+struct HostQueueState {
+    group: VecDeque<(QueuedCommand, OwnedSemaphorePermit)>,
+    account: VecDeque<(QueuedCommand, OwnedSemaphorePermit)>,
+    next_seq: u64,
+    senders: usize,
+    closed: bool,
+}
+
+/// Bounded two-lane host command queue backed by one shared state mutex and
+/// independent per-lane semaphore permits.
+///
+/// Assigning the sequence number and pushing into either lane under the same
+/// mutex, and comparing both lane heads under that same mutex at dequeue,
+/// eliminates any TOCTOU window where an account-wide command enqueued after
+/// a group-scoped command could overtake it (mdk#3801). Independent per-lane
+/// permits still allow pausing account-wide admissions at
+/// [`super::sign_in_reads::PARKED_LIMIT`] without head-of-line blocking
+/// group-scoped commands.
+struct SharedHostQueue {
+    #[cfg(test)]
+    buffer: usize,
+    group_permits: Arc<Semaphore>,
+    account_permits: Arc<Semaphore>,
+    state: std::sync::Mutex<HostQueueState>,
+    notify: tokio::sync::Notify,
+    closed: tokio_util::sync::CancellationToken,
+}
+
+impl SharedHostQueue {
+    fn new(buffer: usize) -> Arc<Self> {
+        Arc::new(Self {
+            #[cfg(test)]
+            buffer,
+            group_permits: Arc::new(Semaphore::new(buffer)),
+            account_permits: Arc::new(Semaphore::new(buffer)),
+            state: std::sync::Mutex::new(HostQueueState {
+                group: VecDeque::new(),
+                account: VecDeque::new(),
+                next_seq: 1,
+                senders: 1,
+                closed: false,
+            }),
+            notify: tokio::sync::Notify::new(),
+            closed: tokio_util::sync::CancellationToken::new(),
+        })
+    }
+
+    fn push_with_permit(
+        &self,
+        is_account: bool,
+        command: AccountWorkerCommand,
+        wait: QueueWait,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<(), Box<AccountWorkerCommand>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.closed {
+            drop(state);
+            drop(permit);
+            return Err(Box::new(command));
+        }
+        let seq = state.next_seq;
+        state.next_seq = state.next_seq.wrapping_add(1);
+        let queued = QueuedCommand { command, wait, seq };
+        if is_account {
+            state.account.push_back((queued, permit));
+        } else {
+            state.group.push_back((queued, permit));
+        }
+        drop(state);
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    fn try_pop(
+        &self,
+        admit_group: bool,
+        admit_account: bool,
+    ) -> Result<QueuedCommand, mpsc::error::TryRecvError> {
+        let popped = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let group_seq = admit_group
+                .then(|| state.group.front().map(|(cmd, _)| cmd.seq))
+                .flatten();
+            let account_seq = admit_account
+                .then(|| state.account.front().map(|(cmd, _)| cmd.seq))
+                .flatten();
+            match (group_seq, account_seq) {
+                (Some(g), Some(a)) if g <= a => state.group.pop_front(),
+                (Some(_), Some(_)) => state.account.pop_front(),
+                (Some(_), None) => state.group.pop_front(),
+                (None, Some(_)) => state.account.pop_front(),
+                (None, None) => {
+                    return if state.senders == 0 {
+                        Err(mpsc::error::TryRecvError::Disconnected)
+                    } else {
+                        Err(mpsc::error::TryRecvError::Empty)
+                    };
+                }
+            }
+        };
+        let (command, permit) = popped.expect("checked front under lock");
+        // Release the lane permit outside the queue mutex so waking a sender
+        // never contends on queue state.
+        drop(permit);
+        Ok(command)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.group.len() + state.account.len()
+    }
+
+    fn is_empty_admitting(&self, admit_group: bool, admit_account: bool) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (!admit_group || state.group.is_empty()) && (!admit_account || state.account.is_empty())
+    }
+}
+
+struct SplitHostSender(Arc<SharedHostQueue>);
+
+impl Clone for SplitHostSender {
+    fn clone(&self) -> Self {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.senders += 1;
+        drop(state);
+        Self(self.0.clone())
+    }
+}
+
+impl Drop for SplitHostSender {
+    fn drop(&mut self) {
+        let last_sender = {
+            let mut state = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.senders = state.senders.saturating_sub(1);
+            state.senders == 0
+        };
+        if last_sender {
+            self.0.notify.notify_one();
+        }
+    }
+}
+
+/// The host's split command receiver for an account worker, exposing one
+/// consistent sequence-ordered view over group-scoped and account-wide lanes
+/// while permitting account-wide admission to pause independently at
+/// [`super::sign_in_reads::PARKED_LIMIT`] (mdk#3801).
+pub(crate) struct HostCommandReceivers {
+    queue: Arc<SharedHostQueue>,
+}
+
+impl Drop for HostCommandReceivers {
+    fn drop(&mut self) {
+        let drained = {
+            let mut state = self
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.closed = true;
+            let group = std::mem::take(&mut state.group);
+            let account = std::mem::take(&mut state.account);
+            (group, account)
+        };
+        self.queue.group_permits.close();
+        self.queue.account_permits.close();
+        self.queue.closed.cancel();
+        drop(drained);
+    }
+}
+
+enum HostInbox {
+    Split(HostCommandReceivers),
+    #[cfg(test)]
+    Single(mpsc::Receiver<QueuedCommand>),
+}
+
+/// What an account worker receives: the host's commands (split into
+/// group-scoped and account-wide lanes with one atomic sequence-ordered view
+/// when both are admitted), and the commands its own timers send (its push
+/// and subscription retries) on a channel of their own. Its own come first,
+/// and only the host's can be held back, so a worker that takes no more host
+/// commands still runs its own retries (mdk#3466, mdk#3801).
 pub(crate) struct WorkerInbox {
-    host: mpsc::Receiver<QueuedCommand>,
+    host: HostInbox,
     own: mpsc::Receiver<QueuedCommand>,
 }
 
 impl WorkerInbox {
-    /// The inbox over the host's channel, and the worker's own sender.
+    /// The inbox over a real worker's split host queue, and the worker's
+    /// own sender.
+    pub(crate) fn new_host(host: HostCommandReceivers) -> (Self, WorkerCommands) {
+        let (sender, own) = mpsc::channel(8);
+        (
+            Self {
+                host: HostInbox::Split(host),
+                own,
+            },
+            WorkerCommands::unobserved(sender),
+        )
+    }
+
+    /// The inbox over a single host channel (used by unit tests), and the
+    /// worker's own sender.
+    #[cfg(test)]
     pub(crate) fn new(host: mpsc::Receiver<QueuedCommand>) -> (Self, WorkerCommands) {
         let (sender, own) = mpsc::channel(8);
-        (Self { host, own }, WorkerCommands::unobserved(sender))
+        (
+            Self {
+                host: HostInbox::Single(host),
+                own,
+            },
+            WorkerCommands::unobserved(sender),
+        )
     }
 
     /// The next command, the worker's own first. `None` once the host's
-    /// channel has closed and holds nothing.
+    /// channels have closed and hold nothing.
     pub(crate) async fn recv(&mut self) -> Option<QueuedCommand> {
-        self.recv_admitting(true).await
+        self.recv_admitting(true, true).await
     }
 
-    /// The next command; the host's only when `admit_host`. Pending while
-    /// the host is held back and the worker sends itself nothing.
-    pub(crate) async fn recv_admitting(&mut self, admit_host: bool) -> Option<QueuedCommand> {
-        tokio::select! {
-            biased;
-            Some(command) = self.own.recv() => Some(command),
-            command = self.host.recv(), if admit_host => command,
-            // Held back, with the worker's own channel closed (a test's
-            // inbox): nothing can come.
-            else => std::future::pending().await,
+    /// The next command; group-scoped host commands only when `admit_group`,
+    /// account-wide host commands only when `admit_account`. Pending while
+    /// both host lanes are held back and the worker sends itself nothing.
+    pub(crate) async fn recv_admitting(
+        &mut self,
+        admit_group: bool,
+        admit_account: bool,
+    ) -> Option<QueuedCommand> {
+        match &mut self.host {
+            HostInbox::Split(receivers) => loop {
+                if let Ok(command) = self.own.try_recv() {
+                    return Some(command);
+                }
+                if admit_group || admit_account {
+                    let notified = receivers.queue.notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    match receivers.queue.try_pop(admit_group, admit_account) {
+                        Ok(command) => return Some(command),
+                        Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                        Err(mpsc::error::TryRecvError::Empty) => {}
+                    }
+                    tokio::select! {
+                        biased;
+                        Some(command) = self.own.recv() => return Some(command),
+                        () = notified => {}
+                    }
+                } else {
+                    match self.own.recv().await {
+                        Some(command) => return Some(command),
+                        None => std::future::pending().await,
+                    }
+                }
+            },
+            #[cfg(test)]
+            HostInbox::Single(host) => {
+                tokio::select! {
+                    biased;
+                    Some(command) = self.own.recv() => Some(command),
+                    command = host.recv(), if admit_group => command,
+                    else => std::future::pending().await,
+                }
+            }
         }
     }
 
     pub(crate) fn try_recv(&mut self) -> Result<QueuedCommand, mpsc::error::TryRecvError> {
-        match self.own.try_recv() {
-            Ok(command) => Ok(command),
-            Err(_) => self.host.try_recv(),
+        self.try_recv_admitting(true, true)
+    }
+
+    pub(crate) fn try_recv_admitting(
+        &mut self,
+        admit_group: bool,
+        admit_account: bool,
+    ) -> Result<QueuedCommand, mpsc::error::TryRecvError> {
+        if let Ok(command) = self.own.try_recv() {
+            return Ok(command);
+        }
+        match &mut self.host {
+            HostInbox::Split(receivers) => {
+                if !admit_group && !admit_account {
+                    return Err(mpsc::error::TryRecvError::Empty);
+                }
+                receivers.queue.try_pop(admit_group, admit_account)
+            }
+            #[cfg(test)]
+            HostInbox::Single(host) => {
+                if !admit_group {
+                    return Err(mpsc::error::TryRecvError::Empty);
+                }
+                host.try_recv()
+            }
         }
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.own.len() + self.host.len()
+        self.own.len()
+            + match &self.host {
+                HostInbox::Split(receivers) => receivers.queue.len(),
+                HostInbox::Single(host) => host.len(),
+            }
     }
 
     /// Whether no command the worker would take now is waiting: its own, and
-    /// the host's while it admits them.
-    pub(crate) fn is_empty_admitting(&self, admit_host: bool) -> bool {
-        self.own.is_empty() && (!admit_host || self.host.is_empty())
+    /// each host lane it currently admits.
+    pub(crate) fn is_empty_admitting(&self, admit_group: bool, admit_account: bool) -> bool {
+        self.own.is_empty()
+            && match &self.host {
+                HostInbox::Split(receivers) => receivers
+                    .queue
+                    .is_empty_admitting(admit_group, admit_account),
+                #[cfg(test)]
+                HostInbox::Single(host) => !admit_group || host.is_empty(),
+            }
     }
 }
 
@@ -491,11 +783,17 @@ impl From<mpsc::Receiver<QueuedCommand>> for WorkerInbox {
     }
 }
 
+#[derive(Clone)]
+enum WorkerCommandsInner {
+    Split(SplitHostSender),
+    Single(mpsc::Sender<QueuedCommand>),
+}
+
 /// An account worker's command sender. A host mutation sent through it while
 /// the worker is inside a long unit carries its wait to the worker.
 #[derive(Clone)]
 pub(crate) struct WorkerCommands {
-    sender: mpsc::Sender<QueuedCommand>,
+    inner: WorkerCommandsInner,
     gauge: Option<Arc<WorkerUnitGauge>>,
 }
 
@@ -506,13 +804,30 @@ impl std::fmt::Debug for WorkerCommands {
 }
 
 impl WorkerCommands {
-    /// The host's sender, whose mutations sample `gauge` when enqueued.
+    /// Split host queue (`buffer` permits each for group-scoped and
+    /// account-wide lanes), whose mutations sample `gauge` when enqueued.
+    pub(crate) fn host_channel(
+        buffer: usize,
+        gauge: Arc<WorkerUnitGauge>,
+    ) -> (Self, HostCommandReceivers) {
+        let queue = SharedHostQueue::new(buffer);
+        (
+            Self {
+                inner: WorkerCommandsInner::Split(SplitHostSender(queue.clone())),
+                gauge: Some(gauge),
+            },
+            HostCommandReceivers { queue },
+        )
+    }
+
+    /// A single-channel observed sender, used by unit tests.
+    #[cfg(test)]
     pub(crate) fn observed(
         sender: mpsc::Sender<QueuedCommand>,
         gauge: Arc<WorkerUnitGauge>,
     ) -> Self {
         Self {
-            sender,
+            inner: WorkerCommandsInner::Single(sender),
             gauge: Some(gauge),
         }
     }
@@ -520,27 +835,48 @@ impl WorkerCommands {
     /// The worker's own sender, for the commands it sends itself.
     pub(crate) fn unobserved(sender: mpsc::Sender<QueuedCommand>) -> Self {
         Self {
-            sender,
+            inner: WorkerCommandsInner::Single(sender),
             gauge: None,
         }
     }
 
-    fn queued(&self, command: AccountWorkerCommand) -> QueuedCommand {
-        let wait = match &self.gauge {
-            Some(gauge) => gauge.mutation_wait(&command),
+    fn mutation_wait(&self, command: &AccountWorkerCommand) -> QueueWait {
+        match &self.gauge {
+            Some(gauge) => gauge.mutation_wait(command),
             None => QueueWait(None),
-        };
-        QueuedCommand { command, wait }
+        }
     }
 
     pub(crate) async fn send(
         &self,
         command: AccountWorkerCommand,
     ) -> Result<(), mpsc::error::SendError<AccountWorkerCommand>> {
-        self.sender
-            .send(self.queued(command))
-            .await
-            .map_err(|mpsc::error::SendError(queued)| mpsc::error::SendError(queued.command))
+        let wait = self.mutation_wait(&command);
+        match &self.inner {
+            WorkerCommandsInner::Split(sender) => {
+                let is_account = command.waits_behind_sign_in_check();
+                let permits = if is_account {
+                    &sender.0.account_permits
+                } else {
+                    &sender.0.group_permits
+                };
+                let Ok(permit) = permits.clone().acquire_owned().await else {
+                    return Err(mpsc::error::SendError(command));
+                };
+                sender
+                    .0
+                    .push_with_permit(is_account, command, wait, permit)
+                    .map_err(|command| mpsc::error::SendError(*command))
+            }
+            WorkerCommandsInner::Single(sender) => sender
+                .send(QueuedCommand {
+                    command,
+                    wait,
+                    seq: 0,
+                })
+                .await
+                .map_err(|error| mpsc::error::SendError(error.0.command)),
+        }
     }
 
     /// Hands an unadmitted command back, as `mpsc::Sender::try_send` does.
@@ -552,46 +888,115 @@ impl WorkerCommands {
         &self,
         command: AccountWorkerCommand,
     ) -> Result<(), mpsc::error::TrySendError<AccountWorkerCommand>> {
-        self.sender
-            .try_send(self.queued(command))
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(queued) => {
-                    mpsc::error::TrySendError::Full(queued.command)
+        match &self.inner {
+            WorkerCommandsInner::Split(sender) => {
+                let is_account = command.waits_behind_sign_in_check();
+                let permits = if is_account {
+                    &sender.0.account_permits
+                } else {
+                    &sender.0.group_permits
+                };
+                let permit = match permits.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(TryAcquireError::NoPermits) => {
+                        return if sender.0.closed.is_cancelled() {
+                            Err(mpsc::error::TrySendError::Closed(command))
+                        } else {
+                            Err(mpsc::error::TrySendError::Full(command))
+                        };
+                    }
+                    Err(TryAcquireError::Closed) => {
+                        return Err(mpsc::error::TrySendError::Closed(command));
+                    }
+                };
+                let wait = self.mutation_wait(&command);
+                sender
+                    .0
+                    .push_with_permit(is_account, command, wait, permit)
+                    .map_err(|command| mpsc::error::TrySendError::Closed(*command))
+            }
+            WorkerCommandsInner::Single(sender) => match sender.try_reserve() {
+                Ok(permit) => {
+                    let wait = self.mutation_wait(&command);
+                    permit.send(QueuedCommand {
+                        command,
+                        wait,
+                        seq: 0,
+                    });
+                    Ok(())
                 }
-                mpsc::error::TrySendError::Closed(queued) => {
-                    mpsc::error::TrySendError::Closed(queued.command)
+                Err(mpsc::error::TrySendError::Full(())) => {
+                    Err(mpsc::error::TrySendError::Full(command))
                 }
-            })
+                Err(mpsc::error::TrySendError::Closed(())) => {
+                    Err(mpsc::error::TrySendError::Closed(command))
+                }
+            },
+        }
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.sender.is_closed()
+        match &self.inner {
+            WorkerCommandsInner::Split(sender) => sender.0.closed.is_cancelled(),
+            WorkerCommandsInner::Single(sender) => sender.is_closed(),
+        }
     }
 
     pub(crate) async fn closed(&self) {
-        self.sender.closed().await;
+        match &self.inner {
+            WorkerCommandsInner::Split(sender) => sender.0.closed.cancelled().await,
+            WorkerCommandsInner::Single(sender) => sender.closed().await,
+        }
     }
 }
 
 #[cfg(test)]
 impl WorkerCommands {
     pub(crate) fn same_channel(&self, other: &Self) -> bool {
-        self.sender.same_channel(&other.sender)
+        match (&self.inner, &other.inner) {
+            (WorkerCommandsInner::Split(a), WorkerCommandsInner::Split(b)) => {
+                Arc::ptr_eq(&a.0, &b.0)
+            }
+            (WorkerCommandsInner::Single(a), WorkerCommandsInner::Single(b)) => a.same_channel(b),
+            _ => false,
+        }
     }
 
     pub(crate) fn max_capacity(&self) -> usize {
-        self.sender.max_capacity()
+        match &self.inner {
+            WorkerCommandsInner::Split(sender) => sender.0.buffer * 2,
+            WorkerCommandsInner::Single(sender) => sender.max_capacity(),
+        }
     }
 
     pub(crate) fn capacity(&self) -> usize {
-        self.sender.capacity()
+        match &self.inner {
+            WorkerCommandsInner::Split(sender) => {
+                sender.0.group_permits.available_permits()
+                    + sender.0.account_permits.available_permits()
+            }
+            WorkerCommandsInner::Single(sender) => sender.capacity(),
+        }
+    }
+
+    #[cfg(all(test, feature = "test-policy-overrides"))]
+    pub(crate) fn account_capacity(&self) -> usize {
+        match &self.inner {
+            WorkerCommandsInner::Split(sender) => sender.0.account_permits.available_permits(),
+            WorkerCommandsInner::Single(sender) => sender.capacity(),
+        }
     }
 
     pub(crate) async fn reserve_many(
         &self,
         n: usize,
     ) -> Result<mpsc::PermitIterator<'_, QueuedCommand>, mpsc::error::SendError<()>> {
-        self.sender.reserve_many(n).await
+        match &self.inner {
+            WorkerCommandsInner::Single(sender) => sender.reserve_many(n).await,
+            WorkerCommandsInner::Split(_) => {
+                unreachable!("reserve_many is only used with single-channel test queues")
+            }
+        }
     }
 }
 
@@ -1083,5 +1488,91 @@ mod tests {
         }
         let after = sample(&telemetry, RuntimeOp::MutationQueueBehindSend);
         assert_eq!((after.started, after.in_flight), (1, 0));
+    }
+
+    /// Enqueueing a group-scoped command (`InviteMembers`) followed by an
+    /// account-wide command (`PendingWelcomeDeliveries`) must never be
+    /// delivered out of order by the split host inbox, even when the receiver
+    /// polls concurrently with arrival (mdk#3801).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn split_host_inbox_never_reverses_group_command_before_account_command() {
+        let (commands, host_rx) = WorkerCommands::host_channel(8, Arc::default());
+        let (mut inbox, _own) = WorkerInbox::new_host(host_rx);
+        let group = cgka_traits::GroupId::new(vec![0x11; 16]);
+        let rounds = 100_000usize;
+        let producer = std::thread::spawn({
+            let commands = commands.clone();
+            let group = group.clone();
+            move || {
+                for _ in 0..rounds {
+                    let (invite_respond, _) = oneshot::channel();
+                    let mut invite = Some(AccountWorkerCommand::InviteMembers {
+                        group_id: group.clone(),
+                        members: Vec::new(),
+                        initial_admins: Vec::new(),
+                        member_resolution: nostr_directory::MemberResolutionPolicy::default(),
+                        respond: invite_respond,
+                    });
+                    let (pending_respond, _) = ReadReply::unobserved();
+                    let mut pending = Some(AccountWorkerCommand::PendingWelcomeDeliveries {
+                        respond: pending_respond,
+                    });
+                    // Wait until both lanes have capacity so the two sends happen
+                    // back-to-back with zero allocation between them.
+                    while commands.capacity() < 2 {
+                        std::hint::spin_loop();
+                    }
+                    loop {
+                        match commands.try_send(invite.take().unwrap()) {
+                            Ok(()) => break,
+                            Err(mpsc::error::TrySendError::Full(cmd)) => {
+                                invite = Some(cmd);
+                                std::hint::spin_loop();
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => return,
+                        }
+                    }
+                    loop {
+                        match commands.try_send(pending.take().unwrap()) {
+                            Ok(()) => break,
+                            Err(mpsc::error::TrySendError::Full(cmd)) => {
+                                pending = Some(cmd);
+                                std::hint::spin_loop();
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => return,
+                        }
+                    }
+                }
+            }
+        });
+        let mut received = 0usize;
+        let mut expect_invite = true;
+        while received < rounds * 2 {
+            match inbox.try_recv() {
+                Ok(cmd) => {
+                    let command = cmd.take_up();
+                    if expect_invite {
+                        assert!(
+                            matches!(command, AccountWorkerCommand::InviteMembers { .. }),
+                            "item {received}: split host inbox reversed PendingWelcomeDeliveries ahead of InviteMembers"
+                        );
+                    } else {
+                        assert!(
+                            matches!(
+                                command,
+                                AccountWorkerCommand::PendingWelcomeDeliveries { .. }
+                            ),
+                            "item {received}: split host inbox reversed InviteMembers ahead of PendingWelcomeDeliveries"
+                        );
+                    }
+                    expect_invite = !expect_invite;
+                    received += 1;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => std::hint::spin_loop(),
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        producer.join().unwrap();
+        assert_eq!(received, rounds * 2);
     }
 }

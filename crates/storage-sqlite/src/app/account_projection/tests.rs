@@ -1113,6 +1113,145 @@ fn account_projection_group_prune_chunks_stale_keys_under_sqlite_variable_limit(
     );
 }
 
+/// Regression for #3798: pruning stale group components must not bind an
+/// unbounded `NOT IN (...)` list past SQLite's variable limit.
+#[test]
+fn account_projection_group_components_prune_chunks_stale_ids_under_sqlite_variable_limit() {
+    const COMPONENT_COUNT: usize = SQLITE_BIND_PARAMETER_CHUNK + 105;
+
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    {
+        let conn = store.lock().unwrap();
+        // SAFETY: Lower this test connection's bind-parameter limit before any
+        // concurrent use; rusqlite retains ownership of the handle.
+        unsafe {
+            rusqlite::ffi::sqlite3_limit(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_LIMIT_VARIABLE_NUMBER,
+                1_000,
+            );
+        }
+    }
+    let components = (0..COMPONENT_COUNT as u16)
+        .map(|id| StoredAccountGroupComponent {
+            component_id: id,
+            component_name: format!("comp-{id}"),
+            component_data_hex: "00".to_owned(),
+        })
+        .collect::<Vec<_>>();
+    let mut stored = group("aa", "many-components");
+    stored.components = components.clone();
+
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![stored.clone()],
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .expect("initial save with >1000 components must not exceed SQLite variable limit");
+
+    stored.components = components[1..].to_vec();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![stored.clone()],
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .expect("pruning one stale component from >1000 retained must succeed");
+    let loaded = app.load_account_projection_state("alice", 16).unwrap();
+    assert_eq!(loaded.groups[0].components.len(), COMPONENT_COUNT - 1);
+    assert!(
+        loaded.groups[0]
+            .components
+            .iter()
+            .all(|component| component.component_id != 0)
+    );
+
+    stored.components = vec![components[COMPONENT_COUNT - 1].clone()];
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![stored],
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .expect("pruning >1000 stale components in chunks must succeed");
+    let loaded = app.load_account_projection_state("alice", 16).unwrap();
+    assert_eq!(loaded.groups[0].components.len(), 1);
+    assert_eq!(
+        loaded.groups[0].components[0].component_id,
+        (COMPONENT_COUNT - 1) as u16
+    );
+}
+
+/// Regression for #3798: push-gossip integer arithmetic must saturate at
+/// `i64::MAX`/`i64::MIN` instead of overflowing to SQLite `REAL`.
+#[test]
+fn push_gossip_arithmetic_saturates_without_sqlite_real_promotion() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![group("aa", "alpha")],
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
+    app.set_group_self_membership("aa", SelfMembership::Member)
+        .unwrap();
+
+    assert_eq!(
+        app.record_group_push_announce_owed("aa", i64::MAX).unwrap(),
+        Some(i64::MAX)
+    );
+    assert_eq!(
+        app.record_group_push_announce_owed("aa", i64::MAX).unwrap(),
+        Some(i64::MAX)
+    );
+
+    app.record_group_push_gossip_join("aa", 10).unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE group_push_gossip_state SET joining_since_ms = 5 WHERE group_id_hex = 'aa'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(app.count_push_join_window_time(i64::MAX).unwrap(), 1);
+    assert_eq!(app.count_push_join_window_time(1).unwrap(), 1);
+    let state = app.group_push_gossip_state("aa").unwrap().unwrap();
+    assert_eq!(state.join_window_counted_ms, i64::MAX);
+
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE group_push_gossip_state SET join_window_counted_ms = ?1 WHERE group_id_hex = 'aa'",
+            params![i64::MIN],
+        )
+        .unwrap();
+    assert_eq!(app.count_push_join_window_time(-5).unwrap(), 1);
+    let state = app.group_push_gossip_state("aa").unwrap().unwrap();
+    assert_eq!(state.join_window_counted_ms, i64::MIN);
+}
+
 #[test]
 fn account_projection_state_does_not_rewrite_unchanged_group_rows() {
     let store = SqliteAccountStorage::in_memory().unwrap();
@@ -4278,7 +4417,13 @@ fn retried_past_a_held_write_lock<T>(
 fn push_token_apply_retries_concurrent_writer_contention() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("push-token-contention.sqlite");
-    let store = open_plaintext_file(&path, SqliteStorageOptions::default());
+    let store = open_plaintext_file(
+        &path,
+        SqliteStorageOptions {
+            busy_timeout_ms: 1,
+            ..SqliteStorageOptions::default()
+        },
+    );
     let writer = store.app_storage();
     let group_id = "aa".repeat(32);
     let member_id = "bb".repeat(32);
@@ -4294,6 +4439,59 @@ fn push_token_apply_retries_concurrent_writer_contention() {
     });
     assert!(applied.expect("tombstone apply retries after transient contention"));
     assert!(writer.group_push_tokens(&group_id).unwrap().is_empty());
+}
+
+/// Regression for #3798: `apply_group_push_token` and
+/// `apply_group_push_token_tombstone` must begin with `BEGIN IMMEDIATE` so
+/// concurrent WAL writers wait via `busy_timeout`/busy handler instead of
+/// failing immediately on a deferred read-to-write lock upgrade.
+#[test]
+fn push_token_apply_takes_immediate_write_lock_under_wal_contention() {
+    use crate::protocol::storage::write_contention::{Release, SharedDatabase};
+
+    let db = SharedDatabase::new();
+    let store = db.open();
+    let writer = store.app_storage();
+    let group_id = "aa".repeat(32);
+    let member_id = "bb".repeat(32);
+
+    // Dirty the WAL in a concurrent `BEGIN IMMEDIATE` transaction so a deferred
+    // reader attempting a write upgrade hits `SQLITE_BUSY_SNAPSHOT` without
+    // invoking the busy handler, whereas `BEGIN IMMEDIATE` waits via the busy
+    // handler until the holder commits.
+    let hold = db.hold_write_lock(Release::WhenTheStoreWaits, |holder| {
+        holder
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO account_groups(group_id_hex, endpoint, updated_at) VALUES('cc', '', 1)",
+                [],
+            )
+            .unwrap();
+    });
+    assert!(
+        writer
+            .apply_group_push_token(&push_token(&group_id, &member_id, 100, "d1"))
+            .expect("BEGIN IMMEDIATE waits via busy handler")
+    );
+    hold.join();
+
+    let hold = db.hold_write_lock(Release::WhenTheStoreWaits, |holder| {
+        holder
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE account_groups SET updated_at = 2 WHERE group_id_hex = 'cc'",
+                [],
+            )
+            .unwrap();
+    });
+    assert!(
+        writer
+            .apply_group_push_token_tombstone(&push_tombstone(&group_id, &member_id, 0, 200, "r1"))
+            .expect("BEGIN IMMEDIATE waits via busy handler")
+    );
+    hold.join();
 }
 
 #[test]

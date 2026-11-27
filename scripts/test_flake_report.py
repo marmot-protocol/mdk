@@ -224,21 +224,75 @@ class LeaderboardTests(unittest.TestCase):
         code, markdown, data = self.main(github)
         self.assertEqual(code, 0)
         self.assertEqual(sorted(github.downloads), [11, 21])
-        # Equal totals rank the test that never passed first.
-        broken, flaky = data["tests"]
-        self.assertEqual((broken["test"], broken["failed_attempts"], broken["runs_seen"]), ("broken", 2, 1))
+        # Only tests that failed and passed on retry belong on the flaky leaderboard;
+        # pure hard failures are separated into `failed_tests`.
+        self.assertEqual(len(data["tests"]), 1)
+        flaky = data["tests"][0]
         self.assertEqual((flaky["test"], flaky["flaky_attempts"], flaky["runs_seen"]), ("flaky", 2, 2))
         self.assertEqual(flaky["stress"], "just flake-stress wn-cli 'binary_id(wn-cli::cli) & test(=flaky)' "
                                           "40 --features test-policy-overrides")
+        self.assertEqual(len(data["failed_tests"]), 1)
+        broken = data["failed_tests"][0]
+        self.assertEqual((broken["test"], broken["failed_attempts"], broken["flaky_attempts"], broken["runs_seen"]),
+                         ("broken", 2, 0, 1))
         self.assertEqual(data["runs"]["malformed_reports"], 1)
         self.assertEqual(data["runs"]["in_progress"], 1)
-        self.assertIn("| 2 | `flaky` | `wn-cli::cli` | 2 | 0 | 2 |", markdown)
+        self.assertIn("| 1 | `flaky` | `wn-cli::cli` | 2 | 0 | 2 |", markdown)
         self.assertIn("`` assertion `left == right` failed ``", markdown)
+        self.assertIn("## Hard failures (failed every attempt)", markdown)
+        flaky_section, hard_section = markdown.split("## Hard failures (failed every attempt)", 1)
+        self.assertNotIn("`broken`", flaky_section)
+        self.assertIn("| 1 | `broken` | `wn-cli::cli` | 2 | 1 |", hard_section)
 
         github.downloads.clear()
         code, _, again = self.main(github)
         self.assertEqual(github.downloads, [])
         self.assertEqual(again["tests"], data["tests"])
+        self.assertEqual(again["failed_tests"], data["failed_tests"])
+
+    def test_pure_hard_failures_do_not_pollute_flaky_leaderboard_or_outrank_flakes(self):
+        # Run 1: `broken` fails every attempt (2 failed attempts); `flaky` fails once then passes.
+        # Run 2: `flaky` fails every attempt (2 failed attempts); `other_flaky` flakes twice.
+        other_flaky = (
+            "other_flaky|"
+            + attempt("flakyFailure", "other_flaky", "crates/cli/tests/cli.rs:20:5", "transient 1")
+            + attempt("flakyFailure", "other_flaky", "crates/cli/tests/cli.rs:20:5", "transient 2")
+        )
+        flaky_hard = (
+            "flaky|"
+            + attempt("failure", "flaky", "crates/cli/tests/cli.rs:12:5", "hard 1")
+            + attempt("rerunFailure", "flaky", "crates/cli/tests/cli.rs:12:5", "hard 2")
+        )
+        github = FakeGitHub(
+            [run(1, 2), run(2, 1)],
+            {
+                1: [(11, "ci-runner-cli-e2e-0-1", artifact_zip(report(PASS, FLAKY, FAILED)))],
+                2: [(21, "ci-runner-cli-e2e-0-1", artifact_zip(report(PASS, flaky_hard, other_flaky)))],
+            },
+        )
+        code, markdown, data = self.main(github)
+        self.assertEqual(code, 0)
+        # Flaky leaderboard ranks by flaky_attempts first (`other_flaky`=2 > `flaky`=1),
+        # even though `flaky` has more total failed attempts (1+2=3), and excludes `broken`.
+        self.assertEqual([row["test"] for row in data["tests"]], ["other_flaky", "flaky"])
+        self.assertEqual([row["test"] for row in data["failed_tests"]], ["broken"])
+        flaky_section, hard_section = markdown.split("## Hard failures (failed every attempt)", 1)
+        self.assertNotIn("`broken`", flaky_section)
+        self.assertIn("`broken`", hard_section)
+
+        # When a window has ONLY pure hard failures, `tests` stays empty while `failed_tests` keeps them.
+        only_hard_cache = Path(self.tmp.name) / "only-hard-cache"
+        out = Path(self.tmp.name) / "only-hard.json"
+        stdout = io.StringIO()
+        hard_gh = FakeGitHub([run(1, 1)], {1: [(1, "ci-runner-cli-e2e-0-1", artifact_zip(report(PASS, FAILED)))]})
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+            rc = flake_report.main(["--cache-dir", str(only_hard_cache), "--json", str(out)], hard_gh)
+        self.assertEqual(rc, 0)
+        hard_data = json.loads(out.read_text())
+        self.assertEqual(hard_data["tests"], [])
+        self.assertEqual([row["test"] for row in hard_data["failed_tests"]], ["broken"])
+        self.assertIn("No test passed on retry after failing in this window.", stdout.getvalue())
+        self.assertIn("## Hard failures (failed every attempt)", stdout.getvalue())
 
     def test_fetching_stops_when_the_rate_limit_reaches_the_reserve(self):
         runs = [run(n, n) for n in range(1, 4)]
@@ -343,8 +397,14 @@ class LeaderboardTests(unittest.TestCase):
         self.assertEqual([row["test"] for row in data["tests"]], ["flaky"])
         self.assertEqual([path.name for path in self.cache.rglob("run-*")], ["run-1.json.gz"])
 
+    def test_defaults_query_scheduled_canary_runs_while_keeping_overrides(self):
+        defaults = flake_report.parse_args([])
+        self.assertEqual((defaults.workflow, defaults.event), ("canary.yml", "schedule"))
+        override = flake_report.parse_args(["--workflow", "ci.yml", "--event", "merge_group"])
+        self.assertEqual((override.workflow, override.event), ("ci.yml", "merge_group"))
+
     def test_markdown_shrinks_to_fit_an_issue_body(self):
-        report_data = {"generated_at": "now", "workflow": "ci.yml", "since": "then", "notes": [],
+        report_data = {"generated_at": "now", "workflow": "canary.yml", "event": "schedule", "since": "then", "notes": [],
                        "runs": {"with_reports": 1, "malformed_reports": 0},
                        "tests": [{"test": f"t{n}", "binary_id": "p", "flaky_attempts": 1, "failed_attempts": 0,
                                   "runs_seen": 1, "first_seen": "d", "last_seen": "d", "stress": "s",
@@ -353,6 +413,22 @@ class LeaderboardTests(unittest.TestCase):
         fitted = flake_report.fit_markdown(report_data, 50, 50, len(full) // 2)
         self.assertLessEqual(len(fitted), len(full) // 2)
         self.assertIn("| 50 | `t49` |", fitted)
+
+        # Hard-failure rows shrink before flaky rows or samples when fitting an issue body.
+        with_hard = {
+            **report_data,
+            "tests": report_data["tests"][:2],
+            "failed_tests": [
+                {"test": f"hard_{n}", "binary_id": "p", "flaky_attempts": 0, "failed_attempts": 5,
+                 "runs_seen": 1, "first_seen": "d", "last_seen": "d", "stress": "s", "samples": []}
+                for n in range(50)
+            ],
+        }
+        hard_full = flake_report.render_markdown(with_hard, 50, 50)
+        hard_fitted = flake_report.fit_markdown(with_hard, 50, 50, len(hard_full) // 2)
+        self.assertLessEqual(len(hard_fitted), len(hard_full) // 2)
+        self.assertIn("| 2 | `t1` |", hard_fitted)
+        self.assertNotIn("`hard_49`", hard_fitted)
 
 
 if __name__ == "__main__":

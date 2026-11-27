@@ -76,7 +76,9 @@ mod finite_req;
 /// SDK clients the relay plane builds itself.
 #[cfg(feature = "sdk")]
 #[doc(hidden)]
-pub use finite_req::{AuthWatch, FiniteEnd, FiniteLimits, FiniteReply, FiniteRequests};
+pub use finite_req::{
+    AUTH_CHALLENGE_WAIT, AuthWatch, FiniteEnd, FiniteLimits, FiniteReply, FiniteRequests,
+};
 mod key_package;
 #[cfg(feature = "sdk")]
 #[doc(hidden)]
@@ -111,11 +113,9 @@ pub use relay_list::{
 };
 #[cfg(feature = "sdk")]
 pub use sdk_client::{
-    NostrReconciliationEndpointFailure, NostrReconciliationFailure, NostrReconciliationItem,
-    NostrReconciliationProgress, NostrReconciliationSummary, NostrSdkNotification,
-    NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan, RelayLiveness,
-    RelayLivenessStatus, RelayRegistrationOutcome, dispatch_sdk_replay, sdk_subscription_refusal,
-    sign_transport_event_for_publish,
+    NostrSdkNotification, NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan,
+    RelayLiveness, RelayLivenessStatus, RelayRegistrationOutcome, dispatch_sdk_replay,
+    sdk_subscription_refusal, sign_transport_event_for_publish,
 };
 pub use telemetry::{
     DurationHistogramSnapshot, HistogramBucket, RelayDeliverySpread, RelayDeliveryStats,
@@ -517,21 +517,24 @@ pub struct NostrAdapterMetrics {
     /// These are not relay failures and may still have reached a relay.
     #[serde(default)]
     pub publish_cancellations: usize,
-    /// Route-level NIP-77 passes attempted after ordinary subscription rebuilds.
+    /// Retained for snapshot schema stability after the legacy
+    /// `reconcile_subscription` stack was retired (#2897 / #3789); remains
+    /// zero under the unified recovery runner (#2660).
     #[serde(default)]
     pub reconciliation_attempts: usize,
+    /// Retained for snapshot schema stability after `#3789`; remains zero.
     #[serde(default)]
     pub reconciliation_relays_succeeded: usize,
+    /// Retained for snapshot schema stability after `#3789`; remains zero.
     #[serde(default)]
     pub reconciliation_relays_failed: usize,
-    /// Event ids the relays reported absent from the durable local route sets.
+    /// Retained for snapshot schema stability after `#3789`; remains zero.
     #[serde(default)]
     pub reconciliation_remote_items: usize,
-    /// Missing events successfully downloaded by reconciliation.
+    /// Retained for snapshot schema stability after `#3789`; remains zero.
     #[serde(default)]
     pub reconciliation_received_items: usize,
-    /// Group passes that returned nothing because no time order covered the
-    /// history they were missing (`NostrReconciliationSummary::order_unproven`).
+    /// Retained for snapshot schema stability after `#3789`; remains zero.
     #[serde(default)]
     pub reconciliation_order_unproven_passes: usize,
     /// Account activations whose every REQ reached every relay.
@@ -914,6 +917,10 @@ pub trait NostrRelayNotificationSource: Send + Sync {
 }
 
 /// Boundary between this adapter and the actual Nostr relay implementation.
+///
+/// Any new method with a default implementation that `NostrSdkRelayClient`
+/// overrides must also be forwarded by `ManagedSdkPublishClient` in
+/// `transport-nostr`.
 #[async_trait]
 pub trait NostrRelayClient: Send + Sync {
     /// Where the messages this client's relays send come from, for a relay
@@ -1422,19 +1429,6 @@ impl NostrTransportAdapter {
             }
         }
         outcome
-    }
-
-    /// Record one privacy-safe aggregate NIP-77 result. These counters are
-    /// diagnostic only and never feed routing, convergence, or cursor policy.
-    #[cfg(feature = "sdk")]
-    pub async fn record_reconciliation(&self, summary: &NostrReconciliationSummary) {
-        let mut state = self.state.write().await;
-        state.metrics.reconciliation_attempts += 1;
-        state.metrics.reconciliation_relays_succeeded += summary.relays_succeeded;
-        state.metrics.reconciliation_relays_failed += summary.relays_failed;
-        state.metrics.reconciliation_remote_items += summary.remote_items;
-        state.metrics.reconciliation_received_items += summary.received_items;
-        state.metrics.reconciliation_order_unproven_passes += usize::from(summary.order_unproven);
     }
 
     /// Record one read-back: the REQs it sent and the relays that returned
@@ -2464,6 +2458,60 @@ impl NostrTransportAdapter {
         )
         .await;
         self.admit_relay_message(&relay_event, message, Some(&account), RelayCopy::RawGroup)
+            .await
+    }
+
+    /// Admit one raw kind-1059 inbox copy from `RelayMessage::Event` after
+    /// verifying its supplied wire bytes.
+    #[cfg(feature = "sdk")]
+    async fn handle_sdk_inbox_copy(
+        &self,
+        event: &nostr::prelude::Event,
+        endpoint: TransportEndpoint,
+        subscription_id: String,
+        account_id: Option<&MemberId>,
+    ) -> Result<usize, TransportAdapterError> {
+        if event.verify().is_err() {
+            // A kind-1059 copy whose supplied bytes fail signature/id
+            // verification cannot be trusted for observation or admission.
+            return Err(TransportAdapterError::InvalidInboundSignature);
+        }
+        let (relay_event, message) =
+            match NostrTransportEvent::from_nostr_event(event).and_then(|transport_event| {
+                let message = transport_event.to_transport_message()?;
+                Ok((transport_event, message))
+            }) {
+                Ok((transport_event, message)) => (
+                    NostrRelayEvent {
+                        endpoint,
+                        subscription_id: Some(subscription_id),
+                        event: transport_event,
+                    },
+                    message,
+                ),
+                Err(error) => {
+                    self.observe_unconvertible_relay_event(
+                        endpoint,
+                        subscription_id,
+                        event.created_at.as_secs(),
+                    )
+                    .await;
+                    return Err(map_inbound_event_error(error));
+                }
+            };
+        tracing::trace!(
+            target: "transport_nostr_adapter::sdk_client",
+            method = "handle_sdk_inbox_copy",
+            "forwarding SDK relay inbox event"
+        );
+        self.observe_relay_event(
+            event.id.as_bytes(),
+            &relay_event.endpoint,
+            relay_event.subscription_id.as_deref(),
+            message.timestamp.0,
+        )
+        .await;
+        self.admit_relay_message(&relay_event, message, account_id, RelayCopy::RawInbox)
             .await
     }
 
@@ -3728,6 +3776,7 @@ struct BufferedReplay {
 enum RelayCopy {
     Deduplicated,
     RawGroup,
+    RawInbox,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6261,6 +6310,9 @@ impl AdapterState {
                 continue;
             }
             if copy == RelayCopy::RawGroup && !source.is_some_and(|source| source.0) {
+                continue;
+            }
+            if copy == RelayCopy::RawInbox && source.is_some_and(|source| source.0) {
                 continue;
             }
             let input = match source {

@@ -315,11 +315,12 @@ pub enum SendIntent {
     /// still removed. `roster_update` is a `marmot.account.device-roster.v1`
     /// update that removes the device entry of a slot the roster lists. A
     /// removal also sets that slot's rejected-slot record with reason
-    /// `removed` and the `tag_signature_key` the entry had, or the signature
-    /// key of the leaf the Commit removes once that leaf has committed
-    /// (mdk#3679). A leaf still built from its Add's KeyPackage is never
-    /// recorded as `removed`, whatever key the record keeps; a failed link
-    /// removes the entry alone. Like a link, it is never queued.
+    /// `removed` and the `tag_signature_key` the entry had, the key its Add
+    /// bound, which is the leaf's signature key ("Key binding", marmot#521);
+    /// receivers refuse a record with any other key. A leaf still built from
+    /// its Add's KeyPackage is never recorded as `removed` unless its device
+    /// founded the group (mdk#3679); a failed link removes the entry alone.
+    /// Like a link, it is never queued.
     UnlinkDevice {
         group_id: GroupId,
         leaf_signature_key: Vec<u8>,

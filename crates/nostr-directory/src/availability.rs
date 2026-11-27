@@ -13,8 +13,7 @@ use cgka_traits::TransportEndpoint;
 use futures::StreamExt;
 use rusqlite::params;
 use storage_sqlite::{
-    PublicKeyPackageBarrierRecord, PublicKeyPackageEvidenceSnapshot,
-    PublicKeyPackageReplacementRecord, SqliteSharedStorage,
+    PublicKeyPackageBarrierRecord, PublicKeyPackageReplacementRecord, SqliteSharedStorage,
 };
 
 use tokio::sync::watch;
@@ -1105,75 +1104,55 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         }
         let directory = self.clone();
         let account = account_id_hex.to_owned();
-        let PublicKeyPackageEvidenceSnapshot {
-            replacements,
-            global_eviction,
-            barriers,
-            watermark,
-            revision: evidence_revision,
-        } = blocking_directory_task(move || {
+        let evidence = blocking_directory_task(move || {
             Ok(directory
                 .resources
                 .shared_storage()?
                 .key_package_evidence_snapshot(&account)?)
         })
         .await?;
-        let now = self.directory_freshness().now;
-        let future_skew_secs = self.config.max_future_skew.as_secs();
-        let current = match value.state {
-            FollowAvailabilityState::Ready => value
-                .key_package_event_id
-                .as_deref()
-                .zip(value.key_package_created_at)
-                .is_some_and(|(event_id, created_at)| {
-                    created_at.saturating_add(KEY_PACKAGE_FRESHNESS.as_secs()) > now
-                        && barriers.iter().all(|barrier| {
-                            if barrier.deleted_event_id.is_none()
-                                && Some(&barrier.key_package_id) != value.key_package_id.as_ref()
-                            {
-                                return true;
-                            }
-                            barrier_allows(event_id, created_at, barrier)
-                        })
-                        && watermark.as_ref().is_none_or(|barrier| {
-                            watermark_allows(event_id, created_at, now, future_skew_secs, barrier)
-                        })
-                        && global_eviction.as_ref().is_none_or(|barrier| {
-                            watermark_allows(event_id, created_at, now, future_skew_secs, barrier)
-                        })
-                        && replacements
-                            .iter()
-                            .filter(|replacement| {
-                                Some(&replacement.key_package_id) == value.key_package_id.as_ref()
-                            })
-                            .all(|replacement| {
-                                replacement_allows(event_id, created_at, replacement)
-                            })
-                }),
-            FollowAvailabilityState::NotFound => {
-                let read_started_at = value.checked_at;
-                let covered = |event_id: &str, observed_at: u64| {
-                    observed_at < read_started_at || value.observed_event_ids.contains(event_id)
-                };
-                replacements
-                    .iter()
-                    .all(|replacement| covered(&replacement.event_id_hex, replacement.observed_at))
-                    && barriers
+        let freshness = self.directory_freshness();
+        let now = freshness.now;
+        let current =
+            match value.state {
+                FollowAvailabilityState::Ready => value
+                    .key_package_event_id
+                    .as_deref()
+                    .zip(value.key_package_created_at)
+                    .is_some_and(|(event_id, created_at)| {
+                        created_at.saturating_add(KEY_PACKAGE_FRESHNESS.as_secs()) > now
+                            && crate::published_records::evidence_allows_key_package(
+                                &evidence,
+                                value.key_package_id.as_deref(),
+                                event_id,
+                                created_at,
+                                freshness,
+                            )
+                    }),
+                FollowAvailabilityState::NotFound => {
+                    let read_started_at = value.checked_at;
+                    let covered = |event_id: &str, observed_at: u64| {
+                        observed_at < read_started_at || value.observed_event_ids.contains(event_id)
+                    };
+                    evidence.replacements.iter().all(|replacement| {
+                        covered(&replacement.event_id_hex, replacement.observed_at)
+                    }) && evidence
+                        .barriers
                         .iter()
                         .all(|barrier| covered(&barrier.event_id_hex, barrier.observed_at))
-                    && watermark
-                        .as_ref()
-                        .is_none_or(|barrier| covered(&barrier.event_id_hex, barrier.observed_at))
-                    && global_eviction
-                        .as_ref()
-                        .is_none_or(|barrier| covered(&barrier.event_id_hex, barrier.observed_at))
-            }
-            FollowAvailabilityState::Unknown => true,
-        };
+                        && evidence.watermark.as_ref().is_none_or(|barrier| {
+                            covered(&barrier.event_id_hex, barrier.observed_at)
+                        })
+                        && evidence.global_eviction.as_ref().is_none_or(|barrier| {
+                            covered(&barrier.event_id_hex, barrier.observed_at)
+                        })
+                }
+                FollowAvailabilityState::Unknown => true,
+            };
         if current {
             if value.state == FollowAvailabilityState::NotFound {
                 value.checked_at = self.directory_freshness().now;
-                value.evidence_revision = evidence_revision;
+                value.evidence_revision = evidence.revision;
             }
             Ok(value)
         } else {

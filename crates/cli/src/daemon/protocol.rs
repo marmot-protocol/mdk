@@ -69,12 +69,13 @@ pub enum DaemonClientError {
     ServerBusy,
 }
 
-/// Failed daemon execute with the original `Cli` and stdin `nsec` sidecar when
+/// Failed daemon execute with the original `Cli` and stdin secret sidecars when
 /// the client can safely retry locally (for example connect refused).
 pub(crate) struct RecoverableDaemonExecute {
     pub err: DaemonClientError,
     pub cli: Cli,
     pub import_nsec: Option<crate::secret::ImportNsec>,
+    pub import_bunker: Option<crate::secret::ImportBunkerUri>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -140,10 +141,15 @@ pub(crate) enum DaemonRequest {
     NotificationsSubscribe {
         cli: Box<Cli>,
     },
+    Nip46Pair {
+        cli: Box<Cli>,
+    },
     Execute {
         cli: Box<Cli>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         import_nsec: Option<crate::secret::ImportNsec>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        import_bunker: Option<crate::secret::ImportBunkerUri>,
     },
 }
 
@@ -234,21 +240,142 @@ pub(crate) async fn send_execute(
     socket: &Path,
     cli: Cli,
     import_nsec: Option<crate::secret::ImportNsec>,
+    import_bunker: Option<crate::secret::ImportBunkerUri>,
 ) -> Result<CliOutput, RecoverableDaemonExecute> {
     let request = DaemonRequest::Execute {
         cli: Box::new(cli),
         import_nsec,
+        import_bunker,
     };
     match send_request(socket, &request).await {
         Ok(output) => Ok(output),
         Err(err) => {
-            let DaemonRequest::Execute { cli, import_nsec } = request else {
+            let DaemonRequest::Execute {
+                cli,
+                import_nsec,
+                import_bunker,
+            } = request
+            else {
                 unreachable!("send_execute only constructs Execute requests")
             };
             Err(RecoverableDaemonExecute {
                 err,
                 cli: *cli,
                 import_nsec,
+                import_bunker,
+            })
+        }
+    }
+}
+
+pub(crate) async fn send_nip46_pair(
+    socket: &Path,
+    cli: Cli,
+) -> Result<CliOutput, RecoverableDaemonExecute> {
+    let json_output = cli.json;
+    let request = DaemonRequest::Nip46Pair { cli: Box::new(cli) };
+    let bytes = match encode_daemon_request(&request) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let DaemonRequest::Nip46Pair { cli } = request else {
+                unreachable!("send_nip46_pair only constructs Nip46Pair requests")
+            };
+            return Err(RecoverableDaemonExecute {
+                err,
+                cli: *cli,
+                import_nsec: None,
+                import_bunker: None,
+            });
+        }
+    };
+    let mut stream = match UnixStream::connect(socket).await {
+        Ok(stream) => stream,
+        Err(source) => {
+            let DaemonRequest::Nip46Pair { cli } = request else {
+                unreachable!("send_nip46_pair only constructs Nip46Pair requests")
+            };
+            return Err(RecoverableDaemonExecute {
+                err: DaemonClientError::Connect {
+                    socket: socket.to_owned(),
+                    source,
+                },
+                cli: *cli,
+                import_nsec: None,
+                import_bunker: None,
+            });
+        }
+    };
+    let result = async {
+        stream.write_all(&bytes).await?;
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line).await?;
+            if read == 0 {
+                return Err(DaemonClientError::EmptyResponse);
+            }
+            let response: DaemonStreamResponse = serde_json::from_str(line.trim_end())?;
+            if response.stream_end {
+                return Err(DaemonClientError::EmptyResponse);
+            }
+            if let Some(error) = &response.error {
+                if error.code == DAEMON_SERVER_BUSY_CODE {
+                    return Err(DaemonClientError::ServerBusy);
+                }
+                if json_output {
+                    return Ok(CliOutput {
+                        code: 1,
+                        stdout: format!(
+                            "{}\n",
+                            serde_json::to_string(&serde_json::json!({
+                                "ok": false,
+                                "error": {
+                                    "code": error.code,
+                                    "message": error.message,
+                                }
+                            }))
+                            .expect("JSON response serialization cannot fail")
+                        ),
+                        stderr: String::new(),
+                    });
+                }
+                return Ok(CliOutput {
+                    code: 1,
+                    stdout: String::new(),
+                    stderr: format!("error: {}\n", crate::terminal_safe_text(&error.message)),
+                });
+            }
+            if let Some(result) = response.result {
+                match result.get("type").and_then(serde_json::Value::as_str) {
+                    Some("pairing_offer") => {
+                        if let Some(uri) = result.get("uri").and_then(serde_json::Value::as_str) {
+                            let _ = crate::commands::nip46::write_pairing_offer_to_stderr(uri);
+                        }
+                    }
+                    Some("cli_output") => {
+                        if let Some(output) = result.get("output") {
+                            return Ok(serde_json::from_value(output.clone())?);
+                        }
+                        return Err(DaemonClientError::EmptyResponse);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    .await;
+    match result {
+        Ok(output) => Ok(output),
+        Err(err) => {
+            let DaemonRequest::Nip46Pair { cli } = request else {
+                unreachable!("send_nip46_pair only constructs Nip46Pair requests")
+            };
+            Err(RecoverableDaemonExecute {
+                err,
+                cli: *cli,
+                import_nsec: None,
+                import_bunker: None,
             })
         }
     }

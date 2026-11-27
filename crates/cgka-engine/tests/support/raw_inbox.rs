@@ -11,7 +11,7 @@ use cgka_traits::error::EngineError;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
-use cgka_traits::types::{GroupId, MessageId};
+use cgka_traits::types::{GroupId, MemberId, MessageId};
 use sha2::{Digest, Sha256};
 
 /// Seal `welcome` as a raw transport message: its payload is the Welcome
@@ -21,15 +21,25 @@ pub fn raw_seal(welcome: &OutboundWelcome) -> TransportMessage {
     hasher.update(welcome.local_id.as_slice());
     hasher.update(welcome.recipient.as_slice());
     hasher.update(&welcome.payload.ciphertext);
+    raw_welcome_message(
+        MessageId::new(hasher.finalize().to_vec()),
+        welcome.payload.ciphertext.clone(),
+        welcome.recipient.clone(),
+    )
+}
+
+pub fn raw_welcome_message(
+    id: MessageId,
+    payload: Vec<u8>,
+    recipient: MemberId,
+) -> TransportMessage {
     TransportMessage {
-        id: MessageId::new(hasher.finalize().to_vec()),
-        payload: welcome.payload.ciphertext.clone(),
+        id,
+        payload,
         timestamp: Timestamp(0),
         causal_deps: Vec::new(),
         source: TransportSource("raw-inbox".into()),
-        envelope: TransportEnvelope::Welcome {
-            recipient: welcome.recipient.clone(),
-        },
+        envelope: TransportEnvelope::Welcome { recipient },
     }
 }
 

@@ -324,7 +324,7 @@ impl AppClient {
 
         let now = unix_now_seconds();
         let mut roster = DeviceRosterV1::default();
-        OsRng.fill_bytes(&mut roster.leaf_tag_key);
+        OsRng.fill_bytes(roster.leaf_tag_key.as_mut());
         // The founding roster lists only this device, its rejections and its
         // recovery key; the founding Add sets the new device's entry, as
         // every later Add does, so no entry ever names a device without its
@@ -333,8 +333,9 @@ impl AppClient {
         // publishes. This device's
         // entry also carries its tag signature key, so the engine tags its
         // founding leaf (3.1d), and its history key (4.1), which a later
-        // announcement writes if it cannot be read now; the new device sets
-        // both of its own once it joins. Nobody chose settings for the
+        // announcement writes if it cannot be read now. Each entry carries the
+        // signature key of the leaf the founding adds for it (marmot#521);
+        // the new device writes its history key once it joins. Nobody chose settings for the
         // founder, so it takes the defaults a new device starts with:
         // siblings add it to chats it is missing, with their history. Each
         // entry is created with a fresh rename id (3.6a), so a later rename
@@ -366,6 +367,7 @@ impl AppClient {
                 keep_while_inactive: false,
             },
             announced_key_package: Some(hex::decode(&link.key_package_ref_hex)?),
+            tag_signature_key: Some(metadata.leaf_signature_key.clone()),
             ..DeviceEntryV1::default()
         };
         // Rejections this device made before it had a device group (3.2).

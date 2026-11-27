@@ -6,8 +6,9 @@ use marmot_app::{AccountRelayListBootstrap, MarmotApp, MarmotAppRuntime};
 use serde_json::json;
 
 use crate::{
-    CommandOutput, ProfileCommand, WnError, ensure_local_signing, npub_for_account_id,
-    resolve_account, terminal_safe_json_display, unix_now_seconds, validate_relay_url,
+    CommandOutput, ProfileCommand, WnError, ensure_signing_capable, ensure_signing_ready,
+    npub_for_account_id, resolve_account, terminal_safe_json_display, unix_now_seconds,
+    validate_relay_url,
 };
 
 pub(crate) async fn profile_command(
@@ -36,9 +37,9 @@ pub(crate) async fn profile_command_with_runtime(
     relay: Option<String>,
 ) -> Result<CommandOutput, WnError> {
     let account = resolve_account(account_home, account_flag)?;
-    ensure_local_signing(&account)?;
     match command {
         ProfileCommand::Show => {
+            ensure_signing_capable(&account)?;
             let entry = app
                 .directory()
                 .directory_entry_for_account_id(&account.account_id_hex)?;
@@ -62,6 +63,7 @@ pub(crate) async fn profile_command_with_runtime(
             nip05,
             lud16,
         } => {
+            ensure_signing_ready(runtime, &account).await?;
             // A flag-per-field update is partial by intent: the user names the
             // fields they want to change and expects the rest of their kind:0
             // profile to survive. kind:0 is a *replaceable* event, though, so a

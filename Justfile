@@ -48,6 +48,42 @@ clippy-all-features:
 wasm-check:
     RUSTFLAGS='-D warnings' CC_wasm32_unknown_unknown="${CC_wasm32_unknown_unknown:-clang}" cargo build --locked --target wasm32-unknown-unknown -p cgka-traits -p cgka-engine -p transport-nostr-peeler
 
+# Compile-check marmot-uniffi for Android arm64-v8a without full NDK packaging.
+# Requires the aarch64-linux-android Rust target and Android NDK
+# (ANDROID_NDK_HOME / ANDROID_NDK_ROOT, or an installed NDK under ANDROID_HOME/ndk).
+android-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ndk="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${NDK_HOME:-}}}"
+    if [[ -z "$ndk" ]]; then
+        sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+        if [[ -n "$sdk_root" && -d "$sdk_root/ndk" ]]; then
+            ndk="$(find "$sdk_root/ndk" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+        fi
+    fi
+    if [[ -z "$ndk" || ! -d "$ndk/toolchains/llvm/prebuilt" ]]; then
+        echo "error: Android NDK not found (set ANDROID_NDK_HOME or ANDROID_NDK_ROOT)" >&2
+        exit 1
+    fi
+    case "$(uname -s)" in
+        Linux) host_tag="linux-x86_64" ;;
+        Darwin) host_tag="$(basename "$(find "$ndk/toolchains/llvm/prebuilt" -mindepth 1 -maxdepth 1 -type d -name 'darwin-*' | sort | tail -n 1)")" ;;
+        *) echo "error: unsupported host OS for android-check: $(uname -s)" >&2; exit 1 ;;
+    esac
+    toolchain_bin="$ndk/toolchains/llvm/prebuilt/$host_tag/bin"
+    clang="$toolchain_bin/aarch64-linux-android26-clang"
+    if [[ ! -x "$clang" ]]; then
+        echo "error: Android clang not found: $clang" >&2
+        exit 1
+    fi
+    CC_aarch64_linux_android="$clang" \
+    AR_aarch64_linux_android="$toolchain_bin/llvm-ar" \
+    RANLIB_aarch64_linux_android="$toolchain_bin/llvm-ranlib" \
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$clang" \
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_AR="$toolchain_bin/llvm-ar" \
+    RUSTFLAGS='-D warnings' \
+    cargo check --locked --target aarch64-linux-android -p marmot-uniffi
+
 test: test-default test-otlp
 
 test-default:
@@ -61,7 +97,7 @@ test-otlp:
 test-message-journeys:
     cargo nextest run -p marmot-app -p marmot-uniffi --features marmot-app/test-policy-overrides -E 'test(message_journey) | test(unavailable_send_retries_the_exact_event_after_transport_recovers) | test(connectivity_restored_wakes_a_retained_send_before_the_retry_timer) | test(connectivity_restored_during_reconnect_wakes_the_retained_send)'
 
-# Rank the tests that failed an attempt in recent merge-queue runs, from the
+# Rank the tests that failed an attempt in recent Canary runs, from the
 # JUnit reports CI keeps for seven days. Needs an authenticated `gh`; caches
 # each run, so a rerun fetches only new ones. See `--help` for options.
 flake-report *args:
@@ -76,6 +112,10 @@ flake-report-contract:
 # the test groups in .config/nextest.toml still cap their binaries.
 flake-stress package filter count="40" *args:
     cargo nextest run -p {{quote(package)}} -E {{quote(filter)}} --stress-count {{quote(count)}} --retries 0 --no-fail-fast --test-threads "${FLAKE_STRESS_THREADS:-num-cpus}" {{args}}
+
+# Test every crate changed since `base` and every crate depending on one, with the Canary's test features.
+dependents-nextest base="origin/master":
+    python3 scripts/dependents_nextest.py --base {{quote(base)}} --features {{test-features}}
 
 # Fail when a test file gains real-time waits (sleeps, or timeouts of a second
 # or less) over scripts/test_timing_baseline.json. After removing waits, run
@@ -165,6 +205,16 @@ release-all-draft version:
 
 release-all-dry-run version:
     ./scripts/cut-full-release.sh --dry-run {{version}}
+
+# One-click promotion of a verified SemVer RC (e.g. 0.20.0-rc.1) to a formal Stable cohort.
+promote-rc rc_version override_version="" dry_run="false":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=(workflow run promote-release.yml --ref master -f "rc_version={{rc_version}}" -f "dry_run={{dry_run}}")
+    if [ -n "{{override_version}}" ]; then
+        args+=(-f "override_version={{override_version}}")
+    fi
+    gh "${args[@]}"
 
 # Intentionally lightweight check for an initial version/docs-only release PR.
 # GitHub CI owns compilation, tests, and artifact builds for this stage.
@@ -297,6 +347,7 @@ cargo-audit-policy-gate:
 ci-path-classifier-gate:
     python3 scripts/test_classify_ci_changes.py
     python3 scripts/test_ci_workflow_policy.py
+    python3 scripts/test_dependents_nextest.py
 
 openclaw-dev-smoke root="":
     #!/usr/bin/env bash
@@ -676,6 +727,22 @@ changelog-gate:
     python3 scripts/changelog.py check
     python3 scripts/test_changelog.py
 
+# Unit tests for the PR commit-trailer validator (`scripts/check_pr_trailers.py`).
+pr-trailers-contract:
+    python3 scripts/test_check_pr_trailers.py
+
+# Unit and synthetic-repo tests for the revert-only Bisect Agent (`scripts/bisect_agent/`).
+bisect-agent-contract:
+    python3 scripts/test_bisect_agent.py
+
+# Unit and synthetic-repo tests for SemVer RC classification, publishing, and Stable promotion.
+rc-release-contract:
+    python3 scripts/test_rc_release.py
+
+# Validate Local-Checks, Local-Review, and Release-Impact trailers on a branch.
+pr-trailers-check base="origin/master" head="HEAD":
+    python3 scripts/check_pr_trailers.py --base {{quote(base)}} --head {{quote(head)}}
+
 # Release metadata PR: fold every changelog.d/ fragment into its CHANGELOG.md.
 changelog-release version *changelogs:
     python3 scripts/changelog.py release {{version}} {{changelogs}}
@@ -715,6 +782,6 @@ release-profile-gate:
 # passes, and the release pin proof. Run it once for shared build-input or
 # workflow changes; ordinary pushes use the scoped checks in AGENTS.md.
 # GitHub CI invokes the static gates directly and runs the full test matrix.
-fast-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate changelog-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate changelog-gate pr-trailers-contract bisect-agent-contract rc-release-contract binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin
 
-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate changelog-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin test
+ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate changelog-gate pr-trailers-contract bisect-agent-contract rc-release-contract binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin test

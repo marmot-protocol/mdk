@@ -1,21 +1,23 @@
 //! This device's tag signature key (mdk#2628 item 3.1d).
 //!
-//! A device tags its KeyPackages and leaves once its entry in its device
-//! group's roster carries its tag signature key, its MLS signature key
-//! (device-tag-v1.md, "Producing tags"). The founder writes its own key into
-//! the founding roster. Every other device sets its own once it has joined,
-//! in a roster update whose own UpdatePath the engine already tags under that
-//! key. That update also writes the device's history key (4.1), so joining
-//! costs no commit for it. Maintenance and every host KeyPackage publication
-//! make that update first, through the roster write path
-//! ([`AccountDeviceRuntime::edit_device_roster_entry`]); the host names the
-//! group.
+//! A device's entry in its device group's roster carries its tag signature
+//! key, its MLS signature key, from the Commit that added it (marmot#521;
+//! device-tag-v1.md, "Producing tags"). The founder writes its own key into
+//! the founding roster. A device that joined makes its first own Commit there
+//! once it has joined: a roster update writing its history key (4.1), or a
+//! self-update when the entry needs no change, whose UpdatePath the engine
+//! tags. That Commit shows its link made, and the device tags its KeyPackages
+//! and its leaves elsewhere only from then on. Maintenance and every host
+//! KeyPackage publication make that Commit first, through the roster write
+//! path ([`AccountDeviceRuntime::edit_device_roster_entry`]); the host names
+//! the group. No Commit changes an entry's key ("Key binding"), so a device
+//! whose entry carries no key or another key never tags from that roster.
 //!
-//! No KeyPackage is staged while the key is due and not yet in the merged
-//! roster: it would be built untagged and published after the key was set.
+//! No KeyPackage is staged while that Commit is due: it would be built
+//! untagged and published after the device started tagging.
 
 use cgka_traits::app_components::DeviceSlotId;
-use cgka_traits::{GroupId, TransportAdapter};
+use cgka_traits::{GroupId, SendIntent, TransportAdapter};
 
 use super::device_roster::{DeviceRosterEdit, DeviceRosterEditBlocked};
 use super::{AccountDeviceEffects, AccountDeviceRuntime, TRACE_TARGET};
@@ -25,14 +27,16 @@ use crate::routing::TransportRoutingPolicy;
 
 /// Where this device's roster entry stands for its tag signature key.
 enum TagKey {
-    /// The entry carries it, or no device group is named.
+    /// The entry carries it and the device's leaf shows its link made, or no
+    /// device group is named.
     Set,
-    /// The entry of this device's slot lacks it.
+    /// The entry of this device's slot lacks the key, or its leaf does not
+    /// show its link made yet: its first own Commit is due.
     Due(DeviceSlotId),
-    /// It cannot be set now: the device group is unreadable, holds no entry
-    /// for this device's slot, or another device's entry or a removed slot
-    /// keeps the key. The engine tags only from this device's own entry, so a
-    /// KeyPackage staged meanwhile is untagged.
+    /// It cannot be set: the device group is unreadable, holds no entry for
+    /// this device's slot, or that entry carries no key or another key,
+    /// which no Commit can change. The engine tags only from this device's
+    /// own entry, so a KeyPackage staged meanwhile is untagged.
     Blocked(&'static str),
 }
 
@@ -94,13 +98,15 @@ where
             })
     }
 
-    /// Set this device's tag signature key in its roster entry when the
-    /// entry lacks it. The returned effects carry the roster commit. The host
-    /// calls this before it publishes a KeyPackage, which is refused until
-    /// the merged roster carries the key.
+    /// Make this device's first own Commit in its device group when it is
+    /// due. The returned
+    /// effects carry the commit. The host calls this before it publishes a
+    /// KeyPackage, which is refused until that Commit has made this device's
+    /// link (`made_device_links` lists its slot).
     ///
     /// Does nothing when no device group is named, the slot is withdrawn, the
-    /// entry already carries the key, or the roster write path sends nothing:
+    /// link is already made, or neither the roster write path nor its
+    /// self-update fallback sends anything:
     /// the device group cannot take a commit from this device now (it is in
     /// `held`, quarantined, or settling, or an earlier change of this
     /// device's there is still queued or unconfirmed), or the entry changed
@@ -141,13 +147,11 @@ where
                 return Ok(AccountDeviceEffects::default());
             }
         };
-        let own_key = self.session.own_signature_key();
-        // The same commit carries this device's history key (4.1), when it
-        // can be read; the tag signature key never waits for it.
+        // The commit carries this device's history key (4.1), when it can be
+        // read; the first Commit never waits for it.
         let history_key = self.own_history_key("set_device_tag_key");
         match self
             .edit_device_roster_entry(group_id, &slot, held, |entry| {
-                entry.tag_signature_key = Some(own_key);
                 if let Some(history_key) = history_key {
                     entry.history_key = Some(history_key);
                 }
@@ -162,8 +166,18 @@ where
                 );
                 Ok(*effects)
             }
-            DeviceRosterEdit::Unchanged
-            | DeviceRosterEdit::Blocked(DeviceRosterEditBlocked::Busy) => {
+            // The entry already says everything this Commit would write, so
+            // a self-update makes it: its UpdatePath carries the first tag.
+            DeviceRosterEdit::Unchanged => {
+                if !self.device_group_takes_commit(group_id, held)? {
+                    return Ok(AccountDeviceEffects::default());
+                }
+                self.send(SendIntent::SelfUpdate {
+                    group_id: group_id.clone(),
+                })
+                .await
+            }
+            DeviceRosterEdit::Blocked(DeviceRosterEditBlocked::Busy) => {
                 Ok(AccountDeviceEffects::default())
             }
             DeviceRosterEdit::Blocked(blocked) => {
@@ -182,33 +196,23 @@ where
         let Some(slot) = self.own_device_slot()? else {
             return Ok(TagKey::Blocked("slot_unavailable"));
         };
-        let roster = self.merged_device_roster(group_id);
-        let Some(mut roster) = roster else {
+        let Some(roster) = self.merged_device_roster(group_id) else {
             return Ok(TagKey::Blocked("device_group_unreadable"));
         };
         let own_key = self.session.own_signature_key();
-        let Some(entry) = roster.devices.remove(&slot) else {
+        let Some(entry) = roster.devices.get(&slot) else {
             return Ok(TagKey::Blocked("no_roster_entry"));
         };
-        if entry.tag_signature_key.as_deref() == Some(own_key.as_slice()) {
-            return Ok(TagKey::Set);
+        if entry.tag_signature_key.as_deref() != Some(own_key.as_slice()) {
+            return Ok(TagKey::Blocked("entry_key_not_own"));
         }
-        // A roster gives each key one device, and a removed slot keeps the
-        // key its tags read as.
-        if roster
-            .devices
-            .values()
-            .any(|other| other.tag_signature_key.as_deref() == Some(own_key.as_slice()))
-        {
-            return Ok(TagKey::Blocked("key_held_by_another_device"));
-        }
-        if roster
-            .rejected_slots
-            .values()
-            .any(|rejected| rejected.tag_signature_key.as_deref() == Some(own_key.as_slice()))
-        {
-            return Ok(TagKey::Blocked("key_held_by_removed_slot"));
-        }
-        Ok(TagKey::Due(slot))
+        let Ok(made) = self.session.made_device_links(group_id, &roster) else {
+            return Ok(TagKey::Blocked("device_group_unreadable"));
+        };
+        Ok(if made.contains(&slot) {
+            TagKey::Set
+        } else {
+            TagKey::Due(slot)
+        })
     }
 }

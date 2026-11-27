@@ -279,21 +279,26 @@ fn record_range(
         until_seconds: slice.until_seconds,
     };
     let mut recorded = integer(now_seconds)?;
+    let touch_until = until.saturating_add(1);
+    let touch_since = since.saturating_sub(1);
     let touching = conn
         .prepare_cached(
             "SELECT since_seconds, until_seconds, recorded_at_seconds
              FROM account_recovery_coverage
              WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3 AND proof = ?4
-               AND since_seconds <= ?5 + 1 AND until_seconds >= ?6 - 1",
+               AND since_seconds <= ?5 AND until_seconds >= ?6",
         )
         .storage()?
-        .query_map(params![kind, id, slice.relay, proof, until, since], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })
+        .query_map(
+            params![kind, id, slice.relay, proof, touch_until, touch_since],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
         .storage()?
         .collect::<Result<Vec<_>, _>>()
         .storage()?;
@@ -2669,5 +2674,69 @@ mod tests {
             assert!(ranges(&app, &route, RELAY_A).is_empty());
             assert!(ranges(&app, &route, "").is_empty());
         }
+    }
+
+    /// Regression for #3798: `record_range` must compute touching bounds in
+    /// Rust with saturating arithmetic so `until == i64::MAX` never overflows
+    /// `?5 + 1` into a SQLite `REAL`.
+    #[test]
+    fn record_range_at_i64_max_avoids_sqlite_real_promotion() {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        use std::cell::RefCell;
+
+        thread_local! {
+            static COVERAGE_SQL: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        }
+        fn trace_coverage_sql(event: TraceEvent<'_>) {
+            if let TraceEvent::Stmt(stmt, _) = event
+                && let Some(expanded) = stmt.expanded_sql()
+                && expanded.contains("FROM account_recovery_coverage")
+            {
+                COVERAGE_SQL.with_borrow_mut(|sqls| sqls.push(expanded));
+            }
+        }
+
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        let route = group(1);
+        let max_ts = i64::MAX as u64;
+        record(
+            &app,
+            &route,
+            RELAY_A,
+            max_ts - 10,
+            max_ts - 2,
+            RecoveryCoverageProof::SweepSlice,
+            1,
+        );
+
+        COVERAGE_SQL.with_borrow_mut(Vec::clear);
+        storage
+            .lock()
+            .unwrap()
+            .trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(trace_coverage_sql));
+        record(
+            &app,
+            &route,
+            RELAY_A,
+            max_ts - 1,
+            max_ts,
+            RecoveryCoverageProof::SweepSlice,
+            2,
+        );
+        storage
+            .lock()
+            .unwrap()
+            .trace_v2(TraceEventCodes::empty(), None);
+
+        assert_eq!(
+            ranges(&app, &route, RELAY_A),
+            vec![(max_ts - 10, max_ts, RecoveryCoverageProof::SweepSlice)]
+        );
+        let sqls = COVERAGE_SQL.with_borrow(Clone::clone);
+        assert!(
+            sqls.iter().all(|sql| !sql.contains("+ 1")),
+            "record_range must not compute `?5 + 1` in SQL where i64::MAX promotes to REAL: {sqls:?}"
+        );
     }
 }

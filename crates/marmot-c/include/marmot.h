@@ -34,6 +34,21 @@
 #include <stdlib.h>
 
 /**
+ * Bitmask flag for `marmot_begin_onboarding_with_options`: automatically
+ * publish a kind-10050 inbox list from recommended defaults when complete
+ * discovery confirms none exists.
+ */
+#define MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST 1
+
+/**
+ * Bitmask flag for `marmot_begin_onboarding_with_options`: pass the
+ * `SingleDevice` step automatically when complete discovery finds
+ * `MARMOT_ONBOARDING_DEVICE_DISCOVERY_NONE_FOUND`, while keeping
+ * `single_device_notice` in the snapshot.
+ */
+#define MARMOT_ONBOARDING_PASS_DEVICE_NOTICE_WHEN_NONE_FOUND 2
+
+/**
  * Status code returned by every fallible `marmot_*` function.
  *
  * `MARMOT_STATUS_OK` (0) means success. Codes 1-9 are binding-level
@@ -363,6 +378,11 @@ enum MarmotStatus
    * Ask the recipient to update their client and publish a compatible KeyPackage.
    */
   MARMOT_STATUS_INCOMPATIBLE_KEY_PACKAGE = 134,
+  /**
+   * A relay check of the account is running; nothing more was checked.
+   * Ask again once its rows stop saying `checking`.
+   */
+  MARMOT_STATUS_RELAY_CHECK_RUNNING = 135,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -491,6 +511,7 @@ typedef enum MarmotOnboardingIssue {
   MARMOT_ONBOARDING_ISSUE_OTHER_INSTALLATION_POSSIBLE,
   MARMOT_ONBOARDING_ISSUE_DISCOVERY_INCOMPLETE,
   MARMOT_ONBOARDING_ISSUE_INSPECTION_COMPLETED,
+  MARMOT_ONBOARDING_ISSUE_RATE_LIMITED,
 } MarmotOnboardingIssue;
 
 typedef enum MarmotOnboardingFindingContext {
@@ -741,7 +762,10 @@ typedef enum MarmotInviteDeliveryStateKind {
 
 /**
  * Why an invite has not reached a relay (mdk#1706). `TooLarge` and
- * `KeyPackageRetired` are not produced yet.
+ * `KeyPackageRetired` are not produced yet. `InboxLookupFailed`: no
+ * usable inbox relay is known for the recipient and MDK's latest lookup
+ * of their inbox relay list failed; MDK looks it up again at its next
+ * retry.
  */
 typedef enum MarmotInviteDeliveryProblem {
   MARMOT_INVITE_DELIVERY_PROBLEM_NO_INBOX_RELAYS,
@@ -750,6 +774,7 @@ typedef enum MarmotInviteDeliveryProblem {
   MARMOT_INVITE_DELIVERY_PROBLEM_MIXED,
   MARMOT_INVITE_DELIVERY_PROBLEM_TOO_LARGE,
   MARMOT_INVITE_DELIVERY_PROBLEM_KEY_PACKAGE_RETIRED,
+  MARMOT_INVITE_DELIVERY_PROBLEM_INBOX_LOOKUP_FAILED,
 } MarmotInviteDeliveryProblem;
 
 /**
@@ -1040,13 +1065,28 @@ typedef enum MarmotRelayRole {
 } MarmotRelayRole;
 
 /**
- * What MDK knows of a relay. Only `Unchecked` and `NotAllowed` are
- * produced yet.
+ * What MDK knows of a relay. `Healthy`, `Suspected` and `Failing` come
+ * from an inbox check and describe one read of the account's inbox at
+ * the row's `checked_at_unix` (see the shared contract). Later versions
+ * may append states: keep a default case.
  */
 typedef enum MarmotRelayHealthState {
+  /**
+   * Allowed, and no check has established anything about it.
+   */
   MARMOT_RELAY_HEALTH_STATE_UNCHECKED,
+  /**
+   * The relay answered the inbox check with EOSE.
+   */
   MARMOT_RELAY_HEALTH_STATE_HEALTHY,
+  /**
+   * The check could not verify the relay: render "could not verify".
+   */
   MARMOT_RELAY_HEALTH_STATE_SUSPECTED,
+  /**
+   * The relay refused to serve this account's inbox when checked,
+   * with the account's own key answering any authentication.
+   */
   MARMOT_RELAY_HEALTH_STATE_FAILING,
   /**
    * The relay policy refuses it: this device never dials it.
@@ -1055,13 +1095,46 @@ typedef enum MarmotRelayHealthState {
 } MarmotRelayHealthState;
 
 /**
- * Why a relay is not allowed. Later versions may append faults: keep a
- * default case.
+ * Why a row is not `Unchecked` or `Healthy`. Later versions may append
+ * faults: keep a default case.
  */
 typedef enum MarmotRelayHealthFault {
+  /**
+   * `NotAllowed`: on the retired-relay list.
+   */
   MARMOT_RELAY_HEALTH_FAULT_RETIRED,
+  /**
+   * `NotAllowed`: not a relay URL.
+   */
   MARMOT_RELAY_HEALTH_FAULT_INVALID,
+  /**
+   * `NotAllowed`: a host this device refuses to dial.
+   */
   MARMOT_RELAY_HEALTH_FAULT_UNSAFE,
+  /**
+   * `Failing` or `Suspected`: authentication required and not accepted.
+   */
+  MARMOT_RELAY_HEALTH_FAULT_AUTHENTICATION_REQUIRED,
+  /**
+   * `Failing` or `Suspected`: payment required.
+   */
+  MARMOT_RELAY_HEALTH_FAULT_PAYMENT_REQUIRED,
+  /**
+   * `Failing` or `Suspected`: restricted or blocked.
+   */
+  MARMOT_RELAY_HEALTH_FAULT_RESTRICTED,
+  /**
+   * `Suspected`: no connection while another relay answered.
+   */
+  MARMOT_RELAY_HEALTH_FAULT_UNREACHABLE,
+  /**
+   * `Suspected`: no answer in time while another relay answered.
+   */
+  MARMOT_RELAY_HEALTH_FAULT_TIMED_OUT,
+  /**
+   * `Suspected`: ended without naming a refusal.
+   */
+  MARMOT_RELAY_HEALTH_FAULT_UNEXPLAINED,
 } MarmotRelayHealthFault;
 
 /**
@@ -1076,19 +1149,27 @@ typedef enum MarmotRelayWarningKind {
    */
   MARMOT_RELAY_WARNING_KIND_INBOX_LIST_EMPTY,
   /**
-   * Critical: the published inbox list allows no relay, so an
-   * invitation sent through it cannot reach this device (see the
-   * shared contract for a sender on this same install).
+   * Critical: every entry of the published inbox list is refused by
+   * the policy or `Failing` (see the shared contract for a sender on
+   * this same install). An `Unchecked` or `Suspected` entry never
+   * raises it.
    */
   MARMOT_RELAY_WARNING_KIND_NO_ALLOWED_INBOX_RELAY,
   /**
-   * Warning: some entries are refused beside at least one allowed.
+   * Warning: some entries are refused beside at least one allowed
+   * entry that is not `Failing`.
    */
   MARMOT_RELAY_WARNING_KIND_INBOX_RELAYS_NOT_ALLOWED,
   /**
-   * Notice: exactly one entry is allowed.
+   * Notice: exactly one entry is allowed and not `Failing`.
    */
   MARMOT_RELAY_WARNING_KIND_SINGLE_INBOX_RELAY,
+  /**
+   * Warning: some entries are `Failing` beside at least one allowed
+   * entry that is not; each refused to serve this account's inbox when
+   * checked.
+   */
+  MARMOT_RELAY_WARNING_KIND_INBOX_RELAY_FAILING,
 } MarmotRelayWarningKind;
 
 /**
@@ -2270,6 +2351,10 @@ typedef struct MarmotClientOptions {
    * blank or over 64 bytes leaves it out.
    */
   const char *device_platform;
+  /**
+   * Disable background acquisition of public avatar URLs. Zero (default) keeps it enabled.
+   */
+  uint8_t disable_public_avatar_acquisition;
 } MarmotClientOptions;
 
 /**
@@ -2931,6 +3016,13 @@ typedef struct MarmotOnboardingSingleDeviceNotice {
   uint64_t acknowledged_at;
 } MarmotOnboardingSingleDeviceNotice;
 
+typedef struct MarmotOnboardingCreatedInboxList {
+  char **relays;
+  uintptr_t relays_len;
+  char *event_id;
+  uint64_t published_at;
+} MarmotOnboardingCreatedInboxList;
+
 typedef struct MarmotOnboardingSnapshot {
   char *account_id_hex;
   char *recovery_epoch;
@@ -2941,6 +3033,7 @@ typedef struct MarmotOnboardingSnapshot {
   struct MarmotOnboardingRepairProposal *proposal;
   struct MarmotOnboardingSingleDeviceNotice *single_device_notice;
   bool cancellation_pending;
+  struct MarmotOnboardingCreatedInboxList *created_inbox_list;
 } MarmotOnboardingSnapshot;
 
 /**
@@ -4251,7 +4344,7 @@ typedef struct MarmotRelayHealthRow {
   uintptr_t roles_len;
   enum MarmotRelayHealthState state;
   /**
-   * Set exactly when `state` is `NotAllowed`.
+   * Set when `state` is `NotAllowed`, `Failing` or `Suspected`.
    */
   bool has_fault;
   /**
@@ -4259,6 +4352,19 @@ typedef struct MarmotRelayHealthRow {
    */
   enum MarmotRelayHealthFault fault;
   enum MarmotRelayStatus liveness;
+  /**
+   * When the inbox check that decided `state` asked the relay, in
+   * Unix seconds; absent while no check has established anything.
+   */
+  bool has_checked_at_unix;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t checked_at_unix;
+  /**
+   * An inbox check of this relay is running.
+   */
+  bool checking;
 } MarmotRelayHealthRow;
 
 /**
@@ -4280,8 +4386,9 @@ typedef struct MarmotAccountRelayWarning {
 } MarmotAccountRelayWarning;
 
 /**
- * The account's relay health from its held lists and the relay policy.
- * Free with `marmot_account_relay_health_free`.
+ * The account's relay health from its held lists, the relay policy and
+ * this process's inbox checks. Free with
+ * `marmot_account_relay_health_free`.
  */
 typedef struct MarmotAccountRelayHealth {
   enum MarmotRelayListPresence inbox_list;
@@ -6002,6 +6109,16 @@ typedef struct MarmotTimelineReplyPreview {
    * The previewed message's own reply target. Nullable.
    */
   char *reply_to_message_id_hex;
+  bool has_retention_seconds;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retention_seconds;
+  bool has_retention_expires_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retention_expires_at;
 } MarmotTimelineReplyPreview;
 
 /**
@@ -6193,7 +6310,7 @@ typedef struct MarmotTimelineMessageRecord {
   /**
    * True for an agent item whose first event this device does not
    * hold, such as one that began before this member joined: the row
-   * is its earliest edit, showing the latest version.
+   * is the first edit this device received, with the latest version.
    */
   bool agent_item_first_event_missing;
   struct MarmotTimelineReactionSummary reactions;
@@ -7453,10 +7570,13 @@ typedef enum MarmotEvent_Tag {
   /**
    * The account's relay health changed; re-read
    * `marmot_account_relay_health`. Fires when its answer, apart from each
-   * row's liveness, differs from the one last announced, which only a
-   * change to the account's held relay lists causes, and once each time
-   * the account's worker starts; never for a relay connecting or
-   * disconnecting. Carries no relays.
+   * row's liveness, `checked_at_unix` and `checking`, differs from the one
+   * last announced, which a change to the account's held relay lists or a
+   * state an inbox check established causes, and once each time the
+   * account's worker starts. It follows the relay lists and check results,
+   * not connects and disconnects: connection changes come from
+   * `marmot_subscribe_relay_liveness`. A check that confirms every state
+   * fires nothing. Carries no relays.
    * Only a running account worker sends it: a list that changes while
    * none runs (an external-signer account whose signer is not registered,
    * say) announces nothing, so read the query when the account starts and
@@ -11045,6 +11165,28 @@ MarmotStatus marmot_account_relay_health(const struct MarmotClient *client,
                                          struct MarmotAccountRelayHealth **out);
 
 /**
+ * Check whether the account's inbox relays serve its inbox and return
+ * the account's relay health after it. The account's worker runs one
+ * bounded read per allowed inbox relay (at most 16) on a connection of
+ * its own; blocks up to about 15 seconds. While a check of the account
+ * runs it returns `MARMOT_STATUS_RELAY_CHECK_RUNNING` at once; without a
+ * running account worker it fails and dials nothing. A remote signer may
+ * be asked to sign a relay's authentication challenge. A check no relay
+ * answered changes nothing. The written health is the answer;
+ * `MARMOT_EVENT_RELAY_HEALTH_CHANGED` follows a changed answer from the
+ * worker. Free with `marmot_account_relay_health_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_check_account_relays(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         struct MarmotAccountRelayHealth **out);
+
+/**
  * Reconnect one configured relay and return its next observed state.
  * Free with `marmot_relay_liveness_free`.
  *
@@ -13172,7 +13314,29 @@ MarmotStatus marmot_update_app_component(const struct MarmotClient *client,
                                          struct MarmotSendSummary **out);
 
 /**
- * Import an identity and persist its onboarding gate without publishing. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+ * Import an identity and persist its onboarding gate without publishing,
+ * configured by bitmask `flags` (`MARMOT_ONBOARDING_CREATE_MISSING_INBOX_LIST`,
+ * `MARMOT_ONBOARDING_PASS_DEVICE_NOTICE_WHEN_NONE_FOUND`, or `0`). Unknown flag
+ * bits return `MARMOT_STATUS_INVALID_ARGUMENT`. Free the returned snapshot with
+ * `marmot_onboarding_snapshot_free`.
+ *
+ * # Safety
+ * The client must be live, input pointers valid and borrowed, and out writable.
+ */
+MarmotStatus marmot_begin_onboarding_with_options(const struct MarmotClient *client,
+                                                  const char *nsec,
+                                                  const char *const *default_relays,
+                                                  uintptr_t default_relays_len,
+                                                  const char *const *discovery_relays,
+                                                  uintptr_t discovery_relays_len,
+                                                  const char *const *inbox_relays,
+                                                  uintptr_t inbox_relays_len,
+                                                  uint32_t flags,
+                                                  struct MarmotOnboardingSnapshot **out);
+
+/**
+ * Import an identity and persist its onboarding gate without publishing
+ * (`flags = 0`). Free the returned snapshot with `marmot_onboarding_snapshot_free`.
  *
  * # Safety
  * The client must be live, input pointers valid and borrowed, and out writable.

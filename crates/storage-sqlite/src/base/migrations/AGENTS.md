@@ -11,8 +11,16 @@ Shared-store migrations are separate (`../../shared/migrations.rs`).
   registry entry) in strict version order.
 - Prefer Rust migrations when data needs transformation; SQL-only DDL can still live inside `execute_batch`.
 - Keep migrations idempotent where SQLite supports it, but rely on `cgka_schema_migrations` for once-only execution.
-- A body must roll back completely when the runner's transaction fails: no `COMMIT`, no PRAGMA it relies on inside
-  the transaction (declare `suspend_foreign_keys` instead). `tests::every_migration_body_rolls_back_completely` in
+- An empty database starts from `baseline.sql` (migrations through `BASELINE_VERSION` in `baseline.rs`) and replays
+  only later migrations, so a new migration needs no baseline change. A value a fresh database draws for itself
+  (random or clock) needs a `RENEWED_PER_DATABASE` entry and draws it in its own body; `baseline.sql` emits that
+  expression directly in its seed `INSERT` before triggers are created. When replay after the cutoff measurably slows
+  fresh opens, refresh the baseline in a separate change: raise `BASELINE_VERSION` (up to `HEAD`) and regenerate the
+  file with `MDK_WRITE_MIGRATION_BASELINE=1 cargo test -p storage-sqlite baseline_file_matches_a_full_replay`.
+- A body must roll back completely when the runner's transaction fails: no `COMMIT`, no PRAGMA that outlives the
+  transaction (declare `suspend_foreign_keys` instead when a table rebuild needs `foreign_keys = OFF`;
+  `PRAGMA defer_foreign_keys = ON` is allowed when a body updates parent/child keys in place without dropping tables,
+  because SQLite resets it automatically on commit or rollback). `tests::every_migration_body_rolls_back_completely` in
   `../migrations.rs` walks every registered body this way, so a migration's own tests need no apply/rollback probe.
 - A per-migration test stops at its own version (`run_through(N)`) unless its contract is the head path. Tests that
   ran to head and compared whole rows or trigger sets broke whenever a later migration touched the same table

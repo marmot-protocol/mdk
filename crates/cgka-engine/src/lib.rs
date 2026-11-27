@@ -83,6 +83,7 @@ pub mod provider;
 pub mod publish;
 mod queued_intent_refusal;
 pub mod recovery_key;
+mod roster_key_binding;
 mod roster_tag_keys;
 pub mod self_update;
 pub mod snapshot_guard;

@@ -33,6 +33,10 @@ order and the roles agents most often need.
 - **Path:** `overview/nostr-account-transport.md`
   - **Role:** Current working note for Nostr directory, bootstrap, relay-plane, and routing boundaries.
 
+- **Path:** `overview/nostr-consumer-inventory.md`
+  - **Role:** Complete Nostr consumer ownership map, shared vs domain-specific guarantees, retired implementations, and
+    `#2897` release-build resource verification summary.
+
 - **Path:** `overview/whitenoise-integration-map.md`
   - **Role:** Current shim map and engine API friction list for whitenoise-rs integration.
 

@@ -8,28 +8,22 @@ use super::{
 };
 // Stands still at zero: a zero deadline has passed, and a later one never comes.
 use super::resumable::StoppedClock;
-use crate::account_identity_proof::{AccountIdentityProofRequest, AccountIdentityProofSigner};
 use crate::convergence::V1_MAX_REWIND_COMMITS;
+use crate::engine::test_support::{PassthroughPeeler, SeedProofSigner, carried, signing_key};
 use crate::message_processor::MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS;
 use crate::provider::EngineOpenMlsProvider;
 use crate::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
-use cgka_traits::error::PeelerError;
-use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::maintenance::MonotonicClock as _;
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
-use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerStorage, GroupStorage, MessageStorage, OutboundIntentStorage,
     StorageProvider,
 };
-use cgka_traits::transport::{
-    EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
-};
+use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::{OutboundWelcome, SealedWelcome};
-use k256::schnorr::{SigningKey, signature::hazmat::PrehashSigner};
 use openmls::group::MlsGroup;
 use openmls::prelude::{MlsMessageIn, ProcessedMessageContent};
 use openmls_basic_credential::SignatureKeyPair;
@@ -43,86 +37,12 @@ use tls_codec::{Deserialize as _, Serialize as _};
 
 // --- Test devices --------------------------------------------------------
 
-/// Deterministic BIP-340 key for a seed label. Marmot credential identities
-/// MUST be a valid 32-byte x-only secp256k1 public key, so identities are
-/// derived rather than invented.
-fn signing_key(seed: &[u8]) -> SigningKey {
-    for counter in 0u64.. {
-        let mut material = [0u8; 32];
-        let mut hasher = Sha256::new();
-        hasher.update(b"cgka-engine-test-identity-v1");
-        hasher.update(seed);
-        hasher.update(counter.to_be_bytes());
-        material.copy_from_slice(&hasher.finalize());
-        if let Ok(key) = SigningKey::from_slice(&material) {
-            return key;
-        }
-    }
-    unreachable!("a signing key is found within u64 counters")
-}
-
 fn member_id(seed: &[u8]) -> MemberId {
     MemberId::new(signing_key(seed).verifying_key().to_bytes().to_vec())
 }
 
-struct SeedProofSigner(SigningKey);
-
-impl AccountIdentityProofSigner for SeedProofSigner {
-    fn sign_account_identity_proof(
-        &self,
-        request: &AccountIdentityProofRequest,
-    ) -> Result<[u8; 64], String> {
-        Ok(self
-            .0
-            .sign_prehash(&request.proof_event_id()?)
-            .map_err(|e| e.to_string())?
-            .to_bytes())
-    }
-}
-
-/// Transport is not under test here: every message is carried verbatim.
-struct PassthroughPeeler;
-
-impl TransportPeeler for PassthroughPeeler {
-    fn peel_group_message(
-        &self,
-        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
-        _ctx: &GroupContextSnapshot,
-    ) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.message.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::MlsMessage {
-                bytes: msg.message.payload.clone(),
-            },
-            origin: msg.message.clone(),
-        })
-    }
-
-    fn wrap_group_message(
-        &self,
-        payload: &EncryptedPayload,
-        _ctx: &GroupContextSnapshot,
-    ) -> Result<TransportMessage, PeelerError> {
-        Ok(transport_message(
-            &payload.ciphertext,
-            TransportEnvelope::GroupMessage {
-                transport_group_id: vec![],
-            },
-        ))
-    }
-}
-
 fn transport_message(payload: &[u8], envelope: TransportEnvelope) -> TransportMessage {
-    TransportMessage {
-        id: MessageId::new(Sha256::digest(payload).to_vec()),
-        payload: payload.to_vec(),
-        timestamp: Timestamp(0),
-        causal_deps: vec![],
-        source: TransportSource("candidate-branch-peel-test".into()),
-        envelope,
-    }
+    carried("candidate-branch-peel-test", payload, envelope)
 }
 
 fn seal_and_bind(
@@ -229,8 +149,10 @@ async fn graph_seed_keeps_stale_commits() {
     let commit = rival_commit(&storage, &alice.self_id(), &group_id);
     admit_rival(&storage, &group_id, &commit, epoch);
 
+    let rewinds = crate::snapshot_guard::Rewinds::default();
     let retained =
-        super::seed_stored_openmls_graph_inputs(&storage, &group_id, epoch, None).unwrap();
+        super::seed_stored_openmls_graph_inputs(&storage, &rewinds, &group_id, epoch, None)
+            .unwrap();
     assert!(
         retained
             .commit_messages
@@ -238,7 +160,8 @@ async fn graph_seed_keeps_stale_commits() {
             .any(|row| row.message.id == commit.id)
     );
     let stale =
-        super::seed_stored_openmls_graph_inputs(&storage, &group_id, epoch + 1, None).unwrap();
+        super::seed_stored_openmls_graph_inputs(&storage, &rewinds, &group_id, epoch + 1, None)
+            .unwrap();
     assert!(stale.commit_messages.is_empty());
     assert!(stale.stale_commit_drops.iter().any(|row| {
         row.message_id == hex::encode(commit.id.as_slice())
@@ -865,7 +788,14 @@ async fn resumable_search_matches_original_bfs_without_repeating_probes() {
         );
     }
     let before = replay_state(&storage, &group_id);
-    let inputs = super::seed_stored_openmls_graph_inputs(&storage, &group_id, 0, None).unwrap();
+    let inputs = super::seed_stored_openmls_graph_inputs(
+        &storage,
+        &crate::snapshot_guard::Rewinds::default(),
+        &group_id,
+        0,
+        None,
+    )
+    .unwrap();
     let mut reference_budget = super::ReplayBudget::for_pass(messages.len(), 64);
     let reference = super::build_stored_openmls_candidate_paths_reference(
         &storage,
@@ -1377,8 +1307,14 @@ async fn candidate_reconstruction_measurement() {
                 admit_rival(&storage, &group_id, message, epoch);
             }
             let before = replay_state(&storage, &group_id);
-            let inputs =
-                super::seed_stored_openmls_graph_inputs(&storage, &group_id, 0, None).unwrap();
+            let inputs = super::seed_stored_openmls_graph_inputs(
+                &storage,
+                &crate::snapshot_guard::Rewinds::default(),
+                &group_id,
+                0,
+                None,
+            )
+            .unwrap();
             let mut budget = super::ReplayBudget::for_pass(messages.len(), 64);
             let start = std::time::Instant::now();
             let result = super::build_stored_openmls_candidate_paths(
@@ -1841,8 +1777,14 @@ async fn own_checkpoint_checks_parent() {
     let sibling = rival_commit(&peer, &bob.self_id(), &group_id);
     confirmed_update(&mut alice, &group_id).await;
     let next = confirmed_update(&mut alice, &group_id).await;
-    let inputs =
-        super::seed_stored_openmls_graph_inputs(&storage, &group_id, source_epoch, None).unwrap();
+    let inputs = super::seed_stored_openmls_graph_inputs(
+        &storage,
+        &crate::snapshot_guard::Rewinds::default(),
+        &group_id,
+        source_epoch,
+        None,
+    )
+    .unwrap();
     let mut selected = super::canonicalize_stored_openmls_messages(
         &storage,
         &group_id,
@@ -2381,8 +2323,14 @@ async fn own_private_checkpoint_refused() {
     storage
         .update_message_state(&message.id, MessageState::ConvergenceDeferred)
         .unwrap();
-    let inputs =
-        super::seed_stored_openmls_graph_inputs(&storage, &group_id, source_epoch, None).unwrap();
+    let inputs = super::seed_stored_openmls_graph_inputs(
+        &storage,
+        &crate::snapshot_guard::Rewinds::default(),
+        &group_id,
+        source_epoch,
+        None,
+    )
+    .unwrap();
     selected.accepted_commits = vec![hex::encode(message.id.as_slice())];
     selected.selected_tip = Some(source_epoch + 1);
     selected.selected_fork_epoch = Some(source_epoch);
@@ -3048,7 +2996,14 @@ async fn candidate_context_capture_keeps_a_late_native_storage_error() {
     for message in &messages {
         admit_rival(&storage, &group_id, message, 1);
     }
-    let inputs = super::seed_stored_openmls_graph_inputs(&storage, &group_id, 0, None).unwrap();
+    let inputs = super::seed_stored_openmls_graph_inputs(
+        &storage,
+        &crate::snapshot_guard::Rewinds::default(),
+        &group_id,
+        0,
+        None,
+    )
+    .unwrap();
     let mut budget = super::ReplayBudget::for_pass(messages.len(), V1_MAX_REWIND_COMMITS);
     let paths = super::build_stored_openmls_candidate_paths(
         &storage,

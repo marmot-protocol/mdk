@@ -138,7 +138,7 @@ discover_constants \
     "MAX_NATIVE_[A-Z0-9_]+"
 discover_constants \
     "crates/transport-nostr-adapter/src/sdk_client.rs" \
-    "(SDK_RECONCILIATION_(MAX_[A-Z0-9_]+|WAIT|NEGOTIATION_WAIT|WINDOW_PROBES)|SDK_NOTIFICATION_CAPACITY)"
+    "(SDK_NEG_CONCURRENT_SESSIONS|SDK_NOTIFICATION_CAPACITY)"
 discover_constants \
     "crates/transport-nostr-adapter/src/lib.rs" \
     "(RELAY_REPLAY_PAGE_LIMIT|REPLAY_BUFFER_MAX_[A-Z0-9_]+|REPLAY_WAIT_LIMIT|REPLAY_OPEN_UNTIL)"

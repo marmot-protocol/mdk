@@ -2560,7 +2560,6 @@ async fn directory_fetch_owner_cancellation_does_not_orphan_waiters() {
             .await
     });
     directory_fetcher.started.notified().await;
-    first.abort();
 
     let second_plane = relay_plane.clone();
     let second = tokio::spawn(async move {
@@ -2569,6 +2568,8 @@ async fn directory_fetch_owner_cancellation_does_not_orphan_waiters() {
             .await
     });
     wait_for_directory_waiter(&relay_plane).await;
+    first.abort();
+    let _ = first.await;
     directory_fetcher.release.notify_one();
 
     assert_eq!(second.await.unwrap().unwrap(), vec![event]);
@@ -2577,6 +2578,295 @@ async fn directory_fetch_owner_cancellation_does_not_orphan_waiters() {
         relay_plane.relay_health().await.directory_coalesced_waiters,
         1
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn directory_fetch_cancels_when_final_waiter_leaves() {
+    use tokio::sync::watch;
+
+    struct CancellableDirectoryFetcher {
+        fetch_count: AtomicUsize,
+        active_fetches: Arc<AtomicUsize>,
+        dropped_tx: watch::Sender<usize>,
+        started: Notify,
+        release: Notify,
+    }
+
+    struct ActiveDropGuard {
+        active: Arc<AtomicUsize>,
+        dropped_tx: watch::Sender<usize>,
+    }
+
+    impl Drop for ActiveDropGuard {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            self.dropped_tx.send_modify(|count| *count += 1);
+        }
+    }
+
+    #[async_trait]
+    impl DirectoryRelayFetcher for CancellableDirectoryFetcher {
+        async fn fetch_directory_events(
+            &self,
+            _request: DirectoryFetchRequest,
+        ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            self.active_fetches.fetch_add(1, Ordering::SeqCst);
+            let _guard = ActiveDropGuard {
+                active: self.active_fetches.clone(),
+                dropped_tx: self.dropped_tx.clone(),
+            };
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(Vec::new())
+        }
+    }
+
+    for with_completion in [false, true] {
+        let (dropped_tx, mut dropped_rx) = watch::channel(0usize);
+        let fetcher = Arc::new(CancellableDirectoryFetcher {
+            fetch_count: AtomicUsize::new(0),
+            active_fetches: Arc::new(AtomicUsize::new(0)),
+            dropped_tx,
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let plane = relay_plane_with_directory_fetcher(
+            Arc::new(RecordingRelayClient::default()),
+            fetcher.clone(),
+        );
+        let endpoints = vec![TransportEndpoint("wss://relay.example".into())];
+        let queries = vec![DirectoryEventQuery::new(0, vec!["11".repeat(32)], 12)];
+
+        let spawn_fetch = |plane: MarmotRelayPlane,
+                           endpoints: Vec<TransportEndpoint>,
+                           queries: Vec<DirectoryEventQuery>| {
+            tokio::spawn(async move {
+                if with_completion {
+                    plane
+                        .fetch_directory_events_with_completion(endpoints, queries)
+                        .await
+                        .map(|outcome| outcome.records)
+                } else {
+                    plane.fetch_directory_events(endpoints, queries).await
+                }
+            })
+        };
+
+        let first = spawn_fetch(plane.clone(), endpoints.clone(), queries.clone());
+        fetcher.started.notified().await;
+        let second = spawn_fetch(plane.clone(), endpoints.clone(), queries.clone());
+        wait_for_directory_waiter(&plane).await;
+
+        // Dropping one waiter leaves the second waiter attached: the shared
+        // fetch must remain active.
+        first.abort();
+        let _ = first.await;
+        tokio::task::yield_now().await;
+        assert_eq!(fetcher.active_fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(plane.relay_health().await.directory_inflight_fetches, 1);
+
+        // Dropping the final waiter immediately removes the key and cancels
+        // the underlying fetch task.
+        second.abort();
+        let _ = second.await;
+        assert_eq!(plane.relay_health().await.directory_inflight_fetches, 0);
+        timeout(
+            Duration::from_secs(2),
+            dropped_rx.wait_for(|count| *count >= 1),
+        )
+        .await
+        .expect("final waiter drop must cancel the shared directory fetch")
+        .unwrap();
+        assert_eq!(fetcher.active_fetches.load(Ordering::SeqCst), 0);
+
+        // A subsequent request for the same key starts fresh.
+        let third = spawn_fetch(plane.clone(), endpoints, queries);
+        fetcher.started.notified().await;
+        fetcher.release.notify_one();
+        assert!(third.await.unwrap().is_ok());
+        assert_eq!(fetcher.fetch_count.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_plane_shutdown_cancels_and_joins_active_directory_fetches() {
+    use tokio::sync::watch;
+
+    struct ShutdownObservingFetcher {
+        fetch_count: AtomicUsize,
+        active_fetches: Arc<AtomicUsize>,
+        started_tx: watch::Sender<usize>,
+    }
+
+    struct ActiveCounter(Arc<AtomicUsize>);
+    impl Drop for ActiveCounter {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl DirectoryRelayFetcher for ShutdownObservingFetcher {
+        async fn fetch_directory_events(
+            &self,
+            _request: DirectoryFetchRequest,
+        ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            self.active_fetches.fetch_add(1, Ordering::SeqCst);
+            let _active = ActiveCounter(self.active_fetches.clone());
+            self.started_tx.send_modify(|count| *count += 1);
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    let (started_tx, mut started_rx) = watch::channel(0usize);
+    let fetcher = Arc::new(ShutdownObservingFetcher {
+        fetch_count: AtomicUsize::new(0),
+        active_fetches: Arc::new(AtomicUsize::new(0)),
+        started_tx,
+    });
+    let plane = relay_plane_with_directory_fetcher(
+        Arc::new(RecordingRelayClient::default()),
+        fetcher.clone(),
+    );
+    let endpoints = vec![TransportEndpoint("wss://relay.example".into())];
+    let query = vec![DirectoryEventQuery::new(0, vec!["11".repeat(32)], 12)];
+
+    let plain_waiter = tokio::spawn({
+        let plane = plane.clone();
+        let endpoints = endpoints.clone();
+        let query = query.clone();
+        async move { plane.fetch_directory_events(endpoints, query).await }
+    });
+    let strict_waiter = tokio::spawn({
+        let plane = plane.clone();
+        let endpoints = endpoints.clone();
+        let query = query.clone();
+        async move {
+            plane
+                .fetch_directory_events_with_completion(endpoints, query)
+                .await
+        }
+    });
+    timeout(
+        Duration::from_secs(2),
+        started_rx.wait_for(|count| *count >= 2),
+    )
+    .await
+    .expect("both coalesced directory fetches started")
+    .unwrap();
+    assert_eq!(plane.relay_health().await.directory_inflight_fetches, 2);
+
+    plane.shutdown().await;
+
+    assert_eq!(
+        fetcher.active_fetches.load(Ordering::SeqCst),
+        0,
+        "shutdown must cancel and join active coalesced directory fetches before returning"
+    );
+    assert_eq!(plane.relay_health().await.directory_inflight_fetches, 0);
+    assert!(
+        plain_waiter
+            .await
+            .unwrap()
+            .expect_err("plain waiter receives shutdown error")
+            .contains("shutting down")
+    );
+    assert!(
+        strict_waiter
+            .await
+            .unwrap()
+            .expect_err("strict waiter receives shutdown error")
+            .contains("shutting down")
+    );
+
+    let after_shutdown = plane
+        .fetch_directory_events(endpoints, query)
+        .await
+        .expect_err("post-shutdown directory fetch must fail immediately");
+    assert!(after_shutdown.contains("shutting down"));
+    assert_eq!(fetcher.fetch_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn directory_fetch_final_waiter_cancellation_tears_down_real_relay_connection() {
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    for with_completion in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let req_seen = Arc::new(Notify::new());
+        let closed_or_disconnected = Arc::new(Notify::new());
+        let req_seen_server = req_seen.clone();
+        let closed_server = closed_or_disconnected.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            while let Some(item) = socket.next().await {
+                match item {
+                    Ok(Message::Text(text)) => {
+                        let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        if frame[0] == "REQ" {
+                            req_seen_server.notify_one();
+                        } else if frame[0] == "CLOSE" {
+                            closed_server.notify_one();
+                            return;
+                        }
+                    }
+                    Ok(Message::Ping(payload)) => {
+                        let _ = socket.send(Message::Pong(payload)).await;
+                    }
+                    Ok(Message::Close(_)) | Err(_) => {
+                        closed_server.notify_one();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            closed_server.notify_one();
+        });
+
+        let plane = relay_plane_with_directory_fetcher(
+            Arc::new(RecordingRelayClient::default()),
+            Arc::new(NostrSdkDirectoryRelayFetcher::standalone()),
+        );
+        let query = vec![DirectoryEventQuery::new(0, vec!["11".repeat(32)], 4)];
+        let waiter = tokio::spawn({
+            let plane = plane.clone();
+            let endpoint = endpoint.clone();
+            let query = query.clone();
+            async move {
+                if with_completion {
+                    let _ = plane
+                        .fetch_directory_events_with_completion(vec![endpoint], query)
+                        .await;
+                } else {
+                    let _ = plane.fetch_directory_events(vec![endpoint], query).await;
+                }
+            }
+        });
+
+        timeout(Duration::from_secs(5), req_seen.notified())
+            .await
+            .expect("relay received REQ");
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(plane.relay_health().await.directory_inflight_fetches, 0);
+
+        // Must tear down well before DIRECTORY_RELAY_FETCH_WAIT (3s).
+        timeout(
+            Duration::from_millis(1500),
+            closed_or_disconnected.notified(),
+        )
+        .await
+        .expect("final waiter cancellation must close the underlying relay connection");
+        server.abort();
+        let _ = server.await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5477,10 +5767,12 @@ async fn directory_forwards_immediate_event_while_rebuild_is_pending() {
     let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"immediate"}"#)
         .finalize(&keys)
         .unwrap();
-    source.send(RelayPoolNotification::Event {
+    source.send(RelayPoolNotification::Message {
         relay_url: endpoint.clone(),
-        subscription_id: SubscriptionId::new(id),
-        event: Box::new(profile.clone()),
+        message: Box::new(RelayMessage::Event {
+            subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(id)),
+            event: std::borrow::Cow::Owned(profile.clone()),
+        }),
     });
     let record = timeout(Duration::from_secs(2), events.recv())
         .await
@@ -5501,10 +5793,12 @@ async fn directory_forwards_immediate_event_while_rebuild_is_pending() {
     assert!(to_add.contains(id));
     assert_eq!(directory.stats().await.active_subscriptions, 0);
     assert!(directory.mark_auth_required(id, endpoint.as_str()).await);
-    source.send(RelayPoolNotification::Event {
+    source.send(RelayPoolNotification::Message {
         relay_url: endpoint,
-        subscription_id: SubscriptionId::new(id),
-        event: Box::new(profile),
+        message: Box::new(RelayMessage::Event {
+            subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(id)),
+            event: std::borrow::Cow::Owned(profile),
+        }),
     });
     source.send(RelayPoolNotification::Shutdown);
     timeout(Duration::from_secs(2), forwarder)
@@ -5525,8 +5819,9 @@ async fn directory_forwarder_verifies_each_notification_independently() {
     let directory =
         directory_plane_with_active_subscription(id, vec![keys.public_key().to_hex()], vec![0])
             .await;
+    let other_endpoint = RelayUrl::parse("wss://relay-two.example").unwrap();
     directory
-        .set_subscription_endpoints(std::slice::from_ref(&endpoint))
+        .set_subscription_endpoints(&[endpoint.clone(), other_endpoint.clone()])
         .await;
     let valid = EventBuilder::new(Kind::Metadata, r#"{"name":"authentic"}"#)
         .finalize(&keys)
@@ -5538,18 +5833,46 @@ async fn directory_forwarder_verifies_each_notification_independently() {
     assert!(!tampered.verify_id());
     assert!(invalid_signature.verify_id());
     assert!(!invalid_signature.verify_signature());
-    // Exercise the real forwarder after SDK admission, so the SDK's own
-    // verification cannot mask removal of MDK's independent check (mdk#2521).
-    let notifications = [valid.clone(), tampered, invalid_signature, valid.clone()]
-        .into_iter()
-        .map(|event| {
-            NotificationUpdate::Notification(ClientNotification::Event {
-                relay_url: endpoint.clone(),
-                subscription_id: SubscriptionId::new(id),
-                event: Box::new(event),
-            })
-        })
-        .collect::<Vec<_>>();
+    // Exercise the real forwarder after SDK admission:
+    // 1. First-seen `ClientNotification::Event` is ignored (no double delivery).
+    // 2. Per-message `RelayMessage::Event` verifies supplied bytes on every copy
+    //    (mdk#2521) and forwards copies from a second relay without SDK
+    //    `seen_event_ids` hiding them (#2897).
+    let notifications = vec![
+        NotificationUpdate::Notification(ClientNotification::Event {
+            relay_url: endpoint.clone(),
+            subscription_id: SubscriptionId::new(id),
+            event: Box::new(valid.clone()),
+        }),
+        NotificationUpdate::Notification(ClientNotification::Message {
+            relay_url: endpoint.clone(),
+            message: Box::new(RelayMessage::Event {
+                subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(id)),
+                event: std::borrow::Cow::Owned(tampered),
+            }),
+        }),
+        NotificationUpdate::Notification(ClientNotification::Message {
+            relay_url: endpoint.clone(),
+            message: Box::new(RelayMessage::Event {
+                subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(id)),
+                event: std::borrow::Cow::Owned(invalid_signature),
+            }),
+        }),
+        NotificationUpdate::Notification(ClientNotification::Message {
+            relay_url: endpoint.clone(),
+            message: Box::new(RelayMessage::Event {
+                subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(id)),
+                event: std::borrow::Cow::Owned(valid.clone()),
+            }),
+        }),
+        NotificationUpdate::Notification(ClientNotification::Message {
+            relay_url: other_endpoint.clone(),
+            message: Box::new(RelayMessage::Event {
+                subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(id)),
+                event: std::borrow::Cow::Owned(valid.clone()),
+            }),
+        }),
+    ];
     let (sender, mut events) = broadcast::channel(8);
     let forwarder = spawn_directory_notification_forwarder(
         Box::pin(futures::stream::iter(notifications)),
@@ -5562,12 +5885,22 @@ async fn directory_forwarder_verifies_each_notification_independently() {
         .unwrap();
     let mut forwarded = Vec::new();
     while let Ok(DirectoryRelayPlaneEvent::Record(record)) = events.try_recv() {
-        forwarded.push(record.event);
+        forwarded.push((record.endpoints, record.event));
     }
+    let expected = NostrTransportEvent::from_nostr_event(&valid).unwrap();
     assert_eq!(
         forwarded,
-        vec![NostrTransportEvent::from_nostr_event(&valid).unwrap(); 2],
-        "only authentic copies may cross the directory notification boundary"
+        vec![
+            (
+                vec![TransportEndpoint(endpoint.to_string())],
+                expected.clone()
+            ),
+            (
+                vec![TransportEndpoint(other_endpoint.to_string())],
+                expected
+            ),
+        ],
+        "only authentic per-message copies cross the directory notification boundary, with each relay's endpoint preserved"
     );
 }
 
@@ -6158,7 +6491,7 @@ async fn loss_authority_router_updates_a_marker_with_its_control_already_queued(
         Ok(())
     });
     let signal = overflow.record_drop(1, Some(1), None);
-    persist_queue_loss(&sender, &overflow, marker.clone(), signal);
+    persist_queue_loss(&sender, &overflow, marker.clone(), signal, None);
     timeout(Duration::from_secs(2), async {
         while sender.capacity() == 2 {
             tokio::task::yield_now().await;
@@ -6168,7 +6501,7 @@ async fn loss_authority_router_updates_a_marker_with_its_control_already_queued(
     .unwrap();
     let signal = overflow.record_drop(1, Some(1), None);
     assert!(signal.is_none(), "existing control record remains queued");
-    persist_queue_loss(&sender, &overflow, marker, signal);
+    persist_queue_loss(&sender, &overflow, marker, signal, None);
     timeout(Duration::from_secs(2), async {
         while latest.load(Ordering::SeqCst) != 2 || !overflow.marker_barrier_complete() {
             tokio::task::yield_now().await;
@@ -7163,12 +7496,9 @@ async fn directory_wire_rejects_forgery_when_verified_ids_outlive_seen_state() {
             ])
             .await
             .unwrap();
-        let expected = if clear_seen {
-            vec![&seed, &fence]
-        } else {
-            vec![&fence]
-        };
-        for event in expected {
+        // Per-message `RelayMessage::Event` admission rejects every forged copy
+        // and forwards the authentic `seed` copy regardless of SDK seen-state.
+        for event in [&seed, &fence] {
             let DirectoryRelayPlaneEvent::Record(record) =
                 timeout(Duration::from_secs(5), events.recv())
                     .await
@@ -8140,4 +8470,436 @@ async fn account_publishes_and_the_adapter_refuse_the_same_relays() {
             }
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plane_shutdown() {
+    let plane = MarmotRelayPlane::full_history();
+    let alice_keys = Keys::generate();
+    let bob_keys = Keys::generate();
+    let carol_keys = Keys::generate();
+    let dave_keys = Keys::generate();
+    let alice_hex = alice_keys.public_key().to_hex();
+    let bob_hex = bob_keys.public_key().to_hex();
+    let carol_hex = carol_keys.public_key().to_hex();
+    let dave_hex = dave_keys.public_key().to_hex();
+    let alice_id = MemberId::new(alice_keys.public_key().to_bytes().to_vec());
+    let bob_id = MemberId::new(bob_keys.public_key().to_bytes().to_vec());
+    let carol_id = MemberId::new(carol_keys.public_key().to_bytes().to_vec());
+
+    let alice_pub_dyn = plane.account_publish_client(&alice_hex, Arc::new(alice_keys.clone()));
+    let bob_pub_dyn = plane.account_publish_client(&bob_hex, Arc::new(bob_keys));
+    let carol_pub_dyn = plane.account_publish_client(&carol_hex, Arc::new(carol_keys));
+    let dave_pub_dyn = plane.account_publish_client(&dave_hex, Arc::new(dave_keys));
+    // Also cache a client whose only strong reference lives in `account_publish_clients`
+    // so `plane.shutdown()` exercises dropping the last `Arc<ManagedSdkPublishClient>`.
+    let eve_keys = Keys::generate();
+    let eve_hex = eve_keys.public_key().to_hex();
+    let _ = plane.account_publish_client(&eve_hex, Arc::new(eve_keys));
+    let (alice_pub, bob_pub, carol_pub, dave_pub, eve_pub) = {
+        let guard = plane.inner.publish_clients.lock().unwrap();
+        (
+            guard.account[&alice_hex].inner().clone(),
+            guard.account[&bob_hex].inner().clone(),
+            guard.account[&carol_hex].inner().clone(),
+            guard.account[&dave_hex].inner().clone(),
+            guard.account[&eve_hex].inner().clone(),
+        )
+    };
+    assert!(!alice_pub.client().is_shutdown());
+    assert!(!bob_pub.client().is_shutdown());
+    assert!(!carol_pub.client().is_shutdown());
+    assert!(!dave_pub.client().is_shutdown());
+    assert!(!eve_pub.client().is_shutdown());
+
+    // Evicting Carol after all caller refs drop outside a Tokio runtime queues
+    // her shutdown in `pending_client_shutdowns`; deactivating Carol right away
+    // (before any unrelated runtime drop drains that queue) must shut her SDK
+    // client down immediately without touching other accounts.
+    drop(carol_pub_dyn);
+    let plane_for_sync_evict = plane.clone();
+    let carol_hex_for_sync_evict = carol_hex.clone();
+    std::thread::spawn(move || {
+        plane_for_sync_evict.evict_account_publish_client(&carol_hex_for_sync_evict);
+    })
+    .join()
+    .expect("sync eviction thread should join");
+    assert!(
+        !carol_pub.client().is_shutdown(),
+        "off-runtime eviction should queue shutdown rather than skipping it"
+    );
+    plane.deactivate_account_context(&carol_id).await.unwrap();
+    assert!(
+        carol_pub.client().is_shutdown(),
+        "deactivating an account must drain its pending off-runtime publish-client shutdowns"
+    );
+    assert!(!alice_pub.client().is_shutdown());
+    assert!(!bob_pub.client().is_shutdown());
+
+    // Evicting Alice while an account worker still holds its `Arc` must keep
+    // that working pool alive (e.g. across `pin_external_signer` reattach) and
+    // only shut it down once the caller drops its `Arc`.
+    plane.evict_account_publish_client(&alice_hex);
+    tokio::task::yield_now().await;
+    assert!(
+        !alice_pub.client().is_shutdown(),
+        "evicting a cached publish client must not shut down a pool still held by a caller"
+    );
+    let alice_replacement_dyn =
+        plane.account_publish_client(&alice_hex, Arc::new(alice_keys.clone()));
+    let alice_replacement = plane.inner.publish_clients.lock().unwrap().account[&alice_hex]
+        .inner()
+        .clone();
+    drop(alice_pub_dyn);
+    timeout(Duration::from_secs(5), async {
+        while !alice_pub.client().is_shutdown() || !carol_pub.client().is_shutdown() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropped evicted publish client and pending off-runtime eviction must shut down");
+    assert!(!bob_pub.client().is_shutdown());
+
+    // Evict Alice's replacement while still held, then create a third cached
+    // client for Alice so deactivation exercises BOTH a held retired client and
+    // a cached active client for Alice without affecting Bob or Dave.
+    plane.evict_account_publish_client(&alice_hex);
+    let alice_cached_dyn = plane.account_publish_client(&alice_hex, Arc::new(alice_keys));
+    let alice_cached = plane.inner.publish_clients.lock().unwrap().account[&alice_hex]
+        .inner()
+        .clone();
+    assert!(!alice_replacement.client().is_shutdown());
+    assert!(!alice_cached.client().is_shutdown());
+
+    // Evicting Dave while held keeps Dave alive until `plane.shutdown()`.
+    plane.evict_account_publish_client(&dave_hex);
+    tokio::task::yield_now().await;
+    assert!(!dave_pub.client().is_shutdown());
+
+    // Anonymous publish clients stay alive while an adapter clone is held
+    // (including across receive-plane `shutdown()`), shut down once the last
+    // adapter clone drops, and shut down immediately on account deactivation.
+    let adapter_a1 = plane.account_adapter(alice_id.clone(), alice_cached_dyn.clone());
+    let anon_a1 = adapter_a1
+        .anonymous_publish_client
+        .as_ref()
+        .expect("SDK plane creates anonymous publish client")
+        .inner()
+        .clone();
+    let adapter_a2 = plane.account_adapter(alice_id.clone(), alice_cached_dyn.clone());
+    let anon_a2 = adapter_a2
+        .anonymous_publish_client
+        .as_ref()
+        .expect("replacement adapter creates fresh anonymous publish client")
+        .inner()
+        .clone();
+    tokio::task::yield_now().await;
+    assert!(
+        !anon_a1.client().is_shutdown(),
+        "replacing an adapter must not shut down an anonymous client still held by an earlier clone"
+    );
+    drop(adapter_a1);
+    timeout(Duration::from_secs(5), async {
+        while !anon_a1.client().is_shutdown() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropped replaced anonymous publish client must shut down");
+    assert!(!anon_a2.client().is_shutdown());
+
+    let adapter_a3 = plane.account_adapter(alice_id.clone(), alice_cached_dyn.clone());
+    let anon_a3 = adapter_a3
+        .anonymous_publish_client
+        .as_ref()
+        .expect("second replacement adapter creates fresh anonymous publish client")
+        .inner()
+        .clone();
+
+    let adapter_b = plane.account_adapter(bob_id.clone(), bob_pub_dyn);
+    let anon_b = adapter_b
+        .anonymous_publish_client
+        .as_ref()
+        .expect("Bob adapter creates anonymous publish client")
+        .inner()
+        .clone();
+
+    // Retaining Alice's cached + retired signer-bound publish clients and both
+    // `adapter_a2` and `adapter_a3` across account deactivation must tear down
+    // every live publish pool for Alice without touching Bob or Dave.
+    plane.deactivate_account_context(&alice_id).await.unwrap();
+    assert!(
+        alice_cached.client().is_shutdown(),
+        "deactivating an account must shut down its cached signer-bound publish client even while held"
+    );
+    assert!(
+        alice_replacement.client().is_shutdown(),
+        "deactivating an account must shut down its retired signer-bound publish clients even while held"
+    );
+    assert!(
+        anon_a2.client().is_shutdown(),
+        "deactivating an account must shut down retained earlier anonymous publish clients"
+    );
+    assert!(
+        anon_a3.client().is_shutdown(),
+        "deactivating an account must shut down its current anonymous publish client"
+    );
+    assert!(
+        !bob_pub.client().is_shutdown(),
+        "deactivating Alice must not shut down Bob's cached publish client"
+    );
+    assert!(
+        !dave_pub.client().is_shutdown(),
+        "deactivating Alice must not shut down Dave's retired publish client"
+    );
+    assert!(!anon_b.client().is_shutdown());
+    drop(alice_replacement_dyn);
+    drop(alice_cached_dyn);
+    drop(adapter_a2);
+    drop(adapter_a3);
+
+    plane.shutdown().await;
+    assert!(
+        bob_pub.client().is_shutdown(),
+        "plane shutdown must shut down remaining account publish clients"
+    );
+    assert!(
+        dave_pub.client().is_shutdown(),
+        "plane shutdown must shut down retired publish clients still held by callers"
+    );
+    assert!(
+        eve_pub.client().is_shutdown(),
+        "plane shutdown must shut down cached publish clients whose last Arc lived in the map"
+    );
+    assert!(
+        !anon_b.client().is_shutdown(),
+        "plane shutdown must leave a held adapter's anonymous publish client live"
+    );
+    drop(adapter_b);
+    timeout(Duration::from_secs(5), async {
+        while !anon_b.client().is_shutdown() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping the last adapter clone after plane shutdown must shut down its anonymous publish client");
+    drop(dave_pub_dyn);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_joins_in_flight_delivery_spill_and_loss_marker_tasks() {
+    let plane = MarmotRelayPlane::full_history();
+    let account = MemberId::new(vec![0x5B; 32]);
+    let publish_client = Arc::new(RecordingRelayClient::default());
+
+    let spill_started = Arc::new(Notify::new());
+    let (spill_release_tx, spill_release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let spill_release_rx = Arc::new(std::sync::Mutex::new(spill_release_rx));
+    let spill_finished = Arc::new(AtomicBool::new(false));
+    let marker_started = Arc::new(Notify::new());
+    let (marker_release_tx, marker_release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let marker_release_rx = Arc::new(std::sync::Mutex::new(marker_release_rx));
+    let marker_finished = Arc::new(AtomicBool::new(false));
+
+    let spill_started_clone = spill_started.clone();
+    let spill_finished_clone = spill_finished.clone();
+    let spill_store: AccountDeliverySpillStore = Arc::new(move |batch| {
+        spill_started_clone.notify_one();
+        let _ = spill_release_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recv();
+        spill_finished_clone.store(true, Ordering::SeqCst);
+        // Returning Full forces the spill writer to omit into retired queue
+        // loss after `shutdown()` clears `account_deliveries`, spawning a
+        // `persist_marker_before_drop` task that `shutdown()` must also join.
+        Ok(vec![DeliverySpillDisposition::Full; batch.len()])
+    });
+
+    let marker_started_clone = marker_started.clone();
+    let marker_finished_clone = marker_finished.clone();
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _, _| {
+        marker_started_clone.notify_one();
+        let _ = marker_release_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recv();
+        marker_finished_clone.store(true, Ordering::SeqCst);
+        Ok(())
+    });
+
+    let _adapter = plane.account_adapter_with_recovery_marker(
+        account.clone(),
+        publish_client,
+        Some(marker),
+        Some(spill_store),
+    );
+
+    let make_delivery = |index: u64| TransportDelivery {
+        account_id: account.clone(),
+        group_id_hint: None,
+        message: TransportMessage {
+            id: MessageId::new(vec![index as u8; 32]),
+            timestamp: Timestamp(1_700_000_000 + index),
+            envelope: TransportEnvelope::Welcome {
+                recipient: account.clone(),
+            },
+            payload: vec![0xAA; 16],
+            causal_deps: Vec::new(),
+            source: TransportSource("nostr".into()),
+        },
+        received_at: Timestamp(1_700_000_000 + index),
+        source: TransportDeliverySource {
+            transport: TransportSource("nostr".into()),
+            plane: TransportDeliveryPlane::AccountInbox,
+            endpoint: Some(TransportEndpoint("wss://relay.example".into())),
+            subscription_id: None,
+            wire: None,
+        },
+    };
+
+    for index in 0..=ACCOUNT_DELIVERY_BUFFER {
+        plane.route_account_delivery_for_test(make_delivery(index as u64));
+    }
+
+    timeout(Duration::from_secs(2), spill_started.notified())
+        .await
+        .expect("spill writer must start once queue fills");
+    let plane_for_shutdown = plane.clone();
+    let shutdown_task = tokio::spawn(async move {
+        plane_for_shutdown.shutdown().await;
+    });
+    timeout(Duration::from_secs(2), async {
+        while !plane.is_shutting_down() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown should begin");
+    assert!(
+        !shutdown_task.is_finished(),
+        "shutdown() must wait for in-flight spill writer"
+    );
+    spill_release_tx.send(()).expect("release spill writer");
+
+    timeout(Duration::from_secs(2), marker_started.notified())
+        .await
+        .expect("spill omission must spawn loss-marker persistence");
+    assert!(
+        !shutdown_task.is_finished(),
+        "shutdown() must wait for spawned loss-marker task"
+    );
+    marker_release_tx.send(()).expect("release loss marker");
+
+    timeout(Duration::from_secs(5), shutdown_task)
+        .await
+        .expect("shutdown() must finish once tasks complete")
+        .expect("shutdown task must not panic");
+
+    assert!(
+        spill_finished.load(Ordering::SeqCst),
+        "shutdown() must join in-flight delivery_spill writers"
+    );
+    assert!(
+        marker_finished.load(Ordering::SeqCst),
+        "shutdown() must join loss-marker persistence tasks spawned before/during spill drain"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_preserves_below_cursor_spill_deliveries_when_store_exceeds_deadline() {
+    let spill_started = Arc::new(Notify::new());
+    let (spill_release_tx, spill_release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let spill_release_rx = Arc::new(std::sync::Mutex::new(spill_release_rx));
+    let recorded_markers = Arc::new(std::sync::Mutex::new(Vec::<(u64, Option<u64>)>::new()));
+
+    let spill_started_clone = spill_started.clone();
+    let spill_store: AccountDeliverySpillStore = Arc::new(move |_batch| {
+        spill_started_clone.notify_one();
+        // Block past `RELAY_PLANE_SHUTDOWN_WAIT` so shutdown hits its timeout
+        // path before this blocking store call returns.
+        let _ = spill_release_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recv();
+        Err(AccountDeliveryRecoveryMarkerError::Retryable)
+    });
+
+    let recorded_markers_clone = recorded_markers.clone();
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, dropped, earliest, _| {
+        recorded_markers_clone
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((dropped, earliest));
+        Ok(())
+    });
+
+    let (relay_plane, adapter, alice) =
+        cursor_floor_adapter_opened(Some(spill_store), Some(marker), None);
+    let candidate = Some(OPENED_CURSOR + 2_000);
+    assert_eq!(
+        adapter.seal_transport_cursor(candidate, |_| true),
+        candidate
+    );
+
+    // First delivery starts the blocking spill writer below the saved restart
+    // floor; the second stays queued in `handoff.items` with an even earlier
+    // timestamp.
+    let first_below = OPENED_CURSOR - 50_000;
+    let second_below = OPENED_CURSOR - 60_000;
+    relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+        &alice,
+        1,
+        first_below,
+        TransportDeliveryPlane::Group,
+    ));
+    timeout(Duration::from_secs(2), spill_started.notified())
+        .await
+        .expect("in-flight spill writer must start");
+    relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+        &alice,
+        2,
+        second_below,
+        TransportDeliveryPlane::Group,
+    ));
+
+    // Pause time while `spill_store` is blocked, advance past the spill
+    // shutdown deadline so `shutdown()` transfers both the in-flight batch and
+    // queued handoff into durable retired queue loss before aborting the
+    // writer, then resume real time while `shutdown()` joins the marker task.
+    tokio::time::pause();
+    let plane_for_shutdown = relay_plane.clone();
+    let shutdown_task = tokio::spawn(async move {
+        plane_for_shutdown.shutdown().await;
+    });
+    while !relay_plane.is_shutting_down() {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(RELAY_PLANE_SHUTDOWN_WAIT + Duration::from_millis(50)).await;
+    tokio::time::resume();
+
+    timeout(Duration::from_secs(5), shutdown_task)
+        .await
+        .expect("shutdown() must complete after transferring unfinished spills to queue loss")
+        .expect("shutdown task must not panic");
+
+    let markers = recorded_markers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let (dropped, earliest) = markers
+        .last()
+        .copied()
+        .expect("shutdown() must persist recovery debt for unfinished below-cursor spills");
+    assert!(
+        dropped >= 2,
+        "both in-flight and queued spill deliveries must be counted as loss: {markers:?}"
+    );
+    assert_eq!(
+        earliest,
+        Some(second_below),
+        "durable recovery floor must reach back to the earliest unfinished below-cursor spill"
+    );
+
+    let _ = spill_release_tx.send(());
 }

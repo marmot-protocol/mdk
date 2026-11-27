@@ -89,15 +89,6 @@ struct GoneDevices {
     keys: BTreeSet<RosterTagKey>,
 }
 
-/// How [`AppClient::device_group_leaf_of`] found a device's leaf, by its
-/// signature key.
-enum DeviceGroupLeaf {
-    /// Its device tag reads as the device's slot.
-    Tagged(Vec<u8>),
-    /// Its tag says it is the slot's and verifies under its own key.
-    SelfSigned(Vec<u8>),
-}
-
 /// What [`AppClient::remove_own_account_leaves`] did in one chat.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OwnLeafRemoval {
@@ -135,22 +126,13 @@ impl AppClient {
         let Some((group_id, roster)) = self.trusted_device_roster()? else {
             return Err(AppError::DeviceGroupRefused("no_device_group"));
         };
-        let Some(entry) = roster.devices.get(&slot) else {
+        if !roster.devices.contains_key(&slot) {
             return Err(AppError::DeviceGroupRefused("unknown_device"));
-        };
+        }
         if slot == self.own_slot()? {
             return Err(AppError::DeviceGroupRefused("this_device"));
         }
-        // A device sets its tag signature key with its first commit in the
-        // device group; until then the link may still fail and be undone.
-        // One that cleared the key since is removed by its committed leaf
-        // whose tag it signed with that leaf's own key for the slot
-        // (mdk#3679); a pending link's leaf is still its KeyPackage leaf.
-        if entry.tag_signature_key.is_none()
-            && self
-                .device_group_leaf_of(&group_id, &roster, &slot)?
-                .is_none()
-        {
+        if self.device_link_pending(&group_id, &roster, &slot)? {
             return Err(AppError::DeviceGroupRefused("device_link_pending"));
         }
         self.app
@@ -448,23 +430,23 @@ impl AppClient {
         let Some(entry) = roster.devices.get(slot) else {
             return Ok(());
         };
-        // The record keeps a key the device's tags read by: its entry's, or,
-        // for a leaf whose tag only its own key verifies, the key that leaf
-        // signs with. The engine removes the leaf only if its tree still has
-        // it, and the entry either way.
-        let (leaf_signature_key, tag_signature_key) =
-            match self.device_group_leaf_of(group_id, roster, slot)? {
-                Some(DeviceGroupLeaf::Tagged(leaf)) => (leaf, entry.tag_signature_key.clone()),
-                Some(DeviceGroupLeaf::SelfSigned(leaf)) => (leaf.clone(), Some(leaf)),
-                None => (Vec::new(), entry.tag_signature_key.clone()),
-            };
-        // Branch selection can drop the commit that set the device's tag
-        // signature key after the user decided. Until the key is back, or
-        // the device's leaf carries a tag it signed for the slot, the link
+        // The entry's key is the device's leaf's, from the Add that linked
+        // it ("Key binding"), so the Commit removes the leaf signing with it,
+        // if the tree still has it, with the entry, and the record keeps that
+        // key. An entry with no key is from an Add that set none: its link
+        // is not made. Branch selection can also drop the device's first
+        // commit after the user decided. Until the link is made again, it
         // may still fail, and a failed link's undo ends the decision.
-        if tag_signature_key.is_none() {
+        let Some(tag_signature_key) = entry.tag_signature_key.clone() else {
+            return Ok(());
+        };
+        if self.device_link_pending(group_id, roster, slot)? {
             return Ok(());
         }
+        let leaf_signature_key = self
+            .device_group_leaf_of(group_id, roster, slot)?
+            .unwrap_or_default();
+        let tag_signature_key = Some(tag_signature_key);
         let operations = vec![
             DeviceRosterOperationV1::RemoveDevice(*slot),
             DeviceRosterOperationV1::SetRejectedSlot(
@@ -501,46 +483,58 @@ impl AppClient {
         }
     }
 
-    /// The device-group leaf of the device in `slot` (mdk#3679): the one
-    /// whose device tag reads as the slot, else one whose tag names the slot
-    /// and verifies under that leaf's own signature key, which only that
-    /// leaf's device can sign, whatever the slot's entry now says. Either way
-    /// the leaf must have committed since its Add: one still built from its
-    /// Add's KeyPackage is a link not made yet, which the engine never
-    /// records as `removed`. A leaf with neither tag is never taken: any
-    /// device can write a key into a roster entry, so a key there proves no
-    /// leaf is the slot's.
+    /// Whether the link of the device in `slot` may still fail and be undone
+    /// (marmot#521, mdk#3679): it is not made, and either its entry has no
+    /// key, from an Add that set none, or the leaf signing with the entry's
+    /// key is still built from its Add's KeyPackage.
+    fn device_link_pending(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+        slot: &DeviceSlotId,
+    ) -> Result<bool, AppError> {
+        if self
+            .runtime
+            .made_device_links(group_id, roster)?
+            .contains(slot)
+        {
+            return Ok(false);
+        }
+        let Some(entry) = roster.devices.get(slot) else {
+            return Ok(false);
+        };
+        Ok(match entry.tag_signature_key.as_deref() {
+            None => true,
+            Some(key) => self
+                .runtime
+                .own_device_leaves(group_id, roster, slot, Some(key))?
+                .iter()
+                .any(|leaf| leaf.signature_key == key && leaf.add_not_after.is_some()),
+        })
+    }
+
+    /// The signature key of the device-group leaf of the device in `slot`:
+    /// the leaf that signs with its entry's key, which the Add that linked
+    /// it bound ("Key binding"), if the tree still has it.
     fn device_group_leaf_of(
         &self,
         group_id: &GroupId,
         roster: &DeviceRosterV1,
         slot: &DeviceSlotId,
-    ) -> Result<Option<DeviceGroupLeaf>, AppError> {
-        if let Some(leaf) = self
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        let Some(key) = roster
+            .devices
+            .get(slot)
+            .and_then(|entry| entry.tag_signature_key.as_deref())
+        else {
+            return Ok(None);
+        };
+        Ok(self
             .runtime
-            .own_device_leaves(group_id, roster, slot, None)?
+            .own_device_leaves(group_id, roster, slot, Some(key))?
             .into_iter()
-            .find(|leaf| leaf.add_not_after.is_none())
-        {
-            return Ok(Some(DeviceGroupLeaf::Tagged(leaf.signature_key)));
-        }
-        for (leaf, tagged) in self
-            .runtime
-            .own_account_self_signed_tags(group_id, &roster.leaf_tag_key)?
-        {
-            if tagged != *slot {
-                continue;
-            }
-            let committed = self
-                .runtime
-                .own_device_leaves(group_id, roster, slot, Some(&leaf))?
-                .iter()
-                .any(|found| found.signature_key == leaf && found.add_not_after.is_none());
-            if committed {
-                return Ok(Some(DeviceGroupLeaf::SelfSigned(leaf)));
-            }
-        }
-        Ok(None)
+            .find(|leaf| leaf.signature_key == key)
+            .map(|leaf| leaf.signature_key))
     }
 
     /// For each gone device (see the module docs): discard the private
@@ -836,29 +830,20 @@ impl AppClient {
 
     /// This account's leaves in `chat_id` that are a `gone` device's, by
     /// signature key, each with the device's slot: each leaf whose device
-    /// tag names a gone slot, under `roster`'s `leaf_tag_key`, and verifies
-    /// under the leaf's own key, which only that leaf's device can sign
-    /// (mdk#3679), or under one of the slot's keys.
+    /// tag reads, under `roster`'s `leaf_tag_key`, as a gone slot and
+    /// verifies under one of that slot's keys.
     fn gone_device_leaves_in(
         &self,
         chat_id: &GroupId,
         roster: &DeviceRosterV1,
         gone: &GoneDevices,
     ) -> Result<BTreeMap<Vec<u8>, DeviceSlotId>, AppError> {
-        let mut leaves = self
-            .runtime
-            .own_account_self_signed_tags(chat_id, &roster.leaf_tag_key)?
-            .into_iter()
-            .filter(|(_, slot)| gone.slots.contains(slot))
-            .collect::<BTreeMap<_, _>>();
         let keys = gone.keys.iter().cloned().collect::<Vec<_>>();
-        for (leaf, slot) in
-            self.runtime
-                .own_account_leaves_tagged_by(chat_id, &roster.leaf_tag_key, &keys)?
-        {
-            leaves.entry(leaf).or_insert(slot);
-        }
-        Ok(leaves)
+        Ok(self
+            .runtime
+            .own_account_leaves_tagged_by(chat_id, &roster.leaf_tag_key, &keys)?
+            .into_iter()
+            .collect())
     }
 
     /// The `gone` devices whose removal this device's user chose, while this

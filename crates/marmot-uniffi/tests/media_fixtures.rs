@@ -82,6 +82,8 @@ fn projected_outcome(tag: &[String], source_epoch: u64) -> MediaAttachmentOutcom
         tags: Vec::new(),
         kind: 9,
         source_epoch: Some(source_epoch),
+        retention_seconds: None,
+        retention_expires_at: None,
         media: Some(serde_json::json!({ "imeta": [tag] })),
         deleted: false,
         deletion_source: Default::default(),

@@ -1337,6 +1337,15 @@ impl AccountDeviceSession {
         Ok(self.engine.own_account_leaf_claims(group_id, roster)?)
     }
 
+    /// See [`cgka_engine::engine::Engine::made_device_links`].
+    pub fn made_device_links(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> SessionResult<std::collections::BTreeSet<cgka_traits::app_components::DeviceSlotId>> {
+        Ok(self.engine.made_device_links(group_id, roster)?)
+    }
+
     /// See [`cgka_engine::engine::Engine::own_device_leaves`].
     pub fn own_device_leaves(
         &self,
@@ -1348,17 +1357,6 @@ impl AccountDeviceSession {
         Ok(self
             .engine
             .own_device_leaves(group_id, roster, slot, tag_signature_key)?)
-    }
-
-    /// See [`cgka_engine::engine::Engine::own_account_self_signed_tags`].
-    pub fn own_account_self_signed_tags(
-        &self,
-        group_id: &GroupId,
-        leaf_tag_key: &[u8; 32],
-    ) -> SessionResult<Vec<(Vec<u8>, cgka_traits::app_components::DeviceSlotId)>> {
-        Ok(self
-            .engine
-            .own_account_self_signed_tags(group_id, leaf_tag_key)?)
     }
 
     /// See [`cgka_engine::engine::Engine::own_account_leaves_tagged_by`].
@@ -2782,7 +2780,11 @@ impl AccountDeviceSession {
     }
 
     /// See [`cgka_engine::engine::Engine::open_history`].
-    pub fn open_history(&self, context: &[u8], sealed: &[u8]) -> SessionResult<Option<Vec<u8>>> {
+    pub fn open_history(
+        &self,
+        context: &[u8],
+        sealed: &[u8],
+    ) -> SessionResult<Option<SecretBytes>> {
         Ok(self.engine.open_history(context, sealed)?)
     }
 
@@ -2811,7 +2813,7 @@ impl AccountDeviceSession {
         entropy: &[u8; RECOVERY_ENTROPY_LEN],
         context: &[u8],
         sealed: &[u8],
-    ) -> SessionResult<Option<Vec<u8>>> {
+    ) -> SessionResult<Option<SecretBytes>> {
         Ok(self
             .engine
             .open_with_recovery_key(entropy, context, sealed)?)

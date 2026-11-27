@@ -101,7 +101,7 @@ impl AppClient {
     /// seconds. A failed read gives none; the catch-up check itself still
     /// runs on its wakes.
     pub(crate) fn key_package_catch_up_next_at(&self) -> Option<u64> {
-        if self.app.cursor_persistence() != crate::CursorPersistence::Advance {
+        if !matches!(self.maintenance_passes(), Ok(super::MaintenancePasses::Run)) {
             return None;
         }
         self.runtime
