@@ -42,6 +42,24 @@ class ClassifyCiChangesTests(unittest.TestCase):
         result = classify(["crates/marmot-c/API-GUIDE.md", "README.md"])
         self.assertEqual({lane for lane, enabled in result.items() if enabled}, {"run_c"})
 
+    def test_c_precheck_scope(self) -> None:
+        storage = "crates/storage-sqlite/src/shared.rs"
+        for flags, path, enabled in (
+            (["--c-precheck"], storage, False),
+            (["--c-precheck"], "", False),
+            (["--all"], storage, True),
+            (["--c-precheck"], ".cargo/config", True),
+            (["--c-precheck"], "crates/marmot-c/src/commands.rs", True),
+            (["--c-precheck"], "crates/marmot-uniffi/API-GUIDE.md", True),
+            (["--c-precheck"], "scripts/check_binding_docs.py", True),
+        ):
+            with self.subTest(flags=flags, path=path):
+                result = subprocess.run(
+                    ["python3", "scripts/classify_ci_changes.py", *flags],
+                    cwd=REPOSITORY_ROOT, input=f"{path}\0", text=True, check=True, capture_output=True,
+                )
+                self.assertIn(f"run_c={str(enabled).lower()}", result.stdout.splitlines())
+
     def test_non_markdown_agent_skill_file_fails_open_to_every_lane(self) -> None:
         result = classify([".agents/skills/review-local/scripts/launch.sh"])
         self.assertTrue(all(result.values()))

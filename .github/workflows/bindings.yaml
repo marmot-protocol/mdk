@@ -94,6 +94,7 @@ jobs:
       swift_name: ${{ steps.identity.outputs.swift_name }}
       is_snapshot: ${{ steps.identity.outputs.is_snapshot }}
       is_rc: ${{ steps.identity.outputs.is_rc }}
+      api_reference: ${{ steps.reference.outputs.available }}
       is_staged: ${{ steps.identity.outputs.is_staged }}
 
     steps:
@@ -216,13 +217,15 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Stage UniFFI API reference
+        id: reference
         env:
           SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
         run: |
           set -euo pipefail
-          # Historical snapshots still carry their reference in the source tree.
           if [[ -f crates/marmot-uniffi/API-GUIDE.md ]]; then
             python3 scripts/check_binding_docs.py
+          elif [[ ! -f crates/marmot-uniffi/API-REFERENCE.md ]]; then
+            exit 0
           fi
           python3 - <<'PY'
           import os
@@ -246,8 +249,10 @@ jobs:
           output = Path(os.environ["RUNNER_TEMP"]) / reference.name
           output.write_text(re.sub(r"\]\(([^)#:\s]+)(#[^)\s]*)?\)", rebase, reference.read_text()))
           PY
+          echo 'available=true' >> "$GITHUB_OUTPUT"
 
       - name: Upload UniFFI API reference
+        if: steps.reference.outputs.available == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: marmotkit-api-reference-${{ steps.identity.outputs.source_sha }}
@@ -997,6 +1002,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          API_REFERENCE: ${{ needs.metadata.outputs.api_reference }}
         run: |
           set -euo pipefail
           mkdir -p dist/ios dist/macos dist/android dist/docs
@@ -1006,8 +1012,10 @@ jobs:
             --name "marmotkit-macos-$SOURCE_SHA" --dir dist/macos
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
             --name "marmotkit-android-$SOURCE_SHA" --dir dist/android
-          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
-            --name "marmotkit-api-reference-$SOURCE_SHA" --dir dist/docs
+          if [[ "$API_REFERENCE" == 'true' ]]; then
+            gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+              --name "marmotkit-api-reference-$SOURCE_SHA" --dir dist/docs
+          fi
 
       - name: Create and verify immutable release
         shell: bash
@@ -1030,6 +1038,12 @@ jobs:
           notes="$RUNNER_TEMP/release-notes.md"
           checksum="$(cat "dist/ios/$BINARY_NAME.swiftpm-checksum")"
           macos_checksum="$(cat "dist/macos/$MACOS_BINARY_NAME.swiftpm-checksum")"
+          assets=(dist/ios/* dist/macos/* dist/android/*)
+          reference_note=""
+          if [[ -f dist/docs/API-REFERENCE.md ]]; then
+            assets+=(dist/docs/API-REFERENCE.md)
+            reference_note=$'\n- `API-REFERENCE.md`: UniFFI signatures and guidance linked to the source commit.'
+          fi
 
           cat > "$notes" <<EOF
           MarmotKit bindings generated from exact MDK commit \`$SOURCE_SHA\` by workflow commit \`$BUILDER_SHA\`.
@@ -1049,8 +1063,7 @@ jobs:
           - \`marmotkit-android-$version.zip.sha256\`: ordinary SHA-256 verification for the Android bundle.
 
           Shared:
-          - \`MarmotKit-$version.swift\`: generated Swift source matching both binaries.
-          - \`API-REFERENCE.md\`: UniFFI signatures and usage guidance, with links pinned to the source commit.
+          - \`MarmotKit-$version.swift\`: generated Swift source matching both binaries.$reference_note
 
           Verify source and artifact provenance with \`marmotkit-ios-$version.manifest.json\`,
           \`marmotkit-macos-$version.manifest.json\`, and the matching \`.checksums.txt\` assets.
@@ -1090,7 +1103,6 @@ jobs:
             exit 1
           fi
 
-          assets=(dist/ios/* dist/macos/* dist/android/* dist/docs/API-REFERENCE.md)
           if [[ "$IS_RC" == "true" ]]; then
             title="v$version - MarmotKit"
             release_flags=(--prerelease --latest=false --target "$SOURCE_SHA")

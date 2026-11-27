@@ -68,6 +68,8 @@ across the boundary. That deserves its own focused design + tests rather than a 
 - `MarmotStatus` values are stable ABI: append, never renumber. Keep the variant set in lockstep with
   `marmot_uniffi::MarmotKitError`.
 - Generate `include/marmot.h` with `just c-header`. Do not edit or commit it.
+- When C declarations change, run `just c-abi-write` and commit `abi.json`.
+  The release classifier uses this inventory without building the header.
 - Host-supplied `group_id_hex` values are variable-length MLS `GroupId` bytes — do not validate them with the
   32-byte route-id/pubkey/message-id rule.
 - No `tracing`/logging in this crate; error detail strings carry only what `MarmotKitError` Display already exposes.

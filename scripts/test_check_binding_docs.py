@@ -32,6 +32,17 @@ class BindingDocsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing authored guidance: Marmot::start"):
             render("### `Marmot::start`\n\n## Unrelated\n\nSome text.\n", "rust", self.expected)
 
+    def test_rejects_generated_docs(self) -> None:
+        guide = self.text + "\n```rust\npub fn begin(&self)\n```\n"
+        for text in (guide, self.text + "\n[Source](src/lib.rs#L8)\n"):
+            with self.assertRaisesRegex(ValueError, "generated signature or source link in guide"):
+                render(text, "rust", self.expected)
+        c = {"marmot_start": Export("MarmotStatus marmot_start(void);", "include/marmot.h#L1")}
+        with self.assertRaisesRegex(ValueError, "generated signature or source link in guide"):
+            render("### `marmot_start`\n\nStart runtime.\n\n```c\nint marmot_begin(void);\n```\n", "c", c)
+        example = self.text + "\n```rust\nlet outcome = marmot.start().await;\n```\n"
+        self.assertIn(example.split("\n\n", 1)[1], render(example, "rust", self.expected))
+
     def test_nested_indentation_and_free_function_names(self) -> None:
         source = """mod nested {
     #[uniffi::export]

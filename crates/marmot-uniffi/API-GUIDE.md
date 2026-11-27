@@ -3277,7 +3277,7 @@ answer; `RelayHealthChanged` follows a changed answer from the worker. See
 
 Create an offline MDK-owned session from a bunker URI, pairing config, or secret export. Review and approve permissions before URI access or connection. Imports do not silently approve grants. No host signer callback is retained; the handle belongs to its creating Marmot object.
 
- · [Session lifecycle](README.md#nip-46-accounts)
+[Session lifecycle](README.md#nip-46-accounts)
 
 ### `Marmot::nip46_login`
 
@@ -3291,7 +3291,7 @@ Rollback does not reset newer-generation transport state or cancel its pending r
 
 Before commit, a failed Native handoff restores the previous local callback and grant record without deleting pre-existing credentials. Completed accounts rebind without reopening setup and restore prior activation on failure. Already-published KeyPackages are not retracted. New and incomplete accounts retain pairing for possibly exposed publication retries. Post-commit journal cleanup errors do not revoke a network-ready account. Account sign-out cleanup remains explicit; legacy host login behavior is unchanged.
 
- · [Session lifecycle](README.md#nip-46-accounts)
+[Session lifecycle](README.md#nip-46-accounts)
 
 ### `Marmot::nip46_register`
 
@@ -3299,19 +3299,19 @@ Attach a verified imported session to an existing account, persist credentials, 
 
 Admitted adoption outlives caller cancellation and is interrupted and settled by shutdown, as with `nip46_login`. If no prior callback exists, a verified pairing remains attached for recovery when worker startup fails.
 
- · [Session lifecycle](README.md#nip-46-accounts)
+[Session lifecycle](README.md#nip-46-accounts)
 
 ### `Marmot::nip46_resume`
 
 Obtain the account's shared session from MDK-owned credentials, without a host descriptor or signer callback. Persisted approval is retained unchanged; changed required grants need explicit review. Startup restores local credentials before workers; a missing account-identity proof can require bounded remote signing.
 
- · [Session lifecycle](README.md#nip-46-accounts)
+[Session lifecycle](README.md#nip-46-accounts)
 
 ### `Marmot::nip46_remove`
 
 Detach the account's shared session and remove its persisted communication credentials. This does not replace account sign-out or data wiping. The call keeps running when it is cancelled (mdk#3670).
 
- · [Session lifecycle](README.md#nip-46-accounts)
+[Session lifecycle](README.md#nip-46-accounts)
 
 ### `Nip46SessionFfi::permissions`
 

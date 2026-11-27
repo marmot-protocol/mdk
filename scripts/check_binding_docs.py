@@ -7,10 +7,17 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import tomllib
+from zipfile import BadZipFile, ZipFile
 
 from check_c_binding_parity import REPO, UNIFFI_SRC, _braced_block, uniffi_exports
 
 ENTRY = re.compile(r"^### `([^`]+)`\n(.*?)(?=^#{2,3} |^</details>|\Z)", re.MULTILINE | re.DOTALL)
+GENERATED_LINK = re.compile(r"\[(?:Source|Header contract)\]\((?:src/|include/marmot\.h)[^)]*#L\d+\)")
+DECLARATION_FENCE = re.compile(r"(?m)^```(c|rust)[ \t]*\n([^\n]+)\n```[ \t]*$")
+DECLARATION = {
+    "c": re.compile(r"(?!return\b)[A-Za-z_][\w \t*]*[ \t*]marmot_\w+\s*\([^;{}]*\);"),
+    "rust": re.compile(r"(?:pub )?(?:async )?fn \w+\([^{}]*\)(?: -> [^{}]+)?;?"),
+}
 
 
 @dataclass(frozen=True)
@@ -104,8 +111,14 @@ def render(text: str, language: str, expected: dict[str, Export]) -> str:
         if key not in expected:
             errors.append(f"removed/unknown method: {key}")
             return match[0]
-        if not body.strip():
+        guidance = body.strip()
+        if not guidance:
             errors.append(f"missing authored guidance: {key}")
+        elif GENERATED_LINK.search(guidance) or any(
+            DECLARATION[kind].fullmatch(line.strip())
+            for kind, line in DECLARATION_FENCE.findall(guidance)
+        ):
+            errors.append(f"generated signature or source link in guide: {key}")
         export = expected[key]
         return (f"### `{key}`\n\n```{language}\n{export.signature}\n```\n\n"
                 f"[{label}]({export.source})\n{body}")
@@ -142,12 +155,45 @@ def release_problems(root: Path, version: str) -> list[str]:
     return errors
 
 
+def _check_c_bundle(path: Path) -> None:
+    c = "references/marmot-c/API-REFERENCE.md"
+    uniffi = "references/marmot-uniffi/API-REFERENCE.md"
+    with ZipFile(path) as archive:
+        root = f"marmot-c-{path.stem.removeprefix('marmot-c-linux-x86_64-')}"
+        readme = archive.read(f"{root}/README.md").decode()
+        reference = archive.read(f"{root}/{c}").decode()
+        archive.getinfo(f"{root}/{uniffi}")
+        header = archive.read(f"{root}/include/marmot.h").decode()
+
+    for target in (c, uniffi):
+        if not re.search(rf"\]\({re.escape(target)}(?:#[^)]*)?\)", readme):
+            raise ValueError(f"bundled README does not link to {target}")
+    if "](../../README.md)" not in reference:
+        raise ValueError("bundled C reference does not link to the bundled README")
+
+    links = {
+        entry[1]: re.findall(r"\[Header contract\]\(([^)]+)\)", entry[2])
+        for entry in ENTRY.finditer(reference)
+    }
+    for key, export in c_exports_in(header).items():
+        if links.get(key) != [f"../../{export.source}"]:
+            raise ValueError(f"bundled C reference has an invalid header link for {key}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--with-c", action="store_true", help="also generate the C reference from the generated header")
+    mode.add_argument("--c-bundle", type=Path, help="check links in a packaged C release ZIP")
     mode.add_argument("--release-version", help="check release documents and UniFFI guide without writing references")
     args = parser.parse_args()
+    if args.c_bundle:
+        try:
+            _check_c_bundle(args.c_bundle)
+        except (BadZipFile, KeyError, OSError, ValueError) as error:
+            parser.exit(1, f"{args.c_bundle}: {error}\n")
+        return 0
+
     if args.release_version:
         problems = release_problems(REPO, args.release_version)
         if problems:

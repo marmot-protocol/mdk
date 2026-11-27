@@ -14,10 +14,11 @@ description: >-
 # Land a change
 
 Your machine is the only place this change is built and tested before it
-reaches `master`. Team PR CI (`Required CI`) is a ~1-minute static gate:
+reaches `master` for most changes. Team PR CI (`Required CI`) runs static checks:
 commit signatures, formatting, static contracts, `cargo-audit`, and commit
 trailers (advisory, except that a Rust crate change must record `just
-dependents-nextest`), with zero Rust compile. There is no merge queue, and `master`
+dependents-nextest`). Binding inputs also trigger C header and reference generation.
+There is no merge queue, and `master`
 requires only `Required CI`, any CODEOWNERS approvals, and a branch that is up
 to date with `master`. A ready PR that goes green can be merged a minute later
 with nothing else between it and `master`. Post-merge `Canary` (bare-metal

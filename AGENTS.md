@@ -170,8 +170,9 @@ no merge queue. The shipping flow is:
 Local verification proves your change before merge, and post-merge `Canary` runs continuously verify `master` across
 the full suite. Keep local runs scoped to your change: several agents usually build on the same machine, so
 workspace-wide builds and suites run locally only when a rule below calls for one. On team pull requests, `Required CI`
-runs a ~1-minute static gate (verified commit signatures, `cargo fmt --check`, static/contract gates, `cargo audit`,
-and commit-trailer checks, advisory except the `just dependents-nextest` record) with zero Rust compile. External/fork pull requests and PRs labelled `ci:full` run
+runs static checks: verified commit signatures, `cargo fmt --check`, contract gates, `cargo audit`, and commit trailers
+(advisory except the `just dependents-nextest` record). Changes to bindings or their generators also generate the C
+header and both API references for review. External/fork pull requests and PRs labelled `ci:full` run
 the full `ci.yml` matrix on GitHub-hosted runners; `ci:apple` adds both macOS jobs on a team PR regardless of changed
 paths. Master pushes only refresh CI's Rust caches, and only when a dependency or toolchain input changes.
 

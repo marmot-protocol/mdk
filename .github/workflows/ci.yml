@@ -1,9 +1,10 @@
 name: CI
 
-# Team pull requests run a fast static gate (~1 minute, zero Rust compile):
+# Team pull requests run a fast static gate:
 # verified commit signatures, formatting, static/contract gates, cargo-audit,
 # and commit-trailer checks (advisory except the `just dependents-nextest`
-# record). External/fork pull requests, `ci:full`
+# record). Changes to binding inputs also generate the C header and references.
+# External/fork pull requests, `ci:full`
 # pull requests, `workflow_dispatch`, and `workflow_call` runs execute the full
 # CI matrix (`.github/CODEOWNERS` protects `.github/` so fork PRs cannot edit
 # this workflow without owner review). Post-merge verification runs
@@ -217,7 +218,8 @@ jobs:
           echo "is_team_pr=$is_team_pr" >> "$GITHUB_OUTPUT"
 
       # fast: team pull requests without `ci:full` run signatures, formatting,
-      # static gates, cargo-audit, and trailer checks (zero compile).
+      # static gates, cargo-audit, and trailer checks. Binding inputs also
+      # generate C declarations and references for review.
       # full: external/fork PRs, `ci:full` PRs, `workflow_call`, and manual runs
       # execute every CI job.
       # warm: master pushes run only the jobs that save a Rust cache.
@@ -301,6 +303,7 @@ jobs:
           else
             # Include removed paths and rename sources.
             git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" > "$paths"
+            flags=(--c-precheck)
           fi
           python3 scripts/classify_ci_changes.py "${flags[@]}" --github-output "$GITHUB_OUTPUT" < "$paths"
 
@@ -678,7 +681,7 @@ jobs:
   c-smoke:
     name: C bindings smoke
     needs: changes
-    if: needs.changes.outputs.ci_mode != 'fast' && needs.changes.outputs.run_c == 'true'
+    if: needs.changes.outputs.run_c == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -717,6 +720,7 @@ jobs:
         run: |
           bash crates/marmot-c/c-header.sh
           python3 scripts/check_binding_docs.py --with-c
+          python3 scripts/classify_release_impact.py --c-abi check
 
       - name: Upload binding references and C header
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -735,6 +739,25 @@ jobs:
           ref: ${{ needs.changes.outputs.pr_base }}
           path: abi-base
           persist-credentials: false
+
+      - name: Select cbindgen for the PR base
+        if: github.event_name == 'pull_request'
+        id: base-cbindgen
+        run: |
+          set -euo pipefail
+          if [[ ! -s abi-base/crates/marmot-c/include/marmot.h ]]; then
+            version="$(bash abi-base/crates/marmot-c/c-header.sh --print-version)"
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            if [[ "$(cbindgen --version)" != "cbindgen $version" ]]; then
+              echo "tool=cbindgen@$version" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Install cbindgen for the PR base
+        if: steps.base-cbindgen.outputs.tool != ''
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
+        with:
+          tool: ${{ steps.base-cbindgen.outputs.tool }}
 
       - name: Compare C declarations
         if: github.event_name == 'pull_request'
@@ -779,11 +802,11 @@ jobs:
           if-no-files-found: error
 
       - name: Alloc-audit tests
-        if: needs.changes.outputs.ci_mode != 'precheck'
+        if: needs.changes.outputs.ci_mode != 'fast'
         run: cargo test -p marmot-c --features alloc-audit --locked
 
       - name: Compile and run debug C smoke test (gcc)
-        if: needs.changes.outputs.ci_mode != 'precheck'
+        if: needs.changes.outputs.ci_mode != 'fast'
         run: ./crates/marmot-c/c-smoke.sh --debug gcc
 
       - name: Upload runner diagnostics
@@ -2105,6 +2128,7 @@ jobs:
           CI_MODE: ${{ needs.changes.outputs.ci_mode }}
           IS_TEAM_PR: ${{ needs.changes.outputs.is_team_pr }}
           APPLE_OPT_IN: ${{ needs.changes.outputs.apple_opt_in }}
+          RUN_C: ${{ needs.changes.outputs.run_c }}
           TREE_STATE: ${{ needs.changes.outputs.tree_state }}
           TREE_STATE_REASON: ${{ needs.changes.outputs.tree_state_reason }}
           TREE_FIX_OPT_IN: ${{ needs.changes.outputs.tree_fix_opt_in }}
@@ -2124,11 +2148,12 @@ jobs:
               jq --exit-status 'all(.[]; .result == "success")' <<<"$NEEDS"
               ;;
             fast)
-              jq --exit-status --arg apple "$APPLE_OPT_IN" '
+              jq --exit-status --arg apple "$APPLE_OPT_IN" --arg c "${RUN_C:-false}" '
                 .signatures.result == "success"
                 and .changes.result == "success"
                 and .["rust-format"].result == "success"
                 and .["rust-audit"].result == "success"
+                and ($c != "true" or .["c-smoke"].result == "success")
                 and ($apple != "true" or (.["ios-account-clippy"].result == "success" and .["marmotkit-native-host"].result == "success"))
                 and all(.[]; .result | IN("success", "skipped"))
               ' <<<"$NEEDS"

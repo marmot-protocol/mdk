@@ -47,6 +47,7 @@ cd "$WORKSPACE_DIR"
 echo "==> Generating C header"
 bash "$CRATE_DIR/c-header.sh"
 python3 scripts/check_binding_docs.py --with-c
+python3 scripts/classify_release_impact.py --c-abi check
 
 echo "==> Cleaning previous output"
 rm -rf "$OUT_DIR"

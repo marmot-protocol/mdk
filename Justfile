@@ -220,7 +220,6 @@ promote-rc rc_version override_version="" dry_run="false":
 # GitHub CI owns compilation, tests, and artifact builds for this stage.
 release-pr-preflight version:
     git diff --check
-    python3 scripts/check_binding_docs.py --release-version {{version}}
     ./scripts/check_agent_install_docs.sh
     ./scripts/cut-full-release.sh --dry-run {{version}}
 
@@ -700,6 +699,9 @@ naming-gate:
 c-header:
     bash crates/marmot-c/c-header.sh
 
+c-abi-write: c-header
+    python3 scripts/classify_release_impact.py --c-abi write
+
 # Build marmot-c and compile+run the C smoke test (valgrind when available).
 c-smoke: c-header
     ./crates/marmot-c/c-smoke.sh
@@ -717,6 +719,11 @@ c-parity-gate:
 # Generate both complete API references and test the generator.
 binding-docs-gate: c-header
     python3 scripts/check_binding_docs.py --with-c
+    python3 scripts/classify_release_impact.py --c-abi check
+    python3 scripts/test_check_binding_docs.py
+
+uniffi-docs-gate:
+    python3 scripts/check_binding_docs.py
     python3 scripts/test_check_binding_docs.py
 
 # Unreleased entries live as fragments in each changelog.d/ (see AGENTS.md).
@@ -775,6 +782,6 @@ release-profile-gate:
 # passes, and the release pin proof. Run it once for shared build-input or
 # workflow changes; ordinary pushes use the scoped checks in AGENTS.md.
 # GitHub CI invokes the static gates directly and runs the full test matrix.
-fast-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate changelog-gate pr-trailers-contract bisect-agent-contract rc-release-contract binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate tracing-audit c-parity-gate uniffi-docs-gate changelog-gate pr-trailers-contract bisect-agent-contract rc-release-contract binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin
 
 ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate changelog-gate pr-trailers-contract bisect-agent-contract rc-release-contract binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate flake-report-contract test-timing-ratchet apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin test

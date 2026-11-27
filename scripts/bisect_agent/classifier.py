@@ -83,7 +83,7 @@ BARE_METAL_STEP_COMMANDS: dict[str, tuple[str, ...]] = {
 
 # Exact failed step name inside hosted Linux jobs -> faithful local replay command.
 # Steps requiring CI-only fixtures or dynamically installed tools not provisioned on
-# bare-metal Linux (e.g. `Header diff gate` needing pinned cbindgen, `Run Tamarin proofs`
+# bare-metal Linux (e.g. C header generation needing pinned cbindgen, `Run Tamarin proofs`
 # and `Verify pairing authentication and model controls` needing Tamarin/Maude,
 # `Run real relay CLI E2E` needing Docker relays + `MDK_E2E_REQUIRE_RELAYS=1`,
 # `Verify TLA liveness and counterexample` needing Java/TLC, and `Test consent and both
@@ -95,7 +95,7 @@ HOSTED_STEP_COMMANDS: dict[str, tuple[str, ...]] = {
     "Naming gate (retired legacy tokens)": ("just", "naming-gate"),
     "Tracing and direct-output source audit": ("just", "tracing-audit"),
     "C binding command-surface parity gate": ("just", "c-parity-gate"),
-    "Complete binding documentation inventory": ("just", "binding-docs-gate"),
+    "Generate UniFFI method reference and test the generator": ("just", "uniffi-docs-gate"),
     "Changelog fragments": ("just", "changelog-gate"),
     "PR commit trailers contract": ("just", "pr-trailers-contract"),
     "Bisect agent contract": ("just", "bisect-agent-contract"),
@@ -160,9 +160,8 @@ HOSTED_STEP_COMMANDS: dict[str, tuple[str, ...]] = {
         "warnings",
     ),
     "Run default-build convergence policy pin tests": ("just", "test-convergence-policy-pin"),
-    # C bindings smoke (Header diff gate intentionally unmapped: needs pinned cbindgen)
+    # C smoke depends on the generated header, which the replay host cannot provision.
     "Alloc-audit tests": ("cargo", "test", "-p", "marmot-c", "--features", "alloc-audit", "--locked"),
-    "Compile and run debug C smoke test (gcc)": ("./crates/marmot-c/c-smoke.sh", "--debug", "gcc"),
     # Doctests and diagnostic exporters (self-contained Linux steps only)
     "Test native Markdown parser": ("odin", "test", "crates/marmot-markdown/odin"),
     "Run doctests": ("cargo", "test", "--workspace", "--exclude", "cgka-conformance-simulator", "--doc", "--locked"),

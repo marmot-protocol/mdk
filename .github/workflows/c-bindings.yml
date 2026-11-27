@@ -204,6 +204,8 @@ jobs:
                   path, anchor = match[1], match[2] or ""
                   if document == readme and path in readme_references:
                       return f"]({readme_references[path]}{anchor})"
+                  if source_dir == "crates/marmot-c" and path == "README.md" and document != readme:
+                      return f"](../../README.md{anchor})"
                   if path.startswith("/") or (document.parent / path).is_file():
                       return match[0]
                   source = posixpath.normpath(f"{source_dir}/{path}")
@@ -227,6 +229,9 @@ jobs:
           EOF
 
           (cd "$stage_parent" && zip -r "../../$asset" "marmot-c-$version")
+          if [[ -f crates/marmot-c/API-GUIDE.md ]]; then
+            python3 scripts/check_binding_docs.py --c-bundle "$asset"
+          fi
           sha256sum "$asset" | awk -v name="$asset" '{print $1 "  " name}' > "$asset.sha256"
           cp "$asset" "$asset.sha256" dist/
 
@@ -328,29 +333,26 @@ jobs:
               sys.exit(f"error: Marmot C manifest does not match release: {wrong}")
           '
           stage_notes="$RUNNER_TEMP/stage-notes.md"
+          : > "$stage_notes"
+          stage_args=(--stable)
           if [[ "$IS_RC" == "true" ]]; then
-            cat > "$stage_notes" <<EOF
-          SemVer Release Candidate for staging and integration testing. Pin a formal \`marmotc-v<version>\` release for production.
-
-          Marmot C bindings generated from exact MDK commit \`$SOURCE_SHA\`.
-
-          Assets:
-          - \`marmot-c-linux-x86_64-$version.zip\`: \`libmarmot_c.so\` + \`libmarmot_c.a\`, \`marmot.h\`, pkg-config file, C and UniFFI API references, README.
-
-          Verify downloads with the accompanying \`.sha256\` files.
-          EOF
+            printf '%s\n\n' 'SemVer Release Candidate for staging and integration testing. Pin a formal `marmotc-v<version>` release for production.' > "$stage_notes"
             stage_args=()
-          else
-            cat > "$stage_notes" <<EOF
+          fi
+          members="$(unzip -Z1 "$asset")"
+          references=""
+          if grep -Fxq "marmot-c-$version/references/marmot-c/API-REFERENCE.md" <<< "$members" &&
+             grep -Fxq "marmot-c-$version/references/marmot-uniffi/API-REFERENCE.md" <<< "$members"; then
+            references=', C and UniFFI API references'
+          fi
+          cat >> "$stage_notes" <<EOF
           Marmot C bindings generated from exact MDK commit \`$SOURCE_SHA\`.
 
           Assets:
-          - \`marmot-c-linux-x86_64-$version.zip\`: \`libmarmot_c.so\` + \`libmarmot_c.a\`, \`marmot.h\`, pkg-config file, README.
+          - \`marmot-c-linux-x86_64-$version.zip\`: \`libmarmot_c.so\` + \`libmarmot_c.a\`, \`marmot.h\`, pkg-config file, README$references.
 
           Verify downloads with the accompanying \`.sha256\` files.
           EOF
-            stage_args=(--stable)
-          fi
           python3 builder/scripts/rc_release.py stage-draft \
             --tag "$RELEASE_TAG" \
             --title "v$version - Marmot C" \

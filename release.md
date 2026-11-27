@@ -307,7 +307,9 @@ The versioned check requires both `docs/release/$release_version.md` and
 `docs/integration/$release_version.md` from 0.10.2 onward and verifies their reciprocal
 links. It also rejects a supplied version that differs from the workspace. The full-cohort
 release coordinator runs this check before any tag/release mutation, including dry runs.
-A successful check verifies existence/linkage, not the accuracy or completeness of prose.
+Before creating tags, the coordinator also generates the C header with cbindgen 0.29.4
+and checks both binding guides at the exact release commit. Dry runs stay source-only.
+These checks verify links and export coverage, not the accuracy of the prose.
 
 Required GitHub CI on the exact release commit is the authoritative workspace check. Do not repeat that matrix locally
 after the initial release PR merges. If the intended release commit was changed after CI, or required CI did not cover

@@ -8,8 +8,8 @@ stable `vX.Y.Z` tag reachable from it using three independent layers (max-wins):
    - UniFFI exported callables (`check_binding_docs.uniffi_exports_in`) and
      `#[derive(... uniffi::Record | uniffi::Enum | uniffi::Error ...)]` types
      under `crates/marmot-uniffi/src/`.
-   - C ABI functions (`check_binding_docs.c_exports_in`) and `struct` / `enum` /
-     `typedef` declarations in `crates/marmot-c/include/marmot.h`.
+   - C functions, structs, enums, and typedefs in the C ABI inventory, or in
+     the tracked header at older revisions.
    - Emits `signature_delta.json` and Markdown summaries for downstream White
      Noise client agents.
 2. Mechanical storage-migration detector:
@@ -48,6 +48,8 @@ import check_c_binding_parity  # noqa: E402
 import check_pr_trailers  # noqa: E402
 
 IMPACT_RANK = {"none": 0, "patch": 1, "minor": 2}
+C_ABI_PATH = "crates/marmot-c/abi.json"
+C_HEADER_PATH = "crates/marmot-c/include/marmot.h"
 STABLE_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 STABLE_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 MIGRATION_FILE_RE = re.compile(
@@ -285,9 +287,20 @@ def extract_uniffi_surface(root: Path, sha: str) -> tuple[dict[str, dict[str, st
 
 
 def extract_c_surface(root: Path, sha: str) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
-    """Return `(functions, types)` exported by `crates/marmot-c/include/marmot.h` at `sha`."""
-    header = _read_file_at(root, sha, "crates/marmot-c/include/marmot.h")
+    """Read the C declarations at `sha`, including releases before header generation."""
+    inventory = _read_file_at(root, sha, C_ABI_PATH)
+    if inventory is not None:
+        abi = json.loads(inventory)
+        functions = {
+            key: {"signature": signature, "source": C_ABI_PATH}
+            for key, signature in abi["functions"].items()
+        }
+        return functions, abi["types"]
+
+    header = _read_file_at(root, sha, C_HEADER_PATH)
     if header is None:
+        if _read_file_at(root, sha, "crates/marmot-c/Cargo.toml") is not None:
+            raise ClassificationError(f"no C ABI inventory or header at {sha}")
         return {}, {}
     functions = {
         key: {"signature": export.signature, "source": export.source}
@@ -295,6 +308,22 @@ def extract_c_surface(root: Path, sha: str) -> tuple[dict[str, dict[str, str]], 
     }
     types = extract_c_types_in(header)
     return functions, types
+
+
+def _update_c_abi(root: Path, action: str) -> None:
+    header = (root / C_HEADER_PATH).read_text(encoding="utf-8")
+    abi = {
+        "functions": {key: export.signature for key, export in check_binding_docs.c_exports_in(header).items()},
+        "types": extract_c_types_in(header),
+    }
+    if not abi["functions"] or not abi["types"]:
+        raise ClassificationError("generated C header has no functions or types")
+    expected = json.dumps(abi, indent=2, sort_keys=True) + "\n"
+    path = root / C_ABI_PATH
+    if action == "write":
+        path.write_text(expected, encoding="utf-8")
+    elif not path.is_file() or path.read_text(encoding="utf-8") != expected:
+        raise ClassificationError(f"{C_ABI_PATH} differs from the generated header; run `just c-abi-write`")
 
 
 def diff_callables(
@@ -787,6 +816,7 @@ def render_release_notes(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", type=Path, default=ROOT, help="repository root")
+    parser.add_argument("--c-abi", choices=("check", "write"), help="check or write the C ABI inventory from the generated header")
     parser.add_argument("--baseline-ref", help="stable baseline tag or commit (default: latest reachable vX.Y.Z tag)")
     parser.add_argument("--target-ref", default="HEAD", help="target commit or ref (default: HEAD)")
     parser.add_argument("--override-impact", choices=("patch", "minor"), help="explicitly override patch/minor impact")
@@ -797,13 +827,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        if args.c_abi:
+            _update_c_abi(args.root, args.c_abi)
+            return 0
         report, delta = classify_range(
             args.root,
             baseline_ref=args.baseline_ref,
             target_ref=args.target_ref,
             override_impact=args.override_impact,
         )
-    except (ClassificationError, subprocess.CalledProcessError, ValueError) as exc:
+    except (ClassificationError, OSError, subprocess.CalledProcessError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
