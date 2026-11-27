@@ -1535,7 +1535,7 @@ pub(crate) fn open_account_in_memory(
     options: SqliteStorageOptions,
 ) -> StorageResult<OpenedAccount> {
     let connection = rusqlite::Connection::open_in_memory().storage()?;
-    apply_cipher_pragmas(&connection, &options)?;
+    apply_pre_key_pragmas(&connection, &options)?;
     finish_account_open(connection, options, None)
 }
 
@@ -1551,23 +1551,15 @@ pub(crate) fn open_account_encrypted(
     open_account_unkeyed(connection, key, options, observer)
 }
 
-/// Pin cipher configuration before key application, reporting each boundary before it can block.
+/// Apply pre-key pragmas, key the connection, and pin `cipher_compatibility`,
+/// reporting each boundary before it can block.
 pub(crate) fn open_account_unkeyed(
     connection: rusqlite::Connection,
     key: &SqlCipherKey,
     options: SqliteStorageOptions,
     observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
 ) -> StorageResult<OpenedAccount> {
-    crate::base::open_progress::observe(
-        observer,
-        crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::CipherConfiguration),
-    );
-    apply_cipher_pragmas(&connection, &options)?;
-    crate::base::open_progress::observe(
-        observer,
-        crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::CipherKeyApplication),
-    );
-    apply_sqlcipher_key(&connection, key)?;
+    configure_and_key_sqlcipher(&connection, key, &options, observer)?;
     finish_account_open(connection, options, observer)
 }
 
@@ -1753,9 +1745,41 @@ pub(crate) fn ensure_private_db_files(path: &Path) -> StorageResult<()> {
     fs_private::ensure_private_db_files(path).map_err(|err| StorageError::Backend(err.to_string()))
 }
 
-fn apply_sqlcipher_key(connection: &rusqlite::Connection, key: &SqlCipherKey) -> StorageResult<()> {
+fn configure_and_key_sqlcipher(
+    connection: &rusqlite::Connection,
+    key: &SqlCipherKey,
+    options: &SqliteStorageOptions,
+    observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
+) -> StorageResult<()> {
+    crate::base::open_progress::observe(
+        observer,
+        crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::CipherConfiguration),
+    );
+    apply_pre_key_pragmas(connection, options)?;
+    crate::base::open_progress::observe(
+        observer,
+        crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::CipherKeyApplication),
+    );
+    apply_sqlcipher_key(connection, key, options.cipher_compatibility)
+}
+
+fn apply_sqlcipher_key(
+    connection: &rusqlite::Connection,
+    key: &SqlCipherKey,
+    cipher_compatibility: u8,
+) -> StorageResult<()> {
     connection
         .pragma_update(None, "key", key.as_secret_str())
+        .storage()?;
+    // Per-connection `PRAGMA cipher_compatibility` requires an active codec
+    // context, which SQLCipher only creates in `PRAGMA key`. Issue it after
+    // `PRAGMA key` and before the first page read (`sqlite_master` probe).
+    connection
+        .pragma_update(
+            None,
+            "cipher_compatibility",
+            i64::from(cipher_compatibility),
+        )
         .storage()?;
     let _: i64 = connection
         .query_row_cached("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
@@ -1804,17 +1828,10 @@ fn test_process_storage_relaxed() -> bool {
     }
 }
 
-pub(crate) fn apply_cipher_pragmas(
+pub(crate) fn apply_pre_key_pragmas(
     connection: &rusqlite::Connection,
     options: &SqliteStorageOptions,
 ) -> StorageResult<()> {
-    connection
-        .pragma_update(
-            None,
-            "cipher_compatibility",
-            i64::from(options.cipher_compatibility),
-        )
-        .storage()?;
     if options.cipher_memory_security && !test_process_storage_relaxed() {
         connection
             .execute_batch("PRAGMA cipher_memory_security = ON;")
@@ -1822,6 +1839,9 @@ pub(crate) fn apply_cipher_pragmas(
         #[cfg(target_os = "android")]
         report_sqlcipher_platform_limit_once(&SQLCIPHER_PLATFORM_LIMIT_REPORTED);
     }
+    connection
+        .busy_timeout(Duration::from_millis(options.busy_timeout_ms))
+        .storage()?;
     Ok(())
 }
 
@@ -1829,9 +1849,6 @@ fn apply_operational_pragmas(
     connection: &rusqlite::Connection,
     options: &SqliteStorageOptions,
 ) -> StorageResult<()> {
-    connection
-        .busy_timeout(Duration::from_millis(options.busy_timeout_ms))
-        .storage()?;
     connection
         .pragma_update(None, "foreign_keys", true)
         .storage()?;
@@ -1864,8 +1881,9 @@ fn apply_operational_pragmas(
 /// SQLCipher hardening for connections opened *outside* the account-storage
 /// aggregate (the app's directory cache, legacy account-projection import, and
 /// key-rotation paths). It mirrors the hardening [`SqliteAccountStorage`]
-/// applies so every SQLCipher database the workspace opens pins
-/// `cipher_compatibility`, enables `cipher_memory_security` *before* keying,
+/// applies so every SQLCipher database the workspace opens enables
+/// `cipher_memory_security` and `busy_timeout` before keying, pins
+/// `cipher_compatibility` after `PRAGMA key` and before the first page read,
 /// and optionally scrubs deleted rows and keeps temp state in memory.
 ///
 /// The cipher fields default to the same values as [`SqliteStorageOptions`] so
@@ -1910,27 +1928,27 @@ impl SqlCipherHardening {
 }
 
 /// Apply SQLCipher hardening to `connection` and key it, in the order the
-/// PRAGMAs require to take effect: `cipher_compatibility` and
-/// `cipher_memory_security` are set **before** `PRAGMA key`, then the privacy
+/// PRAGMAs require to take effect: `cipher_memory_security` and `busy_timeout`
+/// are set **before** `PRAGMA key`, `cipher_compatibility` is set **after**
+/// `PRAGMA key` and before the `sqlite_master` probe, and then the privacy
 /// PRAGMAs (`secure_delete`, `temp_store`) are applied after keying.
 ///
 /// This is the shared entry point for SQLCipher databases opened outside
 /// [`SqliteAccountStorage`]. The cipher-pragma ordering invariant is exercised
-/// by `public_hardened_open_pins_cipher_pragmas_before_keying`.
+/// by `public_hardened_open_orders_cipher_pragmas_around_keying`.
 pub fn open_hardened_sqlcipher(
     connection: &rusqlite::Connection,
     key: &SqlCipherKey,
     hardening: SqlCipherHardening,
 ) -> StorageResult<()> {
-    // Reuse the account-storage cipher-pragma path so the "cipher pragmas
-    // before keying" ordering lives in exactly one place.
+    // Reuse the account-storage SQLCipher setup path so the pragma ordering
+    // lives in exactly one place.
     let cipher_options = SqliteStorageOptions {
         cipher_compatibility: hardening.cipher_compatibility,
         cipher_memory_security: hardening.cipher_memory_security,
         ..SqliteStorageOptions::default()
     };
-    apply_cipher_pragmas(connection, &cipher_options)?;
-    apply_sqlcipher_key(connection, key)?;
+    configure_and_key_sqlcipher(connection, key, &cipher_options, None)?;
     if hardening.secure_delete {
         connection
             .pragma_update(None, "secure_delete", true)
@@ -3149,7 +3167,12 @@ mod tests {
         );
 
         let reopened = rusqlite::Connection::open(&path).unwrap();
-        apply_sqlcipher_key(&reopened, &key).unwrap();
+        apply_sqlcipher_key(
+            &reopened,
+            &key,
+            SqliteStorageOptions::default().cipher_compatibility,
+        )
+        .unwrap();
         reopened
             .pragma_update(None, "locking_mode", "EXCLUSIVE")
             .unwrap();
@@ -3652,7 +3675,12 @@ mod tests {
         );
 
         let reopened = rusqlite::Connection::open(&path).unwrap();
-        apply_sqlcipher_key(&reopened, &key).unwrap();
+        apply_sqlcipher_key(
+            &reopened,
+            &key,
+            SqliteStorageOptions::default().cipher_compatibility,
+        )
+        .unwrap();
         let ids = |table: &str| -> Vec<i64> {
             reopened
                 .prepare(&format!("SELECT id FROM {table} ORDER BY id"))
@@ -3728,8 +3756,8 @@ mod tests {
         };
         let key = SqlCipherKey::raw(TAKEOVER_PROBE_KEY);
         let connection = rusqlite::Connection::open(path).unwrap();
-        apply_cipher_pragmas(&connection, &SqliteStorageOptions::default()).unwrap();
-        apply_sqlcipher_key(&connection, &key).unwrap();
+        configure_and_key_sqlcipher(&connection, &key, &SqliteStorageOptions::default(), None)
+            .unwrap();
         connection.busy_timeout(Duration::ZERO).unwrap();
         connection
             .pragma_update(None, "locking_mode", "EXCLUSIVE")
@@ -3809,9 +3837,11 @@ mod tests {
         }
     }
 
-    /// Asserts the traced setup pinned `cipher_compatibility`, then enabled
-    /// `cipher_memory_security`, both before `PRAGMA key` and its probe.
-    fn assert_cipher_pragmas_precede_keying() {
+    /// Asserts the traced setup enables `cipher_memory_security` before
+    /// `PRAGMA key`, then pins `cipher_compatibility` after `PRAGMA key` and
+    /// before the `sqlite_master` probe (SQLCipher ignores per-connection
+    /// `cipher_compatibility` before `PRAGMA key` initializes the codec context).
+    fn assert_cipher_pragma_order() {
         let statements = TRACED_SQLCIPHER_SETUP.lock().unwrap().clone();
         let position = |step: &str| {
             statements
@@ -3820,22 +3850,22 @@ mod tests {
                 .unwrap_or_else(|| panic!("{step} was not traced: {statements:?}"))
         };
         let order = [
-            "cipher_compatibility",
             "cipher_memory_security",
             "key",
+            "cipher_compatibility",
             "key_probe",
         ]
         .map(position);
         assert!(
             order.is_sorted(),
-            "cipher pragmas must precede SQLCipher keying and its probe: {statements:?}"
+            "cipher_memory_security must precede key, and cipher_compatibility must follow key before key_probe: {statements:?}"
         );
     }
 
     /// One key kind for this and the next test: both kinds reach the same
     /// `apply_sqlcipher_key` call, which has no branch by key kind.
     #[test]
-    fn encrypted_connection_pins_cipher_pragmas_before_keying() {
+    fn encrypted_connection_orders_cipher_pragmas_around_keying() {
         use_production_storage_for_test_process();
         let _guard = TRACE_TEST_LOCK.lock().unwrap();
         TRACED_SQLCIPHER_SETUP.lock().unwrap().clear();
@@ -3853,11 +3883,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_cipher_pragmas_precede_keying();
+        assert_cipher_pragma_order();
     }
 
     #[test]
-    fn public_hardened_open_pins_cipher_pragmas_before_keying() {
+    fn public_hardened_open_orders_cipher_pragmas_around_keying() {
         use_production_storage_for_test_process();
         let _guard = TRACE_TEST_LOCK.lock().unwrap();
         TRACED_SQLCIPHER_SETUP.lock().unwrap().clear();
@@ -3875,7 +3905,81 @@ mod tests {
         )
         .unwrap();
 
-        assert_cipher_pragmas_precede_keying();
+        assert_cipher_pragma_order();
+    }
+
+    /// Regression for #3798: `PRAGMA cipher_compatibility = 3` only takes
+    /// effect when issued after `PRAGMA key` and before the first page read.
+    #[test]
+    fn cipher_compatibility_3_applies_sqlcipher_v3_kdf_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::raw([0x33; 32]);
+
+        let account_options = SqliteStorageOptions {
+            cipher_compatibility: 3,
+            ..SqliteStorageOptions::default()
+        };
+        let store = SqliteAccountStorage::open_encrypted_with_options(
+            dir.path().join("v3-account.sqlite"),
+            &key,
+            account_options,
+        )
+        .unwrap();
+        {
+            let conn = store.lock().unwrap();
+            assert_eq!(pragma_string(&conn, "kdf_iter"), "64000");
+            assert_eq!(pragma_string(&conn, "cipher_page_size"), "1024");
+        }
+
+        let hardened_conn =
+            rusqlite::Connection::open(dir.path().join("v3-hardened.sqlite")).unwrap();
+        let hardening = SqlCipherHardening {
+            cipher_compatibility: 3,
+            ..SqlCipherHardening::live_cache()
+        };
+        open_hardened_sqlcipher(&hardened_conn, &key, hardening).unwrap();
+        assert_eq!(pragma_string(&hardened_conn, "kdf_iter"), "64000");
+        assert_eq!(pragma_string(&hardened_conn, "cipher_page_size"), "1024");
+    }
+
+    /// Regression for #3798: `busy_timeout` is configured before `PRAGMA key`
+    /// and the `sqlite_master` probe so startup opens apply the configured
+    /// timeout instead of whatever default or prior value the connection had.
+    #[test]
+    fn public_hardened_open_sets_busy_timeout_before_key_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hardened-busy.sqlite");
+        let key = SqlCipherKey::raw([0x51; 32]);
+        let wrong_key = SqlCipherKey::raw([0x52; 32]);
+
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection.busy_timeout(Duration::ZERO).unwrap();
+            open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+            assert_eq!(
+                pragma_i64(&connection, "busy_timeout"),
+                SqliteStorageOptions::default().busy_timeout_ms as i64
+            );
+            connection
+                .execute_batch("CREATE TABLE marker (id INTEGER PRIMARY KEY);")
+                .unwrap();
+        }
+
+        // Even when the `sqlite_master` probe fails with the wrong key,
+        // `busy_timeout` must already have been applied beforehand.
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.busy_timeout(Duration::ZERO).unwrap();
+        let err =
+            open_hardened_sqlcipher(&connection, &wrong_key, SqlCipherHardening::live_cache())
+                .unwrap_err();
+        assert!(
+            matches!(&err, StorageError::Backend(detail) if detail.contains("file is not a database")),
+            "{err:?}"
+        );
+        assert_eq!(
+            pragma_i64(&connection, "busy_timeout"),
+            SqliteStorageOptions::default().busy_timeout_ms as i64
+        );
     }
 
     #[test]
