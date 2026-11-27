@@ -2298,16 +2298,18 @@ impl MarmotApp {
         relay_plane: &MarmotRelayPlane,
         lifecycle: runtime::RuntimeLifecycle,
         startup_progress: Option<&AccountStartupProgress>,
+        tasks: Option<&runtime::account_worker::WorkerTaskScope>,
     ) -> Result<AppClient, AppError> {
         // Deferred hydration (mdk#1161): the account worker drives the
         // background per-group hydration pipeline after signalling local
         // readiness, so runtime opens stay flat in stored-group count.
-        self.local_client_with_relay_plane_and_hydration(
+        self.local_client_with_relay_plane_and_hydration_scoped(
             label,
             relay_plane,
             Some(lifecycle),
             true,
             startup_progress,
+            tasks,
         )
         .await
     }
@@ -2354,6 +2356,26 @@ impl MarmotApp {
         defer_group_hydration: bool,
         startup_progress: Option<&AccountStartupProgress>,
     ) -> Result<AppClient, AppError> {
+        self.local_client_with_relay_plane_and_hydration_scoped(
+            label,
+            relay_plane,
+            lifecycle,
+            defer_group_hydration,
+            startup_progress,
+            None,
+        )
+        .await
+    }
+
+    async fn local_client_with_relay_plane_and_hydration_scoped(
+        &self,
+        label: &str,
+        relay_plane: &MarmotRelayPlane,
+        lifecycle: Option<runtime::RuntimeLifecycle>,
+        defer_group_hydration: bool,
+        startup_progress: Option<&AccountStartupProgress>,
+        tasks: Option<&runtime::account_worker::WorkerTaskScope>,
+    ) -> Result<AppClient, AppError> {
         let app = self.clone();
         // Resolve every supported account ref before touching label-keyed
         // caches or the session-owner registry.
@@ -2365,11 +2387,12 @@ impl MarmotApp {
                 marmot_account::AccountHomeError::AccountUnlinked(account.label),
             ));
         }
+        let account_id_hex = account.account_id_hex;
         let label = account.label;
         let relay_plane_for_open = relay_plane.clone();
         let permit = lifecycle
             .as_ref()
-            .map(runtime::RuntimeLifecycle::begin_account_open)
+            .map(|lifecycle| lifecycle.begin_account_open(&account_id_hex))
             .transpose()?;
         // Only a starting worker records stage spans; other opens pass `None`.
         let enter_stage = |progress: Option<&AccountStartupProgress>, stage| {
@@ -2379,21 +2402,49 @@ impl MarmotApp {
         };
         enter_stage(startup_progress, AccountStartupStage::OpenQueued);
         let blocking_progress = startup_progress.cloned();
-        let open = blocking_app_task(move || {
+        let cancel = tasks.map(runtime::account_worker::WorkerTaskScope::token);
+        // Transfer the opened account through a oneshot inside the blocking
+        // closure so if this future is cancelled or aborted while opening, the
+        // rejected `OpenedAccount` (and its session-owner guard) drops BEFORE
+        // `_permit` and the `WorkerTaskScope` token drop (mdk#3801).
+        let (open_tx, open_rx) = tokio::sync::oneshot::channel();
+        let run_open = move || {
             let _permit = permit;
+            if cancel
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                let _ = open_tx.send(Err(AppError::TransportClosed));
+                return;
+            }
             enter_stage(
                 blocking_progress.as_ref(),
                 AccountStartupStage::AccountState,
             );
-            app.ensure_account_state(&label)?;
-            enter_stage(blocking_progress.as_ref(), AccountStartupStage::SessionOpen);
-            let open = app.open_account(&label, &relay_plane_for_open, defer_group_hydration);
-            #[cfg(test)]
-            app.local_open_gates
-                .wait(&label, AccountStartupStage::SessionOpen);
-            open
-        })
-        .await?;
+            let open = match app.ensure_account_state(&label) {
+                Ok(()) => {
+                    enter_stage(blocking_progress.as_ref(), AccountStartupStage::SessionOpen);
+                    let open =
+                        app.open_account(&label, &relay_plane_for_open, defer_group_hydration);
+                    #[cfg(test)]
+                    app.local_open_gates
+                        .wait(&label, AccountStartupStage::SessionOpen);
+                    open
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(rejected) = open_tx.send(open) {
+                drop(rejected);
+            }
+        };
+        if let Some(tasks) = tasks {
+            tasks.spawn_blocking(run_open);
+        } else {
+            tokio::task::spawn_blocking(run_open);
+        }
+        let open = open_rx
+            .await
+            .map_err(|_| AppError::BlockingTask("blocking account open task failed".into()))??;
         enter_stage(startup_progress, AccountStartupStage::ClientRestore);
         if let Some(lifecycle) = &lifecycle {
             lifecycle.ensure_running()?;
@@ -8432,7 +8483,9 @@ impl MarmotApp {
         account_id_hex: &str,
         signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     ) -> Arc<dyn NostrRelayClient> {
-        let stop = self.account_publish_stop(account_id_hex);
+        let entry = self.account_publish_stop_entry_resolved(account_id_hex);
+        let app = self.clone();
+        let account_id_owned = account_id_hex.to_owned();
         // The publisher sends nothing once the account is unlinked, and no
         // event over a relay's known limit (mdk#2334).
         let guard = |client: Arc<dyn NostrRelayClient>| -> Arc<dyn NostrRelayClient> {
@@ -8440,8 +8493,11 @@ impl MarmotApp {
                 client,
                 self.relay_event_limits(),
             ));
-            Arc::new(unlinked_publish_gate::UnlinkedPublishGate::new(
-                client, stop,
+            Arc::new(unlinked_publish_gate::UnlinkedPublishGate::for_account(
+                client,
+                app,
+                account_id_owned,
+                entry,
             ))
         };
         #[cfg(test)]

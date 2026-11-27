@@ -29,7 +29,7 @@
 //! stored, still held back, and the next pairing drive unlinks the device.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -301,9 +301,9 @@ impl AppClient {
     pub(crate) fn hold_removed_sign_out_publishing(&self) -> Result<bool, AppError> {
         let removed = self.removed_while_signing_out()?;
         if removed {
-            self.app
-                .account_publish_stop(&hex::encode(self.adapter.account_id().as_slice()))
-                .store(true, Ordering::Release);
+            self.app.stop_unlinked_account_publishing(&hex::encode(
+                self.adapter.account_id().as_slice(),
+            ));
         }
         Ok(removed)
     }

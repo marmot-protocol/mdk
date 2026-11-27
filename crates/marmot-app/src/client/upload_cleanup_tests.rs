@@ -768,7 +768,14 @@ async fn staging_does_not_hold_an_account_transaction() {
         progressed,
         "account transaction must finish while source read is held"
     );
-    crate::media::outgoing::release_outgoing_uploads(app.clone(), "alice".into(), tokens).await;
+    let media = app.account_media_store("alice", &storage).unwrap();
+    crate::media::outgoing::release_outgoing_uploads(
+        storage,
+        media,
+        &crate::runtime::account_worker::WorkerTaskScope::new(),
+        tokens,
+    )
+    .await;
 }
 
 /// A send dropped while its body is still being staged (a caller timing out
