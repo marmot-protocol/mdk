@@ -1,9 +1,10 @@
 ### Breaking changes
 
-- `SqliteStorageOptions::cipher_compatibility` and `SqlCipherHardening::cipher_compatibility` are now enforced after
-  `PRAGMA key` with no silent format fallback. Default `cipher_compatibility = 4` databases are unaffected; callers
-  that previously created a database with a non-default value (such as `3`) produced a SQLCipher v4 file on disk and
-  must reopen it with `cipher_compatibility = 4` (or migrate/rekey it offline).
+- `SqliteStorageOptions::cipher_compatibility` and `SqlCipherHardening::cipher_compatibility` (`1..=4`) are now
+  enforced after `PRAGMA key` with no silent format fallback, and unsupported values outside `1..=4` are rejected before
+  keying. Default `cipher_compatibility = 4` databases are unaffected; callers that previously created a database with a
+  non-default value (such as `3`) produced a SQLCipher v4 file on disk and must reopen it with
+  `cipher_compatibility = 4` (or migrate/rekey it offline).
 
 ### Fixed
 

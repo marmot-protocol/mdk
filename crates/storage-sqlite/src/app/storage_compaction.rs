@@ -24,7 +24,9 @@ use rusqlite::Connection;
 use crate::base::connection::ConnectionGuard;
 use crate::{SqliteAppStorage, SqliteResultExt};
 
-/// `PRAGMA auto_vacuum` value for incremental mode.
+/// `PRAGMA auto_vacuum` values.
+const AUTO_VACUUM_NONE: i64 = 0;
+const AUTO_VACUUM_FULL: i64 = 1;
 const AUTO_VACUUM_INCREMENTAL: i64 = 2;
 /// Virtual machine steps between the `VACUUM`'s checks of the close latch.
 const CLOSE_POLL_OPS: std::ffi::c_int = 1_000;
@@ -138,6 +140,11 @@ impl SqliteAppStorage {
             ));
         }
         pause();
+        let prior_auto_vacuum: i64 = conn
+            .query_row("SELECT auto_vacuum FROM pragma_auto_vacuum()", [], |r| {
+                r.get(0)
+            })
+            .storage()?;
         // A close (a host about to suspend) must not wait out the copy, and
         // may begin at any moment, even before the copy starts: the VACUUM
         // polls the close latch as it runs, stops once a close has begun,
@@ -145,13 +152,32 @@ impl SqliteAppStorage {
         let closing = self.connection.closing_probe();
         conn.progress_handler(CLOSE_POLL_OPS, Some(closing))
             .storage()?;
-        let vacuumed = conn
-            .execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")
-            .and_then(|()| conn.vacuum());
+        // - `NONE (0)`: setting `INCREMENTAL` only updates an in-memory
+        //   connection flag until `VACUUM` commits; reset it to `NONE` on
+        //   failure so a later raw `VACUUM` keeps the prior mode.
+        // - `FULL (1)`: SQLite persists `FULL -> INCREMENTAL` immediately in
+        //   the pragma statement (both modes share pointer-map pages). Run
+        //   `VACUUM` first so a busy or interrupted `VACUUM` leaves the
+        //   on-disk mode as `FULL`, then flip to `INCREMENTAL` only after
+        //   `VACUUM` commits.
+        // - `INCREMENTAL (2)`: already incremental; run `VACUUM` directly and
+        //   never downgrade to `NONE` on failure.
+        let vacuumed = match prior_auto_vacuum {
+            AUTO_VACUUM_NONE => conn
+                .execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")
+                .and_then(|()| conn.vacuum()),
+            AUTO_VACUUM_FULL => conn
+                .vacuum()
+                .and_then(|()| conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")),
+            _ => conn.vacuum(),
+        };
         let cleared_handler = conn
             .progress_handler(CLOSE_POLL_OPS, None::<fn() -> bool>)
             .storage();
         if let Err(err) = vacuumed {
+            if prior_auto_vacuum == AUTO_VACUUM_NONE {
+                let _ = conn.execute_batch("PRAGMA auto_vacuum=NONE;");
+            }
             if err.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
                 && self.connection.is_closing()
             {

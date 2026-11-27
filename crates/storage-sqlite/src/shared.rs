@@ -284,6 +284,20 @@ impl SqliteSharedStorage {
         .storage()?;
         migrations::run_all(&mut conn)?;
         crate::base::text_search::register_search_functions(&conn).storage()?;
+        conn.create_scalar_function(
+            "marmot_is_valid_u64",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC
+                | rusqlite::functions::FunctionFlags::SQLITE_INNOCUOUS,
+            |ctx| match ctx.get_raw(0) {
+                rusqlite::types::ValueRef::Text(bytes) => Ok(std::str::from_utf8(bytes)
+                    .ok()
+                    .is_some_and(|s| s.parse::<u64>().is_ok())),
+                _ => Ok(false),
+            },
+        )
+        .storage()?;
         Ok(Self {
             conn: Arc::new(CloseableConnection::new(conn, CLOSED_DETAIL)),
         })
@@ -652,49 +666,77 @@ impl SqliteSharedStorage {
         query: &str,
         account_ids: &[String],
     ) -> StorageResult<Vec<SearchProfile>> {
-        const PROJECTION: &str =
-            "SELECT account_id_hex, npub, profile_json,
-                    CASE WHEN profile_json IS NULL THEN NULL
-                         WHEN NOT json_valid(profile_json)
-                           OR json_type(profile_json) != 'object' THEN 'invalid'
-                         ELSE COALESCE(profile_json -> '$.created_at', '0')
-                    END,
-                    min(
-                        marmot_search_rank(CASE WHEN json_valid(profile_json) THEN json_extract(profile_json, '$.name') END, ?1) * 6,
-                        marmot_search_rank(CASE WHEN json_valid(profile_json) THEN json_extract(profile_json, '$.nip05') END, ?1) * 6 + 1,
-                        marmot_search_rank(CASE WHEN json_valid(profile_json) THEN json_extract(profile_json, '$.display_name') END, ?1) * 6 + 2,
-                        marmot_search_rank(CASE WHEN json_valid(profile_json) THEN json_extract(profile_json, '$.about') END, ?1) * 6 + 3,
-                        marmot_search_rank(npub, ?1) * 6 + 4,
-                        marmot_search_rank(account_id_hex, ?1) * 6 + 5
-                    ) AS search_rank,
-                    min(
-                        marmot_search_rank(npub, ?1) * 6 + 4,
-                        marmot_search_rank(account_id_hex, ?1) * 6 + 5
-                    ) AS identity_rank
-             FROM directory_users";
+        // Evaluate profile validity and effective search rank inside SQL so
+        // malformed `profile_json` rows (invalid JSON, non-object JSON, or
+        // non-u64 `created_at`) degrade to identity-only rank *before*
+        // `WHERE search_rank < 18 ... LIMIT` applies.
+        let build_query = |inner_where: &str, outer_suffix: &str| {
+            format!(
+                "SELECT account_id_hex, npub, profile_json, created_at_token,
+                        search_rank, malformed_profile
+                 FROM (
+                     SELECT account_id_hex,
+                            npub,
+                            CASE WHEN created_at_token IS NOT NULL
+                                   AND marmot_is_valid_u64(created_at_token)
+                                 THEN profile_json
+                                 ELSE NULL
+                            END AS profile_json,
+                            CASE WHEN created_at_token IS NOT NULL
+                                   AND marmot_is_valid_u64(created_at_token)
+                                 THEN created_at_token
+                                 ELSE NULL
+                            END AS created_at_token,
+                            CASE WHEN created_at_token IS NOT NULL
+                                   AND marmot_is_valid_u64(created_at_token)
+                                 THEN min(
+                                     marmot_search_rank(json_extract(profile_json, '$.name'), ?1) * 6,
+                                     marmot_search_rank(json_extract(profile_json, '$.nip05'), ?1) * 6 + 1,
+                                     marmot_search_rank(json_extract(profile_json, '$.display_name'), ?1) * 6 + 2,
+                                     marmot_search_rank(json_extract(profile_json, '$.about'), ?1) * 6 + 3,
+                                     identity_rank
+                                 )
+                                 ELSE identity_rank
+                            END AS search_rank,
+                            (profile_json IS NOT NULL
+                             AND (created_at_token IS NULL
+                                  OR NOT marmot_is_valid_u64(created_at_token))) AS malformed_profile
+                     FROM (
+                         SELECT account_id_hex,
+                                npub,
+                                profile_json,
+                                CASE
+                                    WHEN profile_json IS NULL THEN NULL
+                                    WHEN NOT json_valid(profile_json) THEN 'invalid'
+                                    WHEN json_type(profile_json) != 'object' THEN 'invalid'
+                                    ELSE COALESCE(profile_json -> '$.created_at', '0')
+                                END AS created_at_token,
+                                min(
+                                    marmot_search_rank(npub, ?1) * 6 + 4,
+                                    marmot_search_rank(account_id_hex, ?1) * 6 + 5
+                                ) AS identity_rank
+                         FROM directory_users
+                         {inner_where}
+                     )
+                 )
+                 {outer_suffix}"
+            )
+        };
         let conn = self.lock()?;
-        // Returns `(record, malformed_profile)`. A row with corrupt JSON or a
-        // non-u64 `created_at` degrades to `profile_json: None, created_at: None`
-        // with its `npub`/`account_id_hex` rank so the user stays findable by
-        // identity and a valid copy in another cache still wins on `created_at`.
         let read_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(SearchProfile, bool)> {
-            let (profile_json, created_at, rank, malformed) =
-                match row.get::<_, Option<String>>(3)? {
-                    None => (None, None, row.get(4)?, false),
-                    Some(value) => match value.parse::<u64>() {
-                        Ok(timestamp) => (row.get(2)?, Some(timestamp), row.get(4)?, false),
-                        Err(_) => (None, None, row.get(5)?, true),
-                    },
-                };
+            let created_at = row
+                .get::<_, Option<String>>(3)?
+                .and_then(|value| value.parse::<u64>().ok());
+            let malformed = row.get::<_, i64>(5)? != 0;
             Ok((
                 (
                     PublicDirectoryProfileRecord {
                         account_id_hex: row.get(0)?,
                         npub: row.get(1)?,
-                        profile_json,
+                        profile_json: row.get(2)?,
                     },
                     created_at,
-                    rank,
+                    row.get(4)?,
                 ),
                 malformed,
             ))
@@ -702,21 +744,19 @@ impl SqliteSharedStorage {
         let mut profiles = Vec::new();
         let mut malformed_profiles = 0usize;
         if account_ids.is_empty() {
-            let mut statement = conn
-                .prepare_cached(&format!(
-                    "{PROJECTION} WHERE search_rank < 18
+            let sql = build_query(
+                "",
+                &format!(
+                    "WHERE search_rank < 18
                      ORDER BY account_id_hex LIMIT {PUBLIC_DIRECTORY_USERS_MAX}"
-                ))
-                .storage()?;
+                ),
+            );
+            let mut statement = conn.prepare_cached(&sql).storage()?;
             let rows = statement.query_map([query], read_row).storage()?;
             for row in rows {
                 let (profile, malformed) = row.storage()?;
                 if malformed {
                     malformed_profiles += 1;
-                    // Discard rows that matched only via their corrupt profile JSON.
-                    if profile.2 >= 18 {
-                        continue;
-                    }
                 }
                 profiles.push(profile);
             }
@@ -725,11 +765,8 @@ impl SqliteSharedStorage {
                 let placeholders = std::iter::repeat_n("?", ids.len())
                     .collect::<Vec<_>>()
                     .join(",");
-                let mut statement = conn
-                    .prepare_cached(&format!(
-                        "{PROJECTION} WHERE account_id_hex IN ({placeholders})"
-                    ))
-                    .storage()?;
+                let sql = build_query(&format!("WHERE account_id_hex IN ({placeholders})"), "");
+                let mut statement = conn.prepare_cached(&sql).storage()?;
                 let rows = statement
                     .query_map(
                         params_from_iter(
@@ -1884,6 +1921,66 @@ mod tests {
         assert_eq!(by_ids[6].0.profile_json, None);
         assert_eq!(by_ids[6].1, None);
         assert_eq!(by_ids[6].2, 16);
+    }
+
+    /// Regression for PR #3818 review: malformed profile rows whose corrupt JSON
+    /// text matches the query must be ranked identity-only *before* SQL applies
+    /// `WHERE search_rank < 18 ... LIMIT 10000` so they cannot displace valid
+    /// trailing matches.
+    #[test]
+    fn public_directory_profiles_malformed_rows_do_not_consume_scan_cap() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        let mut conn = storage.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO directory_users (
+                        account_id_hex, npub, profile_json, relay_lists_json
+                     ) VALUES (?1, ?2, ?3, '{}')",
+                )
+                .unwrap();
+            // Five malformed profiles with `account_id_hex` sorting before all
+            // valid rows and `name: "Alice"` inside corrupt/invalid JSON.
+            for (idx, bad_json) in [
+                r#"{"name":"Alice","created_at":-1}"#,
+                r#"{"name":"Alice","created_at":"bad"}"#,
+                r#"{"name":"Alice","created_at":null}"#,
+                r#"{"name":"Alice","created_at":1.5}"#,
+                r#"{"name":"Alice","created_at":18446744073709551616}"#,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let id = format!("0000{idx:060x}");
+                stmt.execute(params![id, format!("npub1bad{idx}"), bad_json])
+                    .unwrap();
+            }
+            for idx in 0..PUBLIC_DIRECTORY_USERS_MAX {
+                let id = format!("1000{idx:060x}");
+                stmt.execute(params![
+                    id,
+                    format!("npub1ok{idx}"),
+                    r#"{"name":"Alice","created_at":42}"#
+                ])
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        drop(conn);
+
+        let last_valid_id = format!("1000{:060x}", PUBLIC_DIRECTORY_USERS_MAX - 1);
+        let results = storage.public_directory_profiles("alice", &[]).unwrap();
+        assert_eq!(
+            results.len(),
+            PUBLIC_DIRECTORY_USERS_MAX,
+            "malformed rows must not consume slots from the {PUBLIC_DIRECTORY_USERS_MAX}-row scan cap"
+        );
+        assert_eq!(
+            results.last().unwrap().0.account_id_hex,
+            last_valid_id,
+            "the last valid matching user must not be pushed past the SQL cap"
+        );
     }
 
     // #761: the batched listing is defensively bounded. The uncapped path still

@@ -373,17 +373,19 @@ pub(crate) fn retire_all_encrypted_media_secrets_for_group_tx(
     tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<usize> {
+    let canonical_group_id_hex = group_id_hex.to_ascii_lowercase();
+    let group_id_hex = canonical_group_id_hex.as_str();
     let has_group_data = tx
         .query_row_cached(
             "SELECT
-                 EXISTS (SELECT 1 FROM account_groups WHERE group_id_hex = ?1)
-                 OR EXISTS (SELECT 1 FROM app_events WHERE group_id_hex = ?1)
+                 EXISTS (SELECT 1 FROM account_groups WHERE LOWER(group_id_hex) = ?1)
+                 OR EXISTS (SELECT 1 FROM app_events WHERE LOWER(group_id_hex) = ?1)
                  OR EXISTS (
-                     SELECT 1 FROM encrypted_media_epoch_secrets WHERE group_id_hex = ?1
+                     SELECT 1 FROM encrypted_media_epoch_secrets WHERE LOWER(group_id_hex) = ?1
                  )
                  OR EXISTS (
                      SELECT 1 FROM encrypted_media_epoch_secret_references
-                     WHERE group_id_hex = ?1
+                     WHERE LOWER(group_id_hex) = ?1
                  )",
             params![group_id_hex],
             |row| row.get::<_, i64>(0),
@@ -405,14 +407,20 @@ pub(crate) fn retire_all_encrypted_media_secrets_for_group_tx(
     )
     .storage()?;
     tx.execute_cached(
-        "UPDATE encrypted_media_epoch_secrets
-         SET secret = zeroblob(length(secret))
-         WHERE group_id_hex = ?1",
+        "DELETE FROM encrypted_media_epoch_secret_retirement_watermarks
+         WHERE LOWER(group_id_hex) = ?1 AND group_id_hex != ?1",
         params![group_id_hex],
     )
     .storage()?;
     tx.execute_cached(
-        "DELETE FROM encrypted_media_epoch_secrets WHERE group_id_hex = ?1",
+        "UPDATE encrypted_media_epoch_secrets
+         SET secret = zeroblob(length(secret))
+         WHERE LOWER(group_id_hex) = ?1",
+        params![group_id_hex],
+    )
+    .storage()?;
+    tx.execute_cached(
+        "DELETE FROM encrypted_media_epoch_secrets WHERE LOWER(group_id_hex) = ?1",
         params![group_id_hex],
     )
     .storage()

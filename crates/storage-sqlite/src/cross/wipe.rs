@@ -107,7 +107,9 @@ impl SqliteAccountStorage {
                         "SELECT prior_nostr_routes_json, pending_confirmation,
                                 welcomer_account_id_hex, via_welcome_message_id_hex
                          FROM account_groups
-                         WHERE group_id_hex = ?1",
+                         WHERE LOWER(group_id_hex) = ?1
+                         ORDER BY CASE WHEN group_id_hex = ?1 THEN 0 ELSE 1 END, group_id_hex
+                         LIMIT 1",
                         params![group_id_hex],
                         |row| {
                             Ok((
@@ -197,7 +199,7 @@ impl SqliteAccountStorage {
                 ] {
                     deleted = deleted.saturating_add(
                         tx.execute_cached(
-                            &format!("DELETE FROM {table} WHERE group_id_hex = ?1"),
+                            &format!("DELETE FROM {table} WHERE LOWER(group_id_hex) = ?1"),
                             params![group_id_hex],
                         )
                         .storage()?,
@@ -272,7 +274,7 @@ impl SqliteAccountStorage {
                         &cgka_traits::GroupId::new(group_id.clone()),
                     )?;
                     tx.execute_cached(
-                        "DELETE FROM local_group_deletion_frontiers WHERE group_id_hex = ?1",
+                        "DELETE FROM local_group_deletion_frontiers WHERE LOWER(group_id_hex) = ?1",
                         params![group_id_hex],
                     )
                     .storage()?;
@@ -323,7 +325,7 @@ impl SqliteAccountStorage {
                         "chat_pin_positions",
                     ] {
                         tx.execute_cached(
-                            &format!("DELETE FROM {table} WHERE group_id_hex = ?1"),
+                            &format!("DELETE FROM {table} WHERE LOWER(group_id_hex) = ?1"),
                             params![group_id_hex],
                         )
                         .storage()?;
@@ -395,7 +397,9 @@ fn active_trusted_device_group_forget(
     let record: Option<Vec<u8>> = tx
         .query_row_cached(
             "SELECT g.record FROM cgka_groups g JOIN device_groups d
-         ON d.group_id_hex = ?1 WHERE g.id = ?2 AND d.trust IN ('created','linked')",
+         ON LOWER(d.group_id_hex) = ?1 WHERE g.id = ?2 AND d.trust IN ('created','linked')
+         ORDER BY CASE WHEN d.group_id_hex = ?1 THEN 0 ELSE 1 END, d.group_id_hex
+         LIMIT 1",
             params![group_hex, group_id],
             |row| row.get(0),
         )

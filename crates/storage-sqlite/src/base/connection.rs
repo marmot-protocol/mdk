@@ -1475,8 +1475,9 @@ pub struct SqliteStorageOptions {
     /// in the process. Android receives a once-per-process diagnostic because
     /// its finite `mlock` budget makes page locking best effort.
     pub cipher_memory_security: bool,
-    /// Pin `PRAGMA cipher_compatibility` after `PRAGMA key` and before the
-    /// first page read, with no silent format fallback. Defaults to `4`
+    /// Pin `PRAGMA cipher_compatibility` (`1..=4`) after `PRAGMA key` and
+    /// before the first page read, with no silent format fallback. Unsupported
+    /// values outside `1..=4` are rejected before keying. Defaults to `4`
     /// (unchanged on disk); callers that previously created a database with a
     /// non-default value on an earlier build wrote a SQLCipher v4 file and must
     /// reopen it with `4` (or migrate/rekey offline).
@@ -1551,6 +1552,7 @@ pub(crate) fn open_account_encrypted(
     options: SqliteStorageOptions,
     observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
 ) -> StorageResult<OpenedAccount> {
+    validate_cipher_compatibility(options.cipher_compatibility)?;
     ensure_private_db_files(path)?;
     let connection = rusqlite::Connection::open(path).storage()?;
     open_account_unkeyed(connection, key, options, observer)
@@ -1753,12 +1755,22 @@ pub(crate) fn ensure_private_db_files(path: &Path) -> StorageResult<()> {
     fs_private::ensure_private_db_files(path).map_err(|err| StorageError::Backend(err.to_string()))
 }
 
+fn validate_cipher_compatibility(cipher_compatibility: u8) -> StorageResult<()> {
+    if !(1..=4).contains(&cipher_compatibility) {
+        return Err(StorageError::Backend(format!(
+            "unsupported SQLCipher cipher_compatibility {cipher_compatibility}; expected 1..=4"
+        )));
+    }
+    Ok(())
+}
+
 fn configure_and_key_sqlcipher(
     connection: &rusqlite::Connection,
     key: &SqlCipherKey,
     options: &SqliteStorageOptions,
     observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
 ) -> StorageResult<()> {
+    validate_cipher_compatibility(options.cipher_compatibility)?;
     crate::base::open_progress::observe(
         observer,
         crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::CipherConfiguration),
@@ -1776,6 +1788,7 @@ fn apply_sqlcipher_key(
     key: &SqlCipherKey,
     cipher_compatibility: u8,
 ) -> StorageResult<()> {
+    validate_cipher_compatibility(cipher_compatibility)?;
     connection
         .pragma_update(None, "key", key.as_secret_str())
         .storage()?;
@@ -1898,12 +1911,13 @@ fn apply_operational_pragmas(
 /// the two hardening paths cannot silently drift apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SqlCipherHardening {
-    /// Pin `cipher_compatibility` after `PRAGMA key` so a future SQLCipher
-    /// default-compat bump cannot silently change the on-disk format these
-    /// databases require. Enforced fail-closed with no silent fallback; default
-    /// `4` databases are unchanged, while databases created with a non-default
-    /// value on an earlier build are SQLCipher v4 on disk and must be reopened
-    /// with `4` (or migrated/rekeyed offline).
+    /// Pin `cipher_compatibility` (`1..=4`) after `PRAGMA key` so a future
+    /// SQLCipher default-compat bump cannot silently change the on-disk format
+    /// these databases require. Unsupported values outside `1..=4` are rejected
+    /// before keying, and supported values are enforced fail-closed with no
+    /// silent fallback; default `4` databases are unchanged, while databases
+    /// created with a non-default value on an earlier build are SQLCipher v4 on
+    /// disk and must be reopened with `4` (or migrated/rekeyed offline).
     pub cipher_compatibility: u8,
     /// Enable `cipher_memory_security` so key/page material is wiped from the
     /// SQLCipher heap.
@@ -4066,6 +4080,55 @@ mod tests {
             .query_row("SELECT value FROM probe", [], |r| r.get(0))
             .unwrap();
         assert_eq!(recovered, "preserved");
+    }
+
+    /// Regression for PR #3818 review: unsupported `cipher_compatibility`
+    /// values (outside `1..=4`) must be rejected before keying instead of
+    /// silently falling back to SQLCipher v4 defaults.
+    #[test]
+    fn rejects_out_of_range_cipher_compatibility_before_keying() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::raw([0x35; 32]);
+
+        for invalid in [0_u8, 5, 255] {
+            let account_path = dir.path().join(format!("invalid-account-{invalid}.sqlite"));
+            let err = SqliteAccountStorage::open_encrypted_with_options(
+                &account_path,
+                &key,
+                SqliteStorageOptions {
+                    cipher_compatibility: invalid,
+                    ..SqliteStorageOptions::default()
+                },
+            )
+            .err()
+            .expect("unsupported cipher_compatibility must fail");
+            assert!(
+                matches!(&err, StorageError::Backend(detail) if detail.contains("cipher_compatibility")),
+                "account open must reject cipher_compatibility={invalid}: {err:?}"
+            );
+            assert!(
+                !account_path.exists(),
+                "invalid cipher_compatibility={invalid} must fail before creating database files"
+            );
+
+            let hardened_path = dir
+                .path()
+                .join(format!("invalid-hardened-{invalid}.sqlite"));
+            let conn = rusqlite::Connection::open(&hardened_path).unwrap();
+            let err = open_hardened_sqlcipher(
+                &conn,
+                &key,
+                SqlCipherHardening {
+                    cipher_compatibility: invalid,
+                    ..SqlCipherHardening::live_cache()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, StorageError::Backend(detail) if detail.contains("cipher_compatibility")),
+                "open_hardened_sqlcipher must reject cipher_compatibility={invalid}: {err:?}"
+            );
+        }
     }
 
     /// Regression for #3798: `busy_timeout` is configured before `PRAGMA key`

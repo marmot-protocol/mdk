@@ -298,3 +298,107 @@ fn failed_compaction_does_not_reset_auto_vacuum_to_none() {
         "failed compact_database must not rewrite a non-incremental header on disk"
     );
 }
+
+/// Regression for PR #3818 review: on an existing `auto_vacuum = FULL`
+/// database, a failed `compact_database` (e.g. `VACUUM` blocked by a competing
+/// writer) must leave the on-disk mode as `FULL` rather than persisting
+/// `INCREMENTAL` before `VACUUM` succeeds.
+#[test]
+fn failed_compaction_preserves_full_auto_vacuum_mode_under_write_contention() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("full-mode-contention.sqlite");
+    let key = key();
+    let store = SqliteAccountStorage::open_encrypted_with_options(
+        &path,
+        &key,
+        crate::SqliteStorageOptions {
+            busy_timeout_ms: 0,
+            ..crate::SqliteStorageOptions::default()
+        },
+    )
+    .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute_batch("PRAGMA auto_vacuum = FULL; VACUUM;")
+            .unwrap();
+        let mode: i64 = conn
+            .query_row("SELECT auto_vacuum FROM pragma_auto_vacuum()", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(mode, 1, "fixture should start in auto_vacuum=FULL");
+    }
+    let app = store.app_storage();
+    assert!(!app.database_space().unwrap().incremental);
+
+    thread_local! {
+        static BLOCKER: std::cell::RefCell<Option<rusqlite::Connection>> =
+            const { std::cell::RefCell::new(None) };
+        static FIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    fn lock_before_vacuum(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+            && sql.eq_ignore_ascii_case("VACUUM")
+            && !FIRED.replace(true)
+        {
+            BLOCKER.with_borrow(|blocker| {
+                if let Some(conn) = blocker {
+                    conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+                }
+            });
+        }
+    }
+
+    let blocker = rusqlite::Connection::open(&path).unwrap();
+    crate::open_hardened_sqlcipher(&blocker, &key, crate::SqlCipherHardening::cipher_only())
+        .unwrap();
+    FIRED.set(false);
+    BLOCKER.set(Some(blocker));
+    // Acquire the competing write lock right as `VACUUM` begins (after any
+    // preceding `PRAGMA auto_vacuum=INCREMENTAL` would already have committed
+    // to a `FULL` database header on disk).
+    store.lock().unwrap().trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(lock_before_vacuum),
+    );
+
+    let err = app.compact_database().unwrap_err();
+    assert!(matches!(err, StorageError::Busy(_)), "{err:?}");
+    assert!(FIRED.get(), "trace hook must have fired before VACUUM");
+    store
+        .lock()
+        .unwrap()
+        .trace_v2(rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT, None);
+    let blocker = BLOCKER.take().unwrap();
+    blocker.execute_batch("ROLLBACK;").unwrap();
+    drop(blocker);
+    store.close().unwrap();
+
+    let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let reopened_mode: i64 = reopened
+        .lock()
+        .unwrap()
+        .query_row("SELECT auto_vacuum FROM pragma_auto_vacuum()", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        reopened_mode, 1,
+        "failed compact_database on FULL database must not persist INCREMENTAL on disk"
+    );
+    assert!(!reopened.app_storage().database_space().unwrap().incremental);
+
+    // Once uncontended, compaction transitions FULL -> INCREMENTAL cleanly.
+    assert!(reopened.app_storage().compact_database().unwrap());
+    assert!(reopened.app_storage().database_space().unwrap().incremental);
+    reopened.close().unwrap();
+
+    let after_success = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    assert!(
+        after_success
+            .app_storage()
+            .database_space()
+            .unwrap()
+            .incremental
+    );
+}

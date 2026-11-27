@@ -266,3 +266,268 @@ fn delete_local_group_data_and_forget_normalize_uppercase_group_id_hex() {
         );
     }
 }
+
+/// Regression for PR #3818 review: group wipe must delete persisted uppercase
+/// and mixed-case rows (such as public app-event writes storing verbatim casing)
+/// and complete or preserve pre-upgrade pending WAL checkpoint intents recorded
+/// under non-lowercase scopes.
+#[test]
+fn delete_local_group_data_wipes_persisted_mixed_case_rows_and_pre_upgrade_intents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed-case-wipe.sqlite");
+    let key = crate::SqlCipherKey::raw([0x77; 32]);
+    let store = SqliteAccountStorage::open_encrypted_with_options(
+        &path,
+        &key,
+        crate::SqliteStorageOptions {
+            busy_timeout_ms: 0,
+            ..crate::SqliteStorageOptions::default()
+        },
+    )
+    .unwrap();
+
+    // 1. Public app-event write stores uppercase `group_id_hex` verbatim, along
+    //    with persisted uppercase/mixed-case rows in other app/forget tables.
+    store
+        .app_storage()
+        .record_app_event(&crate::StoredAppEvent {
+            group_id_hex: "AABB".to_owned(),
+            message_id_hex: "m1".to_owned(),
+            source_message_id_hex: None,
+            source_epoch: None,
+            direction: "received".to_owned(),
+            sender: "alice".to_owned(),
+            plaintext: "persisted uppercase".to_owned(),
+            kind: 9,
+            tags: Vec::new(),
+            recorded_at: 1,
+            received_at: 1,
+            origin_commit_id: None,
+            moderation_grant: false,
+        })
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO cgka_groups(id, epoch, record) VALUES(x'aabb', 1, x'00'), (x'ccdd', 1, x'00');
+             INSERT INTO account_groups(group_id_hex, endpoint, updated_at)
+             VALUES('AABB', '', 0), ('CcDd', '', 0);
+             INSERT INTO chat_list_rows(group_id_hex, updated_at) VALUES('AABB', 1), ('CcDd', 1);
+             INSERT INTO encrypted_media_epoch_secrets(group_id_hex, component_id, source_epoch, secret, created_at_unix_seconds)
+             VALUES('AABB', 0, 1, x'0102', 1);
+             INSERT INTO device_groups(group_id_hex, trust, key_package_ref_hex, recorded_at)
+             VALUES('CcDd', 'untrusted', NULL, 1);
+             INSERT INTO message_drafts(group_id_hex, content, created_at_ms, updated_at_ms)
+             VALUES('CcDd', 'draft', 1, 1);",
+        )
+        .unwrap();
+
+    let wiped = store.delete_local_group_data("aabb").unwrap();
+    assert!(
+        wiped.did_delete(),
+        "wipe must delete persisted uppercase rows"
+    );
+    for table in [
+        "app_events",
+        "message_timeline",
+        "account_groups",
+        "chat_list_rows",
+        "encrypted_media_epoch_secrets",
+    ] {
+        assert_eq!(
+            count(
+                &store,
+                &format!("SELECT count(*) FROM {table} WHERE LOWER(group_id_hex) = 'aabb'")
+            ),
+            0,
+            "{table} still retained mixed-case rows after lowercase wipe"
+        );
+    }
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM encrypted_media_epoch_secret_retirement_watermarks WHERE group_id_hex = 'aabb'"
+        ),
+        1
+    );
+
+    assert!(
+        store
+            .forget_group_local_data("ccdd", cgka_traits::Timestamp(10))
+            .unwrap()
+    );
+    for table in [
+        "account_groups",
+        "chat_list_rows",
+        "device_groups",
+        "message_drafts",
+    ] {
+        assert_eq!(
+            count(
+                &store,
+                &format!("SELECT count(*) FROM {table} WHERE LOWER(group_id_hex) = 'ccdd'")
+            ),
+            0,
+            "{table} still retained mixed-case rows after lowercase forget"
+        );
+    }
+
+    // 2. Pre-upgrade pending WAL checkpoint intent stored under uppercase scope
+    //    `'EEFF'`: an empty retry while WAL checkpoint is blocked must report
+    //    `erasure_pending = true`, and a subsequent retry after the reader
+    //    releases must consume the old intent and report completion.
+    let op = crate::app::account_projection::SECURE_DELETE_LOCAL_GROUP_OPERATION;
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            r#"INSERT INTO secure_delete_checkpoint_intents(operation_kind, scope, intent_nonce, result_json)
+               VALUES(?1, 'EEFF', randomblob(16), '{"deleted_rows":4,"completed_pending_checkpoint":false,"erasure_pending":false}')"#,
+            params![op],
+        )
+        .unwrap();
+    let reader = rusqlite::Connection::open(&path).unwrap();
+    crate::open_hardened_sqlcipher(&reader, &key, crate::SqlCipherHardening::cipher_only())
+        .unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM sqlite_master;")
+        .unwrap();
+
+    let blocked_retry = store.delete_local_group_data("eeff").unwrap();
+    assert_eq!(
+        blocked_retry,
+        DeleteLocalGroupDataResult {
+            deleted_rows: 4,
+            completed_pending_checkpoint: false,
+            erasure_pending: true,
+        },
+        "empty retry must preserve pre-upgrade uppercase pending checkpoint intent while reader blocks WAL truncate"
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM secure_delete_checkpoint_intents"
+        ),
+        1
+    );
+
+    reader.execute_batch("COMMIT;").unwrap();
+    drop(reader);
+
+    let completed_retry = store.delete_local_group_data("EEFF").unwrap();
+    assert_eq!(
+        completed_retry,
+        DeleteLocalGroupDataResult {
+            deleted_rows: 4,
+            completed_pending_checkpoint: true,
+            erasure_pending: false,
+        },
+        "empty retry after reader releases must consume pre-upgrade uppercase intent"
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM secure_delete_checkpoint_intents"
+        ),
+        0
+    );
+
+    // 3. Merging a new deletion onto a pre-upgrade uppercase intent consolidates
+    //    the accumulated count under canonical lowercase scope and drops the old row.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO account_groups(group_id_hex, endpoint, updated_at) VALUES('DD01', '', 0)",
+            [],
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            r#"INSERT INTO secure_delete_checkpoint_intents(operation_kind, scope, intent_nonce, result_json)
+               VALUES(?1, 'DD01', randomblob(16), '{"deleted_rows":3,"completed_pending_checkpoint":false,"erasure_pending":false}')"#,
+            params![op],
+        )
+        .unwrap();
+    let reader = rusqlite::Connection::open(&path).unwrap();
+    crate::open_hardened_sqlcipher(&reader, &key, crate::SqlCipherHardening::cipher_only())
+        .unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM sqlite_master;")
+        .unwrap();
+
+    let merged_blocked = store.delete_local_group_data("dd01").unwrap();
+    assert_eq!(
+        merged_blocked,
+        DeleteLocalGroupDataResult {
+            deleted_rows: 4,
+            completed_pending_checkpoint: false,
+            erasure_pending: true,
+        }
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM secure_delete_checkpoint_intents WHERE scope = 'dd01'"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM secure_delete_checkpoint_intents WHERE scope = 'DD01'"
+        ),
+        0
+    );
+    reader.execute_batch("COMMIT;").unwrap();
+    drop(reader);
+
+    let merged_done = store.delete_local_group_data("DD01").unwrap();
+    assert_eq!(
+        merged_done,
+        DeleteLocalGroupDataResult {
+            deleted_rows: 4,
+            completed_pending_checkpoint: true,
+            erasure_pending: false,
+        }
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM secure_delete_checkpoint_intents"
+        ),
+        0
+    );
+
+    // 4. Coexisting uppercase and lowercase pending intents both complete
+    //    atomically on an empty retry with their row counts summed.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            r#"INSERT INTO secure_delete_checkpoint_intents(operation_kind, scope, intent_nonce, result_json)
+               VALUES(?1, 'FF01', randomblob(16), '{"deleted_rows":2,"completed_pending_checkpoint":false,"erasure_pending":false}'),
+                     (?1, 'ff01', randomblob(16), '{"deleted_rows":5,"completed_pending_checkpoint":false,"erasure_pending":false}')"#,
+            params![op],
+        )
+        .unwrap();
+    let combined_done = store.delete_local_group_data("ff01").unwrap();
+    assert_eq!(
+        combined_done,
+        DeleteLocalGroupDataResult {
+            deleted_rows: 7,
+            completed_pending_checkpoint: true,
+            erasure_pending: false,
+        }
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM secure_delete_checkpoint_intents"
+        ),
+        0
+    );
+}

@@ -41,8 +41,35 @@ impl DeleteLocalGroupDataResult {
 
 #[derive(Clone, Debug)]
 struct SecureDeleteIntent {
+    scope: String,
     nonce: Vec<u8>,
     result_json: String,
+}
+
+pub(crate) trait MergeCheckpointResult: Sized {
+    fn merge_from(&mut self, other: Self);
+}
+
+impl MergeCheckpointResult for DeleteLocalGroupDataResult {
+    fn merge_from(&mut self, other: Self) {
+        self.deleted_rows = self.deleted_rows.saturating_add(other.deleted_rows);
+    }
+}
+
+impl MergeCheckpointResult for crate::app::timeline::SecurePruneAppEventsResult {
+    fn merge_from(&mut self, other: Self) {
+        self.pruned_messages = self.pruned_messages.saturating_add(other.pruned_messages);
+        self.pruned_media_epoch_secrets = self
+            .pruned_media_epoch_secrets
+            .saturating_add(other.pruned_media_epoch_secrets);
+        let mut hashes = self
+            .media_ciphertext_sha256
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        hashes.extend(other.media_ciphertext_sha256);
+        self.media_ciphertext_sha256 = hashes.into_iter().collect();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3807,25 +3834,41 @@ pub(crate) fn combine_secure_delete_operation_and_restore<T>(
     }
 }
 
+fn secure_delete_intents(
+    conn: &Connection,
+    operation_kind: &str,
+    scope: &str,
+) -> StorageResult<Vec<SecureDeleteIntent>> {
+    let mut statement = conn
+        .prepare_cached(
+            "SELECT scope, intent_nonce, result_json
+             FROM secure_delete_checkpoint_intents
+             WHERE operation_kind = ?1 AND LOWER(scope) = LOWER(?2)
+             ORDER BY CASE WHEN scope = LOWER(?2) THEN 0 ELSE 1 END, scope",
+        )
+        .storage()?;
+    statement
+        .query_map(params![operation_kind, scope], |row| {
+            Ok(SecureDeleteIntent {
+                scope: row.get(0)?,
+                nonce: row.get(1)?,
+                result_json: row.get(2)?,
+            })
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()
+}
+
+#[cfg(test)]
 fn secure_delete_intent(
     conn: &Connection,
     operation_kind: &str,
     scope: &str,
 ) -> StorageResult<Option<SecureDeleteIntent>> {
-    conn.query_row_cached(
-        "SELECT intent_nonce, result_json
-         FROM secure_delete_checkpoint_intents
-         WHERE operation_kind = ?1 AND scope = ?2",
-        params![operation_kind, scope],
-        |row| {
-            Ok(SecureDeleteIntent {
-                nonce: row.get(0)?,
-                result_json: row.get(1)?,
-            })
-        },
-    )
-    .optional()
-    .storage()
+    Ok(secure_delete_intents(conn, operation_kind, scope)?
+        .into_iter()
+        .next())
 }
 
 fn upsert_secure_delete_intent_tx(
@@ -3847,35 +3890,44 @@ fn upsert_secure_delete_intent_tx(
     Ok(())
 }
 
+fn delete_non_canonical_secure_delete_intents_tx(
+    tx: &Connection,
+    operation_kind: &str,
+    canonical_scope: &str,
+) -> StorageResult<()> {
+    tx.execute_cached(
+        "DELETE FROM secure_delete_checkpoint_intents
+         WHERE operation_kind = ?1
+           AND LOWER(scope) = LOWER(?2)
+           AND scope != ?2",
+        params![operation_kind, canonical_scope],
+    )
+    .storage()?;
+    Ok(())
+}
+
 fn merge_secure_prune_intent_tx(
     tx: &Connection,
     group_id_hex: &str,
     new_result: &crate::app::timeline::SecurePruneAppEventsResult,
 ) -> StorageResult<()> {
-    let mut merged = secure_delete_intent(tx, SECURE_DELETE_RETENTION_OPERATION, group_id_hex)?
-        .map(|intent| {
-            serde_json::from_str::<crate::app::timeline::SecurePruneAppEventsResult>(
-                &intent.result_json,
-            )
-            .map_err(|error| StorageError::Serialization(error.to_string()))
-        })
-        .transpose()?
-        .unwrap_or_default();
-    merged.pruned_messages = merged
-        .pruned_messages
-        .saturating_add(new_result.pruned_messages);
-    merged.pruned_media_epoch_secrets = merged
-        .pruned_media_epoch_secrets
-        .saturating_add(new_result.pruned_media_epoch_secrets);
-    let mut hashes = merged
-        .media_ciphertext_sha256
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    hashes.extend(new_result.media_ciphertext_sha256.iter().cloned());
-    merged.media_ciphertext_sha256 = hashes.into_iter().collect();
+    let mut merged = crate::app::timeline::SecurePruneAppEventsResult::default();
+    for intent in secure_delete_intents(tx, SECURE_DELETE_RETENTION_OPERATION, group_id_hex)? {
+        let existing = serde_json::from_str::<crate::app::timeline::SecurePruneAppEventsResult>(
+            &intent.result_json,
+        )
+        .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        merged.merge_from(existing);
+    }
+    merged.merge_from(new_result.clone());
     merged.erasure_pending = false;
     let result_json = serde_json::to_string(&merged)
         .map_err(|error| StorageError::Serialization(error.to_string()))?;
+    delete_non_canonical_secure_delete_intents_tx(
+        tx,
+        SECURE_DELETE_RETENTION_OPERATION,
+        group_id_hex,
+    )?;
     upsert_secure_delete_intent_tx(
         tx,
         SECURE_DELETE_RETENTION_OPERATION,
@@ -3889,18 +3941,22 @@ pub(crate) fn merge_local_group_delete_intent_tx(
     group_id_hex: &str,
     deleted_rows: usize,
 ) -> StorageResult<()> {
-    let mut merged = secure_delete_intent(tx, SECURE_DELETE_LOCAL_GROUP_OPERATION, group_id_hex)?
-        .map(|intent| {
-            serde_json::from_str::<DeleteLocalGroupDataResult>(&intent.result_json)
-                .map_err(|error| StorageError::Serialization(error.to_string()))
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let mut merged = DeleteLocalGroupDataResult::default();
+    for intent in secure_delete_intents(tx, SECURE_DELETE_LOCAL_GROUP_OPERATION, group_id_hex)? {
+        let existing = serde_json::from_str::<DeleteLocalGroupDataResult>(&intent.result_json)
+            .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        merged.merge_from(existing);
+    }
     merged.deleted_rows = merged.deleted_rows.saturating_add(deleted_rows);
     merged.completed_pending_checkpoint = false;
     merged.erasure_pending = false;
     let result_json = serde_json::to_string(&merged)
         .map_err(|error| StorageError::Serialization(error.to_string()))?;
+    delete_non_canonical_secure_delete_intents_tx(
+        tx,
+        SECURE_DELETE_LOCAL_GROUP_OPERATION,
+        group_id_hex,
+    )?;
     upsert_secure_delete_intent_tx(
         tx,
         SECURE_DELETE_LOCAL_GROUP_OPERATION,
@@ -3915,19 +3971,26 @@ pub(crate) fn finish_secure_delete_checkpoint_intent<T>(
     scope: &str,
 ) -> StorageResult<SecureDeleteCheckpointFinish<T>>
 where
-    T: serde::de::DeserializeOwned,
+    T: serde::de::DeserializeOwned + MergeCheckpointResult,
 {
     let mut last_result = None;
     for _ in 0..8 {
-        let conn = storage.lock()?;
-        let Some(intent) = secure_delete_intent(&conn, operation_kind, scope)? else {
+        let mut conn = storage.lock()?;
+        let intents = secure_delete_intents(&conn, operation_kind, scope)?;
+        if intents.is_empty() {
             return Ok(SecureDeleteCheckpointFinish {
                 result: None,
                 erasure_pending: false,
             });
-        };
-        let result = serde_json::from_str(&intent.result_json)
-            .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        }
+        let mut iter = intents.iter().map(|intent| {
+            serde_json::from_str::<T>(&intent.result_json)
+                .map_err(|error| StorageError::Serialization(error.to_string()))
+        });
+        let mut result = iter.next().expect("non-empty intents")?;
+        for next in iter {
+            result.merge_from(next?);
+        }
         match checkpoint_wal_truncate_after_secure_delete(&conn) {
             Ok(()) => {}
             Err(StorageError::Busy(_)) => {
@@ -3938,15 +4001,39 @@ where
             }
             Err(error) => return Err(error),
         }
-        let deleted = conn
-            .execute_cached(
+        let consumed_all = if intents.len() == 1 {
+            let intent = &intents[0];
+            conn.execute_cached(
                 "DELETE FROM secure_delete_checkpoint_intents
                  WHERE operation_kind = ?1 AND scope = ?2
                    AND intent_nonce = ?3",
-                params![operation_kind, scope, &intent.nonce],
+                params![operation_kind, &intent.scope, &intent.nonce],
             )
-            .storage()?;
-        if deleted == 0 {
+            .storage()?
+                == 1
+        } else {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .storage()?;
+            let mut deleted = 0usize;
+            for intent in &intents {
+                deleted += tx
+                    .execute_cached(
+                        "DELETE FROM secure_delete_checkpoint_intents
+                         WHERE operation_kind = ?1 AND scope = ?2
+                           AND intent_nonce = ?3",
+                        params![operation_kind, &intent.scope, &intent.nonce],
+                    )
+                    .storage()?;
+            }
+            if deleted == intents.len() {
+                tx.commit().storage()?;
+                true
+            } else {
+                false
+            }
+        };
+        if !consumed_all {
             last_result = Some(result);
             continue;
         }
