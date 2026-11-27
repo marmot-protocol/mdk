@@ -1068,10 +1068,22 @@ async fn a_device_group_welcome_stays_out_of_host_redelivery() {
         .unwrap_err();
     assert!(
         matches!(
-            error,
-            AppError::Storage(cgka_traits::storage::StorageError::NotFound)
+            error.as_engine_error(),
+            Some(cgka_traits::EngineError::Storage(
+                cgka_traits::storage::StorageError::NotFound
+            ))
         ),
-        "host redeliver_welcome must reject the device group's Welcome as NotFound, got {error:?}"
+        "host redeliver_welcome must reject the device group's Welcome as engine Storage::NotFound, got {error:?}"
+    );
+    let missing_error = phone.redeliver_welcome(&"ff".repeat(32)).await.unwrap_err();
+    assert!(
+        matches!(
+            missing_error.as_engine_error(),
+            Some(cgka_traits::EngineError::Storage(
+                cgka_traits::storage::StorageError::NotFound
+            ))
+        ),
+        "host redeliver_welcome must report an unknown Welcome as engine Storage::NotFound, got {missing_error:?}"
     );
     assert_eq!(
         relay.published_event_ids(),

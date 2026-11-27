@@ -8137,14 +8137,26 @@ impl AppClient {
         &self,
         message_id: &cgka_traits::MessageId,
     ) -> Result<(), AppError> {
+        use cgka_traits::EngineError;
         use cgka_traits::storage::{MessageStorage as _, StorageError};
+        use marmot_session::{AccountError, SessionError};
 
+        // Match `AccountDeviceRuntime::redeliver_welcome`'s engine-wrapped
+        // storage error so missing and hidden device-group Welcomes remain
+        // indistinguishable and preserve the host/CLI `as_engine_error()`
+        // contract.
+        let engine_storage_error = |error: StorageError| {
+            AppError::Account(AccountError::Session(SessionError::Engine(
+                EngineError::Storage(error),
+            )))
+        };
         let record = self
             .app
             .account_storage(&self.state.label)?
-            .get_message(message_id)?;
+            .get_message(message_id)
+            .map_err(engine_storage_error)?;
         if !self.host_may_see_group(&record.group_id) {
-            return Err(AppError::Storage(StorageError::NotFound));
+            return Err(engine_storage_error(StorageError::NotFound));
         }
         Ok(())
     }
