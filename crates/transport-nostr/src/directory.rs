@@ -8,18 +8,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cgka_traits::TransportEndpoint;
 use futures::StreamExt;
-use nostr::nips::nip67::EoseHint;
 use nostr_sdk::authenticator::{Authenticator, SignerAuthenticator};
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, Event, EventId, Filter, Kind, PublicKey, RelayMessage,
-    RelayNotification, RelayStatus, RelayUrl, SingleLetterTag, SubscribeAutoCloseOptions,
-    SubscriptionId, Timestamp,
+    Client as NostrSdkClient, Event, EventId, Filter, Kind, PublicKey, RelayMessage, RelayUrl,
+    SingleLetterTag, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use transport_nostr_adapter::NotificationUpdate;
 use transport_nostr_adapter::{
     FiniteEnd, FiniteLimits, FiniteReply, FiniteRequests, KIND_MARMOT_KEY_PACKAGE,
     NostrAcquisitionCancellation as CancellationToken, RELAY_REPLAY_PAGE_LIMIT,
@@ -1704,32 +1701,32 @@ async fn strict_fetch_endpoint(
     relay_url: RelayUrl,
     queries: Vec<DirectoryEventQuery>,
 ) -> DirectoryFetchOutcome {
-    // One bounded subscription owns this connection and its pre-admission wire
-    // counter. Cancellation/early failure closes it through the scoped guard.
-    let builder = super::nostr_builder();
-    let wire =
-        super::directory_wire::DirectoryWireTransport::new(builder.websocket_transport.clone());
-    let owned = ScopedInspectionClient(builder.websocket_transport(wire.clone()).build(), None);
+    // One isolated client owns this connection and its per-REQ finite
+    // requests; cancellation or early return closes the relay immediately
+    // through `ScopedInspectionClient`.
+    let (builder, finite) = FiniteRequests::install(super::nostr_builder());
+    let mut owned = ScopedInspectionClient(builder.build(), None);
     let client = &owned.0;
     let endpoint = TransportEndpoint(relay_url.to_string());
-    if !matches!(client.relay(&relay_url).await, Ok(Some(_)))
-        && client.add_relay(relay_url.clone()).await.is_err()
-    {
+    if client.add_relay(relay_url.clone()).await.is_err() {
         return DirectoryFetchOutcome::default();
     }
+    let Ok(Some(relay)) = client.relay(relay_url.clone()).await else {
+        return DirectoryFetchOutcome::default();
+    };
+    owned.1 = Some(relay.clone());
     if !matches!(
         timeout(
             DIRECTORY_RELAY_CONNECT_WAIT,
-            client.connect_relay(relay_url.clone()),
+            client
+                .try_connect_relay(relay_url)
+                .timeout(DIRECTORY_RELAY_CONNECT_WAIT),
         )
         .await,
         Ok(Ok(()))
     ) {
         return DirectoryFetchOutcome::default();
     }
-    let Ok(Some(relay)) = client.relay(relay_url).await else {
-        return DirectoryFetchOutcome::default();
-    };
     let mut filters = Vec::with_capacity(queries.len());
     for query in &queries {
         let Ok(filter) = directory_query_filter(query, false) else {
@@ -1739,169 +1736,75 @@ async fn strict_fetch_endpoint(
     }
 
     let max_records = queries.iter().map(|query| query.limit).sum::<usize>();
-    let mut notifications = transport_nostr_adapter::with_gaps(relay.notifications());
+    let cancel = CancellationToken::new();
+    let limits = FiniteLimits {
+        max_items: usize::MAX,
+        max_event_bytes: DIRECTORY_REPLY_MAX_BYTES,
+        timeout: DIRECTORY_RELAY_FETCH_WAIT,
+    };
     let mut records = Vec::new();
     let mut seen_event_ids = HashSet::new();
-    // Every subscription this connection has carried. The wire counter sees
-    // all EVENT frames on the connection, so a live event an earlier chunk's
-    // subscription receives after its EOSE must still count as admitted.
-    let mut issued = HashSet::new();
-    let mut admitted_messages = 0usize;
     let mut complete = true;
-    let all_queries = &queries;
     for (queries, filters) in queries
         .chunks(DIRECTORY_MAX_FILTERS_PER_REQ)
         .zip(filters.chunks(DIRECTORY_MAX_FILTERS_PER_REQ))
     {
-        let subscription_id = SubscriptionId::generate();
-        if relay
-            .subscribe(filters.to_vec())
-            .with_id(subscription_id.clone())
-            .close_on(
-                SubscribeAutoCloseOptions::default()
-                    .timeout(Some(DIRECTORY_RELAY_FETCH_WAIT))
-                    .idle_timeout(Some(DIRECTORY_RELAY_FETCH_WAIT)),
-            )
-            .await
-            .is_err()
-        {
-            // Keep what earlier chunks returned: the fetch is incomplete,
-            // but its records are still usable.
-            complete = false;
-            continue;
-        }
-        issued.insert(subscription_id.clone());
-
-        let mut query_counts = vec![0usize; queries.len()];
+        let reply = finite
+            .fetch(&relay, filters.to_vec(), limits, &cancel)
+            .await;
         // Counted per REQ: an event an earlier chunk already returned still
         // fills this chunk's queries toward their limits. Only the returned
         // records are deduplicated across chunks.
-        let mut chunk_event_ids = HashSet::new();
-        let chunk_complete = timeout(DIRECTORY_RELAY_FETCH_WAIT, async {
-            loop {
-                let received = match notifications.next().await {
-                    Some(NotificationUpdate::Notification(RelayNotification::Event {
-                        subscription_id: received_id,
-                        event,
-                    })) if received_id == subscription_id => Some((*event, false)),
-                    Some(NotificationUpdate::Notification(RelayNotification::Message {
-                        message,
-                    })) => match *message {
-                        RelayMessage::Event {
-                            subscription_id: received_id,
-                            event,
-                        } if received_id.as_ref() == &subscription_id => {
-                            admitted_messages += 1;
-                            Some((event.into_owned(), false))
-                        }
-                        RelayMessage::Event {
-                            subscription_id: received_id,
-                            event,
-                        } if issued.contains(received_id.as_ref()) => {
-                            admitted_messages += 1;
-                            Some((event.into_owned(), true))
-                        }
-                        RelayMessage::EndOfStoredEvents {
-                            subscription_id: received_id,
-                            hints,
-                        } if received_id.as_ref() == &subscription_id => {
-                            // NIP-67: a relay that has more, or holds more back
-                            // until authentication, did not send all it has.
-                            let withheld = hints.is_some_and(|hints| {
-                                hints
-                                    .iter()
-                                    .any(|hint| matches!(hint, EoseHint::More | EoseHint::Auth))
-                            });
-                            // A filter that reaches its limit cannot establish absence,
-                            // and neither can one that reaches the page a relay
-                            // silently clamps every REQ to. A frame discarded before
-                            // notifications cannot establish negative coverage, even
-                            // after EOSE.
-                            break !withheld
-                                && wire.event_count() == admitted_messages
-                                && queries.iter().zip(&query_counts).all(|(query, count)| {
-                                    *count < query.limit.min(RELAY_REPLAY_PAGE_LIMIT)
-                                });
-                        }
-                        RelayMessage::Closed {
-                            subscription_id: received_id,
-                            ..
-                        } if received_id.as_ref() == &subscription_id => break false,
-                        _ => None,
-                    },
-                    Some(NotificationUpdate::Notification(
-                        RelayNotification::AuthenticationFailed,
-                    )) => {
-                        break false;
-                    }
-                    Some(NotificationUpdate::Notification(RelayNotification::RelayStatus {
-                        status: RelayStatus::Disconnected | RelayStatus::Idle | RelayStatus::Banned,
-                    })) => {
-                        break false;
-                    }
-                    // Lag may have dropped an inbox EVENT immediately before
-                    // EOSE. Continuing cannot establish absence safely.
-                    Some(NotificationUpdate::Lagged { .. }) | None => break false,
-                    _ => None,
-                };
-                if let Some((event, late)) = received {
-                    if event.verify().is_err() {
-                        continue;
-                    }
-                    let Ok(event) = NostrTransportEvent::from_nostr_event(&event) else {
-                        continue;
-                    };
-                    if late {
-                        // An earlier chunk's subscription, after that chunk
-                        // settled: keep the record, but it says nothing about
-                        // this chunk's queries.
-                        if all_queries.iter().any(|query| query.matches(&event))
-                            && records.len() < max_records
-                            && seen_event_ids.insert(event.id.clone())
-                        {
-                            records.push(DirectoryRelayEventRecord {
-                                endpoints: vec![endpoint.clone()],
-                                event,
-                            });
-                        }
-                        continue;
-                    }
-                    if !queries.iter().any(|query| query.matches(&event)) {
-                        // A filter-ignoring relay cannot establish a complete empty
-                        // scoped deletion result by filling its page with other posts.
-                        if queries.iter().any(|query| query.reference.is_some()) {
-                            break false;
-                        }
-                        continue;
-                    }
-                    if !chunk_event_ids.insert(event.id.clone()) {
-                        continue;
-                    }
-                    for (query, count) in queries.iter().zip(&mut query_counts) {
-                        if query.matches(&event) {
-                            *count += 1;
-                        }
-                    }
-                    if !seen_event_ids.insert(event.id.clone()) {
-                        continue;
-                    }
-                    if records.len() < max_records {
-                        records.push(DirectoryRelayEventRecord {
-                            endpoints: vec![endpoint.clone()],
-                            event,
-                        });
-                    } else {
-                        break false;
-                    }
+        let mut query_counts = vec![0usize; queries.len()];
+        let mut converted_all_matched = true;
+        let mut record_cap_hit = false;
+        for event in &reply.events {
+            let Ok(converted) = NostrTransportEvent::from_nostr_event(event) else {
+                converted_all_matched = false;
+                continue;
+            };
+            if !queries.iter().any(|query| query.matches(&converted)) {
+                converted_all_matched = false;
+                continue;
+            }
+            for (query, count) in queries.iter().zip(&mut query_counts) {
+                if query.matches(&converted) {
+                    *count += 1;
                 }
             }
-        })
-        .await
-        .unwrap_or(false);
-        let _ = relay.unsubscribe(&subscription_id).await;
-        // Later chunks still run: their records are usable even when this
-        // chunk cannot establish absence.
+            if !seen_event_ids.insert(converted.id.clone()) {
+                continue;
+            }
+            if records.len() < max_records {
+                records.push(DirectoryRelayEventRecord {
+                    endpoints: vec![endpoint.clone()],
+                    event: converted,
+                });
+            } else {
+                record_cap_hit = true;
+            }
+        }
+        // A chunk establishes absence only when:
+        // - it ended at EOSE without NIP-67 `more` or `auth` withholding hints,
+        // - every wire EVENT frame for the REQ passed SDK limits, signature
+        //   verification, and filter matching (`raw_items == received_items`),
+        // - every kept event converted and matched one of this chunk's queries
+        //   without overflowing `max_records`, and
+        // - no query reached its requested limit or the silent relay clamp.
+        let chunk_complete = reply.end == FiniteEnd::Eose
+            && !reply.more
+            && !reply.auth
+            && reply.raw_items == reply.received_items
+            && converted_all_matched
+            && !record_cap_hit
+            && queries
+                .iter()
+                .zip(&query_counts)
+                .all(|(query, count)| *count < query.limit.min(RELAY_REPLAY_PAGE_LIMIT));
         complete &= chunk_complete;
+        if reply.end == FiniteEnd::Disconnected {
+            break;
+        }
     }
     DirectoryFetchOutcome {
         records,
@@ -1927,6 +1830,8 @@ fn parsed_directory_relay_urls(endpoints: &[TransportEndpoint]) -> Result<Vec<Re
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
     use nostr_sdk::prelude::FinalizeEvent;
 
@@ -3492,22 +3397,36 @@ mod tests {
         assert_eq!(deletion.tags.len(), 2001);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let reqs_seen = Arc::new(AtomicUsize::new(0));
+        let reqs_seen_server = reqs_seen.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = accept_async(stream).await.unwrap();
-            while let Some(Ok(Message::Text(text))) = socket.next().await {
+            while let Some(Ok(message)) = socket.next().await {
+                let text = match message {
+                    Message::Text(text) => text,
+                    Message::Ping(payload) => {
+                        let _ = socket.send(Message::Pong(payload)).await;
+                        continue;
+                    }
+                    _ => continue,
+                };
                 let request: serde_json::Value = serde_json::from_str(&text).unwrap();
                 if request[0] != "REQ" {
                     continue;
                 }
+                reqs_seen_server.fetch_add(1, Ordering::Relaxed);
                 for response in [
                     serde_json::json!(["EVENT", request[1], deletion]),
                     serde_json::json!(["EOSE", request[1]]),
                 ] {
-                    socket
+                    if socket
                         .send(Message::Text(response.to_string().into()))
                         .await
-                        .unwrap();
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         });
@@ -3529,6 +3448,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+        assert_eq!(reqs_seen.load(Ordering::Relaxed), 1);
         assert!(
             outcome.records.is_empty(),
             "SDK tag admission limit stays enabled"
@@ -3537,6 +3457,89 @@ mod tests {
             !outcome.complete,
             "a discarded signed deletion cannot become complete empty evidence"
         );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_directory_invalid_signature_frame_keeps_valid_records_but_not_absence_proof() {
+        use futures::{SinkExt, StreamExt};
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let keys = Keys::generate();
+        let valid = EventBuilder::new(Kind::Metadata, r#"{"name":"ok"}"#)
+            .finalize(&keys)
+            .unwrap();
+        let mut forged = serde_json::to_value(
+            EventBuilder::new(Kind::Metadata, r#"{"name":"forged"}"#)
+                .finalize(&keys)
+                .unwrap(),
+        )
+        .unwrap();
+        forged["content"] = serde_json::Value::String(r#"{"name":"tampered"}"#.to_owned());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let reqs_seen = Arc::new(AtomicUsize::new(0));
+        let reqs_seen_server = reqs_seen.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let text = match message {
+                    Message::Text(text) => text,
+                    Message::Ping(payload) => {
+                        let _ = socket.send(Message::Pong(payload)).await;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if request[0] != "REQ" {
+                    continue;
+                }
+                reqs_seen_server.fetch_add(1, Ordering::Relaxed);
+                for response in [
+                    serde_json::json!(["EVENT", request[1], valid]),
+                    serde_json::json!(["EVENT", request[1], forged]),
+                    serde_json::json!(["EOSE", request[1]]),
+                ] {
+                    if socket
+                        .send(Message::Text(response.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+        let request = DirectoryFetchRequest::new(
+            vec![endpoint],
+            vec![DirectoryEventQuery::new(
+                0,
+                vec![keys.public_key().to_hex()],
+                4,
+            )],
+        )
+        .unwrap();
+        let outcome = timeout(
+            Duration::from_secs(8),
+            NostrSdkDirectoryRelayFetcher::standalone()
+                .fetch_directory_events_with_completion(request),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(reqs_seen.load(Ordering::Relaxed), 1);
+        assert_eq!(outcome.records.len(), 1);
+        assert!(
+            !outcome.complete,
+            "an invalid-signature EVENT frame must prevent establishing absence"
+        );
+        assert!(outcome.complete_endpoints.is_empty());
         server.abort();
         let _ = server.await;
     }
