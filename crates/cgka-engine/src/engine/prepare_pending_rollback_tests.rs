@@ -1175,3 +1175,105 @@ async fn auto_commit_guard_drop_fault_recovers_on_reopen_and_allows_send() {
         .unwrap();
     assert_eq!(alice_reopened.members(&group_id).unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn leaver_reopen_preserves_own_pending_self_remove_proposal_for_commit_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let bob_path = dir.path().join("bob-leaver.sqlite");
+    let bob_key = SqlCipherKey::raw([0x6b; 32]);
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = build_client(
+        b"leaver-reopen-alice",
+        alice_storage,
+        &clock,
+        selfremove_registry(),
+    );
+    let bob_storage = SqliteAccountStorage::open_encrypted(&bob_path, &bob_key).unwrap();
+    let mut bob = build_client(
+        b"leaver-reopen-bob",
+        bob_storage.clone(),
+        &clock,
+        selfremove_registry(),
+    );
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "leaver reopen".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("expected FoundingGroupCreated");
+    };
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+
+    // Bob sends Leave (SelfRemove proposal), then restarts before Alice's
+    // SelfRemove commit arrives.
+    let SendResult::Proposal {
+        msg: leave_proposal,
+    } = bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected Leave Proposal");
+    };
+    let had_pending_proposals_before_restart =
+        stored_mls_group(&bob_storage, &group_id).has_pending_proposals();
+    drop(bob);
+    drop(bob_storage);
+
+    // Reopen Bob and hydrate: hydration must preserve any legitimate pending
+    // SelfRemove proposal owned by the leaver (no pending_commit on Bob).
+    let reopened_bob_storage = SqliteAccountStorage::open_encrypted(&bob_path, &bob_key).unwrap();
+    let mut bob_reopened = build_client(
+        b"leaver-reopen-bob",
+        reopened_bob_storage.clone(),
+        &clock,
+        selfremove_registry(),
+    );
+    bob_reopened.hydrate_all_stored_groups().unwrap();
+    assert_eq!(
+        stored_mls_group(&reopened_bob_storage, &group_id).has_pending_proposals(),
+        had_pending_proposals_before_restart,
+        "hydration must not strip a leaving member's own stored SelfRemove proposal"
+    );
+
+    // Alice commits Bob's SelfRemove by reference; reopened Bob applies it cleanly.
+    alice.ingest(leave_proposal).await.unwrap();
+    clock.advance_ms(60_000);
+    alice
+        .converge_and_drain_queued_outbound_intents(&group_id, clock.now().monotonic_ms)
+        .await
+        .unwrap();
+    let mut auto_publishes = alice.drain_auto_publish();
+    assert_eq!(auto_publishes.len(), 1);
+    let auto_publish = auto_publishes.remove(0);
+    alice.confirm_published(auto_publish.pending).await.unwrap();
+
+    let commit_msg = cgka_traits::transport::TransportMessage {
+        envelope: cgka_traits::transport::TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..auto_publish.msg
+    };
+    bob_reopened.ingest(commit_msg).await.unwrap();
+    clock.advance_ms(60_000);
+    bob_reopened
+        .converge_and_drain_queued_outbound_intents(&group_id, clock.now().monotonic_ms)
+        .await
+        .unwrap();
+    assert!(
+        reopened_bob_storage.get_group(&group_id).unwrap().removed,
+        "reopened leaver must cleanly apply the SelfRemove commit referencing its proposal"
+    );
+}

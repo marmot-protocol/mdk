@@ -2905,46 +2905,6 @@ impl<S: StorageProvider> Engine<S> {
                     group_id: group_id.clone(),
                     recovered_epoch,
                 });
-        } else if mls_group.pending_commit().is_none()
-            && !restored_pending
-            && !restored_durable_evolution
-        {
-            // A SelfRemove staging failure before `stage_commit` (plus a failed
-            // guard drop or crash) can leave stored SelfRemove proposals in
-            // OpenMLS with no pending commit. Normal engine operation keeps
-            // inbound proposals in MessageStorage rather than OpenMLS's store
-            // (mdk#154), so remove stranded SelfRemove proposals atomically.
-            let stranded_self_remove_refs: Vec<openmls::ciphersuite::hash_ref::ProposalRef> =
-                mls_group
-                    .pending_proposals()
-                    .filter(|proposal| {
-                        matches!(proposal.proposal(), openmls::prelude::Proposal::SelfRemove)
-                    })
-                    .map(|proposal| proposal.proposal_reference_ref().clone())
-                    .collect();
-            if !stranded_self_remove_refs.is_empty() {
-                self.storage
-                    .with_transaction(|storage| {
-                        let tx_provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-                            &self.crypto,
-                            storage.mls_storage(),
-                        );
-                        let tx_mls_storage = <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&tx_provider);
-                        for proposal_ref in &stranded_self_remove_refs {
-                            match mls_group.remove_pending_proposal(tx_mls_storage, proposal_ref) {
-                                Ok(())
-                                | Err(openmls::group::RemoveProposalError::ProposalNotFound) => {}
-                                Err(e) => {
-                                    return Err(EngineError::Backend(format!(
-                                        "remove_pending_proposal: {e:?}"
-                                    )));
-                                }
-                            }
-                        }
-                        Ok::<_, EngineError>(())
-                    })
-                    .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-            }
         }
 
         // The one full message scan for this hydration (mdk#1161): the
@@ -4300,6 +4260,13 @@ impl<S: StorageProvider> Engine<S> {
         let Some(proposal_refs) = self.unfinished_staging_cleanups.pending_refs(group_id) else {
             return Ok(());
         };
+        if !self
+            .epoch_manager
+            .state(group_id)
+            .is_none_or(cgka_traits::engine_state::EpochState::is_stable)
+        {
+            return Ok(());
+        }
         crate::pending_commit_guard::cleanup_staged_commit_and_proposals(
             self.storage.as_ref(),
             group_id,
