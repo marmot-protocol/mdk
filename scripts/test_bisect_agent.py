@@ -674,6 +674,42 @@ class ClassifierTests(unittest.TestCase):
             rc = cli_main(["poll", "--live", "--repo-dir", str(tmp), "--no-fetch"])
             self.assertEqual(rc, 2)
 
+    def test_predicate_git_trusts_only_its_own_worktree(self):
+        # The `mdk-runner` sandbox runs git in a worktree `mdk-bot` owns, and git refuses it
+        # ("detected dubious ownership"). Every `just fast-ci` replay failed in
+        # `changelog-gate`, on green commits too, so a fast-ci break read as a baseline break
+        # and was never bisected. Git must trust exactly the replay's worktree.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            wt = Path(tmp_str) / "wt"
+            wt.mkdir()
+            # Hosts may already list other trusted paths (GitHub runners do); this worktree
+            # must be among them.
+            git_trusts_this_worktree = ("sh", "-c", 'git config --get-all safe.directory | grep -Fqx "$(pwd -P)"')
+            verdict, _ = default_worktree_runner(git_trusts_this_worktree)(wt)
+            self.assertEqual(verdict, RunVerdict.PASS)
+
+    def test_isolated_predicate_gets_a_private_tmpdir_it_removes(self):
+        # Gates write fixed paths under TMPDIR (`/tmp/android-elf-tests/...`). Shared with
+        # the bot's own Canary runs, the `mdk-runner` replay hit directories `mdk-bot`
+        # owned and failed `binding-build-gate` on a green commit.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            wt = tmp / "wt"
+            wt.mkdir()
+            record = tmp / "tmpdir.txt"
+            write_under_tmpdir = (
+                "python3",
+                "-c",
+                "import os, pathlib, sys; d = pathlib.Path(os.environ['TMPDIR']); "
+                "(d / 'android-elf-tests').mkdir(); pathlib.Path(sys.argv[1]).write_text(str(d))",
+                str(record),
+            )
+            verdict, _ = default_worktree_runner(write_under_tmpdir, runner_prefix=("env",))(wt)
+            self.assertEqual(verdict, RunVerdict.PASS)
+            private = Path(record.read_text())
+            self.assertNotEqual(private, Path(os.environ.get("TMPDIR", "/tmp")))
+            self.assertFalse(private.exists())
+
     def test_predicate_nextest_store_lands_in_the_sandbox_target_dir(self):
         # nextest keeps its store at `<workspace>/target/nextest` whatever `CARGO_TARGET_DIR`
         # says. The `mdk-runner` sandbox cannot write the bot-owned worktree, so every live

@@ -410,12 +410,21 @@ def default_worktree_runner(
                 sandbox_home=sandbox,
                 cargo_target_dir=cargo_target_dir,
             )
+            # Git refuses a repository another user owns ("dubious ownership"), and the
+            # isolated runner never owns the bot's worktree: trust exactly this one.
+            env.update(
+                {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": str(wt.resolve())}
+            )
             if runner_prefix:
                 # Pass scrubbed env explicitly after `runner_prefix` so `sudo`'s default
                 # `env_reset` does not drop `CARGO_TARGET_DIR`, `ODIN`, or `ANDROID_NDK_HOME`.
                 os.chmod(sandbox, 0o777)
                 env_pairs = [f"{k}={v}" for k, v in sorted(env.items())]
-                argv = [*runner_prefix, "env", "-i", *env_pairs, *command]
+                # A private TMPDIR the runner creates and removes itself: gates write fixed
+                # paths under TMPDIR that the bot's own Canary runs also use, and the bot
+                # cannot delete files the runner writes.
+                private_tmp = ("sh", "-c", 'TMPDIR="$(mktemp -d)" && export TMPDIR && trap \'rm -rf "$TMPDIR"\' EXIT && "$@"', "sh")
+                argv = [*runner_prefix, "env", "-i", *env_pairs, *private_tmp, *command]
             else:
                 argv = list(command)
             try:
@@ -2042,7 +2051,11 @@ class BisectController:
         return result
 
 
-SELFTEST_REPLAY_COMMAND: tuple[str, ...] = ("cargo", "nextest", "run", "--locked", "-p", "cgka-traits", "--profile", "ci")
+# A small nextest suite, and a git command as gates such as `changelog-gate` run one.
+SELFTEST_REPLAY_COMMANDS: tuple[tuple[str, ...], ...] = (
+    ("cargo", "nextest", "run", "--locked", "-p", "cgka-traits", "--profile", "ci"),
+    ("git", "ls-files", "--error-unmatch", "Cargo.toml"),
+)
 
 
 def selftest(
@@ -2087,19 +2100,20 @@ def selftest(
     if sha is None:
         problems.append("origin/master is not available in --repo-dir")
     else:
-        verdict, detail = run_in_detached_worktree(
-            repo_dir,
-            sha,
-            default_worktree_runner(
-                SELFTEST_REPLAY_COMMAND,
-                timeout_secs=timeout_secs,
-                cargo_target_dir=cargo_target_dir,
-                runner_prefix=runner_prefix,
-            ),
-            worktree_root=worktree_root,
-        )
-        if verdict != RunVerdict.PASS:
-            problems.append(f"sandboxed replay on {sha[:9]} was {verdict.value}: {detail}")
+        for command in SELFTEST_REPLAY_COMMANDS:
+            verdict, detail = run_in_detached_worktree(
+                repo_dir,
+                sha,
+                default_worktree_runner(
+                    command,
+                    timeout_secs=timeout_secs,
+                    cargo_target_dir=cargo_target_dir,
+                    runner_prefix=runner_prefix,
+                ),
+                worktree_root=worktree_root,
+            )
+            if verdict != RunVerdict.PASS:
+                problems.append(f"sandboxed `{command[0]} {command[1]}` replay on {sha[:9]} was {verdict.value}: {detail}")
     return problems
 
 
@@ -2131,7 +2145,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "selftest",
         parents=[common],
-        help="Fetch a real hosted Canary job log and replay a small nextest suite in the predicate sandbox",
+        help="Fetch a real hosted Canary job log and replay a small nextest suite and a git command in the predicate sandbox",
     )
     return parser
 
