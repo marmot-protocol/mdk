@@ -261,6 +261,28 @@ fn an_item_whose_first_event_never_arrives_is_shown_from_its_edits() {
     assert_eq!(preview.retention_expires_at, None);
 }
 
+/// Any member can send an edit naming an item, and an edit's `created_at` is
+/// the sender's to choose. The row of an item whose first event this device
+/// lacks is built from the first such edit this device received, so a
+/// backdated one that arrives later cannot take the item from its agent.
+#[test]
+fn a_backdated_edit_received_later_cannot_take_an_item_shown_from_its_edits() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .record_app_event(&item_edit("edit-5", ITEM, 30, 5, "waiting"))
+        .unwrap();
+    let mut forged = item_edit("forged", ITEM, 1, 9, "done");
+    forged.sender = "someone".to_owned();
+    store.record_app_event(&forged).unwrap();
+    for _ in 0..2 {
+        let held = row(&store, ITEM);
+        assert_eq!(held.sender, "agent");
+        assert_eq!(held.plaintext, "v5 waiting");
+        assert_eq!(held.timeline_at, 30);
+        store.rebuild_message_timeline_for_group(GROUP).unwrap();
+    }
+}
+
 /// The agent deleting an item it never sent this device removes the row
 /// built from its edits, as it would the item's own.
 #[test]

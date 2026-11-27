@@ -92,10 +92,10 @@ fn edits_by_target(events: &[RawAppEvent]) -> (HashMap<&str, Vec<&RawAppEvent>>,
 
 /// The row of an agent item whose first event this device does not hold. A
 /// member added to the group after the item began can never read that event
-/// (marmot-agents D-124), and an edit carries the whole item, so the earliest
-/// readable edit stands in for the first event, at its place in the timeline,
-/// and every edit then applies to it as usual. Only that edit's sender's
-/// edits count, as a first event's sender's would. The first event, should it
+/// (marmot-agents D-124), and an edit carries the whole item, so the first
+/// readable edit this device received stands in for the first event, at its
+/// place in the timeline, and every edit then applies to it as usual. Only
+/// that edit's sender's edits count, as a first event's sender's would. The first event, should it
 /// arrive (in a sibling's history, say), replaces the row.
 pub(super) fn held_agent_item_row<'a>(
     target: &str,
@@ -116,9 +116,11 @@ pub(super) fn held_agent_item_row<'a>(
     }))
 }
 
-/// The edit a held item's row is built from: the earliest readable agent-item
-/// edit naming `target` alone that its sender has not deleted. `target` must
-/// be an event id, since an answer to the item names it.
+/// The edit a held item's row is built from: the first readable agent-item
+/// edit naming `target` alone, that its sender has not deleted, that this
+/// device received. Any member can send one, and its `created_at` is the
+/// sender's to choose, so arrival order decides, not that timestamp.
+/// `target` must be an event id, since an answer to the item names it.
 pub(super) fn held_agent_item_anchor<'a>(
     target: &str,
     edits: impl Iterator<Item = &'a RawAppEvent>,
@@ -139,7 +141,7 @@ pub(super) fn held_agent_item_anchor<'a>(
                 && sole_target(e) == Some(target)
                 && cgka_traits::AgentItem::from_tags(&e.tags).is_ok()
         })
-        .min_by(|a, b| (a.recorded_at, &a.message_id_hex).cmp(&(b.recorded_at, &b.message_id_hex)))
+        .min_by_key(|e| e.insert_order)
 }
 
 /// The one message an edit names with its single `e` tag.

@@ -40,7 +40,7 @@ fn raw(conn: &Connection, group: &str, id: &str) -> StorageResult<Option<RawAppE
     conn.query_row_cached(
         "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch,
          direction, sender, plaintext, kind, tags_json, recorded_at, received_at,
-         invalidated, invalidation_reason, moderation_grant
+         invalidated, invalidation_reason, moderation_grant, insert_order
          FROM app_events WHERE group_id_hex = ?1 AND message_id_hex = ?2",
         params![group.as_ref(), id],
         raw_event_from_row,
