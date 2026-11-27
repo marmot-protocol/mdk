@@ -2351,6 +2351,10 @@ typedef struct MarmotClientOptions {
    * blank or over 64 bytes leaves it out.
    */
   const char *device_platform;
+  /**
+   * Disable background acquisition of public avatar URLs. Zero (default) keeps it enabled.
+   */
+  uint8_t disable_public_avatar_acquisition;
 } MarmotClientOptions;
 
 /**

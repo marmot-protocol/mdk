@@ -1299,12 +1299,18 @@ FFI scheduling, and Swift/Kotlin decoding and rendering.
 
 ## Durable avatar access
 
+Set `disablePublicAvatarAcquisition` on `MarmotOptions` when the host manages permissions for public
+avatar URLs. The avatar worker skips public profile URLs and unencrypted group avatar URLs. Encrypted
+group images remain eligible for acquisition.
+
 Chat rows and conversation header/identity records include `avatarAsset` metadata. For visible content, batch its
-opaque `target` values into `requestAvatarAssets`, then pass returned `reference` values to `readAvatarAssets`. Both
-accept at most 16 items; byte reads additionally require a 1-byte to 16-MiB aggregate budget. A `deferred` result means
-that complete image did not fit the remaining budget. Ready/stale images can render offline; decode and render on the
+opaque `target` values into `requestAvatarAssets`, then pass returned `reference` values to `readAvatarAssets`.
+Explicit `requestAvatarAssets` calls can still queue public avatars with the option set. The worker fetches them
+only when public acquisition is enabled. Both methods accept at most 16 items. Byte reads additionally require a
+1-byte to 16-MiB aggregate budget. A `deferred` result means that the complete image did not fit the remaining
+budget. Ready or stale images can render offline. Decode and render on the
 host, caching decoded images by reference plus content revision. Screen subscriptions update metadata when acquisition
-completes. `clearAvatarCache` clears durable bytes and demand; later visible requests can acquire again.
+completes. `clearAvatarCache` clears durable bytes and demand. Later visible requests can acquire eligible avatars again.
 
 Keep host persistent caches until migration and device validation are complete. See
 [the avatar contract](../../docs/marmot-architecture/further-context/avatar-cache-storage.md)
