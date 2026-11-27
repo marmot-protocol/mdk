@@ -402,9 +402,9 @@ fn walk_directory_path(
         };
         let mut options = OpenOptions::new();
         use std::os::unix::fs::OpenOptionsExt;
-        options
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.read(true).custom_flags(
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        );
         let (depth, directory, anchor) =
             open_walk_anchor(start, &components, |prefix| options.open(prefix)).map_err(
                 |error| io_context("locate openable directory-walk anchor", path, error),
@@ -425,9 +425,9 @@ fn walk_directory_path(
         };
         let mut options = OpenOptions::new();
         use std::os::unix::fs::OpenOptionsExt;
-        options
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.read(true).custom_flags(
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        );
         let directory = options
             .open(start)
             .map(Into::into)
@@ -521,9 +521,9 @@ fn walk_directory_path(
         let mut missing = Vec::new();
         loop {
             let mut options = OpenOptions::new();
-            options
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW_ANY | libc::O_CLOEXEC);
+            options.read(true).custom_flags(
+                libc::O_DIRECTORY | libc::O_NOFOLLOW_ANY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            );
             match options.open(&candidate) {
                 Ok(directory) => {
                     missing.reverse();
@@ -565,7 +565,11 @@ fn walk_directory_path(
             libc::openat(
                 parent,
                 component.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
             )
         };
         if descriptor < 0 {
@@ -894,13 +898,14 @@ fn io_context(operation: &str, path: &Path, error: io::Error) -> io::Error {
     )
 }
 
-/// Configure `options` to create files owner-only (0600). No-op off Unix.
+/// Configure `options` to create files owner-only (0600) without following a
+/// final symlink or blocking on a FIFO. No-op off Unix.
 pub fn set_private_file_mode(options: &mut OpenOptions) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(PRIVATE_FILE_MODE);
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(not(unix))]
     {
@@ -908,54 +913,78 @@ pub fn set_private_file_mode(options: &mut OpenOptions) {
     }
 }
 
-/// Create `path` and any missing ancestors as 0700 directories; tighten the
-/// leaf to 0700 if it already existed.
-pub fn create_dir_all_private(path: &Path) -> io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(PRIVATE_DIR_MODE);
-    }
-    builder.create(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut options = OpenOptions::new();
-        options.read(true).custom_flags(libc::O_NOFOLLOW);
-        let directory = options.open(path)?;
-        if !directory.metadata()?.file_type().is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "private directory target must be a directory",
-            ));
-        }
-        set_directory_handle_private(&directory)?;
+fn verify_regular_file(file: &std::fs::File) -> io::Result<()> {
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private file target must be a regular file",
+        ));
     }
     Ok(())
 }
 
-/// Write `bytes` to `path`, creating the file 0600; tightens a pre-existing
-/// file to 0600 before writing.
+/// Open an existing regular file with `options` without following a final
+/// symlink (or Windows reparse point) and without blocking on a FIFO.
+/// Refuses any non-regular file with [`io::ErrorKind::InvalidInput`].
+pub fn open_existing_regular_nofollow(
+    path: &Path,
+    options: &mut OpenOptions,
+) -> io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    verify_regular_file(&file)?;
+    Ok(file)
+}
+
+/// Create `path` and any missing ancestors as 0700 directories without
+/// traversing untrusted symlinks; tighten the leaf to 0700 if it already
+/// existed.
+pub fn create_dir_all_private(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        prepare_directory_path(path, PRIVATE_DIR_MODE, ExistingDirectoryMode::Enforce).map(|_| ())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        builder.create(path)
+    }
+}
+
+/// Write `bytes` to `path`, creating the file 0600; verifies it is a regular
+/// file and tightens a pre-existing file to 0600 before truncating and writing.
 pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create(true);
     set_private_file_mode(&mut options);
     let mut file = options.open(path)?;
+    verify_regular_file(&file)?;
     set_handle_private(&file)?;
+    file.set_len(0)?;
     file.write_all(bytes)?;
     file.sync_all()
 }
 
-/// Open `path` for appending, creating it 0600; tightens a pre-existing file
-/// to 0600.
+/// Open `path` for appending, creating it 0600; verifies it is a regular file
+/// and tightens a pre-existing file to 0600.
 pub fn open_private_append(path: &Path) -> io::Result<std::fs::File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     set_private_file_mode(&mut options);
     let file = options.open(path)?;
+    verify_regular_file(&file)?;
     set_handle_private(&file)?;
     Ok(file)
 }
@@ -969,7 +998,8 @@ pub fn create_new_private(path: &Path) -> io::Result<std::fs::File> {
 }
 
 /// Ensure a file exists at `path` with mode 0600: created atomically at 0600
-/// if missing, tightened to 0600 if pre-existing. Contents are untouched.
+/// if missing, verified as a regular file and tightened to 0600 if
+/// pre-existing. Contents are untouched.
 ///
 /// Opens and closes a descriptor on the file. Never use it for a SQLite
 /// database or sidecar: use [`ensure_private_db_files`].
@@ -978,21 +1008,21 @@ pub fn ensure_private_file(path: &Path) -> io::Result<()> {
     options.write(true).create(true);
     set_private_file_mode(&mut options);
     let file = options.open(path)?;
+    verify_regular_file(&file)?;
     set_handle_private(&file)
 }
 
-/// Tighten an existing file at `path` to 0600; `Ok(())` when it does not
-/// exist.
+/// Tighten an existing regular file at `path` to 0600; `Ok(())` when it does
+/// not exist.
 ///
 /// Opens and closes a descriptor on the file. Never use it for a SQLite
 /// database or sidecar: use [`ensure_private_db_files`].
 pub fn tighten_existing_private_file(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         let mut options = OpenOptions::new();
-        options.read(true).custom_flags(libc::O_NOFOLLOW);
-        match options.open(path) {
+        options.read(true);
+        match open_existing_regular_nofollow(path, &mut options) {
             Ok(file) => set_handle_private(&file),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err),
@@ -1164,12 +1194,6 @@ fn set_handle_private(file: &std::fs::File) -> io::Result<()> {
     }
 }
 
-#[cfg(unix)]
-fn set_directory_handle_private(directory: &std::fs::File) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    directory.set_permissions(std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))
-}
-
 /// The workspace's one octal permission-mode parser.
 ///
 /// Accepts an optional `0o` prefix followed by octal digits, parsed
@@ -1257,9 +1281,75 @@ impl BoundUnixListener {
     }
 }
 
+#[cfg(unix)]
+struct SocketStagingSlotPool {
+    next: usize,
+    free: Vec<usize>,
+}
+
+#[cfg(unix)]
+impl SocketStagingSlotPool {
+    const fn new() -> Self {
+        Self {
+            next: 0,
+            free: Vec::new(),
+        }
+    }
+
+    fn acquire(&mut self) -> usize {
+        if let Some(slot) = self.free.pop() {
+            slot
+        } else {
+            let slot = self.next;
+            self.next = self.next.saturating_add(1);
+            slot
+        }
+    }
+
+    fn release(&mut self, slot: usize) {
+        self.free.push(slot);
+    }
+}
+
+#[cfg(unix)]
+static SOCKET_STAGING_SLOTS: std::sync::Mutex<SocketStagingSlotPool> =
+    std::sync::Mutex::new(SocketStagingSlotPool::new());
+
+#[cfg(unix)]
+struct SocketStagingSlot(usize);
+
+#[cfg(unix)]
+impl SocketStagingSlot {
+    fn acquire() -> Self {
+        let mut pool = SOCKET_STAGING_SLOTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self(pool.acquire())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SocketStagingSlot {
+    fn drop(&mut self) {
+        let mut pool = SOCKET_STAGING_SLOTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pool.release(self.0);
+    }
+}
+
+#[cfg(unix)]
+std::thread_local! {
+    static SOCKET_STAGING_THREAD_ID: SocketStagingSlot = SocketStagingSlot::acquire();
+}
+
 /// The staging directory `bind_unix_listener_private` binds through for
-/// `final_path`. Exposed so callers and tests can assert staging cleanup
-/// without re-deriving the (otherwise private) naming scheme.
+/// `final_path` on the current thread. Exposed so callers and tests can assert
+/// staging cleanup without re-deriving the (otherwise private) naming scheme.
+///
+/// Thread slots are recycled on thread exit, so the 2-hex-digit slot field
+/// keeps the staging path length stable across thread churn up to 256
+/// simultaneously live binding threads.
 #[cfg(unix)]
 pub fn socket_staging_dir(final_path: &Path) -> std::path::PathBuf {
     let parent = match final_path.parent() {
@@ -1267,10 +1357,14 @@ pub fn socket_staging_dir(final_path: &Path) -> std::path::PathBuf {
         _ => Path::new("."),
     };
     let name = final_path.file_name().unwrap_or_default();
-    // Keyed by pid for crash recovery and by target name so concurrent binds
-    // of different sockets in the same parent never share staging state.
+    let thread_id = SOCKET_STAGING_THREAD_ID.with(|slot| slot.0);
+    // Keyed by pid, recycled per-thread slot, and target name so concurrent
+    // binds across processes, threads, or different sockets never share
+    // staging state. Hex pid + 2-hex-digit recycled slot keeps the prefix
+    // shorter than the legacy `.sock.<pid>.` form and length-stable within
+    // `sun_path` limits across long-lived blocking-pool thread churn.
     parent.join(format!(
-        ".sock.{}.{}",
+        ".s{:x}.{thread_id:02x}.{}",
         std::process::id(),
         name.to_string_lossy()
     ))
@@ -1278,6 +1372,10 @@ pub fn socket_staging_dir(final_path: &Path) -> std::path::PathBuf {
 
 /// Check the final and staging addresses before creating or removing artifacts.
 /// Use the standard library's platform-specific pathname validation.
+///
+/// Note that the staging directory length is checked for the calling thread's
+/// slot; slots stay 2 hex digits for up to 256 concurrent binding threads and
+/// recycle when threads exit.
 #[cfg(unix)]
 pub fn validate_private_unix_socket_path(final_path: &Path) -> io::Result<()> {
     use std::os::unix::net::SocketAddr;
@@ -1300,8 +1398,8 @@ pub fn validate_private_unix_socket_path(final_path: &Path) -> io::Result<()> {
 /// (failing with `AddrInUse` if `final_path` already exists, matching plain
 /// `bind` semantics so callers keep their stale-socket recovery).
 ///
-/// The staging directory name stays short (`.sock.<pid>.<name>`) to respect
-/// `sun_path` length limits.
+/// The staging directory name stays short (`.s<pid_hex>.<tid_hex>.<name>`) to
+/// respect `sun_path` length limits.
 #[cfg(unix)]
 pub fn bind_unix_listener_private(
     final_path: &Path,
@@ -1325,10 +1423,15 @@ pub fn bind_unix_listener_private_tracked(
     })?;
     validate_private_unix_socket_path(final_path)?;
     let staging_dir = socket_staging_dir(final_path);
-    // A leftover staging dir can only be ours (pid-suffixed, 0700) from a
-    // crashed previous run; clear it so the atomic 0700 create succeeds.
-    if staging_dir.symlink_metadata().is_ok() {
-        std::fs::remove_dir_all(&staging_dir)?;
+    // A leftover staging dir can only be ours (pid+thread-suffixed, 0700) from
+    // an earlier failed run; clear it without following symlinks so the atomic
+    // 0700 create succeeds.
+    if let Ok(metadata) = staging_dir.symlink_metadata() {
+        if metadata.file_type().is_dir() {
+            std::fs::remove_dir_all(&staging_dir)?;
+        } else {
+            std::fs::remove_file(&staging_dir)?;
+        }
     }
     let mut builder = std::fs::DirBuilder::new();
     builder.mode(PRIVATE_DIR_MODE);
@@ -1899,6 +2002,80 @@ mod unix_tests {
         let error = create_dir_all_private(&link).unwrap_err();
         assert!(refused_symlink(&error), "{error}");
         assert_eq!(mode_of(&target), 0o755);
+    }
+
+    #[test]
+    fn create_dir_all_private_rejects_intermediate_symlinks_and_fifos() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = create_dir_all_private(&link.join("child")).unwrap_err();
+        assert_untrusted_alias_refusal(&error);
+        assert!(!target.join("child").exists());
+        assert_eq!(mode_of(&target), 0o755);
+
+        let fifo = dir.path().join("fifo");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o644) }, 0);
+        std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = create_dir_all_private(&fifo).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotADirectory, "{error}");
+        assert_eq!(mode_of(&fifo), 0o644);
+    }
+
+    #[test]
+    fn private_file_helpers_reject_fifos_without_hanging_or_tightening() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("artifact.fifo");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o644) }, 0);
+        std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Hold an open peer descriptor first so even an open that succeeds
+        // without ENXIO must still be rejected by the regular-file check.
+        let peer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+
+        for error in [
+            write_private(&fifo, b"secret").unwrap_err(),
+            open_private_append(&fifo).unwrap_err(),
+            ensure_private_file(&fifo).unwrap_err(),
+            tighten_existing_private_file(&fifo).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        }
+        assert_eq!(mode_of(&fifo), 0o644, "FIFO mode must remain untouched");
+        drop(peer);
+
+        // With no peer attached, O_NONBLOCK keeps every helper non-blocking.
+        for error in [
+            write_private(&fifo, b"secret").unwrap_err(),
+            open_private_append(&fifo).unwrap_err(),
+            ensure_private_file(&fifo).unwrap_err(),
+            tighten_existing_private_file(&fifo).unwrap_err(),
+        ] {
+            assert!(
+                error.kind() == io::ErrorKind::InvalidInput
+                    || error.raw_os_error() == Some(libc::ENXIO),
+                "{error}"
+            );
+        }
+        assert_eq!(mode_of(&fifo), 0o644, "FIFO mode must remain untouched");
     }
 
     #[test]
@@ -2721,5 +2898,108 @@ mod unix_tests {
         assert_eq!(mode_of(&first), 0o600);
         assert_eq!(mode_of(&second), 0o600);
         drop((first_listener, second_listener));
+    }
+
+    #[test]
+    fn open_existing_regular_nofollow_rejects_symlinks_directories_and_fifos() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("regular");
+        std::fs::write(&regular, b"ok").unwrap();
+        let mut opened = open_existing_regular_nofollow(&regular, OpenOptions::new().read(true))
+            .expect("regular file opens");
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut opened, &mut bytes).unwrap();
+        assert_eq!(bytes, b"ok");
+
+        let link = dir.path().join("link");
+        symlink(&regular, &link).unwrap();
+        let err = open_existing_regular_nofollow(&link, OpenOptions::new().read(true)).unwrap_err();
+        assert!(refused_symlink(&err), "{err}");
+
+        let subdir = dir.path().join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        let err =
+            open_existing_regular_nofollow(&subdir, OpenOptions::new().read(true)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+
+        let fifo = dir.path().join("fifo");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        let err = open_existing_regular_nofollow(&fifo, OpenOptions::new().read(true)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+    }
+
+    #[test]
+    fn concurrent_same_pid_binds_for_same_socket_use_distinct_staging_dirs() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Barrier};
+
+        // Keep the root short on macOS where the default temp dir eats most of sun_path.
+        let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let socket = Arc::new(dir.path().join("shared.sock"));
+        let threads = 8;
+        let barrier = Arc::new(Barrier::new(threads));
+
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let socket = Arc::clone(&socket);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let staging = socket_staging_dir(&socket);
+                    barrier.wait();
+                    let result = bind_unix_listener_private(&socket, 0o600);
+                    (staging, result)
+                })
+            })
+            .collect();
+
+        let mut staging_dirs = HashSet::new();
+        let mut winners = Vec::new();
+        let mut addr_in_use = 0usize;
+        for handle in handles {
+            let (staging, result) = handle.join().unwrap();
+            assert!(
+                staging_dirs.insert(staging),
+                "each thread in the same process must get a distinct staging dir"
+            );
+            match result {
+                Ok(listener) => winners.push(listener),
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse => addr_in_use += 1,
+                Err(error) => panic!("unexpected concurrent bind error: {error}"),
+            }
+        }
+
+        assert_eq!(winners.len(), 1, "exactly one concurrent bind must win");
+        assert_eq!(addr_in_use, threads - 1);
+        assert_eq!(mode_of(&socket), 0o600);
+        let client = std::os::unix::net::UnixStream::connect(&*socket).unwrap();
+        let (_server, _addr) = winners[0].accept().unwrap();
+        drop(client);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("shared.sock")]);
+    }
+
+    #[test]
+    fn socket_staging_dir_recycles_thread_slots_across_thread_churn() {
+        let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let socket = dir.path().join("churn.sock");
+        let baseline_len = socket_staging_dir(&socket).as_os_str().len();
+
+        for _ in 0..300 {
+            let socket = socket.clone();
+            let len = std::thread::spawn(move || socket_staging_dir(&socket).as_os_str().len())
+                .join()
+                .unwrap();
+            assert_eq!(
+                len, baseline_len,
+                "recycled thread slots must keep staging dir length bounded across thread churn"
+            );
+        }
     }
 }
