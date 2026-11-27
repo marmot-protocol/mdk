@@ -1295,6 +1295,32 @@ async fn a_sibling_welcome_decodes_only_its_exact_encoding() {
     ] {
         assert_serialize_error(SiblingWelcome::decode(&refused), "invalid sibling Welcome");
     }
+
+    // Relay list count bound: up to NOSTR_ROUTING_MAX_RELAYS (16) entries
+    // decode cleanly; 17 entries are rejected on decode (mdk#3795).
+    let max_relays: Vec<Vec<u8>> = (0..cgka_traits::app_components::NOSTR_ROUTING_MAX_RELAYS)
+        .map(|i| format!("wss://relay-{i}.example").into_bytes())
+        .collect();
+    let max_decoded = SiblingWelcome::decode(&wire(
+        &sibling.key_package_ref,
+        &sibling.welcome,
+        &max_relays,
+    ))
+    .expect("16 relays is the allowed maximum");
+    assert_eq!(
+        max_decoded.relays.len(),
+        cgka_traits::app_components::NOSTR_ROUTING_MAX_RELAYS
+    );
+    let mut too_many_relays = max_relays;
+    too_many_relays.push(b"wss://relay-overflow.example".to_vec());
+    assert_serialize_error(
+        SiblingWelcome::decode(&wire(
+            &sibling.key_package_ref,
+            &sibling.welcome,
+            &too_many_relays,
+        )),
+        "invalid sibling Welcome",
+    );
 }
 
 /// A KeyPackage's bytes, which are no Welcome.

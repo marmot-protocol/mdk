@@ -7,8 +7,9 @@ use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
     APP_OWNED_APP_COMPONENT_ID_START, AccountEntryV1, AppComponentData, AppComponentId,
     DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1,
-    DeviceSlotId, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
-    RejectedSlotReasonV1, decode_device_roster_update_v1, encode_device_roster_update_v1,
+    DeviceSlotId, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_LIFECYCLE_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID, RejectedSlotReasonV1, decode_device_roster_update_v1,
+    encode_device_roster_update_v1,
 };
 use cgka_traits::engine::SendResult;
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
@@ -79,6 +80,24 @@ impl<S: StorageProvider> Engine<S> {
             .await
     }
 
+    /// Internal-only entry point for `SendIntent::EnableDisbanding`, which is
+    /// the sole caller allowed to install `GROUP_LIFECYCLE_COMPONENT_ID`
+    /// through the `AppDataUpdate` staging path.
+    pub(crate) async fn do_send_enable_disbanding_updates(
+        &mut self,
+        group_id: GroupId,
+        updates: Vec<AppComponentData>,
+    ) -> Result<SendResult, EngineError> {
+        self.do_send_app_data_updates_with_purpose(
+            group_id,
+            updates,
+            Vec::new(),
+            AppDataCommitPurpose::Ordinary,
+            true,
+        )
+        .await
+    }
+
     /// [`Self::do_send_update_app_components`] for a Commit that carries only
     /// `updates`: proposals pending in the store stay there. A leave's
     /// automatic step-down uses it (mdk#3014).
@@ -94,6 +113,7 @@ impl<S: StorageProvider> Engine<S> {
             AppDataCommitPurpose::Isolated {
                 context: "leave_step_down",
             },
+            false,
         )
         .await
     }
@@ -219,6 +239,7 @@ impl<S: StorageProvider> Engine<S> {
             AppDataCommitPurpose::Isolated {
                 context: "carried_rejections",
             },
+            false,
         )
         .await
     }
@@ -258,6 +279,7 @@ impl<S: StorageProvider> Engine<S> {
             }],
             Vec::new(),
             AppDataCommitPurpose::MoveStatus(slot),
+            false,
         )
         .await
     }
@@ -340,6 +362,7 @@ impl<S: StorageProvider> Engine<S> {
             updates,
             removals,
             AppDataCommitPurpose::Ordinary,
+            false,
         )
         .await
     }
@@ -350,6 +373,7 @@ impl<S: StorageProvider> Engine<S> {
         updates: Vec<AppComponentData>,
         removals: Vec<AppComponentId>,
         purpose: AppDataCommitPurpose,
+        allow_lifecycle_enable: bool,
     ) -> Result<SendResult, EngineError> {
         self.epoch_manager.ensure_pending_space()?;
         if updates.is_empty() {
@@ -377,11 +401,25 @@ impl<S: StorageProvider> Engine<S> {
                     "UpdateAppComponents contains duplicate component ids".into(),
                 ));
             }
+            if !allow_lifecycle_enable && *component_id == GROUP_LIFECYCLE_COMPONENT_ID {
+                return Err(EngineError::Other(
+                    "group lifecycle component cannot be updated through UpdateAppComponents; \
+                     use EnableDisbanding or Disband"
+                        .into(),
+                ));
+            }
         }
         for update in &updates {
             if !seen.insert(update.component_id) {
                 return Err(EngineError::Other(
                     "UpdateAppComponents contains duplicate component ids".into(),
+                ));
+            }
+            if !allow_lifecycle_enable && update.component_id == GROUP_LIFECYCLE_COMPONENT_ID {
+                return Err(EngineError::Other(
+                    "group lifecycle component cannot be updated through UpdateAppComponents; \
+                     use EnableDisbanding or Disband"
+                        .into(),
                 ));
             }
             // MIP-03 §150, ordered ahead of the component validator: that

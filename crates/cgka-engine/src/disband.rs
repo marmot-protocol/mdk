@@ -74,7 +74,8 @@ impl<S: StorageProvider> Engine<S> {
                 data: encode_group_lifecycle_v1(GroupLifecycleV1::Active),
             });
         }
-        self.do_send_update_app_components(group_id, updates).await
+        self.do_send_enable_disbanding_updates(group_id, updates)
+            .await
     }
 
     /// Persist the irreversible product intent and install its durable send

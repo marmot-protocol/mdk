@@ -643,6 +643,31 @@ fn authorize_proposal(
                         "app_components_require_never_required_component",
                     ));
                 }
+                // admin-policy-v1.md: 0x8003 is mandatory in every Marmot
+                // group and cannot be dropped from 0x0001 in either profile.
+                if proposed_required
+                    .as_ref()
+                    .is_some_and(|ids| !ids.contains(GROUP_ADMIN_POLICY_COMPONENT_ID))
+                {
+                    return Err(StandaloneProposalRejection::invalid(
+                        "app_components_unrequire_admin_policy",
+                    ));
+                }
+                // group-lifecycle-v1.md: once 0x800c is required, no proposal
+                // may drop it from 0x0001 in either profile.
+                if proposed_required
+                    .as_ref()
+                    .is_some_and(|ids| !ids.contains(GROUP_LIFECYCLE_COMPONENT_ID))
+                    && required_app_components_of_group(mls_group)
+                        .map_err(|_| {
+                            StandaloneProposalRejection::invalid("proposal_group_state_invalid")
+                        })?
+                        .contains(GROUP_LIFECYCLE_COMPONENT_ID)
+                {
+                    return Err(StandaloneProposalRejection::invalid(
+                        "app_components_unrequire_group_lifecycle",
+                    ));
+                }
                 // account-devices-v1.md, "Data": no AppDataUpdate targets the
                 // component once its source state requires it. "Removal": no
                 // proposal drops it from the required list either.
@@ -704,6 +729,66 @@ fn authorize_proposal(
             }
             let proposed_required =
                 validate_group_context_extension_proposal(mls_group, profile, update.extensions())?;
+            if standalone {
+                let current_dict = mls_group
+                    .extensions()
+                    .app_data_dictionary()
+                    .map(|ext| ext.dictionary());
+                let proposed_dict = update
+                    .extensions()
+                    .app_data_dictionary()
+                    .map(|ext| ext.dictionary());
+                if current_dict.is_some() && proposed_dict.is_none() {
+                    return Err(StandaloneProposalRejection::invalid(
+                        "group_context_extensions_drops_app_data_dictionary",
+                    ));
+                }
+                if current_dict.is_some_and(|dict| dict.contains(&GROUP_ADMIN_POLICY_COMPONENT_ID))
+                    && !proposed_dict
+                        .is_some_and(|dict| dict.contains(&GROUP_ADMIN_POLICY_COMPONENT_ID))
+                {
+                    return Err(StandaloneProposalRejection::invalid(
+                        "group_context_extensions_drops_admin_policy",
+                    ));
+                }
+                if current_dict.is_some_and(|dict| dict.contains(&GROUP_LIFECYCLE_COMPONENT_ID))
+                    && !proposed_dict
+                        .is_some_and(|dict| dict.contains(&GROUP_LIFECYCLE_COMPONENT_ID))
+                {
+                    return Err(StandaloneProposalRejection::invalid(
+                        "group_context_extensions_drops_group_lifecycle",
+                    ));
+                }
+                let current_required =
+                    required_app_components_of_group(mls_group).map_err(|_| {
+                        StandaloneProposalRejection::invalid("proposal_group_state_invalid")
+                    })?;
+                let proposed_required_any = optional_required_app_components_of_extensions(
+                    update.extensions(),
+                    "proposed group state",
+                )
+                .map_err(|_| {
+                    StandaloneProposalRejection::invalid(
+                        "group_context_extensions_app_components_invalid",
+                    )
+                })?;
+                if (current_required.contains(GROUP_ADMIN_POLICY_COMPONENT_ID)
+                    || proposed_dict
+                        .is_some_and(|dict| dict.contains(&APP_COMPONENTS_COMPONENT_ID)))
+                    && !proposed_required_any.contains(GROUP_ADMIN_POLICY_COMPONENT_ID)
+                {
+                    return Err(StandaloneProposalRejection::invalid(
+                        "group_context_extensions_unrequire_admin_policy",
+                    ));
+                }
+                if current_required.contains(GROUP_LIFECYCLE_COMPONENT_ID)
+                    && !proposed_required_any.contains(GROUP_LIFECYCLE_COMPONENT_ID)
+                {
+                    return Err(StandaloneProposalRejection::invalid(
+                        "group_context_extensions_unrequire_group_lifecycle",
+                    ));
+                }
+            }
             if standalone
                 && profile == ProtocolProfile::Current
                 && proposed_required.contains(DEVICE_ROSTER_COMPONENT_ID)
@@ -1017,6 +1102,14 @@ pub(crate) fn validate_app_component_integrity_for_staged_commit(
     {
         protected.insert(APP_COMPONENTS_COMPONENT_ID);
     }
+    for component_id in [
+        GROUP_ADMIN_POLICY_COMPONENT_ID,
+        GROUP_LIFECYCLE_COMPONENT_ID,
+    ] {
+        if current.is_some_and(|dictionary| dictionary.contains(&component_id)) {
+            protected.insert(component_id);
+        }
+    }
     for component_id in &protected {
         // The account proof is required by the GroupContext but its data is
         // LeafNode-only, and on the current profile a no-data component has
@@ -1096,9 +1189,11 @@ pub(crate) fn validate_current_profile_group_invariants(
 }
 
 /// Receiving-flow step 7 (`protocol-core/joining.md`) for the state a Welcome
-/// joins: [`validate_current_profile_group_invariants`], and the GroupInfo
-/// rule of `marmot.group.account-devices.v1` ("Data"): when the joined state
-/// requires the component, the GroupInfo carries no entry under its id.
+/// joins: [`validate_current_profile_group_invariants`], the lifecycle rule of
+/// `marmot.group.lifecycle.v1` (a `Disbanded` group is terminal and cannot be
+/// joined in either profile), and the GroupInfo rule of
+/// `marmot.group.account-devices.v1` ("Data"): when the joined state requires
+/// the component, the GroupInfo carries no entry under its id.
 /// `group_info_app_data` is the GroupInfo's `app_data_dictionary`, which the
 /// caller reads before OpenMLS stages the Welcome and drops the GroupInfo.
 pub(crate) fn validate_joined_group_invariants(
@@ -1106,6 +1201,11 @@ pub(crate) fn validate_joined_group_invariants(
     group_info_app_data: Option<&AppDataDictionaryExtension>,
 ) -> Result<(), EngineError> {
     validate_current_profile_group_invariants(joined)?;
+    if lifecycle_of_group(joined)? == Some(GroupLifecycleV1::Disbanded) {
+        return Err(EngineError::Other(
+            "invalid group lifecycle state: cannot join a Disbanded group".into(),
+        ));
+    }
     if carries_account_devices_data(group_info_app_data) && group_requires_account_devices(joined)?
     {
         return Err(EngineError::Other(
@@ -1115,8 +1215,14 @@ pub(crate) fn validate_joined_group_invariants(
     Ok(())
 }
 
-/// Validate current-profile invariants against the complete state a staged
-/// Commit would produce, before the Commit can mutate canonical group state.
+/// Validate profile- and component-transition invariants against the complete
+/// state a staged Commit would produce, before the Commit can mutate canonical
+/// group state.
+///
+/// Legacy groups skip the Current-profile-only checks (account-devices,
+/// device-roster, required-extension set), but still enforce
+/// [`validate_group_lifecycle_transition`] so lifecycle-v1 transitions and
+/// terminal disband shape apply across both profiles.
 pub(crate) fn validate_current_profile_invariants_for_staged_commit(
     group: &MlsGroup,
     staged: &StagedCommit,
@@ -1124,7 +1230,7 @@ pub(crate) fn validate_current_profile_invariants_for_staged_commit(
 ) -> Result<(), EngineError> {
     let profile = crate::account_identity_proof::protocol_profile_of_group(group)?;
     if profile == ProtocolProfile::Legacy {
-        return Ok(());
+        return validate_group_lifecycle_transition_inner(group, staged, committer_index, None);
     }
     let extensions = staged.group_context().extensions();
     let required_components =
@@ -1136,7 +1242,7 @@ pub(crate) fn validate_current_profile_invariants_for_staged_commit(
     validate_device_roster_transition(group, &required_components)?;
     crate::roster_key_binding::validate_commit(group, staged, committer_index, &leaves)?;
     validate_device_roster_state(extensions, &required_components, &leaves)?;
-    validate_group_lifecycle_transition(group, staged, committer_index)
+    validate_group_lifecycle_transition_inner(group, staged, committer_index, Some(&leaves))
 }
 
 /// Whether `group` requires `marmot.group.account-devices.v1`. A group on
@@ -1412,16 +1518,26 @@ pub(crate) fn staged_commit_disbands(
 /// Enforce lifecycle-v1 transition and terminal Commit shape at the shared
 /// staged-Commit chokepoint used by local sends, direct ingest, convergence
 /// replay, and fork recovery.
+#[allow(dead_code)]
 pub(crate) fn validate_group_lifecycle_transition(
     group: &MlsGroup,
     staged: &StagedCommit,
     committer_index: LeafNodeIndex,
 ) -> Result<(), EngineError> {
+    validate_group_lifecycle_transition_inner(group, staged, committer_index, None)
+}
+
+fn validate_group_lifecycle_transition_inner(
+    group: &MlsGroup,
+    staged: &StagedCommit,
+    committer_index: LeafNodeIndex,
+    prevalidated_leaves: Option<&[LeafNode]>,
+) -> Result<(), EngineError> {
     let before = lifecycle_from_extensions(group.extensions())?;
     let after = lifecycle_from_extensions(staged.group_context().extensions())?;
     let before_required =
         required_app_components_of_group(group)?.contains(GROUP_LIFECYCLE_COMPONENT_ID);
-    let after_required = required_app_components_of_extensions(
+    let after_required = optional_required_app_components_of_extensions(
         staged.group_context().extensions(),
         "resulting group state",
     )?
@@ -1438,6 +1554,21 @@ pub(crate) fn validate_group_lifecycle_transition(
         return Err(EngineError::Other(
             "commit is invalid: lifecycle-v1 cannot be un-required".into(),
         ));
+    }
+    // On the Current profile, `validate_resulting_leaf_capabilities` already
+    // verified every resulting leaf advertises every required component. On
+    // Legacy (where `prevalidated_leaves` is `None`), enforce the lifecycle-v1
+    // support invariant directly whenever the resulting epoch requires 0x800c.
+    if after_required && prevalidated_leaves.is_none() {
+        for leaf in conceptual_resulting_leaves(group, staged, committer_index)? {
+            if !app_components_of_leaf(&leaf)?.contains(GROUP_LIFECYCLE_COMPONENT_ID) {
+                return Err(EngineError::Other(
+                    "commit is invalid: lifecycle-v1 requires every resulting leaf to advertise \
+                     lifecycle-v1"
+                        .into(),
+                ));
+            }
+        }
     }
     if enabling {
         if after != Some(GroupLifecycleV1::Active) {
@@ -1671,6 +1802,22 @@ fn validate_current_profile_group_context(
         }
     }
     Ok(required_components)
+}
+
+fn optional_required_app_components_of_extensions(
+    extensions: &Extensions<GroupContext>,
+    context: &str,
+) -> Result<AppComponentSet, EngineError> {
+    let Some(bytes) = extensions
+        .app_data_dictionary()
+        .and_then(|dictionary| dictionary.dictionary().get(&APP_COMPONENTS_COMPONENT_ID))
+    else {
+        return Ok(AppComponentSet::default());
+    };
+    let ids = decode_components_list(bytes).map_err(|error| {
+        EngineError::Serialize(format!("invalid {context} app_components: {error}"))
+    })?;
+    Ok(AppComponentSet::from(ids))
 }
 
 fn required_app_components_of_extensions(
@@ -2100,7 +2247,8 @@ fn validate_initial_app_component(component: &AppComponentData) -> Result<(), En
         | SAFE_AAD_COMPONENT_ID
         | ACCOUNT_IDENTITY_PROOF_COMPONENT_ID
         | GROUP_PROFILE_COMPONENT_ID
-        | GROUP_ADMIN_POLICY_COMPONENT_ID => Err(EngineError::Other(
+        | GROUP_ADMIN_POLICY_COMPONENT_ID
+        | GROUP_LIFECYCLE_COMPONENT_ID => Err(EngineError::Other(
             "group creation request cannot override engine-owned app components".into(),
         )),
         NOSTR_ROUTING_COMPONENT_ID => decode_nostr_routing_v1(&component.data)
@@ -2173,6 +2321,13 @@ fn validate_app_component_bytes(
                     EngineError::Serialize(format!("invalid group lifecycle component: {error}"))
                 })
         }
+        // Device-roster bytes are context-dependent: GroupContext holds
+        // `DeviceRosterV1` state while `AppDataUpdate` carries a
+        // `DeviceRosterUpdateV1` diff, and an unrequired `0x800e` entry stays
+        // opaque unknown data (`device-roster-v1.md`). Validated contextually
+        // in `validate_device_roster_state`, `resolved_app_data_update`, and
+        // `validate_initial_app_component`.
+        DEVICE_ROSTER_COMPONENT_ID => Ok(()),
         _ => Ok(()),
     }
 }
@@ -2252,6 +2407,12 @@ fn validate_app_data_update_batch_against<'a>(
                             ))
                         })?,
                     );
+                    if !resulting_required.contains(GROUP_ADMIN_POLICY_COMPONENT_ID) {
+                        return Err(EngineError::Other(
+                            "commit is invalid: admin-policy component cannot be un-required"
+                                .into(),
+                        ));
+                    }
                 }
                 AppDataUpdateOperation::Remove => {
                     return Err(EngineError::Other(
@@ -2299,6 +2460,11 @@ fn validate_app_component_remove_against(
     if component_id == SAFE_AAD_COMPONENT_ID {
         return Err(EngineError::Other(
             "safe_aad group-component state is not supported yet".into(),
+        ));
+    }
+    if component_id == GROUP_ADMIN_POLICY_COMPONENT_ID {
+        return Err(EngineError::Other(
+            "group admin policy component cannot be removed".into(),
         ));
     }
     if component_id == GROUP_LIFECYCLE_COMPONENT_ID {
@@ -3232,6 +3398,74 @@ mod tests {
                     content == ContentType::Proposal
                 );
             }
+        }
+    }
+
+    #[test]
+    fn admin_policy_cannot_be_removed_or_unrequired_in_either_profile() {
+        let remove = AppDataUpdateProposal::remove(GROUP_ADMIN_POLICY_COMPONENT_ID);
+        assert!(
+            matches!(
+                validate_app_component_remove_against(
+                    &AppComponentSet::default(),
+                    GROUP_ADMIN_POLICY_COMPONENT_ID,
+                ),
+                Err(EngineError::Other(reason)) if reason == "group admin policy component cannot be removed"
+            ),
+            "admin policy removal must be unconditionally forbidden"
+        );
+        assert!(
+            matches!(
+                validate_standalone_app_data_update(&remove),
+                Err(EngineError::Other(reason)) if reason == "group admin policy component cannot be removed"
+            ),
+            "standalone admin policy removal must be rejected"
+        );
+
+        let initial =
+            AppComponentSet::new([GROUP_PROFILE_COMPONENT_ID, GROUP_ADMIN_POLICY_COMPONENT_ID]);
+        let without_admin: BTreeSet<AppComponentId> =
+            [GROUP_PROFILE_COMPONENT_ID].into_iter().collect();
+        let unrequire_only = [AppDataUpdateProposal::update(
+            APP_COMPONENTS_COMPONENT_ID,
+            encode_components_list(&without_admin),
+        )];
+        let unrequire_and_remove = [
+            AppDataUpdateProposal::update(
+                APP_COMPONENTS_COMPONENT_ID,
+                encode_components_list(&without_admin),
+            ),
+            AppDataUpdateProposal::remove(GROUP_ADMIN_POLICY_COMPONENT_ID),
+        ];
+
+        for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
+            for batch in [unrequire_only.as_slice(), unrequire_and_remove.as_slice()] {
+                let error =
+                    validate_app_data_update_batch_against(initial.clone(), profile, batch.iter())
+                        .expect_err("un-requiring admin policy must be rejected in every profile");
+                assert!(
+                    matches!(error, EngineError::Other(ref reason) if reason.contains("admin-policy component cannot be un-required")),
+                    "{profile:?}: unexpected error: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn group_creation_rejects_caller_supplied_lifecycle_component() {
+        for state in [GroupLifecycleV1::Active, GroupLifecycleV1::Disbanded] {
+            let component = AppComponentData {
+                component_id: GROUP_LIFECYCLE_COMPONENT_ID,
+                data: encode_group_lifecycle_v1(state),
+            };
+            assert!(
+                matches!(
+                    validate_initial_app_component(&component),
+                    Err(EngineError::Other(reason))
+                        if reason == "group creation request cannot override engine-owned app components"
+                ),
+                "{state:?}: caller lifecycle override must be rejected"
+            );
         }
     }
 }
