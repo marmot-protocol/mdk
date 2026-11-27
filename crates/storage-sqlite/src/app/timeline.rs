@@ -348,8 +348,9 @@ pub struct TimelineMessageRecord {
     #[serde(default)]
     pub agent_item: Option<cgka_traits::AgentItem>,
     /// True for an agent item whose first event this device does not hold,
-    /// such as one that began before this member joined: the row is its
-    /// earliest edit, at that edit's place, showing the latest version
+    /// such as one that began before this member joined: the row is the
+    /// first edit of it this device received, at that edit's place, showing
+    /// the latest version
     /// (marmot-agents D-124). An app can say the item started earlier. False
     /// once the first event arrives, and for every other row.
     #[serde(default)]
@@ -554,6 +555,8 @@ struct RawAppEvent {
     invalidated: bool,
     invalidation_reason: Option<String>,
     moderation_grant: bool,
+    /// This device's arrival order (`app_events.insert_order`).
+    insert_order: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -2539,7 +2542,7 @@ fn raw_app_event_tx(
         .query_row_cached(
             "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                     plaintext, kind, tags_json, recorded_at, received_at,
-                    invalidated, invalidation_reason, moderation_grant
+                    invalidated, invalidation_reason, moderation_grant, insert_order
              FROM app_events
              WHERE group_id_hex = ?1 AND message_id_hex = ?2",
             params![group_id_hex.as_ref(), message_id_hex],
@@ -2943,7 +2946,7 @@ fn app_events_targeting_message_tx(
                     app_events.plaintext, app_events.kind, app_events.tags_json,
                     app_events.recorded_at, app_events.received_at,
                     app_events.invalidated, app_events.invalidation_reason,
-                    app_events.moderation_grant
+                    app_events.moderation_grant, app_events.insert_order
              FROM message_modifier_edges AS edges
              CROSS JOIN app_events
                ON app_events.group_id_hex = edges.group_id_hex
@@ -3071,7 +3074,7 @@ fn app_events_for_rebuild_tx(
         .prepare_cached(
             "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                     plaintext, kind, tags_json, recorded_at, received_at,
-                    invalidated, invalidation_reason, moderation_grant
+                    invalidated, invalidation_reason, moderation_grant, insert_order
              FROM app_events
              WHERE group_id_hex = ?1
              ORDER BY recorded_at, message_id_hex, insert_order",
@@ -5006,6 +5009,7 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
         invalidated: row.get::<_, i64>(11)? != 0,
         invalidation_reason: row.get(12)?,
         moderation_grant: row.get::<_, i64>(13)? != 0,
+        insert_order: row.get(14)?,
     })
 }
 

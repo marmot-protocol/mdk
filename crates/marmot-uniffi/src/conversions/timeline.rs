@@ -513,8 +513,9 @@ pub struct TimelineMessageRecordFfi {
     /// unreadable agent item.
     pub agent_item: Option<AgentItemFfi>,
     /// True for an agent item whose first event this device does not hold,
-    /// such as one that began before this member joined: the row is its
-    /// earliest edit, at that edit's place, showing the latest version. Say
+    /// such as one that began before this member joined: the row is the
+    /// first edit of it this device received, at that edit's place, showing
+    /// the latest version. Say
     /// the item started earlier. False once the first event arrives.
     pub agent_item_first_event_missing: bool,
     pub reactions: TimelineReactionSummaryFfi,
