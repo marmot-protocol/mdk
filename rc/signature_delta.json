@@ -1,0 +1,439 @@
+{
+  "baseline_sha": "3fce95465cdea1edc8456dbd1c6691d1c8dc1f2e",
+  "baseline_tag": "v0.19.0",
+  "baseline_version": "0.19.0",
+  "c_abi": {
+    "breaking": [
+      "changed C type `MarmotEvent`",
+      "changed C type `MarmotEvent_Tag`",
+      "changed C type `MarmotLocalSendStatus`",
+      "changed C type `MarmotNotificationTrafficClass`",
+      "changed C type `MarmotOnboardingIssue`",
+      "changed C type `MarmotOnboardingSnapshot`",
+      "changed C type `MarmotTimelineMessageRecord`",
+      "changed C type `MarmotTimelineReplyPreview`",
+      "changed C type `MarmotTimelineUpdateTrigger`",
+      "changed C type `enum MarmotStatus`"
+    ],
+    "functions": {
+      "added": [
+        {
+          "name": "marmot_account_relay_health",
+          "signature": "MarmotStatus marmot_account_relay_health(const struct MarmotClient *client, const char *account_ref, struct MarmotAccountRelayHealth **out);",
+          "source": "include/marmot.h#L11159"
+        },
+        {
+          "name": "marmot_account_relay_health_free",
+          "signature": "void marmot_account_relay_health_free(struct MarmotAccountRelayHealth *ptr);",
+          "source": "include/marmot.h#L17052"
+        },
+        {
+          "name": "marmot_begin_onboarding_with_options",
+          "signature": "MarmotStatus marmot_begin_onboarding_with_options(const struct MarmotClient *client, const char *nsec, const char *const *default_relays, uintptr_t default_relays_len, const char *const *discovery_relays, uintptr_t discovery_relays_len, const char *const *inbox_relays, uintptr_t inbox_relays_len, uint32_t flags, struct MarmotOnboardingSnapshot **out);",
+          "source": "include/marmot.h#L13322"
+        },
+        {
+          "name": "marmot_check_account_relays",
+          "signature": "MarmotStatus marmot_check_account_relays(const struct MarmotClient *client, const char *account_ref, struct MarmotAccountRelayHealth **out);",
+          "source": "include/marmot.h#L11181"
+        },
+        {
+          "name": "marmot_invite_deliveries",
+          "signature": "MarmotStatus marmot_invite_deliveries(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, struct MarmotInviteDeliveryList **out);",
+          "source": "include/marmot.h#L9848"
+        },
+        {
+          "name": "marmot_invite_delivery_list_free",
+          "signature": "void marmot_invite_delivery_list_free(struct MarmotInviteDeliveryList *list);",
+          "source": "include/marmot.h#L16527"
+        },
+        {
+          "name": "marmot_send_custom_event_with_client_token",
+          "signature": "MarmotStatus marmot_send_custom_event_with_client_token(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, uint64_t kind, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *content, const char *client_token, struct MarmotLocalSendAcceptance **out);",
+          "source": "include/marmot.h#L13162"
+        },
+        {
+          "name": "marmot_submit_tagged_reply",
+          "signature": "MarmotStatus marmot_submit_tagged_reply(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *target_message_id, const char *text, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *client_token, struct MarmotLocalSendAcceptance **out);",
+          "source": "include/marmot.h#L13121"
+        },
+        {
+          "name": "marmot_submit_tagged_sticker",
+          "signature": "MarmotStatus marmot_submit_tagged_sticker(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *pack_coordinate, const char *shortcode, const char *plaintext_sha256, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *client_token, struct MarmotLocalSendAcceptance **out);",
+          "source": "include/marmot.h#L13927"
+        },
+        {
+          "name": "marmot_submit_tagged_text",
+          "signature": "MarmotStatus marmot_submit_tagged_text(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *text, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *client_token, struct MarmotLocalSendAcceptance **out);",
+          "source": "include/marmot.h#L13103"
+        },
+        {
+          "name": "marmot_submit_thread_message",
+          "signature": "MarmotStatus marmot_submit_thread_message(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *parent_message_id, const char *text, const struct MarmotMediaAttachmentReference *attachments, uintptr_t attachments_len, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *client_token, struct MarmotLocalSendAcceptance **out);",
+          "source": "include/marmot.h#L12721"
+        }
+      ],
+      "changed": [],
+      "removed": []
+    },
+    "types": {
+      "added": [
+        {
+          "definition": "typedef struct MarmotAccountRelayHealth {{ enum MarmotRelayListPresence inbox_list; struct MarmotRelayHealthRow *rows; uintptr_t rows_len; struct MarmotAccountRelayWarning *warnings; uintptr_t warnings_len; bool has_highest_severity; enum MarmotRelayWarningSeverity highest_severity; bool falls_back_to_defaults; } MarmotAccountRelayHealth;",
+          "name": "MarmotAccountRelayHealth"
+        },
+        {
+          "definition": "typedef struct MarmotAccountRelayWarning {{ enum MarmotRelayWarningKind kind; enum MarmotRelayWarningSeverity severity; char **relays; uintptr_t relays_len; enum MarmotRelayRepairAction *actions; uintptr_t actions_len; } MarmotAccountRelayWarning;",
+          "name": "MarmotAccountRelayWarning"
+        },
+        {
+          "definition": "typedef struct MarmotAgentItem {{ uint64_t version; enum MarmotAgentItemState state; char *title; char *harness; char *item_id; uint64_t seq; char *item_type; char *fields_json; char *session; char *turn; char *started_by_message_id_hex; char **settles; uintptr_t settles_len; bool alerts; } MarmotAgentItem;",
+          "name": "MarmotAgentItem"
+        },
+        {
+          "definition": "typedef enum MarmotAgentItemState {{ MARMOT_AGENT_ITEM_STATE_RUNNING, MARMOT_AGENT_ITEM_STATE_WAITING, MARMOT_AGENT_ITEM_STATE_DONE, MARMOT_AGENT_ITEM_STATE_FAILED, MARMOT_AGENT_ITEM_STATE_DECLINED, MARMOT_AGENT_ITEM_STATE_CANCELLED, } MarmotAgentItemState;",
+          "name": "MarmotAgentItemState"
+        },
+        {
+          "definition": "typedef struct MarmotEvent_InviteDeliveryChanged_Body {{ char *account_id_hex; char *account_label; struct MarmotInviteDelivery delivery; } MarmotEvent_InviteDeliveryChanged_Body;",
+          "name": "MarmotEvent_InviteDeliveryChanged_Body"
+        },
+        {
+          "definition": "typedef struct MarmotEvent_RelayHealthChanged_Body {{ char *account_id_hex; char *account_label; } MarmotEvent_RelayHealthChanged_Body;",
+          "name": "MarmotEvent_RelayHealthChanged_Body"
+        },
+        {
+          "definition": "typedef enum MarmotInviteCancelReason {{ MARMOT_INVITE_CANCEL_REASON_SUPERSEDED_BY_GROUP_CHANGE, MARMOT_INVITE_CANCEL_REASON_WITHDRAWN, } MarmotInviteCancelReason;",
+          "name": "MarmotInviteCancelReason"
+        },
+        {
+          "definition": "typedef struct MarmotInviteDelivery {{ char *group_id_hex; char *recipient_hex; char *invite_id_hex; struct MarmotInviteDeliveryState state; uint32_t device_count; uint32_t accepted_device_count; struct MarmotInviteDeviceDelivery *devices; uintptr_t devices_len; } MarmotInviteDelivery;",
+          "name": "MarmotInviteDelivery"
+        },
+        {
+          "definition": "typedef struct MarmotInviteDeliveryList {{ struct MarmotInviteDelivery *items; uintptr_t len; } MarmotInviteDeliveryList;",
+          "name": "MarmotInviteDeliveryList"
+        },
+        {
+          "definition": "typedef enum MarmotInviteDeliveryProblem {{ MARMOT_INVITE_DELIVERY_PROBLEM_NO_INBOX_RELAYS, MARMOT_INVITE_DELIVERY_PROBLEM_REFUSED_BY_RELAYS, MARMOT_INVITE_DELIVERY_PROBLEM_RELAYS_UNREACHABLE, MARMOT_INVITE_DELIVERY_PROBLEM_MIXED, MARMOT_INVITE_DELIVERY_PROBLEM_TOO_LARGE, MARMOT_INVITE_DELIVERY_PROBLEM_KEY_PACKAGE_RETIRED, MARMOT_INVITE_DELIVERY_PROBLEM_INBOX_LOOKUP_FAILED, } MarmotInviteDeliveryProblem;",
+          "name": "MarmotInviteDeliveryProblem"
+        },
+        {
+          "definition": "typedef struct MarmotInviteDeliveryState {{ enum MarmotInviteDeliveryStateKind kind; bool has_problem; enum MarmotInviteDeliveryProblem problem; enum MarmotInviteCancelReason cancel_reason; } MarmotInviteDeliveryState;",
+          "name": "MarmotInviteDeliveryState"
+        },
+        {
+          "definition": "typedef enum MarmotInviteDeliveryStateKind {{ MARMOT_INVITE_DELIVERY_STATE_KIND_WAITING, MARMOT_INVITE_DELIVERY_STATE_KIND_SENDING, MARMOT_INVITE_DELIVERY_STATE_KIND_RELAY_ACCEPTED, MARMOT_INVITE_DELIVERY_STATE_KIND_UNDELIVERABLE, MARMOT_INVITE_DELIVERY_STATE_KIND_CANCELLED, } MarmotInviteDeliveryStateKind;",
+          "name": "MarmotInviteDeliveryStateKind"
+        },
+        {
+          "definition": "typedef struct MarmotInviteDeviceDelivery {{ char *delivery_id_hex; struct MarmotInviteDeliveryState state; uint64_t created_at; bool has_deliver_until; uint64_t deliver_until; uint32_t attempt_count; bool has_last_attempt_at; uint64_t last_attempt_at; bool has_accepted_at; uint64_t accepted_at; struct MarmotInviteRelayCounts relays; } MarmotInviteDeviceDelivery;",
+          "name": "MarmotInviteDeviceDelivery"
+        },
+        {
+          "definition": "typedef struct MarmotInviteRelayCounts {{ uint32_t total; uint32_t accepted; uint32_t refused; uint32_t unreachable; uint32_t untried; } MarmotInviteRelayCounts;",
+          "name": "MarmotInviteRelayCounts"
+        },
+        {
+          "definition": "typedef struct MarmotOnboardingCreatedInboxList {{ char **relays; uintptr_t relays_len; char *event_id; uint64_t published_at; } MarmotOnboardingCreatedInboxList;",
+          "name": "MarmotOnboardingCreatedInboxList"
+        },
+        {
+          "definition": "typedef enum MarmotRelayHealthFault {{ MARMOT_RELAY_HEALTH_FAULT_RETIRED, MARMOT_RELAY_HEALTH_FAULT_INVALID, MARMOT_RELAY_HEALTH_FAULT_UNSAFE, MARMOT_RELAY_HEALTH_FAULT_AUTHENTICATION_REQUIRED, MARMOT_RELAY_HEALTH_FAULT_PAYMENT_REQUIRED, MARMOT_RELAY_HEALTH_FAULT_RESTRICTED, MARMOT_RELAY_HEALTH_FAULT_UNREACHABLE, MARMOT_RELAY_HEALTH_FAULT_TIMED_OUT, MARMOT_RELAY_HEALTH_FAULT_UNEXPLAINED, } MarmotRelayHealthFault;",
+          "name": "MarmotRelayHealthFault"
+        },
+        {
+          "definition": "typedef struct MarmotRelayHealthRow {{ char *url; enum MarmotRelayRole *roles; uintptr_t roles_len; enum MarmotRelayHealthState state; bool has_fault; enum MarmotRelayHealthFault fault; enum MarmotRelayStatus liveness; bool has_checked_at_unix; uint64_t checked_at_unix; bool checking; } MarmotRelayHealthRow;",
+          "name": "MarmotRelayHealthRow"
+        },
+        {
+          "definition": "typedef enum MarmotRelayHealthState {{ MARMOT_RELAY_HEALTH_STATE_UNCHECKED, MARMOT_RELAY_HEALTH_STATE_HEALTHY, MARMOT_RELAY_HEALTH_STATE_SUSPECTED, MARMOT_RELAY_HEALTH_STATE_FAILING, MARMOT_RELAY_HEALTH_STATE_NOT_ALLOWED, } MarmotRelayHealthState;",
+          "name": "MarmotRelayHealthState"
+        },
+        {
+          "definition": "typedef enum MarmotRelayListPresence {{ MARMOT_RELAY_LIST_PRESENCE_UNKNOWN, MARMOT_RELAY_LIST_PRESENCE_PUBLISHED, } MarmotRelayListPresence;",
+          "name": "MarmotRelayListPresence"
+        },
+        {
+          "definition": "typedef enum MarmotRelayRepairAction {{ MARMOT_RELAY_REPAIR_ACTION_ADD_INBOX_RELAY, MARMOT_RELAY_REPAIR_ACTION_REMOVE_INBOX_RELAY, } MarmotRelayRepairAction;",
+          "name": "MarmotRelayRepairAction"
+        },
+        {
+          "definition": "typedef enum MarmotRelayRole {{ MARMOT_RELAY_ROLE_INBOX, MARMOT_RELAY_ROLE_WRITE, MARMOT_RELAY_ROLE_READ, } MarmotRelayRole;",
+          "name": "MarmotRelayRole"
+        },
+        {
+          "definition": "typedef enum MarmotRelayWarningKind {{ MARMOT_RELAY_WARNING_KIND_INBOX_LIST_EMPTY, MARMOT_RELAY_WARNING_KIND_NO_ALLOWED_INBOX_RELAY, MARMOT_RELAY_WARNING_KIND_INBOX_RELAYS_NOT_ALLOWED, MARMOT_RELAY_WARNING_KIND_SINGLE_INBOX_RELAY, MARMOT_RELAY_WARNING_KIND_INBOX_RELAY_FAILING, } MarmotRelayWarningKind;",
+          "name": "MarmotRelayWarningKind"
+        },
+        {
+          "definition": "typedef enum MarmotRelayWarningSeverity {{ MARMOT_RELAY_WARNING_SEVERITY_NOTICE, MARMOT_RELAY_WARNING_SEVERITY_WARNING, MARMOT_RELAY_WARNING_SEVERITY_CRITICAL, } MarmotRelayWarningSeverity;",
+          "name": "MarmotRelayWarningSeverity"
+        }
+      ],
+      "changed": [
+        {
+          "after": "typedef struct MarmotEvent {{ MarmotEvent_Tag tag; union { MarmotEvent_GroupJoined_Body GROUP_JOINED; MarmotEvent_GroupStateUpdated_Body GROUP_STATE_UPDATED; MarmotEvent_MessageReceived_Body MESSAGE_RECEIVED; MarmotEvent_ProjectionUpdated_Body PROJECTION_UPDATED; MarmotEvent_GroupEvent_Body GROUP_EVENT; MarmotEvent_AccountError_Body ACCOUNT_ERROR; MarmotEvent_WelcomeDeliveryPending_Body WELCOME_DELIVERY_PENDING; MarmotEvent_InviteDeliveryChanged_Body INVITE_DELIVERY_CHANGED; MarmotEvent_EpochStallEscalated_Body EPOCH_STALL_ESCALATED; MarmotEvent_GroupChangeSuperseded_Body GROUP_CHANGE_SUPERSEDED; MarmotEvent_HistoryNoticesChanged_Body HISTORY_NOTICES_CHANGED; MarmotEvent_LinkedDevicesChanged_Body LINKED_DEVICES_CHANGED; MarmotEvent_KeyPackageRefreshOverdueChanged_Body KEY_PACKAGE_REFRESH_OVERDUE_CHANGED; MarmotEvent_UnrecognizedSignInsChanged_Body UNRECOGNIZED_SIGN_INS_CHANGED; MarmotEvent_CompromiseWarningChanged_Body COMPROMISE_WARNING_CHANGED; MarmotEvent_DeviceLinkChanged_Body DEVICE_LINK_CHANGED; MarmotEvent_RecoveryStatusChanged_Body RECOVERY_STATUS_CHANGED; MarmotEvent_DeviceUnlinked_Body DEVICE_UNLINKED; MarmotEvent_ChatHistoryImportsChanged_Body CHAT_HISTORY_IMPORTS_CHANGED; MarmotEvent_RelayHealthChanged_Body RELAY_HEALTH_CHANGED; }; } MarmotEvent;",
+          "before": "typedef struct MarmotEvent {{ MarmotEvent_Tag tag; union { MarmotEvent_GroupJoined_Body GROUP_JOINED; MarmotEvent_GroupStateUpdated_Body GROUP_STATE_UPDATED; MarmotEvent_MessageReceived_Body MESSAGE_RECEIVED; MarmotEvent_ProjectionUpdated_Body PROJECTION_UPDATED; MarmotEvent_GroupEvent_Body GROUP_EVENT; MarmotEvent_AccountError_Body ACCOUNT_ERROR; MarmotEvent_WelcomeDeliveryPending_Body WELCOME_DELIVERY_PENDING; MarmotEvent_EpochStallEscalated_Body EPOCH_STALL_ESCALATED; MarmotEvent_GroupChangeSuperseded_Body GROUP_CHANGE_SUPERSEDED; MarmotEvent_HistoryNoticesChanged_Body HISTORY_NOTICES_CHANGED; MarmotEvent_LinkedDevicesChanged_Body LINKED_DEVICES_CHANGED; MarmotEvent_KeyPackageRefreshOverdueChanged_Body KEY_PACKAGE_REFRESH_OVERDUE_CHANGED; MarmotEvent_UnrecognizedSignInsChanged_Body UNRECOGNIZED_SIGN_INS_CHANGED; MarmotEvent_CompromiseWarningChanged_Body COMPROMISE_WARNING_CHANGED; MarmotEvent_DeviceLinkChanged_Body DEVICE_LINK_CHANGED; MarmotEvent_RecoveryStatusChanged_Body RECOVERY_STATUS_CHANGED; MarmotEvent_DeviceUnlinked_Body DEVICE_UNLINKED; MarmotEvent_ChatHistoryImportsChanged_Body CHAT_HISTORY_IMPORTS_CHANGED; }; } MarmotEvent;",
+          "name": "MarmotEvent"
+        },
+        {
+          "after": "typedef enum MarmotEvent_Tag {{ MARMOT_EVENT_GROUP_JOINED, MARMOT_EVENT_GROUP_STATE_UPDATED, MARMOT_EVENT_MESSAGE_RECEIVED, MARMOT_EVENT_PROJECTION_UPDATED, MARMOT_EVENT_GROUP_EVENT, MARMOT_EVENT_ACCOUNT_ERROR, MARMOT_EVENT_WELCOME_DELIVERY_PENDING, MARMOT_EVENT_INVITE_DELIVERY_CHANGED, MARMOT_EVENT_EPOCH_STALL_ESCALATED, MARMOT_EVENT_GROUP_CHANGE_SUPERSEDED, MARMOT_EVENT_HISTORY_NOTICES_CHANGED, MARMOT_EVENT_LINKED_DEVICES_CHANGED, MARMOT_EVENT_KEY_PACKAGE_REFRESH_OVERDUE_CHANGED, MARMOT_EVENT_UNRECOGNIZED_SIGN_INS_CHANGED, MARMOT_EVENT_COMPROMISE_WARNING_CHANGED, MARMOT_EVENT_DEVICE_LINK_CHANGED, MARMOT_EVENT_RECOVERY_STATUS_CHANGED, MARMOT_EVENT_DEVICE_UNLINKED, MARMOT_EVENT_CHAT_HISTORY_IMPORTS_CHANGED, MARMOT_EVENT_RELAY_HEALTH_CHANGED, } MarmotEvent_Tag;",
+          "before": "typedef enum MarmotEvent_Tag {{ MARMOT_EVENT_GROUP_JOINED, MARMOT_EVENT_GROUP_STATE_UPDATED, MARMOT_EVENT_MESSAGE_RECEIVED, MARMOT_EVENT_PROJECTION_UPDATED, MARMOT_EVENT_GROUP_EVENT, MARMOT_EVENT_ACCOUNT_ERROR, MARMOT_EVENT_WELCOME_DELIVERY_PENDING, MARMOT_EVENT_EPOCH_STALL_ESCALATED, MARMOT_EVENT_GROUP_CHANGE_SUPERSEDED, MARMOT_EVENT_HISTORY_NOTICES_CHANGED, MARMOT_EVENT_LINKED_DEVICES_CHANGED, MARMOT_EVENT_KEY_PACKAGE_REFRESH_OVERDUE_CHANGED, MARMOT_EVENT_UNRECOGNIZED_SIGN_INS_CHANGED, MARMOT_EVENT_COMPROMISE_WARNING_CHANGED, MARMOT_EVENT_DEVICE_LINK_CHANGED, MARMOT_EVENT_RECOVERY_STATUS_CHANGED, MARMOT_EVENT_DEVICE_UNLINKED, MARMOT_EVENT_CHAT_HISTORY_IMPORTS_CHANGED, } MarmotEvent_Tag;",
+          "name": "MarmotEvent_Tag"
+        },
+        {
+          "after": "typedef struct MarmotLocalSendStatus {{ uint32_t state; struct MarmotSendSummary *summary; char *message_id_hex; } MarmotLocalSendStatus;",
+          "before": "typedef struct MarmotLocalSendStatus {{ uint32_t state; struct MarmotSendSummary *summary; } MarmotLocalSendStatus;",
+          "name": "MarmotLocalSendStatus"
+        },
+        {
+          "after": "typedef enum MarmotNotificationTrafficClass {{ MARMOT_NOTIFICATION_TRAFFIC_CLASS_STANDARD, } MarmotNotificationTrafficClass;",
+          "before": "typedef enum MarmotNotificationTrafficClass {{ MARMOT_NOTIFICATION_TRAFFIC_CLASS_STANDARD, MARMOT_NOTIFICATION_TRAFFIC_CLASS_AGENT_ACTIVITY, } MarmotNotificationTrafficClass;",
+          "name": "MarmotNotificationTrafficClass"
+        },
+        {
+          "after": "typedef enum MarmotOnboardingIssue {{ MARMOT_ONBOARDING_ISSUE_MISSING, MARMOT_ONBOARDING_ISSUE_MALFORMED, MARMOT_ONBOARDING_ISSUE_FUTURE_DATED, MARMOT_ONBOARDING_ISSUE_INVALID_RELAY, MARMOT_ONBOARDING_ISSUE_RETIRED_RELAY, MARMOT_ONBOARDING_ISSUE_UNSAFE_RELAY, MARMOT_ONBOARDING_ISSUE_UNREACHABLE, MARMOT_ONBOARDING_ISSUE_TIMED_OUT, MARMOT_ONBOARDING_ISSUE_AUTHENTICATION_REQUIRED, MARMOT_ONBOARDING_ISSUE_PAYMENT_REQUIRED, MARMOT_ONBOARDING_ISSUE_ACCESS_RESTRICTED, MARMOT_ONBOARDING_ISSUE_NO_USABLE_ROUTE, MARMOT_ONBOARDING_ISSUE_PUBLICATION_FAILED, MARMOT_ONBOARDING_ISSUE_SIGNER_UNAVAILABLE, MARMOT_ONBOARDING_ISSUE_SIGNER_REJECTED, MARMOT_ONBOARDING_ISSUE_RECORD_CHANGED, MARMOT_ONBOARDING_ISSUE_INTERRUPTED, MARMOT_ONBOARDING_ISSUE_TOO_MANY_RELAYS, MARMOT_ONBOARDING_ISSUE_MULTI_DEVICE_UNSUPPORTED, MARMOT_ONBOARDING_ISSUE_OTHER_INSTALLATION_POSSIBLE, MARMOT_ONBOARDING_ISSUE_DISCOVERY_INCOMPLETE, MARMOT_ONBOARDING_ISSUE_INSPECTION_COMPLETED, MARMOT_ONBOARDING_ISSUE_RATE_LIMITED, } MarmotOnboardingIssue;",
+          "before": "typedef enum MarmotOnboardingIssue {{ MARMOT_ONBOARDING_ISSUE_MISSING, MARMOT_ONBOARDING_ISSUE_MALFORMED, MARMOT_ONBOARDING_ISSUE_FUTURE_DATED, MARMOT_ONBOARDING_ISSUE_INVALID_RELAY, MARMOT_ONBOARDING_ISSUE_RETIRED_RELAY, MARMOT_ONBOARDING_ISSUE_UNSAFE_RELAY, MARMOT_ONBOARDING_ISSUE_UNREACHABLE, MARMOT_ONBOARDING_ISSUE_TIMED_OUT, MARMOT_ONBOARDING_ISSUE_AUTHENTICATION_REQUIRED, MARMOT_ONBOARDING_ISSUE_PAYMENT_REQUIRED, MARMOT_ONBOARDING_ISSUE_ACCESS_RESTRICTED, MARMOT_ONBOARDING_ISSUE_NO_USABLE_ROUTE, MARMOT_ONBOARDING_ISSUE_PUBLICATION_FAILED, MARMOT_ONBOARDING_ISSUE_SIGNER_UNAVAILABLE, MARMOT_ONBOARDING_ISSUE_SIGNER_REJECTED, MARMOT_ONBOARDING_ISSUE_RECORD_CHANGED, MARMOT_ONBOARDING_ISSUE_INTERRUPTED, MARMOT_ONBOARDING_ISSUE_TOO_MANY_RELAYS, MARMOT_ONBOARDING_ISSUE_MULTI_DEVICE_UNSUPPORTED, MARMOT_ONBOARDING_ISSUE_OTHER_INSTALLATION_POSSIBLE, MARMOT_ONBOARDING_ISSUE_DISCOVERY_INCOMPLETE, MARMOT_ONBOARDING_ISSUE_INSPECTION_COMPLETED, } MarmotOnboardingIssue;",
+          "name": "MarmotOnboardingIssue"
+        },
+        {
+          "after": "typedef struct MarmotOnboardingSnapshot {{ char *account_id_hex; char *recovery_epoch; uint64_t revision; bool ready; struct MarmotOnboardingStepState *steps; uintptr_t steps_len; struct MarmotOnboardingRepairProposal *proposal; struct MarmotOnboardingSingleDeviceNotice *single_device_notice; bool cancellation_pending; struct MarmotOnboardingCreatedInboxList *created_inbox_list; } MarmotOnboardingSnapshot;",
+          "before": "typedef struct MarmotOnboardingSnapshot {{ char *account_id_hex; char *recovery_epoch; uint64_t revision; bool ready; struct MarmotOnboardingStepState *steps; uintptr_t steps_len; struct MarmotOnboardingRepairProposal *proposal; struct MarmotOnboardingSingleDeviceNotice *single_device_notice; bool cancellation_pending; } MarmotOnboardingSnapshot;",
+          "name": "MarmotOnboardingSnapshot"
+        },
+        {
+          "after": "typedef struct MarmotTimelineMessageRecord {{ char *message_id_hex; bool has_reports; struct MarmotPollProjection *poll; char *source_message_id_hex; bool has_source_epoch; uint64_t source_epoch; bool has_retention_seconds; uint64_t retention_seconds; bool has_retention_expires_at; uint64_t retention_expires_at; char *direction; char *group_id_hex; char *sender; char *plaintext; struct MarmotMarkdownDocument content_tokens; uint64_t kind; struct MarmotStickerRef *sticker; struct MarmotMessageTag *tags; uintptr_t tags_len; uint64_t timeline_at; uint64_t received_at; char *reply_to_message_id_hex; struct MarmotTimelineReplyPreview *reply_preview; char *media_json; struct MarmotMediaAttachmentOutcome *media; uintptr_t media_len; struct MarmotGroupSystemEvent *group_system; struct MarmotAgentItem *agent_item; bool agent_item_first_event_missing; struct MarmotTimelineReactionSummary reactions; struct MarmotTimelineEditSummary *edit; bool deleted; enum MarmotDeletionSource deletion_source; char *deleted_by_message_id_hex; char *invalidation_status; bool recipient_confirmed; char *client_token; struct MarmotHistoryImportSource *imported_from; struct MarmotHistoryImportProvenance *history_import_provenance; struct MarmotTimelineThreadRef *thread; } MarmotTimelineMessageRecord;",
+          "before": "typedef struct MarmotTimelineMessageRecord {{ char *message_id_hex; bool has_reports; struct MarmotPollProjection *poll; char *source_message_id_hex; bool has_source_epoch; uint64_t source_epoch; bool has_retention_seconds; uint64_t retention_seconds; bool has_retention_expires_at; uint64_t retention_expires_at; char *direction; char *group_id_hex; char *sender; char *plaintext; struct MarmotMarkdownDocument content_tokens; uint64_t kind; struct MarmotStickerRef *sticker; struct MarmotMessageTag *tags; uintptr_t tags_len; uint64_t timeline_at; uint64_t received_at; char *reply_to_message_id_hex; struct MarmotTimelineReplyPreview *reply_preview; char *media_json; struct MarmotMediaAttachmentOutcome *media; uintptr_t media_len; struct MarmotGroupSystemEvent *group_system; struct MarmotTimelineReactionSummary reactions; struct MarmotTimelineEditSummary *edit; bool deleted; enum MarmotDeletionSource deletion_source; char *deleted_by_message_id_hex; char *invalidation_status; bool recipient_confirmed; char *client_token; struct MarmotHistoryImportSource *imported_from; struct MarmotHistoryImportProvenance *history_import_provenance; struct MarmotTimelineThreadRef *thread; } MarmotTimelineMessageRecord;",
+          "name": "MarmotTimelineMessageRecord"
+        },
+        {
+          "after": "typedef struct MarmotTimelineReplyPreview {{ char *message_id_hex; char *sender; char *plaintext; struct MarmotMarkdownDocument content_tokens; uint64_t kind; struct MarmotStickerRef *sticker; char *media_json; struct MarmotMediaAttachmentOutcome *media; uintptr_t media_len; bool deleted; enum MarmotDeletionSource deletion_source; char *invalidation_status; struct MarmotTimelineThreadRef *thread; char *reply_to_message_id_hex; bool has_retention_seconds; uint64_t retention_seconds; bool has_retention_expires_at; uint64_t retention_expires_at; } MarmotTimelineReplyPreview;",
+          "before": "typedef struct MarmotTimelineReplyPreview {{ char *message_id_hex; char *sender; char *plaintext; struct MarmotMarkdownDocument content_tokens; uint64_t kind; struct MarmotStickerRef *sticker; char *media_json; struct MarmotMediaAttachmentOutcome *media; uintptr_t media_len; bool deleted; enum MarmotDeletionSource deletion_source; char *invalidation_status; struct MarmotTimelineThreadRef *thread; char *reply_to_message_id_hex; } MarmotTimelineReplyPreview;",
+          "name": "MarmotTimelineReplyPreview"
+        },
+        {
+          "after": "typedef enum MarmotTimelineUpdateTrigger {{ MARMOT_TIMELINE_UPDATE_TRIGGER_NEW_MESSAGE, MARMOT_TIMELINE_UPDATE_TRIGGER_MESSAGE_EDITED_OR_REPROJECTED, MARMOT_TIMELINE_UPDATE_TRIGGER_REACTION_ADDED, MARMOT_TIMELINE_UPDATE_TRIGGER_REACTION_REMOVED, MARMOT_TIMELINE_UPDATE_TRIGGER_MESSAGE_DELETED, MARMOT_TIMELINE_UPDATE_TRIGGER_REPLY_PREVIEW_CHANGED, MARMOT_TIMELINE_UPDATE_TRIGGER_AGENT_ITEM, MARMOT_TIMELINE_UPDATE_TRIGGER_GROUP_SYSTEM, MARMOT_TIMELINE_UPDATE_TRIGGER_CUSTOM_EVENT, MARMOT_TIMELINE_UPDATE_TRIGGER_DELIVERY_OR_SEND_STATE_CHANGED, MARMOT_TIMELINE_UPDATE_TRIGGER_RECEIPT_CHANGED, MARMOT_TIMELINE_UPDATE_TRIGGER_SNAPSHOT_REFRESH, } MarmotTimelineUpdateTrigger;",
+          "before": "typedef enum MarmotTimelineUpdateTrigger {{ MARMOT_TIMELINE_UPDATE_TRIGGER_NEW_MESSAGE, MARMOT_TIMELINE_UPDATE_TRIGGER_MESSAGE_EDITED_OR_REPROJECTED, MARMOT_TIMELINE_UPDATE_TRIGGER_REACTION_ADDED, MARMOT_TIMELINE_UPDATE_TRIGGER_REACTION_REMOVED, MARMOT_TIMELINE_UPDATE_TRIGGER_MESSAGE_DELETED, MARMOT_TIMELINE_UPDATE_TRIGGER_REPLY_PREVIEW_CHANGED, MARMOT_TIMELINE_UPDATE_TRIGGER_AGENT_ACTIVITY, MARMOT_TIMELINE_UPDATE_TRIGGER_AGENT_OPERATION, MARMOT_TIMELINE_UPDATE_TRIGGER_GROUP_SYSTEM, MARMOT_TIMELINE_UPDATE_TRIGGER_CUSTOM_EVENT, MARMOT_TIMELINE_UPDATE_TRIGGER_DELIVERY_OR_SEND_STATE_CHANGED, MARMOT_TIMELINE_UPDATE_TRIGGER_RECEIPT_CHANGED, MARMOT_TIMELINE_UPDATE_TRIGGER_SNAPSHOT_REFRESH, } MarmotTimelineUpdateTrigger;",
+          "name": "MarmotTimelineUpdateTrigger"
+        },
+        {
+          "after": "enum MarmotStatus #if defined(__cplusplus) || __STDC_VERSION__ >= 202311L : int32_t #endif {{ MARMOT_STATUS_OK = 0, MARMOT_STATUS_NULL_POINTER = 1, MARMOT_STATUS_INVALID_UTF8 = 2, MARMOT_STATUS_PANIC_CAUGHT = 3, MARMOT_STATUS_TIMEOUT = 4, MARMOT_STATUS_CLOSED = 5, MARMOT_STATUS_INVALID_ARGUMENT = 6, MARMOT_STATUS_DUPLICATE_IDENTITY = 10, MARMOT_STATUS_UNKNOWN_ACCOUNT = 11, MARMOT_STATUS_UNKNOWN_GROUP = 12, MARMOT_STATUS_INVALID_HEX = 13, MARMOT_STATUS_INVALID_IDENTITY = 14, MARMOT_STATUS_MISSING_KEY_PACKAGE = 15, MARMOT_STATUS_PUBLISH = 16, MARMOT_STATUS_TRANSPORT_CLOSED = 17, MARMOT_STATUS_RUNTIME_STOPPING = 18, MARMOT_STATUS_NOT_GROUP_ADMIN = 19, MARMOT_STATUS_ADMIN_CANNOT_SELF_REMOVE = 20, MARMOT_STATUS_WOULD_REMOVE_LAST_ADMIN = 21, MARMOT_STATUS_MEMBER_NOT_IN_GROUP = 22, MARMOT_STATUS_ALREADY_ADMIN = 23, MARMOT_STATUS_NOT_ADMIN = 24, MARMOT_STATUS_STORAGE_BUSY = 25, MARMOT_STATUS_SECRET_NOT_FOUND = 26, MARMOT_STATUS_KEYSTORE_UNAVAILABLE = 27, MARMOT_STATUS_EMPTY_PASSPHRASE = 28, MARMOT_STATUS_ENCRYPTION_FAILED = 29, MARMOT_STATUS_IO = 30, MARMOT_STATUS_RUNTIME = 31, MARMOT_STATUS_EXTERNAL_SIGNER_UNAVAILABLE = 32, MARMOT_STATUS_EXTERNAL_SIGNER_MISMATCH = 33, MARMOT_STATUS_EXTERNAL_SIGNER_REJECTED = 34, MARMOT_STATUS_INVALID_GROUP_MEMBERSHIP_PAGE = 35, MARMOT_STATUS_GROUP_HYDRATION_PENDING = 36, MARMOT_STATUS_INVALID_CHAT_PIN = 37, MARMOT_STATUS_INVALID_MESSAGE_DRAFT = 38, MARMOT_STATUS_INVALID_MEDIA_REFERENCE = 39, MARMOT_STATUS_INVALID_KEY_PACKAGE_EVENT = 40, MARMOT_STATUS_FOLLOW_LIST_UNAVAILABLE = 41, MARMOT_STATUS_RUNTIME_BUSY = 42, MARMOT_STATUS_ACCOUNT_SESSION_BUSY = 43, MARMOT_STATUS_ACCOUNT_SETUP_RECOVERY_REQUIRED = 44, MARMOT_STATUS_ACCOUNT_SETUP_RETRY_REQUIRED = 45, MARMOT_STATUS_ACCOUNT_SETUP_RESET_NOT_APPLICABLE = 46, MARMOT_STATUS_ACCOUNT_SETUP_KEY_PACKAGE_RECOVERY_AVAILABLE = 47, MARMOT_STATUS_ACCOUNT_CATCH_UP = 48, MARMOT_STATUS_LEAVE_ALREADY_REQUESTED = 49, MARMOT_STATUS_DISBANDING_UNSUPPORTED_MEMBERS = 50, MARMOT_STATUS_DISBANDING_NOT_ENABLED = 51, MARMOT_STATUS_GROUP_DISBANDING = 52, MARMOT_STATUS_STORAGE_CLOSED = 53, MARMOT_STATUS_GROUP_SEND_QUEUE_FULL = 54, MARMOT_STATUS_CREATED_GROUP_PROJECTION_UNAVAILABLE = 55, MARMOT_STATUS_INVALID_CACHED_IDENTITY_PAGE = 56, MARMOT_STATUS_DIRECT_CONVERSATION_INDEX_NOT_READY = 57, MARMOT_STATUS_GROUP_UNRECOVERABLE_REPAIR_REQUIRED = 58, MARMOT_STATUS_ACCOUNT_WORKER_BUSY = 59, MARMOT_STATUS_ACCOUNT_WORKER_RESPONSE_TIMED_OUT = 60, MARMOT_STATUS_GROUP_INVITE_NOT_PENDING = 61, MARMOT_STATUS_MISSING_MEMBER_INBOX_ROUTE = 62, MARMOT_STATUS_GROUP_REMOVED = 63, MARMOT_STATUS_ONBOARDING_ACTION_UNAVAILABLE = 64, MARMOT_STATUS_ONBOARDING_REQUIRED = 65, MARMOT_STATUS_CONSENT_REQUIRED = 66, MARMOT_STATUS_INVALID_PRODUCT_ANALYTICS_CONFIGURATION = 67, MARMOT_STATUS_INVALID_PRODUCT_OBSERVATION = 68, MARMOT_STATUS_CHAT_PRESENTATION_NOT_READY = 69, MARMOT_STATUS_MEDIA_ATTACHMENT_REJECTED = 70, MARMOT_STATUS_MEDIA_UNFETCHABLE = 71, MARMOT_STATUS_MEDIA_DOWNLOAD_FAILED = 72, MARMOT_STATUS_CHAT_WINDOW_INVALID_LIMIT = 73, MARMOT_STATUS_CHAT_WINDOW_STALE = 74, MARMOT_STATUS_CHAT_WINDOW_ANCHOR_OUTSIDE = 75, MARMOT_STATUS_CHAT_WINDOW_CLOSED = 76, MARMOT_STATUS_CHAT_WINDOW_QUERY = 77, MARMOT_STATUS_USER_BLOCKED = 78, MARMOT_STATUS_BLOCK_LIST_UNAVAILABLE = 79, MARMOT_STATUS_BLOCK_PUBLICATION_UNCERTAIN = 80, MARMOT_STATUS_CONVERSATION_WINDOW_INVALID_LIMIT = 81, MARMOT_STATUS_CONVERSATION_WINDOW_STALE = 82, MARMOT_STATUS_CONVERSATION_WINDOW_WRONG_GENERATION = 83, MARMOT_STATUS_CONVERSATION_WINDOW_ANCHOR_OUTSIDE = 84, MARMOT_STATUS_CONVERSATION_WINDOW_CLOSED = 85, MARMOT_STATUS_CONVERSATION_WINDOW_NOT_READY = 86, MARMOT_STATUS_CONVERSATION_WINDOW_TIMED_OUT = 87, MARMOT_STATUS_CONVERSATION_WINDOW_INVALID_TARGET = 88, MARMOT_STATUS_CONVERSATION_WINDOW_QUERY = 89, MARMOT_STATUS_CONVERSATION_WINDOW_PRESENTATION = 90, MARMOT_STATUS_MESSAGE_DRAFT_REVISION_CONFLICT = 91, MARMOT_STATUS_CONVERSATION_WINDOW_MESSAGE_NOT_RETAINED = 92, MARMOT_STATUS_ATTACHMENT_MODE_REQUIRED = 93, MARMOT_STATUS_ATTACHMENT_ACCOUNT_SIGNED_OUT = 94, MARMOT_STATUS_INVALID_APP_COMPONENT = 95, MARMOT_STATUS_MODERATION_REPORTING_NOT_CONFIGURED = 96, MARMOT_STATUS_INVALID_MODERATION_REPORT_CONFIG = 97, MARMOT_STATUS_INVALID_REPORTED_PUBLIC_KEY = 98, MARMOT_STATUS_CANNOT_REPORT_SELF = 99, MARMOT_STATUS_MODERATION_REPORT_RATE_LIMITED = 100, MARMOT_STATUS_GROUP_CATCHING_UP = 101, MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED = 102, MARMOT_STATUS_INVALID_PUBLIC_EVENT_REFERENCES = 103, MARMOT_STATUS_DIRECTORY_LOOKUP_INCOMPLETE = 104, MARMOT_STATUS_INVALID_EDIT_TARGET = 105, MARMOT_STATUS_STORAGE_FULL = 106, MARMOT_STATUS_FOLLOW_LIST_TOO_LARGE = 107, MARMOT_STATUS_MEDIA_REFERENCE_STALE_EPOCH = 108, MARMOT_STATUS_MEDIA_REFERENCE_EPOCH_UNSETTLED = 109, MARMOT_STATUS_ACCOUNT_DEVICES_ACTIVATION_REFUSED = 110, MARMOT_STATUS_INVALID_STICKER = 111, MARMOT_STATUS_STICKER_NOT_FOUND = 112, MARMOT_STATUS_STICKER_NETWORK = 113, MARMOT_STATUS_STICKER_IMPORT = 114, MARMOT_STATUS_STICKER_IMPORT_UNSUPPORTED = 115, MARMOT_STATUS_ACCOUNT_UNLINKED = 116, MARMOT_STATUS_GROUP_RECOVERY_UNSETTLED = 117, MARMOT_STATUS_GROUP_RECOVERY_SOURCE_MISMATCH = 118, MARMOT_STATUS_EVENT_TOO_LARGE = 119, MARMOT_STATUS_INVALID_CHAT_LIST_QUERY = 120, MARMOT_STATUS_INVALID_EMOJI_SET = 121, MARMOT_STATUS_EMOJI_SET_NOT_FOUND = 122, MARMOT_STATUS_EMOJI_SET_NETWORK = 123, MARMOT_STATUS_EMOJI_IMAGE_TOO_LARGE = 124, MARMOT_STATUS_EMOJI_IMAGE_UNSUPPORTED = 125, MARMOT_STATUS_EMOJI_SET_LIMIT = 126, MARMOT_STATUS_EMOJI_SET_CHANGED = 127, MARMOT_STATUS_EMOJI_SET_INSTALL_CANCELLED = 128, MARMOT_STATUS_LEAVE_NOT_BLOCKED = 129, MARMOT_STATUS_CREATED_GROUP_MEMBER_REPORT_UNAVAILABLE = 130, MARMOT_STATUS_GROUP_COMMIT_PENDING = 131, MARMOT_STATUS_REACTION_NOT_FOUND = 132, MARMOT_STATUS_NO_USABLE_RELAY = 133, MARMOT_STATUS_INCOMPATIBLE_KEY_PACKAGE = 134, MARMOT_STATUS_RELAY_CHECK_RUNNING = 135, } ;",
+          "before": "enum MarmotStatus #if defined(__cplusplus) || __STDC_VERSION__ >= 202311L : int32_t #endif {{ MARMOT_STATUS_OK = 0, MARMOT_STATUS_NULL_POINTER = 1, MARMOT_STATUS_INVALID_UTF8 = 2, MARMOT_STATUS_PANIC_CAUGHT = 3, MARMOT_STATUS_TIMEOUT = 4, MARMOT_STATUS_CLOSED = 5, MARMOT_STATUS_INVALID_ARGUMENT = 6, MARMOT_STATUS_DUPLICATE_IDENTITY = 10, MARMOT_STATUS_UNKNOWN_ACCOUNT = 11, MARMOT_STATUS_UNKNOWN_GROUP = 12, MARMOT_STATUS_INVALID_HEX = 13, MARMOT_STATUS_INVALID_IDENTITY = 14, MARMOT_STATUS_MISSING_KEY_PACKAGE = 15, MARMOT_STATUS_PUBLISH = 16, MARMOT_STATUS_TRANSPORT_CLOSED = 17, MARMOT_STATUS_RUNTIME_STOPPING = 18, MARMOT_STATUS_NOT_GROUP_ADMIN = 19, MARMOT_STATUS_ADMIN_CANNOT_SELF_REMOVE = 20, MARMOT_STATUS_WOULD_REMOVE_LAST_ADMIN = 21, MARMOT_STATUS_MEMBER_NOT_IN_GROUP = 22, MARMOT_STATUS_ALREADY_ADMIN = 23, MARMOT_STATUS_NOT_ADMIN = 24, MARMOT_STATUS_STORAGE_BUSY = 25, MARMOT_STATUS_SECRET_NOT_FOUND = 26, MARMOT_STATUS_KEYSTORE_UNAVAILABLE = 27, MARMOT_STATUS_EMPTY_PASSPHRASE = 28, MARMOT_STATUS_ENCRYPTION_FAILED = 29, MARMOT_STATUS_IO = 30, MARMOT_STATUS_RUNTIME = 31, MARMOT_STATUS_EXTERNAL_SIGNER_UNAVAILABLE = 32, MARMOT_STATUS_EXTERNAL_SIGNER_MISMATCH = 33, MARMOT_STATUS_EXTERNAL_SIGNER_REJECTED = 34, MARMOT_STATUS_INVALID_GROUP_MEMBERSHIP_PAGE = 35, MARMOT_STATUS_GROUP_HYDRATION_PENDING = 36, MARMOT_STATUS_INVALID_CHAT_PIN = 37, MARMOT_STATUS_INVALID_MESSAGE_DRAFT = 38, MARMOT_STATUS_INVALID_MEDIA_REFERENCE = 39, MARMOT_STATUS_INVALID_KEY_PACKAGE_EVENT = 40, MARMOT_STATUS_FOLLOW_LIST_UNAVAILABLE = 41, MARMOT_STATUS_RUNTIME_BUSY = 42, MARMOT_STATUS_ACCOUNT_SESSION_BUSY = 43, MARMOT_STATUS_ACCOUNT_SETUP_RECOVERY_REQUIRED = 44, MARMOT_STATUS_ACCOUNT_SETUP_RETRY_REQUIRED = 45, MARMOT_STATUS_ACCOUNT_SETUP_RESET_NOT_APPLICABLE = 46, MARMOT_STATUS_ACCOUNT_SETUP_KEY_PACKAGE_RECOVERY_AVAILABLE = 47, MARMOT_STATUS_ACCOUNT_CATCH_UP = 48, MARMOT_STATUS_LEAVE_ALREADY_REQUESTED = 49, MARMOT_STATUS_DISBANDING_UNSUPPORTED_MEMBERS = 50, MARMOT_STATUS_DISBANDING_NOT_ENABLED = 51, MARMOT_STATUS_GROUP_DISBANDING = 52, MARMOT_STATUS_STORAGE_CLOSED = 53, MARMOT_STATUS_GROUP_SEND_QUEUE_FULL = 54, MARMOT_STATUS_CREATED_GROUP_PROJECTION_UNAVAILABLE = 55, MARMOT_STATUS_INVALID_CACHED_IDENTITY_PAGE = 56, MARMOT_STATUS_DIRECT_CONVERSATION_INDEX_NOT_READY = 57, MARMOT_STATUS_GROUP_UNRECOVERABLE_REPAIR_REQUIRED = 58, MARMOT_STATUS_ACCOUNT_WORKER_BUSY = 59, MARMOT_STATUS_ACCOUNT_WORKER_RESPONSE_TIMED_OUT = 60, MARMOT_STATUS_GROUP_INVITE_NOT_PENDING = 61, MARMOT_STATUS_MISSING_MEMBER_INBOX_ROUTE = 62, MARMOT_STATUS_GROUP_REMOVED = 63, MARMOT_STATUS_ONBOARDING_ACTION_UNAVAILABLE = 64, MARMOT_STATUS_ONBOARDING_REQUIRED = 65, MARMOT_STATUS_CONSENT_REQUIRED = 66, MARMOT_STATUS_INVALID_PRODUCT_ANALYTICS_CONFIGURATION = 67, MARMOT_STATUS_INVALID_PRODUCT_OBSERVATION = 68, MARMOT_STATUS_CHAT_PRESENTATION_NOT_READY = 69, MARMOT_STATUS_MEDIA_ATTACHMENT_REJECTED = 70, MARMOT_STATUS_MEDIA_UNFETCHABLE = 71, MARMOT_STATUS_MEDIA_DOWNLOAD_FAILED = 72, MARMOT_STATUS_CHAT_WINDOW_INVALID_LIMIT = 73, MARMOT_STATUS_CHAT_WINDOW_STALE = 74, MARMOT_STATUS_CHAT_WINDOW_ANCHOR_OUTSIDE = 75, MARMOT_STATUS_CHAT_WINDOW_CLOSED = 76, MARMOT_STATUS_CHAT_WINDOW_QUERY = 77, MARMOT_STATUS_USER_BLOCKED = 78, MARMOT_STATUS_BLOCK_LIST_UNAVAILABLE = 79, MARMOT_STATUS_BLOCK_PUBLICATION_UNCERTAIN = 80, MARMOT_STATUS_CONVERSATION_WINDOW_INVALID_LIMIT = 81, MARMOT_STATUS_CONVERSATION_WINDOW_STALE = 82, MARMOT_STATUS_CONVERSATION_WINDOW_WRONG_GENERATION = 83, MARMOT_STATUS_CONVERSATION_WINDOW_ANCHOR_OUTSIDE = 84, MARMOT_STATUS_CONVERSATION_WINDOW_CLOSED = 85, MARMOT_STATUS_CONVERSATION_WINDOW_NOT_READY = 86, MARMOT_STATUS_CONVERSATION_WINDOW_TIMED_OUT = 87, MARMOT_STATUS_CONVERSATION_WINDOW_INVALID_TARGET = 88, MARMOT_STATUS_CONVERSATION_WINDOW_QUERY = 89, MARMOT_STATUS_CONVERSATION_WINDOW_PRESENTATION = 90, MARMOT_STATUS_MESSAGE_DRAFT_REVISION_CONFLICT = 91, MARMOT_STATUS_CONVERSATION_WINDOW_MESSAGE_NOT_RETAINED = 92, MARMOT_STATUS_ATTACHMENT_MODE_REQUIRED = 93, MARMOT_STATUS_ATTACHMENT_ACCOUNT_SIGNED_OUT = 94, MARMOT_STATUS_INVALID_APP_COMPONENT = 95, MARMOT_STATUS_MODERATION_REPORTING_NOT_CONFIGURED = 96, MARMOT_STATUS_INVALID_MODERATION_REPORT_CONFIG = 97, MARMOT_STATUS_INVALID_REPORTED_PUBLIC_KEY = 98, MARMOT_STATUS_CANNOT_REPORT_SELF = 99, MARMOT_STATUS_MODERATION_REPORT_RATE_LIMITED = 100, MARMOT_STATUS_GROUP_CATCHING_UP = 101, MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED = 102, MARMOT_STATUS_INVALID_PUBLIC_EVENT_REFERENCES = 103, MARMOT_STATUS_DIRECTORY_LOOKUP_INCOMPLETE = 104, MARMOT_STATUS_INVALID_EDIT_TARGET = 105, MARMOT_STATUS_STORAGE_FULL = 106, MARMOT_STATUS_FOLLOW_LIST_TOO_LARGE = 107, MARMOT_STATUS_MEDIA_REFERENCE_STALE_EPOCH = 108, MARMOT_STATUS_MEDIA_REFERENCE_EPOCH_UNSETTLED = 109, MARMOT_STATUS_ACCOUNT_DEVICES_ACTIVATION_REFUSED = 110, MARMOT_STATUS_INVALID_STICKER = 111, MARMOT_STATUS_STICKER_NOT_FOUND = 112, MARMOT_STATUS_STICKER_NETWORK = 113, MARMOT_STATUS_STICKER_IMPORT = 114, MARMOT_STATUS_STICKER_IMPORT_UNSUPPORTED = 115, MARMOT_STATUS_ACCOUNT_UNLINKED = 116, MARMOT_STATUS_GROUP_RECOVERY_UNSETTLED = 117, MARMOT_STATUS_GROUP_RECOVERY_SOURCE_MISMATCH = 118, MARMOT_STATUS_EVENT_TOO_LARGE = 119, MARMOT_STATUS_INVALID_CHAT_LIST_QUERY = 120, MARMOT_STATUS_INVALID_EMOJI_SET = 121, MARMOT_STATUS_EMOJI_SET_NOT_FOUND = 122, MARMOT_STATUS_EMOJI_SET_NETWORK = 123, MARMOT_STATUS_EMOJI_IMAGE_TOO_LARGE = 124, MARMOT_STATUS_EMOJI_IMAGE_UNSUPPORTED = 125, MARMOT_STATUS_EMOJI_SET_LIMIT = 126, MARMOT_STATUS_EMOJI_SET_CHANGED = 127, MARMOT_STATUS_EMOJI_SET_INSTALL_CANCELLED = 128, MARMOT_STATUS_LEAVE_NOT_BLOCKED = 129, MARMOT_STATUS_CREATED_GROUP_MEMBER_REPORT_UNAVAILABLE = 130, MARMOT_STATUS_GROUP_COMMIT_PENDING = 131, MARMOT_STATUS_REACTION_NOT_FOUND = 132, MARMOT_STATUS_NO_USABLE_RELAY = 133, } ;",
+          "name": "enum MarmotStatus"
+        }
+      ],
+      "removed": []
+    }
+  },
+  "impact": "minor",
+  "schema": 1,
+  "storage_migrations": [
+    "crates/storage-sqlite/src/base/migrations.rs",
+    "crates/storage-sqlite/src/base/migrations/0219_agent_item_order.rs",
+    "crates/storage-sqlite/src/base/migrations/0220_chat_activity_creation_fallback.rs",
+    "crates/storage-sqlite/src/base/migrations/0221_agent_item_expired_targets.rs",
+    "crates/storage-sqlite/src/base/migrations/0222_small_state_broadcast_devices.rs",
+    "crates/storage-sqlite/src/base/migrations/0223_local_deletion_invitation.rs",
+    "crates/storage-sqlite/src/base/migrations/0224_epoch_gap_evidence_floor.rs",
+    "crates/storage-sqlite/src/base/migrations/0225_welcome_delivery_ledger.rs",
+    "crates/storage-sqlite/src/base/migrations/0226_local_submission_refused.rs",
+    "crates/storage-sqlite/src/base/migrations/0227_welcome_expiry_mark.rs",
+    "crates/storage-sqlite/src/base/migrations/baseline.sql"
+  ],
+  "target_base_version": "0.20.0",
+  "target_sha": "f732c9353779fecbb1dc97ee23fac4e1e1ababf5",
+  "uniffi": {
+    "breaking": [
+      "changed UniFFI type `LocalSendStatusFfi`",
+      "changed UniFFI type `MarmotEventFfi`",
+      "changed UniFFI type `MarmotKitError`",
+      "changed UniFFI type `NotificationTrafficClassFfi`",
+      "changed UniFFI type `OnboardingIssueFfi`",
+      "changed UniFFI type `OnboardingOptionsFfi`",
+      "changed UniFFI type `OnboardingSnapshotFfi`",
+      "changed UniFFI type `TimelineMessageRecordFfi`",
+      "changed UniFFI type `TimelineReplyPreviewFfi`",
+      "changed UniFFI type `TimelineUpdateTriggerFfi`"
+    ],
+    "functions": {
+      "added": [
+        {
+          "name": "Marmot::account_relay_health",
+          "signature": "pub async fn account_relay_health( &self, account_ref: String, ) -> Result<conversions::AccountRelayHealthFfi, MarmotKitError>",
+          "source": "src/commands/relay.rs#L77"
+        },
+        {
+          "name": "Marmot::check_account_relays",
+          "signature": "pub async fn check_account_relays( &self, account_ref: String, ) -> Result<conversions::AccountRelayHealthFfi, MarmotKitError>",
+          "source": "src/commands/relay.rs#L99"
+        },
+        {
+          "name": "Marmot::invite_deliveries",
+          "signature": "pub async fn invite_deliveries( &self, account_ref: String, group_id_hex: Option<String>, ) -> Result<Vec<crate::conversions::InviteDeliveryFfi>, MarmotKitError>",
+          "source": "src/commands/group.rs#L1208"
+        },
+        {
+          "name": "Marmot::send_custom_event_with_client_token",
+          "signature": "pub async fn send_custom_event_with_client_token( &self, account_ref: String, group_id_hex: String, kind: u64, tags: Vec<Vec<String>>, content: String, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>",
+          "source": "src/commands/local_submissions.rs#L212"
+        },
+        {
+          "name": "Marmot::submit_tagged_reply",
+          "signature": "pub async fn submit_tagged_reply( &self, account_ref: String, group_id_hex: String, target_message_id: String, text: String, tags: Vec<Vec<String>>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>",
+          "source": "src/commands/local_submissions.rs#L137"
+        },
+        {
+          "name": "Marmot::submit_tagged_sticker",
+          "signature": "pub async fn submit_tagged_sticker( &self, account_ref: String, group_id_hex: String, sticker_ref: StickerRefFfi, tags: Vec<Vec<String>>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>",
+          "source": "src/commands/local_submissions.rs#L188"
+        },
+        {
+          "name": "Marmot::submit_tagged_text",
+          "signature": "pub async fn submit_tagged_text( &self, account_ref: String, group_id_hex: String, text: String, tags: Vec<Vec<String>>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>",
+          "source": "src/commands/local_submissions.rs#L115"
+        },
+        {
+          "name": "Marmot::submit_thread_message",
+          "signature": "pub async fn submit_thread_message( &self, account_ref: String, group_id_hex: String, parent_message_id: String, text: String, attachments: Vec<MediaAttachmentReferenceFfi>, tags: Vec<Vec<String>>, client_token: String, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>",
+          "source": "src/commands/local_submissions.rs#L162"
+        }
+      ],
+      "changed": [],
+      "removed": []
+    },
+    "types": {
+      "added": [
+        {
+          "definition": "pub struct AccountRelayHealthFfi {{ pub inbox_list: RelayListPresenceFfi, pub rows: Vec<RelayHealthRowFfi>, pub warnings: Vec<AccountRelayWarningFfi>, pub highest_severity: Option<RelayWarningSeverityFfi>, pub falls_back_to_defaults: bool,}",
+          "name": "AccountRelayHealthFfi"
+        },
+        {
+          "definition": "pub struct AccountRelayWarningFfi {{ pub kind: RelayWarningKindFfi, pub severity: RelayWarningSeverityFfi, pub relays: Vec<String>, pub actions: Vec<RelayRepairActionFfi>,}",
+          "name": "AccountRelayWarningFfi"
+        },
+        {
+          "definition": "pub struct AgentItemFfi {{ pub version: u64, pub state: AgentItemStateFfi, pub title: String, pub harness: String, pub item_id: String, pub seq: u64, pub item_type: String, pub fields_json: String, pub session: Option<String>, pub turn: Option<String>, pub started_by_message_id_hex: Option<String>, pub settles: Vec<String>, pub alerts: bool,}",
+          "name": "AgentItemFfi"
+        },
+        {
+          "definition": "pub enum AgentItemStateFfi {{ Running, Waiting, Done, Failed, Declined, Cancelled,}",
+          "name": "AgentItemStateFfi"
+        },
+        {
+          "definition": "pub enum InviteCancelReasonFfi {{ SupersededByGroupChange, Withdrawn,}",
+          "name": "InviteCancelReasonFfi"
+        },
+        {
+          "definition": "pub struct InviteDeliveryFfi {{ pub group_id_hex: String, pub recipient_hex: String, pub invite_id_hex: Option<String>, pub state: InviteDeliveryStateFfi, pub device_count: u32, pub accepted_device_count: u32, pub devices: Vec<InviteDeviceDeliveryFfi>,}",
+          "name": "InviteDeliveryFfi"
+        },
+        {
+          "definition": "pub enum InviteDeliveryProblemFfi {{ NoInboxRelays, RefusedByRelays, RelaysUnreachable, Mixed, TooLarge, KeyPackageRetired, InboxLookupFailed,}",
+          "name": "InviteDeliveryProblemFfi"
+        },
+        {
+          "definition": "pub enum InviteDeliveryStateFfi {{ Waiting, Sending { last_problem: Option<InviteDeliveryProblemFfi>, }, RelayAccepted, Undeliverable { cause: InviteDeliveryProblemFfi }, Cancelled { reason: InviteCancelReasonFfi },}",
+          "name": "InviteDeliveryStateFfi"
+        },
+        {
+          "definition": "pub struct InviteDeviceDeliveryFfi {{ pub delivery_id_hex: String, pub state: InviteDeliveryStateFfi, pub created_at: u64, pub deliver_until: Option<u64>, pub attempt_count: u32, pub last_attempt_at: Option<u64>, pub accepted_at: Option<u64>, pub relays: InviteRelayCountsFfi,}",
+          "name": "InviteDeviceDeliveryFfi"
+        },
+        {
+          "definition": "pub struct InviteRelayCountsFfi {{ pub total: u32, pub accepted: u32, pub refused: u32, pub unreachable: u32, pub untried: u32,}",
+          "name": "InviteRelayCountsFfi"
+        },
+        {
+          "definition": "pub struct OnboardingCreatedInboxListFfi {{ pub relays: Vec<String>, pub event_id: String, pub published_at: u64,}",
+          "name": "OnboardingCreatedInboxListFfi"
+        },
+        {
+          "definition": "pub enum RelayHealthFaultFfi {{ Retired, Invalid, Unsafe, AuthenticationRequired, PaymentRequired, Restricted, Unreachable, TimedOut, Unexplained,}",
+          "name": "RelayHealthFaultFfi"
+        },
+        {
+          "definition": "pub struct RelayHealthRowFfi {{ pub url: String, pub roles: Vec<RelayRoleFfi>, pub state: RelayHealthStateFfi, pub fault: Option<RelayHealthFaultFfi>, pub liveness: RelayStatusFfi, pub checked_at_unix: Option<u64>, pub checking: bool,}",
+          "name": "RelayHealthRowFfi"
+        },
+        {
+          "definition": "pub enum RelayHealthStateFfi {{ Unchecked, Healthy, Suspected, Failing, NotAllowed,}",
+          "name": "RelayHealthStateFfi"
+        },
+        {
+          "definition": "pub enum RelayListPresenceFfi {{ Unknown, Published,}",
+          "name": "RelayListPresenceFfi"
+        },
+        {
+          "definition": "pub enum RelayRepairActionFfi {{ AddInboxRelay, RemoveInboxRelay,}",
+          "name": "RelayRepairActionFfi"
+        },
+        {
+          "definition": "pub enum RelayRoleFfi {{ Inbox, Write, Read,}",
+          "name": "RelayRoleFfi"
+        },
+        {
+          "definition": "pub enum RelayWarningKindFfi {{ InboxListEmpty, NoAllowedInboxRelay, InboxRelaysNotAllowed, SingleInboxRelay, InboxRelayFailing,}",
+          "name": "RelayWarningKindFfi"
+        },
+        {
+          "definition": "pub enum RelayWarningSeverityFfi {{ Notice, Warning, Critical,}",
+          "name": "RelayWarningSeverityFfi"
+        }
+      ],
+      "changed": [
+        {
+          "after": "pub enum LocalSendStatusFfi {{ Queued { message_id_hex: String, }, EngineOwned { message_id_hex: String, }, Completed { summary: SendSummaryFfi, }, Rejected, RefusedNewMembers,}",
+          "before": "pub enum LocalSendStatusFfi {{ Queued, EngineOwned, Completed { summary: SendSummaryFfi }, Rejected,}",
+          "name": "LocalSendStatusFfi"
+        },
+        {
+          "after": "pub enum MarmotEventFfi {{ GroupJoined { account_id_hex: String, account_label: String, group_id_hex: String, }, GroupStateUpdated { account_id_hex: String, account_label: String, group_id_hex: String, }, MessageReceived { received: RuntimeMessageReceivedFfi, }, ProjectionUpdated { update: RuntimeProjectionUpdateFfi, }, GroupEvent { account_id_hex: String, account_label: String, group_id_hex: String, event: GroupEventKindFfi, }, AccountError { account_id_hex: String, account_label: String, message: String, }, WelcomeDeliveryPending { account_id_hex: String, account_label: String, group_id_hex: String, message_id_hex: String, recipient_hex: String, size_class: Option<crate::EventSizeClassFfi>, }, InviteDeliveryChanged { account_id_hex: String, account_label: String, delivery: crate::conversions::InviteDeliveryFfi, }, EpochStallEscalated { account_id_hex: String, account_label: String, group_id_hex: String, stalled_epoch: u64, arms: u32, }, GroupChangeSuperseded { account_id_hex: String, account_label: String, group_id_hex: String, commit_id_hex: String, kind: String, outcome: String, reason: String, }, HistoryNoticesChanged { account_id_hex: String, account_label: String, }, LinkedDevicesChanged { account_id_hex: String, account_label: String, }, KeyPackageRefreshOverdueChanged { account_id_hex: String, account_label: String, }, RelayHealthChanged { account_id_hex: String, account_label: String, }, UnrecognizedSignInsChanged { account_id_hex: String, account_label: String, }, CompromiseWarningChanged { account_id_hex: String, account_label: String, }, DeviceLinkChanged { account_id_hex: String, account_label: String, }, ChatHistoryImportsChanged { account_id_hex: String, account_label: String, }, RecoveryStatusChanged { account_id_hex: String, account_label: String, }, DeviceUnlinked { account_id_hex: String, account_label: String, },}",
+          "before": "pub enum MarmotEventFfi {{ GroupJoined { account_id_hex: String, account_label: String, group_id_hex: String, }, GroupStateUpdated { account_id_hex: String, account_label: String, group_id_hex: String, }, MessageReceived { received: RuntimeMessageReceivedFfi, }, ProjectionUpdated { update: RuntimeProjectionUpdateFfi, }, GroupEvent { account_id_hex: String, account_label: String, group_id_hex: String, event: GroupEventKindFfi, }, AccountError { account_id_hex: String, account_label: String, message: String, }, WelcomeDeliveryPending { account_id_hex: String, account_label: String, group_id_hex: String, message_id_hex: String, recipient_hex: String, size_class: Option<crate::EventSizeClassFfi>, }, EpochStallEscalated { account_id_hex: String, account_label: String, group_id_hex: String, stalled_epoch: u64, arms: u32, }, GroupChangeSuperseded { account_id_hex: String, account_label: String, group_id_hex: String, commit_id_hex: String, kind: String, outcome: String, reason: String, }, HistoryNoticesChanged { account_id_hex: String, account_label: String, }, LinkedDevicesChanged { account_id_hex: String, account_label: String, }, KeyPackageRefreshOverdueChanged { account_id_hex: String, account_label: String, }, UnrecognizedSignInsChanged { account_id_hex: String, account_label: String, }, CompromiseWarningChanged { account_id_hex: String, account_label: String, }, DeviceLinkChanged { account_id_hex: String, account_label: String, }, ChatHistoryImportsChanged { account_id_hex: String, account_label: String, }, RecoveryStatusChanged { account_id_hex: String, account_label: String, }, DeviceUnlinked { account_id_hex: String, account_label: String, },}",
+          "name": "MarmotEventFfi"
+        },
+        {
+          "after": "pub enum MarmotKitError {{ #[error(\"user is blocked\")] UserBlocked, #[error(\"block list synchronization unavailable\")] BlockListUnavailable, #[error(\"block list publication outcome uncertain\")] BlockPublicationUncertain, #[error(\"moderation reporting is not configured\")] ModerationReportingNotConfigured, #[error(\"invalid moderation report configuration: {details}\")] InvalidModerationReportConfig { details: String }, #[error(\"reported user public key is invalid\")] InvalidReportedPublicKey, #[error(\"an account cannot report itself\")] CannotReportSelf, #[error(\"too many moderation reports; try again later\")] ModerationReportRateLimited, #[error(\"edit target must be an available self-authored chat message\")] InvalidEditTarget, #[error(\"usage and diagnostics consent required\")] ConsentRequired, #[error(\"invalid product analytics configuration\")] InvalidProductAnalyticsConfiguration, #[error(\"unregistered or invalid product observation\")] InvalidProductObservation, #[error(\"identity already exists: {account}\")] DuplicateIdentity { account: String }, #[error(\"unknown account: {account_ref}\")] UnknownAccount { account_ref: String }, #[error(\"unknown group: {group_id_hex}\")] UnknownGroup { group_id_hex: String }, #[error(\"group invite is not pending\")] GroupInviteNotPending, #[error(\"group was created but its local chat projection is unavailable: {group_id_hex}\")] CreatedGroupProjectionUnavailable { group_id_hex: String }, #[error(\"group was created but its original member report is unavailable: {group_id_hex}\")] CreatedGroupMemberReportUnavailable { group_id_hex: String }, #[error(\"group membership page exceeds the maximum of {max_groups} groups\")] InvalidGroupMembershipPage { max_groups: u64 }, #[error(\"cached identity page exceeds the maximum of {max_accounts} accounts\")] InvalidCachedIdentityPage { max_accounts: u64 }, #[error(\"public event preview batch exceeds the maximum of {max_references} references\")] InvalidPublicEventReferences { max_references: u64 }, #[error(\"group hydration pending: {group_id_hex}\")] GroupHydrationPending { group_id_hex: String }, #[error(\"direct conversation index is not ready; retry after account hydration\")] DirectConversationIndexNotReady, #[error(\"chat presentation preparation is incomplete; retry after local maintenance\")] ChatPresentationNotReady, #[error(\"invalid chat pin: {details}\")] InvalidChatPin { details: String }, #[error(\"invalid message draft: {details}\")] InvalidMessageDraft { details: String }, #[error(\"invalid media reference: {details}\")] InvalidMediaReference { details: String }, #[error( \"media reference was encrypted at epoch {source_epoch} but the group has moved off it (now at epoch {current_epoch}); upload it again\" )] MediaReferenceStaleEpoch { source_epoch: u64, current_epoch: u64, }, #[error( \"the group's epoch is unsettled, so media encrypted at epoch {source_epoch} cannot be sent yet; sync and send again\" )] MediaReferenceEpochUnsettled { source_epoch: u64 }, #[error(\"invalid media attachment [{kind}]: {details}\")] MediaAttachmentRejected { kind: crate::conversions::MediaAttachmentRejectionKindFfi, details: String, }, #[error(\"media is unfetchable under the current locator policy: {details}\")] MediaUnfetchable { details: String }, #[error(\"media download failed: {details}\")] MediaDownloadFailed { details: String }, #[error(\"invalid hex: {details}\")] InvalidHex { details: String }, #[error(\"invalid nostr identity: {details}\")] InvalidIdentity { details: String }, #[error(\"invalid key package event: {details}\")] InvalidKeyPackageEvent { details: String }, #[error(\"missing key package for {account} [{reason}]\")] MissingKeyPackage { account: String, reason: MissingKeyPackageReasonFfi, }, #[error(\"member {account} has no valid Marmot inbox relay\")] MissingMemberInboxRoute { account: String }, #[error(\"directory lookup did not complete\")] DirectoryLookupIncomplete { account: String }, #[error(\"publish failed: {details}\")] Publish { details: String }, #[error(\"event too large: {artifact} ({size_class})\")] EventTooLarge { artifact: OversizedArtifactFfi, size_class: EventSizeClassFfi, }, #[error(\"no usable relay\")] NoUsableRelay, #[error(\"current account follow list is unavailable\")] FollowListUnavailable, #[error(\"current account follow list is too large to update\")] FollowListTooLarge, #[error(\"transport closed\")] TransportClosed, #[error(\"marmot runtime root is already in use\")] RuntimeBusy, #[error(\"marmot account session is already in use\")] AccountSessionBusy, #[error(\"incomplete account setup requires explicit recovery\")] AccountSetupRecoveryRequired, #[error(\"durable account setup can be resumed by retrying\")] AccountSetupRetryRequired, #[error(\"onboarding action is unavailable or stale\")] OnboardingActionUnavailable, #[error(\"account must complete interactive onboarding\")] OnboardingRequired, #[error(\"account is not eligible for incomplete-setup reset\")] AccountSetupResetNotApplicable, #[error(\"recoverable KeyPackage setup state exists; retry instead of resetting\")] AccountSetupKeyPackageRecoveryAvailable, #[error(\"marmot runtime is shutting down\")] RuntimeStopping, #[error(\"host-managed attachment mode required\")] AttachmentModeRequired, #[error(\"automatic attachment approval requires a signed-in account\")] AttachmentAccountSignedOut, #[error(\"account catch-up failed: {details}\")] AccountCatchUp { details: String }, #[error(\"local account is not an admin of group {group_id_hex}\")] NotGroupAdmin { group_id_hex: String }, #[error(\"admin must self-demote before leaving group {group_id_hex}\")] AdminCannotSelfRemove { group_id_hex: String }, #[error(\"a leave request is already pending for group {group_id_hex}\")] LeaveAlreadyRequested { group_id_hex: String }, #[error(\"the leave for group {group_id_hex} is not blocked\")] LeaveNotBlocked { group_id_hex: String }, #[error(\"operation would remove the last admin from group {group_id_hex}\")] WouldRemoveLastAdmin { group_id_hex: String }, #[error(\"group {group_id_hex} cannot enable disbanding until all members support it\")] DisbandingUnsupportedMembers { group_id_hex: String, member_ids_hex: Vec<String>, }, #[error(\"group {group_id_hex} has not enabled disbanding\")] DisbandingNotEnabled { group_id_hex: String }, #[error(\"group {group_id_hex} cannot turn on account-devices now: {reason:?}\")] AccountDevicesActivationRefused { group_id_hex: String, reason: crate::conversions::AccountDevicesActivationFfi, }, #[error(\"group {group_id_hex} is disbanding or disbanded\")] GroupDisbanding { group_id_hex: String }, #[error(\"this device was removed from group {group_id_hex}\")] GroupRemoved { group_id_hex: String }, #[error(\"group {group_id_hex} is still catching up on missed changes\")] GroupCatchingUp { group_id_hex: String }, #[error(\"group {group_id_hex}'s last change has not reached every relay yet\")] GroupCommitUndelivered { group_id_hex: String }, #[error(\"group {group_id_hex}'s last change is still being sent\")] GroupCommitPending { group_id_hex: String }, #[error(\"member {member_id_hex} is not in group {group_id_hex}\")] MemberNotInGroup { group_id_hex: String, member_id_hex: String, }, #[error(\"member {member_id_hex} is already an admin of group {group_id_hex}\")] AlreadyAdmin { group_id_hex: String, member_id_hex: String, }, #[error(\"member {member_id_hex} is not an admin of group {group_id_hex}\")] NotAdmin { group_id_hex: String, member_id_hex: String, }, #[error(\"storage busy: {details}\")] StorageBusy { details: String }, #[error(\"storage closed: {details}\")] StorageClosed { details: String }, #[error(\"storage full: {details}\")] StorageFull { details: String }, #[error(\"account secret not found: {details}\")] SecretNotFound { details: String }, #[error(\"account keystore unavailable: {details}\")] KeystoreUnavailable { details: String }, #[error(\"passphrase cannot be empty\")] EmptyPassphrase, #[error(\"encrypted secret-key export failed: {details}\")] EncryptionFailed { details: String }, #[error(\"io error: {details}\")] Io { details: String }, #[error(\"external signer unavailable for account {account}\")] ExternalSignerUnavailable { account: String }, #[error(\"external signer public key does not match account\")] ExternalSignerMismatch, #[error(\"{reason}\")] Nip46 { reason: crate::Nip46ErrorFfi }, #[error(\"external signer request was rejected or cancelled\")] ExternalSignerRejected, #[error(\"group {group_id_hex} has too many messages waiting to be sent\")] GroupSendQueueFull { group_id_hex: String }, #[error(\"group {group_id_hex} is unrecoverable and needs to be re-joined before sending\")] GroupUnrecoverableRepairRequired { group_id_hex: String }, #[error(\"invalid sticker data: {details}\")] InvalidSticker { details: String }, #[error(\"sticker pack or asset is unavailable\")] StickerNotFound, #[error(\"sticker network operation failed: {details}\")] StickerNetwork { details: String }, #[error(\"sticker import failed: {details}\")] StickerImport { details: String }, #[error(\"Signal sticker import is unavailable for external-signing accounts\")] StickerImportUnsupported, #[error(\"invalid emoji set: {details}\")] InvalidEmojiSet { details: String }, #[error(\"emoji set or emoji is unavailable\")] EmojiSetNotFound, #[error(\"emoji set network operation failed: {details}\")] EmojiSetNetwork { details: String }, #[error(\"emoji image is too large: {details}\")] EmojiImageTooLarge { details: String }, #[error(\"emoji image is unsupported: {details}\")] EmojiImageUnsupported { details: String }, #[error(\"emoji set limit reached: {details}\")] EmojiSetLimit { details: String }, #[error(\"emoji set changed; current version {current_event_id_hex}\")] EmojiSetChanged { current_event_id_hex: String }, #[error(\"emoji set install was cancelled\")] EmojiSetInstallCancelled, #[error(\"this device was unlinked from the account: {account_ref}\")] AccountUnlinked { account_ref: String }, #[error(\"group recovery requires a settled source\")] GroupRecoveryUnsettled { group_id_hex: String }, #[error(\"group recovery requires a fresh challenge\")] GroupRecoverySourceMismatch { group_id_hex: String }, #[error(\"marmot runtime error: {details}\")] Runtime { details: String }, #[error(\"marmot account worker is busy catching up; operation was not started\")] AccountWorkerBusy, #[error(\"marmot account worker response timed out; operation completion is unknown\")] AccountWorkerResponseTimedOut, #[error(\"chat window requests require 1 to 100 rows\")] ChatWindowInvalidLimit, #[error(\"chat window changed; use the latest sequence\")] ChatWindowStale, #[error(\"visible anchor must belong to the retained window\")] ChatWindowAnchorOutside, #[error(\"chat window is closed; reopen it\")] ChatWindowClosed, #[error(\"chat window query failed: {details}\")] ChatWindowQuery { details: String }, #[error(\"invalid chat-list query: {reason}\")] InvalidChatListQuery { reason: crate::conversions::ChatListQueryErrorFfi, }, #[error(\"conversation window requests require 1 to 200 rows\")] ConversationWindowInvalidLimit, #[error(\"selected draft changed; refresh before retrying\")] MessageDraftRevisionConflict, #[error(\"conversation changed; refresh the sequence before retrying\")] ConversationWindowStale, #[error(\"revision belongs to another conversation window generation\")] ConversationWindowWrongGeneration, #[error(\"visible anchor must belong to the retained conversation window\")] ConversationWindowAnchorOutside, #[error(\"conversation window closed; reopen it\")] ConversationWindowClosed, #[error(\"conversation capture temporarily unavailable; retry pending\")] ConversationWindowNotReady, #[error(\"conversation operation timed out; accepted commands may still complete\")] ConversationWindowTimedOut, #[error(\"conversation opening mode and message target disagree\")] ConversationWindowInvalidTarget, #[error(\"conversation query failed: {details}\")] ConversationWindowQuery { details: String }, #[error(\"conversation presentation failed: {details}\")] ConversationWindowPresentation { details: String }, #[error(\"conversation target message is no longer retained\")] ConversationWindowMessageNotRetained, #[error(\"invalid app component: {details}\")] InvalidAppComponent { details: String }, #[error(\"no matching reaction to remove\")] ReactionNotFound, #[error(\"incompatible KeyPackage\")] IncompatibleKeyPackage, #[error(\"a relay check of this account is already running\")] RelayCheckRunning,}",
+          "before": "pub enum MarmotKitError {{ #[error(\"user is blocked\")] UserBlocked, #[error(\"block list synchronization unavailable\")] BlockListUnavailable, #[error(\"block list publication outcome uncertain\")] BlockPublicationUncertain, #[error(\"moderation reporting is not configured\")] ModerationReportingNotConfigured, #[error(\"invalid moderation report configuration: {details}\")] InvalidModerationReportConfig { details: String }, #[error(\"reported user public key is invalid\")] InvalidReportedPublicKey, #[error(\"an account cannot report itself\")] CannotReportSelf, #[error(\"too many moderation reports; try again later\")] ModerationReportRateLimited, #[error(\"edit target must be an available self-authored chat message\")] InvalidEditTarget, #[error(\"usage and diagnostics consent required\")] ConsentRequired, #[error(\"invalid product analytics configuration\")] InvalidProductAnalyticsConfiguration, #[error(\"unregistered or invalid product observation\")] InvalidProductObservation, #[error(\"identity already exists: {account}\")] DuplicateIdentity { account: String }, #[error(\"unknown account: {account_ref}\")] UnknownAccount { account_ref: String }, #[error(\"unknown group: {group_id_hex}\")] UnknownGroup { group_id_hex: String }, #[error(\"group invite is not pending\")] GroupInviteNotPending, #[error(\"group was created but its local chat projection is unavailable: {group_id_hex}\")] CreatedGroupProjectionUnavailable { group_id_hex: String }, #[error(\"group was created but its original member report is unavailable: {group_id_hex}\")] CreatedGroupMemberReportUnavailable { group_id_hex: String }, #[error(\"group membership page exceeds the maximum of {max_groups} groups\")] InvalidGroupMembershipPage { max_groups: u64 }, #[error(\"cached identity page exceeds the maximum of {max_accounts} accounts\")] InvalidCachedIdentityPage { max_accounts: u64 }, #[error(\"public event preview batch exceeds the maximum of {max_references} references\")] InvalidPublicEventReferences { max_references: u64 }, #[error(\"group hydration pending: {group_id_hex}\")] GroupHydrationPending { group_id_hex: String }, #[error(\"direct conversation index is not ready; retry after account hydration\")] DirectConversationIndexNotReady, #[error(\"chat presentation preparation is incomplete; retry after local maintenance\")] ChatPresentationNotReady, #[error(\"invalid chat pin: {details}\")] InvalidChatPin { details: String }, #[error(\"invalid message draft: {details}\")] InvalidMessageDraft { details: String }, #[error(\"invalid media reference: {details}\")] InvalidMediaReference { details: String }, #[error( \"media reference was encrypted at epoch {source_epoch} but the group has moved off it (now at epoch {current_epoch}); upload it again\" )] MediaReferenceStaleEpoch { source_epoch: u64, current_epoch: u64, }, #[error( \"the group's epoch is unsettled, so media encrypted at epoch {source_epoch} cannot be sent yet; sync and send again\" )] MediaReferenceEpochUnsettled { source_epoch: u64 }, #[error(\"invalid media attachment [{kind}]: {details}\")] MediaAttachmentRejected { kind: crate::conversions::MediaAttachmentRejectionKindFfi, details: String, }, #[error(\"media is unfetchable under the current locator policy: {details}\")] MediaUnfetchable { details: String }, #[error(\"media download failed: {details}\")] MediaDownloadFailed { details: String }, #[error(\"invalid hex: {details}\")] InvalidHex { details: String }, #[error(\"invalid nostr identity: {details}\")] InvalidIdentity { details: String }, #[error(\"invalid key package event: {details}\")] InvalidKeyPackageEvent { details: String }, #[error(\"missing key package for {account} [{reason}]\")] MissingKeyPackage { account: String, reason: MissingKeyPackageReasonFfi, }, #[error(\"member {account} has no valid Marmot inbox relay\")] MissingMemberInboxRoute { account: String }, #[error(\"directory lookup did not complete\")] DirectoryLookupIncomplete { account: String }, #[error(\"publish failed: {details}\")] Publish { details: String }, #[error(\"event too large: {artifact} ({size_class})\")] EventTooLarge { artifact: OversizedArtifactFfi, size_class: EventSizeClassFfi, }, #[error(\"no usable relay\")] NoUsableRelay, #[error(\"current account follow list is unavailable\")] FollowListUnavailable, #[error(\"current account follow list is too large to update\")] FollowListTooLarge, #[error(\"transport closed\")] TransportClosed, #[error(\"marmot runtime root is already in use\")] RuntimeBusy, #[error(\"marmot account session is already in use\")] AccountSessionBusy, #[error(\"incomplete account setup requires explicit recovery\")] AccountSetupRecoveryRequired, #[error(\"durable account setup can be resumed by retrying\")] AccountSetupRetryRequired, #[error(\"onboarding action is unavailable or stale\")] OnboardingActionUnavailable, #[error(\"account must complete interactive onboarding\")] OnboardingRequired, #[error(\"account is not eligible for incomplete-setup reset\")] AccountSetupResetNotApplicable, #[error(\"recoverable KeyPackage setup state exists; retry instead of resetting\")] AccountSetupKeyPackageRecoveryAvailable, #[error(\"marmot runtime is shutting down\")] RuntimeStopping, #[error(\"host-managed attachment mode required\")] AttachmentModeRequired, #[error(\"automatic attachment approval requires a signed-in account\")] AttachmentAccountSignedOut, #[error(\"account catch-up failed: {details}\")] AccountCatchUp { details: String }, #[error(\"local account is not an admin of group {group_id_hex}\")] NotGroupAdmin { group_id_hex: String }, #[error(\"admin must self-demote before leaving group {group_id_hex}\")] AdminCannotSelfRemove { group_id_hex: String }, #[error(\"a leave request is already pending for group {group_id_hex}\")] LeaveAlreadyRequested { group_id_hex: String }, #[error(\"the leave for group {group_id_hex} is not blocked\")] LeaveNotBlocked { group_id_hex: String }, #[error(\"operation would remove the last admin from group {group_id_hex}\")] WouldRemoveLastAdmin { group_id_hex: String }, #[error(\"group {group_id_hex} cannot enable disbanding until all members support it\")] DisbandingUnsupportedMembers { group_id_hex: String, member_ids_hex: Vec<String>, }, #[error(\"group {group_id_hex} has not enabled disbanding\")] DisbandingNotEnabled { group_id_hex: String }, #[error(\"group {group_id_hex} cannot turn on account-devices now: {reason:?}\")] AccountDevicesActivationRefused { group_id_hex: String, reason: crate::conversions::AccountDevicesActivationFfi, }, #[error(\"group {group_id_hex} is disbanding or disbanded\")] GroupDisbanding { group_id_hex: String }, #[error(\"this device was removed from group {group_id_hex}\")] GroupRemoved { group_id_hex: String }, #[error(\"group {group_id_hex} is still catching up on missed changes\")] GroupCatchingUp { group_id_hex: String }, #[error(\"group {group_id_hex}'s last change has not reached every relay yet\")] GroupCommitUndelivered { group_id_hex: String }, #[error(\"group {group_id_hex}'s last change is still being sent\")] GroupCommitPending { group_id_hex: String }, #[error(\"member {member_id_hex} is not in group {group_id_hex}\")] MemberNotInGroup { group_id_hex: String, member_id_hex: String, }, #[error(\"member {member_id_hex} is already an admin of group {group_id_hex}\")] AlreadyAdmin { group_id_hex: String, member_id_hex: String, }, #[error(\"member {member_id_hex} is not an admin of group {group_id_hex}\")] NotAdmin { group_id_hex: String, member_id_hex: String, }, #[error(\"storage busy: {details}\")] StorageBusy { details: String }, #[error(\"storage closed: {details}\")] StorageClosed { details: String }, #[error(\"storage full: {details}\")] StorageFull { details: String }, #[error(\"account secret not found: {details}\")] SecretNotFound { details: String }, #[error(\"account keystore unavailable: {details}\")] KeystoreUnavailable { details: String }, #[error(\"passphrase cannot be empty\")] EmptyPassphrase, #[error(\"encrypted secret-key export failed: {details}\")] EncryptionFailed { details: String }, #[error(\"io error: {details}\")] Io { details: String }, #[error(\"external signer unavailable for account {account}\")] ExternalSignerUnavailable { account: String }, #[error(\"external signer public key does not match account\")] ExternalSignerMismatch, #[error(\"{reason}\")] Nip46 { reason: crate::Nip46ErrorFfi }, #[error(\"external signer request was rejected or cancelled\")] ExternalSignerRejected, #[error(\"group {group_id_hex} has too many messages waiting to be sent\")] GroupSendQueueFull { group_id_hex: String }, #[error(\"group {group_id_hex} is unrecoverable and needs to be re-joined before sending\")] GroupUnrecoverableRepairRequired { group_id_hex: String }, #[error(\"invalid sticker data: {details}\")] InvalidSticker { details: String }, #[error(\"sticker pack or asset is unavailable\")] StickerNotFound, #[error(\"sticker network operation failed: {details}\")] StickerNetwork { details: String }, #[error(\"sticker import failed: {details}\")] StickerImport { details: String }, #[error(\"Signal sticker import is unavailable for external-signing accounts\")] StickerImportUnsupported, #[error(\"invalid emoji set: {details}\")] InvalidEmojiSet { details: String }, #[error(\"emoji set or emoji is unavailable\")] EmojiSetNotFound, #[error(\"emoji set network operation failed: {details}\")] EmojiSetNetwork { details: String }, #[error(\"emoji image is too large: {details}\")] EmojiImageTooLarge { details: String }, #[error(\"emoji image is unsupported: {details}\")] EmojiImageUnsupported { details: String }, #[error(\"emoji set limit reached: {details}\")] EmojiSetLimit { details: String }, #[error(\"emoji set changed; current version {current_event_id_hex}\")] EmojiSetChanged { current_event_id_hex: String }, #[error(\"emoji set install was cancelled\")] EmojiSetInstallCancelled, #[error(\"this device was unlinked from the account: {account_ref}\")] AccountUnlinked { account_ref: String }, #[error(\"group recovery requires a settled source\")] GroupRecoveryUnsettled { group_id_hex: String }, #[error(\"group recovery requires a fresh challenge\")] GroupRecoverySourceMismatch { group_id_hex: String }, #[error(\"marmot runtime error: {details}\")] Runtime { details: String }, #[error(\"marmot account worker is busy catching up; operation was not started\")] AccountWorkerBusy, #[error(\"marmot account worker response timed out; operation completion is unknown\")] AccountWorkerResponseTimedOut, #[error(\"chat window requests require 1 to 100 rows\")] ChatWindowInvalidLimit, #[error(\"chat window changed; use the latest sequence\")] ChatWindowStale, #[error(\"visible anchor must belong to the retained window\")] ChatWindowAnchorOutside, #[error(\"chat window is closed; reopen it\")] ChatWindowClosed, #[error(\"chat window query failed: {details}\")] ChatWindowQuery { details: String }, #[error(\"invalid chat-list query: {reason}\")] InvalidChatListQuery { reason: crate::conversions::ChatListQueryErrorFfi, }, #[error(\"conversation window requests require 1 to 200 rows\")] ConversationWindowInvalidLimit, #[error(\"selected draft changed; refresh before retrying\")] MessageDraftRevisionConflict, #[error(\"conversation changed; refresh the sequence before retrying\")] ConversationWindowStale, #[error(\"revision belongs to another conversation window generation\")] ConversationWindowWrongGeneration, #[error(\"visible anchor must belong to the retained conversation window\")] ConversationWindowAnchorOutside, #[error(\"conversation window closed; reopen it\")] ConversationWindowClosed, #[error(\"conversation capture temporarily unavailable; retry pending\")] ConversationWindowNotReady, #[error(\"conversation operation timed out; accepted commands may still complete\")] ConversationWindowTimedOut, #[error(\"conversation opening mode and message target disagree\")] ConversationWindowInvalidTarget, #[error(\"conversation query failed: {details}\")] ConversationWindowQuery { details: String }, #[error(\"conversation presentation failed: {details}\")] ConversationWindowPresentation { details: String }, #[error(\"conversation target message is no longer retained\")] ConversationWindowMessageNotRetained, #[error(\"invalid app component: {details}\")] InvalidAppComponent { details: String }, #[error(\"no matching reaction to remove\")] ReactionNotFound,}",
+          "name": "MarmotKitError"
+        },
+        {
+          "after": "pub enum NotificationTrafficClassFfi {{ Standard,}",
+          "before": "pub enum NotificationTrafficClassFfi {{ Standard, AgentActivity,}",
+          "name": "NotificationTrafficClassFfi"
+        },
+        {
+          "after": "pub enum OnboardingIssueFfi {{ Missing, Malformed, FutureDated, InvalidRelay, RetiredRelay, UnsafeRelay, Unreachable, TimedOut, AuthenticationRequired, PaymentRequired, AccessRestricted, NoUsableRoute, PublicationFailed, SignerUnavailable, SignerRejected, RecordChanged, Interrupted, TooManyRelays, MultiDeviceUnsupported, OtherInstallationPossible, DiscoveryIncomplete, InspectionCompleted, RateLimited,}",
+          "before": "pub enum OnboardingIssueFfi {{ Missing, Malformed, FutureDated, InvalidRelay, RetiredRelay, UnsafeRelay, Unreachable, TimedOut, AuthenticationRequired, PaymentRequired, AccessRestricted, NoUsableRoute, PublicationFailed, SignerUnavailable, SignerRejected, RecordChanged, Interrupted, TooManyRelays, MultiDeviceUnsupported, OtherInstallationPossible, DiscoveryIncomplete, InspectionCompleted,}",
+          "name": "OnboardingIssueFfi"
+        },
+        {
+          "after": "pub struct OnboardingOptionsFfi {{ pub default_relays: Vec<String>, pub discovery_relays: Vec<String>, #[uniffi(default = [])] pub inbox_relays: Vec<String>, #[uniffi(default = false)] pub create_missing_inbox_list: bool, #[uniffi(default = false)] pub pass_device_notice_when_none_found: bool,}",
+          "before": "pub struct OnboardingOptionsFfi {{ pub default_relays: Vec<String>, pub discovery_relays: Vec<String>, #[uniffi(default = [])] pub inbox_relays: Vec<String>,}",
+          "name": "OnboardingOptionsFfi"
+        },
+        {
+          "after": "pub struct OnboardingSnapshotFfi {{ pub account_id_hex: String, pub recovery_epoch: Option<String>, pub revision: u64, pub ready: bool, pub steps: Vec<OnboardingStepStateFfi>, pub proposal: Option<OnboardingRepairProposalFfi>, pub single_device_notice: Option<OnboardingSingleDeviceNoticeFfi>, pub cancellation_pending: bool, #[uniffi(default = None)] pub created_inbox_list: Option<OnboardingCreatedInboxListFfi>,}",
+          "before": "pub struct OnboardingSnapshotFfi {{ pub account_id_hex: String, pub recovery_epoch: Option<String>, pub revision: u64, pub ready: bool, pub steps: Vec<OnboardingStepStateFfi>, pub proposal: Option<OnboardingRepairProposalFfi>, pub single_device_notice: Option<OnboardingSingleDeviceNoticeFfi>, pub cancellation_pending: bool,}",
+          "name": "OnboardingSnapshotFfi"
+        },
+        {
+          "after": "pub struct TimelineMessageRecordFfi {{ pub client_token: Option<String>, pub has_reports: bool, pub poll: Option<PollProjectionFfi>, pub message_id_hex: String, pub source_message_id_hex: Option<String>, pub source_epoch: Option<u64>, pub retention_seconds: Option<u64>, pub retention_expires_at: Option<u64>, pub direction: String, pub group_id_hex: String, pub sender: String, pub plaintext: String, pub content_tokens: MarkdownDocumentFfi, pub kind: u64, pub tags: Vec<MessageTagFfi>, pub sticker: Option<StickerRefFfi>, pub timeline_at: u64, pub received_at: u64, pub reply_to_message_id_hex: Option<String>, pub reply_preview: Option<TimelineReplyPreviewFfi>, pub thread: Option<TimelineThreadRefFfi>, pub media_json: Option<String>, pub media: Vec<MediaAttachmentOutcomeFfi>, pub group_system: Option<GroupSystemEventFfi>, pub agent_item: Option<AgentItemFfi>, pub agent_item_first_event_missing: bool, pub reactions: TimelineReactionSummaryFfi, pub edit: Option<TimelineEditSummaryFfi>, pub deleted: bool, pub deletion_source: DeletionSourceFfi, pub deleted_by_message_id_hex: Option<String>, pub invalidation_status: Option<String>, pub recipient_confirmed: bool, pub imported_from: Option<HistoryImportSourceFfi>, pub history_import_provenance: Option<super::HistoryImportProvenanceFfi>,}",
+          "before": "pub struct TimelineMessageRecordFfi {{ pub client_token: Option<String>, pub has_reports: bool, pub poll: Option<PollProjectionFfi>, pub message_id_hex: String, pub source_message_id_hex: Option<String>, pub source_epoch: Option<u64>, pub retention_seconds: Option<u64>, pub retention_expires_at: Option<u64>, pub direction: String, pub group_id_hex: String, pub sender: String, pub plaintext: String, pub content_tokens: MarkdownDocumentFfi, pub kind: u64, pub tags: Vec<MessageTagFfi>, pub sticker: Option<StickerRefFfi>, pub timeline_at: u64, pub received_at: u64, pub reply_to_message_id_hex: Option<String>, pub reply_preview: Option<TimelineReplyPreviewFfi>, pub thread: Option<TimelineThreadRefFfi>, pub media_json: Option<String>, pub media: Vec<MediaAttachmentOutcomeFfi>, pub group_system: Option<GroupSystemEventFfi>, pub reactions: TimelineReactionSummaryFfi, pub edit: Option<TimelineEditSummaryFfi>, pub deleted: bool, pub deletion_source: DeletionSourceFfi, pub deleted_by_message_id_hex: Option<String>, pub invalidation_status: Option<String>, pub recipient_confirmed: bool, pub imported_from: Option<HistoryImportSourceFfi>, pub history_import_provenance: Option<super::HistoryImportProvenanceFfi>,}",
+          "name": "TimelineMessageRecordFfi"
+        },
+        {
+          "after": "pub struct TimelineReplyPreviewFfi {{ pub message_id_hex: String, pub reply_to_message_id_hex: Option<String>, pub sender: String, pub plaintext: String, pub content_tokens: MarkdownDocumentFfi, pub kind: u64, pub sticker: Option<StickerRefFfi>, pub media_json: Option<String>, pub media: Vec<MediaAttachmentOutcomeFfi>, pub deleted: bool, pub deletion_source: DeletionSourceFfi, pub invalidation_status: Option<String>, pub thread: Option<TimelineThreadRefFfi>, pub retention_seconds: Option<u64>, pub retention_expires_at: Option<u64>,}",
+          "before": "pub struct TimelineReplyPreviewFfi {{ pub message_id_hex: String, pub reply_to_message_id_hex: Option<String>, pub sender: String, pub plaintext: String, pub content_tokens: MarkdownDocumentFfi, pub kind: u64, pub sticker: Option<StickerRefFfi>, pub media_json: Option<String>, pub media: Vec<MediaAttachmentOutcomeFfi>, pub deleted: bool, pub deletion_source: DeletionSourceFfi, pub invalidation_status: Option<String>, pub thread: Option<TimelineThreadRefFfi>,}",
+          "name": "TimelineReplyPreviewFfi"
+        },
+        {
+          "after": "pub enum TimelineUpdateTriggerFfi {{ NewMessage, MessageEditedOrReprojected, ReactionAdded, ReactionRemoved, MessageDeleted, ReplyPreviewChanged, AgentItem, GroupSystem, CustomEvent, DeliveryOrSendStateChanged, ReceiptChanged, SnapshotRefresh,}",
+          "before": "pub enum TimelineUpdateTriggerFfi {{ NewMessage, MessageEditedOrReprojected, ReactionAdded, ReactionRemoved, MessageDeleted, ReplyPreviewChanged, AgentActivity, AgentOperation, GroupSystem, CustomEvent, DeliveryOrSendStateChanged, ReceiptChanged, SnapshotRefresh,}",
+          "name": "TimelineUpdateTriggerFfi"
+        }
+      ],
+      "removed": []
+    }
+  }
+}
