@@ -914,6 +914,10 @@ pub trait NostrRelayNotificationSource: Send + Sync {
 }
 
 /// Boundary between this adapter and the actual Nostr relay implementation.
+///
+/// Any new method with a default implementation that `NostrSdkRelayClient`
+/// overrides must also be forwarded by `ManagedSdkPublishClient` in
+/// `transport-nostr`.
 #[async_trait]
 pub trait NostrRelayClient: Send + Sync {
     /// Where the messages this client's relays send come from, for a relay

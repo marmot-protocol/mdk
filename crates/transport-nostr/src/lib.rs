@@ -198,12 +198,15 @@ struct MarmotRelayPlaneInner {
     /// account worker share this client so the worker can reuse the same relay
     /// pool instead of constructing another TCP/TLS/WebSocket stack.
     account_publish_clients: std::sync::Mutex<HashMap<String, Arc<ManagedSdkPublishClient>>>,
-    /// Each account's current anonymous group-publish / read-back client,
-    /// tracked weakly so adapter clones keep working while held and drop tears
-    /// them down, while deactivation and plane shutdown tear them down right away.
-    anonymous_publish_clients: std::sync::Mutex<HashMap<MemberId, Weak<ManagedSdkPublishClient>>>,
-    /// Evicted or replaced publish clients still held by an active caller.
-    /// Their `Drop` schedules shutdown once the caller releases its `Arc`, and
+    /// Each account's anonymous group-publish / read-back clients (current and
+    /// any retained earlier adapter clones), tracked weakly per account so
+    /// adapter clones keep working while held and drop tears them down, while
+    /// account deactivation and plane shutdown tear down every live pool for
+    /// that account right away.
+    anonymous_publish_clients:
+        std::sync::Mutex<HashMap<MemberId, Vec<Weak<ManagedSdkPublishClient>>>>,
+    /// Evicted account publish clients still held by an active caller. Their
+    /// `Drop` schedules shutdown once the caller releases its `Arc`, and
     /// `MarmotRelayPlane::shutdown()` tears down any still live when the plane stops.
     retired_publish_clients: std::sync::Mutex<Vec<Weak<ManagedSdkPublishClient>>>,
     /// Each account's read-back REQs to each relay in the last hour, shared
@@ -552,6 +555,33 @@ fn spawn_sdk_client_shutdown(transport: &RelayPlaneTransport, client: NostrSdkRe
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(client);
+    }
+}
+
+async fn drain_join_handles(
+    slot: &std::sync::Mutex<Vec<JoinHandle<()>>>,
+    wait: Duration,
+    abort_on_timeout: bool,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let tasks = {
+            let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        if tasks.is_empty() {
+            return true;
+        }
+        for mut handle in tasks {
+            if timeout_at(deadline, &mut handle).await.is_err() {
+                if abort_on_timeout {
+                    handle.abort();
+                    let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut handle).await;
+                } else {
+                    return false;
+                }
+            }
+        }
     }
 }
 
@@ -1997,29 +2027,20 @@ impl MarmotRelayPlane {
         // Never share a socket with the authenticated receive pool or Welcome
         // publisher. Adapter clones retain this account's anonymous WRITE pool;
         // dropping the last clone tears it down, and deactivation or plane
-        // shutdown tears down any live pool immediately.
+        // shutdown tears down every live pool for this account immediately.
         let anonymous_publish_client = self.inner.transport.sdk_relay_client.as_ref().map(|_| {
             let client = ManagedSdkPublishClient::new(
                 NostrSdkRelayClient::from_builder(nostr_builder()),
                 &self.inner.transport,
             );
-            let replaced = self
+            let mut by_account = self
                 .inner
                 .anonymous_publish_clients
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(account_id.clone(), Arc::downgrade(&client));
-            if let Some(replaced) = replaced
-                && replaced.strong_count() > 0
-            {
-                let mut retired = self
-                    .inner
-                    .retired_publish_clients
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                retired.retain(|existing| existing.strong_count() > 0);
-                retired.push(replaced);
-            }
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entries = by_account.entry(account_id.clone()).or_default();
+            entries.retain(|existing| existing.strong_count() > 0);
+            entries.push(Arc::downgrade(&client));
             client
         });
         MarmotRelayPlaneAccountAdapter {
@@ -2245,8 +2266,10 @@ impl MarmotRelayPlane {
         }
     }
 
-    /// Retire a stopped account worker's subscriptions and immutable SDK
-    /// authenticator before a replacement worker can register a fresh signer.
+    /// Retire a stopped account worker's subscriptions, immutable SDK
+    /// authenticator, and live anonymous publish pools (including any retained
+    /// earlier adapter clones for this account) before a replacement worker
+    /// registers a fresh signer and rebuilds its adapter.
     #[doc(hidden)]
     pub async fn deactivate_account_context(
         &self,
@@ -2269,16 +2292,26 @@ impl MarmotRelayPlane {
         if let Some(sdk) = &self.inner.transport.sdk_relay_client {
             sdk.remove_account(account_id).await;
         }
-        let anonymous = self
+        let anonymous_clients = self
             .inner
             .anonymous_publish_clients
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(account_id)
-            .and_then(|weak| weak.upgrade());
-        if let Some(anonymous) = anonymous {
-            let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, anonymous.inner().shutdown()).await;
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .filter_map(|weak| weak.upgrade())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !anonymous_clients.is_empty() {
+            futures::future::join_all(anonymous_clients.iter().map(|client| async move {
+                let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, client.inner().shutdown()).await;
+            }))
+            .await;
         }
+        drop(anonymous_clients);
         if let Some(handle) = self
             .inner
             .transport
@@ -2776,7 +2809,7 @@ impl MarmotRelayPlane {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .drain()
-                    .filter_map(|(_, weak)| weak.upgrade()),
+                    .flat_map(|(_, entries)| entries.into_iter().filter_map(|weak| weak.upgrade())),
             );
             managed.extend(
                 self.inner
@@ -2891,53 +2924,29 @@ impl MarmotRelayPlane {
         // spawned by spill omissions above). Never abort an unfinished marker
         // writer on timeout: leaving it running lets it commit if storage is
         // merely slow, and storage closure terminates it via `Closed`.
-        let marker_deadline = tokio::time::Instant::now() + RELAY_PLANE_SHUTDOWN_WAIT;
-        'markers: loop {
-            let tasks = {
-                let mut guard = self
-                    .inner
-                    .transport
-                    .loss_marker_tasks
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                std::mem::take(&mut *guard)
-            };
-            if tasks.is_empty() {
-                break;
-            }
-            for mut handle in tasks {
-                if timeout_at(marker_deadline, &mut handle).await.is_err() {
-                    tracing::warn!(
-                        target: "marmot_app::relay_plane",
-                        method = "shutdown",
-                        "durable loss-marker persistence still in flight at shutdown deadline",
-                    );
-                    break 'markers;
-                }
-            }
+        // Bounded shutdown cannot guarantee persistence if storage returns
+        // `Retryable` continuously until the host closes SQLite; write-ahead
+        // cursor fencing for that case is tracked separately in mdk#3813.
+        if !drain_join_handles(
+            &self.inner.transport.loss_marker_tasks,
+            RELAY_PLANE_SHUTDOWN_WAIT,
+            false,
+        )
+        .await
+        {
+            tracing::warn!(
+                target: "marmot_app::relay_plane",
+                method = "shutdown",
+                "durable loss-marker persistence still in flight at shutdown deadline",
+            );
         }
         // Drain and join evicted publish-client shutdown tasks.
-        let client_deadline = tokio::time::Instant::now() + RELAY_PLANE_SHUTDOWN_WAIT;
-        loop {
-            let tasks = {
-                let mut guard = self
-                    .inner
-                    .transport
-                    .client_shutdown_tasks
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                std::mem::take(&mut *guard)
-            };
-            if tasks.is_empty() {
-                break;
-            }
-            for mut handle in tasks {
-                if timeout_at(client_deadline, &mut handle).await.is_err() {
-                    handle.abort();
-                    let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut handle).await;
-                }
-            }
-        }
+        let _ = drain_join_handles(
+            &self.inner.transport.client_shutdown_tasks,
+            RELAY_PLANE_SHUTDOWN_WAIT,
+            true,
+        )
+        .await;
     }
 
     fn spawn_router(&self) {

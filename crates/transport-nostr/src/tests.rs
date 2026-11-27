@@ -8267,7 +8267,7 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
         .expect("SDK plane creates anonymous publish client")
         .inner()
         .clone();
-    let adapter_a2 = plane.account_adapter(alice_id.clone(), alice_replacement_dyn);
+    let adapter_a2 = plane.account_adapter(alice_id.clone(), alice_replacement_dyn.clone());
     let anon_a2 = adapter_a2
         .anonymous_publish_client
         .as_ref()
@@ -8289,6 +8289,14 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
     .expect("dropped replaced anonymous publish client must shut down");
     assert!(!anon_a2.client().is_shutdown());
 
+    let adapter_a3 = plane.account_adapter(alice_id.clone(), alice_replacement_dyn);
+    let anon_a3 = adapter_a3
+        .anonymous_publish_client
+        .as_ref()
+        .expect("second replacement adapter creates fresh anonymous publish client")
+        .inner()
+        .clone();
+
     let adapter_b = plane.account_adapter(bob_id.clone(), bob_pub_dyn);
     let anon_b = adapter_b
         .anonymous_publish_client
@@ -8297,12 +8305,20 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
         .inner()
         .clone();
 
+    // Retaining both `adapter_a2` and `adapter_a3` across account deactivation
+    // must tear down every live anonymous client for Alice without touching Bob.
     plane.deactivate_account_context(&alice_id).await.unwrap();
     assert!(
         anon_a2.client().is_shutdown(),
-        "deactivating an account must shut down its anonymous publish client"
+        "deactivating an account must shut down retained earlier anonymous publish clients"
+    );
+    assert!(
+        anon_a3.client().is_shutdown(),
+        "deactivating an account must shut down its current anonymous publish client"
     );
     assert!(!anon_b.client().is_shutdown());
+    drop(adapter_a2);
+    drop(adapter_a3);
 
     plane.shutdown().await;
     assert!(
@@ -8510,7 +8526,9 @@ async fn shutdown_preserves_below_cursor_spill_deliveries_when_store_exceeds_dea
     let shutdown_task = tokio::spawn(async move {
         plane_for_shutdown.shutdown().await;
     });
-    tokio::task::yield_now().await;
+    while !relay_plane.is_shutting_down() {
+        tokio::task::yield_now().await;
+    }
     tokio::time::advance(RELAY_PLANE_SHUTDOWN_WAIT + Duration::from_millis(50)).await;
     tokio::time::resume();
 
