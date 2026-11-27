@@ -8155,12 +8155,19 @@ async fn directory_sync_worker_caches_follow_edges_without_promoting_follows() {
     let followed = format!("{:064x}", 77);
 
     runtime.start().await.unwrap();
+    let initial_follow_list_timestamp = app
+        .directory()
+        .directory_entry_for_account_id(&setup.account.account_id_hex)
+        .unwrap()
+        .expect("directory entry for the local account")
+        .follows_created_at;
     publish_follow_list_at(
         &AccountHome::open(dir.path()),
         &setup.account.label,
         &url,
         std::slice::from_ref(&followed),
-        test_unix_now_seconds(),
+        // The directory accepts only contact lists newer than the initial list.
+        initial_follow_list_timestamp + 1,
     )
     .await;
 
