@@ -46,8 +46,8 @@ use crate::{
     NostrAcquisitionResult, NostrAcquisitionScope, NostrAcquisitionStats, NostrEventPublishRequest,
     NostrNotificationLoss, NostrNotificationLossBounds, NostrNotificationLossFloor,
     NostrNotificationLossScope, NostrPublishBatch, NostrPublishOutcome, NostrRelayClient,
-    NostrRelayEvent, NostrSubscribeReport, NostrSubscription, NostrTransportAdapter,
-    RelayConnection, ReplayRestart, SubscriptionRefusal, SubscriptionRefusalDisposition,
+    NostrSubscribeReport, NostrSubscription, NostrTransportAdapter, RelayConnection, ReplayRestart,
+    SubscriptionRefusal, SubscriptionRefusalDisposition,
 };
 
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
@@ -1756,10 +1756,10 @@ async fn dispatch_sdk_notification(
 ) -> bool {
     match notification {
         ClientNotification::Event { .. } => {
-            // Live group and inbox admission both consume per-message
-            // `RelayMessage::Event` frames so SDK pool `seen_event_ids` cannot
-            // suppress a relay copy after a retired attempt, queue drop, or
-            // multi-relay delivery.
+            // Both notification forwarders filter SDK first-seen
+            // `ClientNotification::Event` frames before queueing; this arm is
+            // the defensive guard for direct callers and tests so SDK pool
+            // `seen_event_ids` cannot hide a relay copy.
             false
         }
         ClientNotification::Message { relay_url, message } => {
@@ -1783,62 +1783,14 @@ async fn dispatch_sdk_notification(
                             )
                             .await;
                     } else if event.kind == Kind::GiftWrap {
-                        if event.verify().is_ok() {
-                            let subscription_id = subscription_id.to_string();
-                            if let Ok(transport_event) =
-                                NostrTransportEvent::from_nostr_event(&event)
-                            {
-                                tracing::trace!(
-                                    target: "transport_nostr_adapter::sdk_client",
-                                    method = "dispatch_sdk_notification",
-                                    "forwarding SDK relay inbox event"
-                                );
-                                let relay_event = NostrRelayEvent {
-                                    endpoint,
-                                    subscription_id: Some(subscription_id.clone()),
-                                    event: transport_event,
-                                };
-                                // Account notifications feed only account/group delivery.
-                                // Public directory interests use the anonymous receiver.
-                                match relay_event.event.to_transport_message() {
-                                    Ok(message) => {
-                                        adapter
-                                            .observe_relay_event(
-                                                event.id.as_bytes(),
-                                                &relay_event.endpoint,
-                                                relay_event.subscription_id.as_deref(),
-                                                message.timestamp.0,
-                                            )
-                                            .await;
-                                        let _ = adapter
-                                            .admit_relay_message(
-                                                &relay_event,
-                                                message,
-                                                account_id,
-                                                crate::RelayCopy::RawInbox,
-                                            )
-                                            .await;
-                                    }
-                                    Err(_) => {
-                                        adapter
-                                            .observe_unconvertible_relay_event(
-                                                relay_event.endpoint,
-                                                subscription_id,
-                                                event.created_at.as_secs(),
-                                            )
-                                            .await;
-                                    }
-                                }
-                            } else {
-                                adapter
-                                    .observe_unconvertible_relay_event(
-                                        endpoint,
-                                        subscription_id,
-                                        event.created_at.as_secs(),
-                                    )
-                                    .await;
-                            }
-                        }
+                        let _ = adapter
+                            .handle_sdk_inbox_copy(
+                                &event,
+                                endpoint,
+                                subscription_id.to_string(),
+                                account_id,
+                            )
+                            .await;
                     } else if event.verify_id() {
                         adapter
                             .observe_relay_event(

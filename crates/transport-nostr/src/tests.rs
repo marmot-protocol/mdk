@@ -8188,29 +8188,42 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
     let alice_keys = Keys::generate();
     let bob_keys = Keys::generate();
     let carol_keys = Keys::generate();
+    let dave_keys = Keys::generate();
     let alice_hex = alice_keys.public_key().to_hex();
     let bob_hex = bob_keys.public_key().to_hex();
     let carol_hex = carol_keys.public_key().to_hex();
+    let dave_hex = dave_keys.public_key().to_hex();
     let alice_id = MemberId::new(alice_keys.public_key().to_bytes().to_vec());
     let bob_id = MemberId::new(bob_keys.public_key().to_bytes().to_vec());
 
-    let alice_pub_dyn = plane.account_publish_client(&alice_hex, Arc::new(alice_keys));
+    let alice_pub_dyn = plane.account_publish_client(&alice_hex, Arc::new(alice_keys.clone()));
     let bob_pub_dyn = plane.account_publish_client(&bob_hex, Arc::new(bob_keys));
-    let _carol_pub_dyn = plane.account_publish_client(&carol_hex, Arc::new(carol_keys));
-    let (alice_pub, bob_pub, carol_pub) = {
+    let carol_pub_dyn = plane.account_publish_client(&carol_hex, Arc::new(carol_keys));
+    let dave_pub_dyn = plane.account_publish_client(&dave_hex, Arc::new(dave_keys));
+    // Also cache a client whose only strong reference lives in `account_publish_clients`
+    // so `plane.shutdown()` exercises dropping the last `Arc<ManagedSdkPublishClient>`.
+    let eve_keys = Keys::generate();
+    let eve_hex = eve_keys.public_key().to_hex();
+    let _ = plane.account_publish_client(&eve_hex, Arc::new(eve_keys));
+    let (alice_pub, bob_pub, carol_pub, dave_pub, eve_pub) = {
         let guard = plane.inner.account_publish_clients.lock().unwrap();
         (
-            guard[&alice_hex].clone(),
-            guard[&bob_hex].clone(),
-            guard[&carol_hex].clone(),
+            guard[&alice_hex].inner().clone(),
+            guard[&bob_hex].inner().clone(),
+            guard[&carol_hex].inner().clone(),
+            guard[&dave_hex].inner().clone(),
+            guard[&eve_hex].inner().clone(),
         )
     };
     assert!(!alice_pub.client().is_shutdown());
     assert!(!bob_pub.client().is_shutdown());
     assert!(!carol_pub.client().is_shutdown());
+    assert!(!dave_pub.client().is_shutdown());
+    assert!(!eve_pub.client().is_shutdown());
 
-    // Evicting Carol's publish client outside a Tokio runtime queues its shutdown
-    // so it is still torn down instead of leaking.
+    // Evicting Carol after all caller refs drop outside a Tokio runtime queues
+    // its shutdown so it is still torn down instead of leaking.
+    drop(carol_pub_dyn);
     let plane_for_sync_evict = plane.clone();
     let carol_hex_for_sync_evict = carol_hex.clone();
     std::thread::spawn(move || {
@@ -8219,43 +8232,70 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
     .join()
     .expect("sync eviction thread should join");
 
-    // Evicting Alice's publish client on a Tokio runtime shuts down both Alice
-    // and any pending off-runtime eviction.
+    // Evicting Alice while an account worker still holds its `Arc` must keep
+    // that working pool alive (e.g. across `pin_external_signer` reattach) and
+    // only shut it down once the caller drops its `Arc`.
     plane.evict_account_publish_client(&alice_hex);
+    tokio::task::yield_now().await;
+    assert!(
+        !alice_pub.client().is_shutdown(),
+        "evicting a cached publish client must not shut down a pool still held by a caller"
+    );
+    let alice_replacement_dyn = plane.account_publish_client(&alice_hex, Arc::new(alice_keys));
+    drop(alice_pub_dyn);
     timeout(Duration::from_secs(5), async {
         while !alice_pub.client().is_shutdown() || !carol_pub.client().is_shutdown() {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("evicted account publish clients must shut down");
+    .expect("dropped evicted publish client and pending off-runtime eviction must shut down");
     assert!(!bob_pub.client().is_shutdown());
 
-    // Anonymous publish clients shut down on adapter replacement, deactivation, and plane shutdown.
-    let adapter_a1 = plane.account_adapter(alice_id.clone(), alice_pub_dyn.clone());
+    // Evicting Dave while held keeps Dave alive until `plane.shutdown()`.
+    plane.evict_account_publish_client(&dave_hex);
+    tokio::task::yield_now().await;
+    assert!(!dave_pub.client().is_shutdown());
+
+    // Anonymous publish clients stay alive while an earlier adapter clone is
+    // still held, shut down once that adapter drops, and shut down immediately
+    // on account deactivation or plane shutdown.
+    let adapter_a1 = plane.account_adapter(alice_id.clone(), alice_replacement_dyn.clone());
     let anon_a1 = adapter_a1
         .anonymous_publish_client
-        .clone()
-        .expect("SDK plane creates anonymous publish client");
-    let adapter_a2 = plane.account_adapter(alice_id.clone(), alice_pub_dyn);
+        .as_ref()
+        .expect("SDK plane creates anonymous publish client")
+        .inner()
+        .clone();
+    let adapter_a2 = plane.account_adapter(alice_id.clone(), alice_replacement_dyn);
     let anon_a2 = adapter_a2
         .anonymous_publish_client
-        .clone()
-        .expect("replacement adapter creates fresh anonymous publish client");
+        .as_ref()
+        .expect("replacement adapter creates fresh anonymous publish client")
+        .inner()
+        .clone();
+    tokio::task::yield_now().await;
+    assert!(
+        !anon_a1.client().is_shutdown(),
+        "replacing an adapter must not shut down an anonymous client still held by an earlier clone"
+    );
+    drop(adapter_a1);
     timeout(Duration::from_secs(5), async {
         while !anon_a1.client().is_shutdown() {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("replaced anonymous publish client must shut down");
+    .expect("dropped replaced anonymous publish client must shut down");
     assert!(!anon_a2.client().is_shutdown());
 
     let adapter_b = plane.account_adapter(bob_id.clone(), bob_pub_dyn);
     let anon_b = adapter_b
         .anonymous_publish_client
-        .clone()
-        .expect("Bob adapter creates anonymous publish client");
+        .as_ref()
+        .expect("Bob adapter creates anonymous publish client")
+        .inner()
+        .clone();
 
     plane.deactivate_account_context(&alice_id).await.unwrap();
     assert!(
@@ -8270,9 +8310,18 @@ async fn publish_clients_shut_down_on_eviction_replacement_deactivation_and_plan
         "plane shutdown must shut down remaining account publish clients"
     );
     assert!(
+        dave_pub.client().is_shutdown(),
+        "plane shutdown must shut down retired publish clients still held by callers"
+    );
+    assert!(
+        eve_pub.client().is_shutdown(),
+        "plane shutdown must shut down cached publish clients whose last Arc lived in the map"
+    );
+    assert!(
         anon_b.client().is_shutdown(),
         "plane shutdown must shut down remaining anonymous publish clients"
     );
+    drop(dave_pub_dyn);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8393,4 +8442,100 @@ async fn shutdown_joins_in_flight_delivery_spill_and_loss_marker_tasks() {
         marker_finished.load(Ordering::SeqCst),
         "shutdown() must join loss-marker persistence tasks spawned before/during spill drain"
     );
+}
+
+#[tokio::test]
+async fn shutdown_preserves_below_cursor_spill_deliveries_when_store_exceeds_deadline() {
+    let spill_started = Arc::new(Notify::new());
+    let (spill_release_tx, spill_release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let spill_release_rx = Arc::new(std::sync::Mutex::new(spill_release_rx));
+    let recorded_markers = Arc::new(std::sync::Mutex::new(Vec::<(u64, Option<u64>)>::new()));
+
+    let spill_started_clone = spill_started.clone();
+    let spill_store: AccountDeliverySpillStore = Arc::new(move |_batch| {
+        spill_started_clone.notify_one();
+        // Block past `RELAY_PLANE_SHUTDOWN_WAIT` so shutdown hits its timeout
+        // path before this blocking store call returns.
+        let _ = spill_release_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recv();
+        Err(AccountDeliveryRecoveryMarkerError::Retryable)
+    });
+
+    let recorded_markers_clone = recorded_markers.clone();
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, dropped, earliest, _| {
+        recorded_markers_clone
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((dropped, earliest));
+        Ok(())
+    });
+
+    let (relay_plane, adapter, alice) =
+        cursor_floor_adapter_opened(Some(spill_store), Some(marker), None);
+    let candidate = Some(OPENED_CURSOR + 2_000);
+    assert_eq!(
+        adapter.seal_transport_cursor(candidate, |_| true),
+        candidate
+    );
+
+    // First delivery starts the blocking spill writer below the saved restart
+    // floor; the second stays queued in `handoff.items` with an even earlier
+    // timestamp.
+    let first_below = OPENED_CURSOR - 50_000;
+    let second_below = OPENED_CURSOR - 60_000;
+    relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+        &alice,
+        1,
+        first_below,
+        TransportDeliveryPlane::Group,
+    ));
+    timeout(Duration::from_secs(2), spill_started.notified())
+        .await
+        .expect("in-flight spill writer must start");
+    relay_plane.route_account_delivery_for_test(cursor_floor_delivery(
+        &alice,
+        2,
+        second_below,
+        TransportDeliveryPlane::Group,
+    ));
+
+    // Pause time while `spill_store` is blocked, advance past the spill
+    // shutdown deadline so `shutdown()` transfers both the in-flight batch and
+    // queued handoff into durable retired queue loss before aborting the
+    // writer, then resume real time while `shutdown()` joins the marker task.
+    tokio::time::pause();
+    let plane_for_shutdown = relay_plane.clone();
+    let shutdown_task = tokio::spawn(async move {
+        plane_for_shutdown.shutdown().await;
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(RELAY_PLANE_SHUTDOWN_WAIT + Duration::from_millis(50)).await;
+    tokio::time::resume();
+
+    timeout(Duration::from_secs(5), shutdown_task)
+        .await
+        .expect("shutdown() must complete after transferring unfinished spills to queue loss")
+        .expect("shutdown task must not panic");
+
+    let markers = recorded_markers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let (dropped, earliest) = markers
+        .last()
+        .copied()
+        .expect("shutdown() must persist recovery debt for unfinished below-cursor spills");
+    assert!(
+        dropped >= 2,
+        "both in-flight and queued spill deliveries must be counted as loss: {markers:?}"
+    );
+    assert_eq!(
+        earliest,
+        Some(second_below),
+        "durable recovery floor must reach back to the earliest unfinished below-cursor spill"
+    );
+
+    let _ = spill_release_tx.send(());
 }

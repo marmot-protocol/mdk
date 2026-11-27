@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{
-    Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,10 +29,11 @@ use transport_nostr_adapter::NotificationUpdate;
 use transport_nostr_adapter::{
     AccountSubscriptionEose, AccountSubscriptionInput, NostrAcquisitionCancellation,
     NostrAcquisitionError, NostrAcquisitionRequest, NostrAcquisitionResult,
-    NostrNotificationLossBounds, NostrNotificationLossFloor, NostrPublishOutcome, NostrRelayClient,
+    NostrEventPublishRequest, NostrNotificationLoss, NostrNotificationLossBounds,
+    NostrNotificationLossFloor, NostrPublishBatch, NostrPublishOutcome, NostrRelayClient,
     NostrRelayNotificationSource, NostrSdkNotification, NostrSdkRelayClient, NostrSdkRelayHealth,
-    NostrTransportAdapter, RelayExportConsent, RelayLabelResolution, RelayRegistrationOutcome,
-    SubscriptionAttempt,
+    NostrSubscribeReport, NostrSubscription, NostrTransportAdapter, RelayConnection,
+    RelayExportConsent, RelayLabelResolution, RelayRegistrationOutcome, SubscriptionAttempt,
 };
 
 pub use transport_nostr_adapter::{
@@ -196,10 +197,15 @@ struct MarmotRelayPlaneInner {
     /// One signer-bound publisher per account. Setup publishes and the managed
     /// account worker share this client so the worker can reuse the same relay
     /// pool instead of constructing another TCP/TLS/WebSocket stack.
-    account_publish_clients: std::sync::Mutex<HashMap<String, Arc<NostrSdkRelayClient>>>,
-    /// Each account's anonymous group-publish / read-back client, tracked here
-    /// so deactivation, adapter replacement, and plane shutdown tear it down.
-    anonymous_publish_clients: std::sync::Mutex<HashMap<MemberId, NostrSdkRelayClient>>,
+    account_publish_clients: std::sync::Mutex<HashMap<String, Arc<ManagedSdkPublishClient>>>,
+    /// Each account's current anonymous group-publish / read-back client,
+    /// tracked weakly so adapter clones keep working while held and drop tears
+    /// them down, while deactivation and plane shutdown tear them down right away.
+    anonymous_publish_clients: std::sync::Mutex<HashMap<MemberId, Weak<ManagedSdkPublishClient>>>,
+    /// Evicted or replaced publish clients still held by an active caller.
+    /// Their `Drop` schedules shutdown once the caller releases its `Arc`, and
+    /// `MarmotRelayPlane::shutdown()` tears down any still live when the plane stops.
+    retired_publish_clients: std::sync::Mutex<Vec<Weak<ManagedSdkPublishClient>>>,
     /// Each account's read-back REQs to each relay in the last hour, shared
     /// by every adapter for the account (mdk#2332).
     read_back_budget: read_back::ReadBackBudget,
@@ -217,6 +223,7 @@ impl Drop for MarmotRelayPlaneInner {
     fn drop(&mut self) {
         let transport = &self.transport;
         transport.shutting_down.store(true, Ordering::SeqCst);
+        transport.shutdown_notify.notify_waiters();
         for slot in [
             &transport.router,
             &transport.notification_forwarder,
@@ -256,24 +263,270 @@ struct RelayPlaneTransport {
     account_notification_forwarders: Mutex<HashMap<MemberId, JoinHandle<()>>>,
     directory_notification_forwarder: Mutex<Option<JoinHandle<()>>>,
     notification_forwarder_health: Arc<RelayNotificationForwarderHealth>,
-    /// Bounded tracking for background spill writers, durable loss-marker
-    /// writers, and evicted publish-client shutdowns so `shutdown()` joins them.
-    background_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    /// Bounded tracking for in-flight delivery spill writers so `shutdown()`
+    /// drains them and transfers any unfinished items into durable queue loss
+    /// before cancelling a wedged task.
+    spill_tasks: std::sync::Mutex<Vec<(Arc<delivery_spill::AccountDeliverySpill>, JoinHandle<()>)>>,
+    /// Bounded tracking for durable loss-marker persistence tasks so
+    /// `shutdown()` awaits their completion without aborting durable writes.
+    loss_marker_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    /// Bounded tracking for evicted publish-client shutdown tasks so
+    /// `shutdown()` joins them.
+    client_shutdown_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     /// Evicted or replaced SDK publish clients awaiting shutdown when teardown
     /// was triggered outside a Tokio runtime.
     pending_client_shutdowns: std::sync::Mutex<Vec<NostrSdkRelayClient>>,
 
     shutting_down: AtomicBool,
+    shutdown_notify: Notify,
 }
 
 impl RelayPlaneTransport {
-    pub(crate) fn track_background_task(&self, handle: JoinHandle<()>) {
+    pub(crate) fn track_spill_task(
+        &self,
+        spill: Arc<delivery_spill::AccountDeliverySpill>,
+        handle: JoinHandle<()>,
+    ) {
         let mut tasks = self
-            .background_tasks
+            .spill_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tasks.retain(|(_, existing)| !existing.is_finished());
+        tasks.push((spill, handle));
+    }
+
+    pub(crate) fn track_loss_marker_task(&self, handle: JoinHandle<()>) {
+        let mut tasks = self
+            .loss_marker_tasks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         tasks.retain(|existing| !existing.is_finished());
         tasks.push(handle);
+    }
+
+    fn track_client_shutdown_task(&self, handle: JoinHandle<()>) {
+        let mut tasks = self
+            .client_shutdown_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tasks.retain(|existing| !existing.is_finished());
+        tasks.push(handle);
+    }
+}
+
+/// Reference-counted SDK publish client handle. Evicting a cached client from
+/// `MarmotRelayPlane` drops only the plane's `Arc`, so an in-flight publish or
+/// running account worker keeps its working pool until it releases its `Arc`,
+/// at which point `Drop` schedules `NostrSdkRelayClient::shutdown()`. Explicit
+/// account deactivation and plane shutdown still tear down live clients
+/// immediately via weak handles.
+struct ManagedSdkPublishClient {
+    inner: NostrSdkRelayClient,
+    transport: Weak<RelayPlaneTransport>,
+}
+
+impl ManagedSdkPublishClient {
+    fn new(inner: NostrSdkRelayClient, transport: &Arc<RelayPlaneTransport>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            transport: Arc::downgrade(transport),
+        })
+    }
+
+    fn inner(&self) -> &NostrSdkRelayClient {
+        &self.inner
+    }
+}
+
+impl std::ops::Deref for ManagedSdkPublishClient {
+    type Target = NostrSdkRelayClient;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Drop for ManagedSdkPublishClient {
+    fn drop(&mut self) {
+        if self.inner.client().is_shutdown() {
+            return;
+        }
+        if let Some(transport) = self.transport.upgrade() {
+            spawn_sdk_client_shutdown(&transport, self.inner.clone());
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let client = self.inner.clone();
+            runtime.spawn(async move {
+                let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, client.shutdown()).await;
+            });
+        }
+    }
+}
+
+#[async_trait]
+impl NostrRelayClient for ManagedSdkPublishClient {
+    fn relay_notification_source(&self) -> Option<Arc<dyn NostrRelayNotificationSource>> {
+        self.inner.relay_notification_source()
+    }
+
+    fn relay_connection(
+        &self,
+        account: &MemberId,
+        endpoint: &TransportEndpoint,
+    ) -> Option<RelayConnection> {
+        self.inner.relay_connection(account, endpoint)
+    }
+
+    async fn reply_sent_nothing(
+        &self,
+        account: Option<&MemberId>,
+        endpoint: &TransportEndpoint,
+        subscription_id: &str,
+    ) -> bool {
+        self.inner
+            .reply_sent_nothing(account, endpoint, subscription_id)
+            .await
+    }
+
+    async fn acquire_history(
+        &self,
+        request: NostrAcquisitionRequest,
+        cancellation: NostrAcquisitionCancellation,
+    ) -> Result<NostrAcquisitionResult, NostrAcquisitionError> {
+        self.inner.acquire_history(request, cancellation).await
+    }
+
+    fn notification_loss(
+        &self,
+    ) -> Result<tokio::sync::watch::Receiver<Option<NostrNotificationLoss>>, NostrAcquisitionError>
+    {
+        self.inner.notification_loss()
+    }
+
+    async fn notification_loss_for_account(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<tokio::sync::watch::Receiver<Option<NostrNotificationLoss>>, NostrAcquisitionError>
+    {
+        self.inner.notification_loss_for_account(account_id).await
+    }
+
+    async fn subscribe(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), TransportAdapterError> {
+        self.inner.subscribe(subscription).await
+    }
+
+    async fn subscribe_reporting(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<NostrSubscribeReport, TransportAdapterError> {
+        self.inner.subscribe_reporting(subscription).await
+    }
+
+    async fn unsubscribe(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), TransportAdapterError> {
+        self.inner.unsubscribe(subscription).await
+    }
+
+    fn supports_scoped_subscriptions(&self) -> bool {
+        self.inner.supports_scoped_subscriptions()
+    }
+
+    async fn subscribe_scoped(
+        &self,
+        subscription: NostrSubscription,
+        subscription_id: String,
+    ) -> Result<(), TransportAdapterError> {
+        self.inner
+            .subscribe_scoped(subscription, subscription_id)
+            .await
+    }
+
+    async fn unsubscribe_scoped(
+        &self,
+        subscription: NostrSubscription,
+        subscription_id: String,
+    ) -> Result<(), TransportAdapterError> {
+        self.inner
+            .unsubscribe_scoped(subscription, subscription_id)
+            .await
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        account_id: &MemberId,
+        replacements: &[NostrSubscription],
+    ) -> Result<(), TransportAdapterError> {
+        self.inner
+            .unsubscribe_account(account_id, replacements)
+            .await
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        self.inner
+            .publish_event(endpoints, event, required_acks)
+            .await
+    }
+
+    async fn connect_for_publish(
+        &self,
+        endpoint: &TransportEndpoint,
+    ) -> Result<(), TransportEndpointFailure> {
+        self.inner.connect_for_publish(endpoint).await
+    }
+
+    async fn publish_event_for_account(
+        &self,
+        account_id: &MemberId,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        self.inner
+            .publish_event_for_account(account_id, endpoints, event, required_acks)
+            .await
+    }
+
+    async fn publish_events_for_account(
+        &self,
+        account_id: &MemberId,
+        requests: &[NostrEventPublishRequest],
+    ) -> Vec<Result<NostrPublishOutcome, TransportAdapterError>> {
+        self.inner
+            .publish_events_for_account(account_id, requests)
+            .await
+    }
+
+    async fn publish_events_for_account_with_timings(
+        &self,
+        account_id: &MemberId,
+        requests: &[NostrEventPublishRequest],
+    ) -> NostrPublishBatch {
+        self.inner
+            .publish_events_for_account_with_timings(account_id, requests)
+            .await
+    }
+
+    async fn publish_events(
+        &self,
+        requests: &[NostrEventPublishRequest],
+    ) -> Vec<Result<NostrPublishOutcome, TransportAdapterError>> {
+        self.inner.publish_events(requests).await
+    }
+
+    async fn publish_events_with_timings(
+        &self,
+        requests: &[NostrEventPublishRequest],
+    ) -> NostrPublishBatch {
+        self.inner.publish_events_with_timings(requests).await
     }
 }
 
@@ -291,7 +544,7 @@ fn spawn_sdk_client_shutdown(transport: &RelayPlaneTransport, client: NostrSdkRe
             let handle = runtime.spawn(async move {
                 let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, client.shutdown()).await;
             });
-            transport.track_background_task(handle);
+            transport.track_client_shutdown_task(handle);
         }
     } else {
         transport
@@ -339,7 +592,7 @@ pub struct MarmotRelayPlaneAccountAdapter {
     account_id: MemberId,
     relay_plane: MarmotRelayPlane,
     publish_client: Arc<dyn NostrRelayClient>,
-    anonymous_publish_client: Option<NostrSdkRelayClient>,
+    anonymous_publish_client: Option<Arc<ManagedSdkPublishClient>>,
     delivery_rx: Arc<Mutex<mpsc::Receiver<AccountDeliveryEvent>>>,
     delivery_overflow: Arc<AccountDeliveryOverflowState>,
     /// The queue generation `delivery_rx` belongs to.
@@ -1573,9 +1826,12 @@ impl MarmotRelayPlane {
             account_notification_forwarders: Mutex::new(HashMap::new()),
             directory_notification_forwarder: Mutex::new(None),
             notification_forwarder_health: Arc::new(RelayNotificationForwarderHealth::default()),
-            background_tasks: std::sync::Mutex::new(Vec::new()),
+            spill_tasks: std::sync::Mutex::new(Vec::new()),
+            loss_marker_tasks: std::sync::Mutex::new(Vec::new()),
+            client_shutdown_tasks: std::sync::Mutex::new(Vec::new()),
             pending_client_shutdowns: std::sync::Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
+            shutdown_notify: Notify::new(),
         });
         let this = Self {
             inner: Arc::new(MarmotRelayPlaneInner {
@@ -1586,6 +1842,7 @@ impl MarmotRelayPlane {
                 directory_subscription_sync: Mutex::new(()),
                 account_publish_clients: std::sync::Mutex::new(HashMap::new()),
                 anonymous_publish_clients: std::sync::Mutex::new(HashMap::new()),
+                retired_publish_clients: std::sync::Mutex::new(Vec::new()),
                 read_back_budget: read_back::ReadBackBudget::default(),
             }),
         };
@@ -1621,16 +1878,23 @@ impl MarmotRelayPlane {
                 );
                 let account_id =
                     MemberId::new(hex::decode(account_id_hex).expect("validated account identity"));
-                Arc::new(NostrSdkRelayClient::from_builder_with_account_signer(
-                    builder, account_id, signer,
-                ))
+                ManagedSdkPublishClient::new(
+                    NostrSdkRelayClient::from_builder_with_account_signer(
+                        builder, account_id, signer,
+                    ),
+                    &self.inner.transport,
+                )
             })
             .clone() as Arc<dyn NostrRelayClient>
     }
 
-    /// Forgets the account's publish client and tears down its underlying SDK
-    /// pool, so the next [`Self::account_publish_client`] builds one with the
-    /// current signer without leaking sockets or pool tasks.
+    /// Forgets the account's cached publish client so the next
+    /// [`Self::account_publish_client`] builds one with the current signer.
+    /// Existing callers (such as a running account worker during external-signer
+    /// reattachment) keep their working `Arc` until they drop it, at which point
+    /// `ManagedSdkPublishClient::drop` shuts down the underlying SDK pool;
+    /// `MarmotRelayPlane::shutdown()` also tears down any still-live evicted
+    /// clients.
     #[doc(hidden)]
     pub fn evict_account_publish_client(&self, account_id_hex: &str) {
         let removed = self
@@ -1640,7 +1904,17 @@ impl MarmotRelayPlane {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(account_id_hex);
         if let Some(client) = removed {
-            spawn_sdk_client_shutdown(&self.inner.transport, (*client).clone());
+            let weak = Arc::downgrade(&client);
+            drop(client);
+            if weak.strong_count() > 0 {
+                let mut retired = self
+                    .inner
+                    .retired_publish_clients
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                retired.retain(|existing| existing.strong_count() > 0);
+                retired.push(weak);
+            }
         }
     }
 
@@ -1721,18 +1995,30 @@ impl MarmotRelayPlane {
         }
         drop(routes);
         // Never share a socket with the authenticated receive pool or Welcome
-        // publisher. Adapter clones retain this account's anonymous WRITE pool,
-        // and the plane owns its teardown on replacement, deactivation, or shutdown.
+        // publisher. Adapter clones retain this account's anonymous WRITE pool;
+        // dropping the last clone tears it down, and deactivation or plane
+        // shutdown tears down any live pool immediately.
         let anonymous_publish_client = self.inner.transport.sdk_relay_client.as_ref().map(|_| {
-            let client = NostrSdkRelayClient::from_builder(nostr_builder());
+            let client = ManagedSdkPublishClient::new(
+                NostrSdkRelayClient::from_builder(nostr_builder()),
+                &self.inner.transport,
+            );
             let replaced = self
                 .inner
                 .anonymous_publish_clients
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(account_id.clone(), client.clone());
-            if let Some(replaced) = replaced {
-                spawn_sdk_client_shutdown(&self.inner.transport, replaced);
+                .insert(account_id.clone(), Arc::downgrade(&client));
+            if let Some(replaced) = replaced
+                && replaced.strong_count() > 0
+            {
+                let mut retired = self
+                    .inner
+                    .retired_publish_clients
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                retired.retain(|existing| existing.strong_count() > 0);
+                retired.push(replaced);
             }
             client
         });
@@ -1988,9 +2274,10 @@ impl MarmotRelayPlane {
             .anonymous_publish_clients
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(account_id);
+            .remove(account_id)
+            .and_then(|weak| weak.upgrade());
         if let Some(anonymous) = anonymous {
-            let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, anonymous.shutdown()).await;
+            let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, anonymous.inner().shutdown()).await;
         }
         if let Some(handle) = self
             .inner
@@ -2453,6 +2740,7 @@ impl MarmotRelayPlane {
             .transport
             .shutting_down
             .store(true, Ordering::SeqCst);
+        self.inner.transport.shutdown_notify.notify_waiters();
         if let Some(sdk_relay_client) = &self.inner.transport.sdk_relay_client {
             let _ = timeout(
                 RELAY_PLANE_SHUTDOWN_WAIT,
@@ -2473,36 +2761,57 @@ impl MarmotRelayPlane {
         if let Some(directory_client) = &self.inner.transport.directory_client {
             let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, directory_client.shutdown()).await;
         }
-        let publish_clients = {
-            let mut account_clients = self
+        let managed_clients = {
+            let mut managed = self
                 .inner
                 .account_publish_clients
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut anonymous_clients = self
-                .inner
-                .anonymous_publish_clients
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut pending_clients = self
-                .inner
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .drain()
+                .map(|(_, client)| client)
+                .collect::<Vec<_>>();
+            managed.extend(
+                self.inner
+                    .anonymous_publish_clients
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .drain()
+                    .filter_map(|(_, weak)| weak.upgrade()),
+            );
+            managed.extend(
+                self.inner
+                    .retired_publish_clients
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .drain(..)
+                    .filter_map(|weak| weak.upgrade()),
+            );
+            managed
+        };
+        let pending_clients = {
+            self.inner
                 .transport
                 .pending_client_shutdowns
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            account_clients
-                .drain()
-                .map(|(_, client)| (*client).clone())
-                .chain(anonymous_clients.drain().map(|(_, client)| client))
-                .chain(pending_clients.drain(..))
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .drain(..)
                 .collect::<Vec<_>>()
         };
-        if !publish_clients.is_empty() {
-            futures::future::join_all(publish_clients.into_iter().map(|client| async move {
+        // Keep `managed_clients` alive until their SDK pools finish shutting
+        // down (and well outside every mutex) so `ManagedSdkPublishClient::drop`
+        // cannot re-enter `pending_client_shutdowns` or spawn duplicate tasks.
+        if !managed_clients.is_empty() || !pending_clients.is_empty() {
+            let clients = managed_clients
+                .iter()
+                .map(|client| client.inner().clone())
+                .chain(pending_clients)
+                .collect::<Vec<_>>();
+            futures::future::join_all(clients.into_iter().map(|client| async move {
                 let _ = timeout(RELAY_PLANE_SHUTDOWN_WAIT, client.shutdown()).await;
             }))
             .await;
         }
+        drop(managed_clients);
         account_deliveries_write(&self.inner.transport.account_deliveries).clear();
         if let Some(handle) = self.inner.transport.router.lock().await.take() {
             let mut handle = handle;
@@ -2551,16 +2860,44 @@ impl MarmotRelayPlane {
             .notification_forwarder_health
             .running_count
             .store(0, Ordering::SeqCst);
-        // Drain and join tracked background spill writers, durable loss-marker
-        // writes, and evicted publish-client shutdowns. A finishing spill writer
-        // may spawn a retired loss-marker task, so loop until empty or deadline.
-        let background_deadline = tokio::time::Instant::now() + RELAY_PLANE_SHUTDOWN_WAIT;
+        // Drain and join in-flight delivery spill writers. If a blocking store
+        // call outlives the shutdown budget, transfer its unfinished batch and
+        // queued handoffs into durable queue loss BEFORE aborting the task so a
+        // delivery below the saved transport cursor is never silently skipped.
+        let spill_deadline = tokio::time::Instant::now() + RELAY_PLANE_SHUTDOWN_WAIT;
         loop {
             let tasks = {
                 let mut guard = self
                     .inner
                     .transport
-                    .background_tasks
+                    .spill_tasks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                std::mem::take(&mut *guard)
+            };
+            if tasks.is_empty() {
+                break;
+            }
+            for (spill, mut handle) in tasks {
+                let timed_out = timeout_at(spill_deadline, &mut handle).await.is_err();
+                spill.omit_unfinished_for_shutdown();
+                if timed_out {
+                    handle.abort();
+                    let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut handle).await;
+                }
+            }
+        }
+        // Drain and join durable loss-marker persistence tasks (including any
+        // spawned by spill omissions above). Never abort an unfinished marker
+        // writer on timeout: leaving it running lets it commit if storage is
+        // merely slow, and storage closure terminates it via `Closed`.
+        let marker_deadline = tokio::time::Instant::now() + RELAY_PLANE_SHUTDOWN_WAIT;
+        'markers: loop {
+            let tasks = {
+                let mut guard = self
+                    .inner
+                    .transport
+                    .loss_marker_tasks
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 std::mem::take(&mut *guard)
@@ -2569,7 +2906,33 @@ impl MarmotRelayPlane {
                 break;
             }
             for mut handle in tasks {
-                if timeout_at(background_deadline, &mut handle).await.is_err() {
+                if timeout_at(marker_deadline, &mut handle).await.is_err() {
+                    tracing::warn!(
+                        target: "marmot_app::relay_plane",
+                        method = "shutdown",
+                        "durable loss-marker persistence still in flight at shutdown deadline",
+                    );
+                    break 'markers;
+                }
+            }
+        }
+        // Drain and join evicted publish-client shutdown tasks.
+        let client_deadline = tokio::time::Instant::now() + RELAY_PLANE_SHUTDOWN_WAIT;
+        loop {
+            let tasks = {
+                let mut guard = self
+                    .inner
+                    .transport
+                    .client_shutdown_tasks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                std::mem::take(&mut *guard)
+            };
+            if tasks.is_empty() {
+                break;
+            }
+            for mut handle in tasks {
+                if timeout_at(client_deadline, &mut handle).await.is_err() {
                     handle.abort();
                     let _ = timeout(RELAY_PLANE_TASK_ABORT_WAIT, &mut handle).await;
                 }
@@ -3809,7 +4172,7 @@ impl MarmotRelayPlaneAccountAdapter {
             .as_ref()
             .filter(|_| event.sig.is_some())
         {
-            Some(client) => client,
+            Some(client) => client.as_ref(),
             None => self.publish_client.as_ref(),
         }
     }
@@ -4707,7 +5070,7 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             return no_answer();
         };
         let outcome = read_back::read_back(
-            client,
+            client.inner(),
             &self.relay_plane.inner.relay_safety,
             &self.relay_plane.inner.read_back_budget,
             account_id,
@@ -4950,7 +5313,7 @@ fn persist_queue_loss(
             }
         });
         if let Some(transport) = transport {
-            transport.track_background_task(handle);
+            transport.track_loss_marker_task(handle);
         }
     } else if overflow.take_durable_marker_signal(generation) {
         enqueue_account_delivery_overflow_signal(sender, overflow, generation);
@@ -4968,7 +5331,7 @@ fn persist_retired_queue_loss(
         let overflow = overflow.clone();
         let handle = tokio::spawn(async move { overflow.persist_marker_before_drop(marker).await });
         if let Some(transport) = transport {
-            transport.track_background_task(handle);
+            transport.track_loss_marker_task(handle);
         }
     }
 }
