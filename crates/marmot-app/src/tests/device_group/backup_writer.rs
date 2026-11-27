@@ -1532,11 +1532,22 @@ async fn the_runtime_writes_a_due_backup() {
         .account("alice")
         .unwrap()
         .account_id_hex;
+    let deployment = MarmotDeployment {
+        new_group_media_endpoints: vec![blossom.url.clone()],
+        ..MarmotDeployment::white_noise()
+    };
+    // Each runtime shutdown terminates its `MarmotApp`'s relay plane, so each
+    // subsequent runtime reopens a fresh `MarmotApp` on the same directory.
+    let reopen_phone_app = || {
+        let app = device_group_app_on(&_dirs[0], relay.clone(), deployment.clone());
+        remember_test_member_inbox(&app, &account_id, "wss://relay.example");
+        app
+    };
     let ledger = storage(&phone_app);
     let old_run = [0xe1; 16];
     ledger.begin_backup_run(&old_run, &[0xf2; 32], 1).unwrap();
     let before = ledger.backup_runs().unwrap();
-    let closed = MarmotAppRuntime::new(phone_app.clone());
+    let closed = MarmotAppRuntime::new(phone_app);
     closed.reconcile_accounts().await.unwrap();
     // Durable cleanup happens synchronously during preparation, so this
     // proves closed admission even before any HTTP future could be polled.
@@ -1560,7 +1571,7 @@ async fn the_runtime_writes_a_due_backup() {
     assert_eq!(pointers_published(&relay), 0);
     closed.shutdown().await;
 
-    let runtime = MarmotAppRuntime::new(phone_app.clone());
+    let runtime = MarmotAppRuntime::new(reopen_phone_app());
     // With no workers or watch receivers, the report must still be retained.
     runtime
         .set_runtime_backup_background_conditions(true, true)
@@ -1748,7 +1759,7 @@ async fn the_runtime_writes_a_due_backup() {
     stopped_upload.release();
 
     // A NEW runtime starts closed even though the previous one reported true.
-    let replacement = MarmotAppRuntime::new(phone_app.clone());
+    let replacement = MarmotAppRuntime::new(reopen_phone_app());
     let new_run = [0xe5; 16];
     ledger.begin_backup_run(&new_run, &[0xf6; 32], 3).unwrap();
     let after_stop = ledger.backup_runs().unwrap();
