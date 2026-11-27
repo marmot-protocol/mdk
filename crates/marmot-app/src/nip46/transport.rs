@@ -359,7 +359,7 @@ pub(super) async fn run(
         let command = tokio::select! {
             biased;
             change = changes.changed() => {
-                if let Some(old) = transport.take() { let _ = tokio::time::timeout(Duration::from_secs(2), old.client.disconnect()).await; }
+                if let Some(old) = transport.take() { let _ = tokio::time::timeout(Duration::from_secs(2), old.client.shutdown()).await; }
                 if change.is_err() || matches!(lock(&shared.data).status.state, Nip46State::Cancelled | Nip46State::LoggedOut) { break; }
                 continue;
             }
@@ -490,7 +490,7 @@ pub(super) async fn run(
             // Discard queued notifications and connections after interruption. A fresh
             // actor transport and unique generation/request ids reject delayed replies.
             if let Some(old) = transport.take() {
-                let _ = tokio::time::timeout(Duration::from_secs(2), old.client.disconnect()).await;
+                let _ = tokio::time::timeout(Duration::from_secs(2), old.client.shutdown()).await;
             }
         }
         let _ = command.reply.send(result);
@@ -506,6 +506,6 @@ pub(super) async fn run(
         let _ = command.reply.send(Err(Nip46Error::Cancelled));
     }
     if let Some(old) = transport {
-        let _ = tokio::time::timeout(Duration::from_secs(2), old.client.disconnect()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), old.client.shutdown()).await;
     }
 }

@@ -1737,14 +1737,14 @@ struct PreparedPublish {
     required_acks: usize,
 }
 
-/// Routes one SDK client notification into `adapter`. Verified raw group copies
-/// pass through replay admission, including ciphertext the SDK already saw on
-/// an abandoned attempt. Other kinds use deduplicated delivery, scoped to
-/// `account_id` when the receiver serves one account. Each relay copy feeds
-/// telemetry and replay-page accounting, an end of stored events feeds subscription
-/// progress, and a `CLOSED` becomes a refusal classified by `classify_closed`
-/// from its own reason. Returns whether the notification was the pool's
-/// shutdown.
+/// Routes one SDK client notification into `adapter`. Verified raw group and
+/// inbox copies pass through per-message admission on `RelayMessage::Event`,
+/// including copies the SDK already saw on another relay, a retired attempt, or
+/// a prior queue drop. SDK first-seen `ClientNotification::Event` frames are
+/// ignored. Each relay copy feeds telemetry and replay-page accounting, an end
+/// of stored events feeds subscription progress, and a `CLOSED` becomes a
+/// refusal classified by `classify_closed` from its own reason. Returns whether
+/// the notification was the pool's shutdown.
 ///
 /// Both consumers enter through `dispatch_sdk_replay` before this payload
 /// handler; untagged SDK input cannot bypass the replay-generation fence.
@@ -1755,43 +1755,11 @@ async fn dispatch_sdk_notification(
     classify_closed: &(dyn Fn(&str) -> crate::SubscriptionRefusal + Sync),
 ) -> bool {
     match notification {
-        ClientNotification::Event {
-            relay_url,
-            subscription_id,
-            event,
-        } => {
-            // The SDK emits Event before its raw Message copy. Only the raw
-            // copy may admit group ciphertext: a delayed Event from a retired
-            // attempt must never bypass the subscription/replay gate.
-            if event.kind == Kind::MlsGroupMessage {
-                return false;
-            }
-            if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
-                tracing::trace!(
-                    target: "transport_nostr_adapter::sdk_client",
-                    method = "dispatch_sdk_notification",
-                    "forwarding SDK relay event"
-                );
-                let endpoint = TransportEndpoint(relay_url.to_string());
-                let subscription_id = subscription_id.to_string();
-                let relay_event = NostrRelayEvent {
-                    endpoint,
-                    subscription_id: Some(subscription_id),
-                    event,
-                };
-                // Account notifications feed only account/group delivery.
-                // Public directory interests use the anonymous receiver.
-                if let Ok(message) = relay_event.event.to_transport_message() {
-                    let _ = adapter
-                        .admit_relay_message(
-                            &relay_event,
-                            message,
-                            account_id,
-                            crate::RelayCopy::Deduplicated,
-                        )
-                        .await;
-                }
-            }
+        ClientNotification::Event { .. } => {
+            // Live group and inbox admission both consume per-message
+            // `RelayMessage::Event` frames so SDK pool `seen_event_ids` cannot
+            // suppress a relay copy after a retired attempt, queue drop, or
+            // multi-relay delivery.
             false
         }
         ClientNotification::Message { relay_url, message } => {
@@ -1801,7 +1769,8 @@ async fn dispatch_sdk_notification(
                     event,
                 } => {
                     // The SDK authenticates event ids, not later cache-hit bytes.
-                    // Group copies reuse trusted bodies or validate the body hash.
+                    // Group copies reuse trusted bodies or validate the body hash;
+                    // kind-1059 inbox copies verify supplied wire bytes directly.
                     // Keep observation and admission in relay/EOSE order.
                     let endpoint = TransportEndpoint(relay_url.to_string());
                     if event.kind == Kind::MlsGroupMessage {
@@ -1813,6 +1782,63 @@ async fn dispatch_sdk_notification(
                                 account_id,
                             )
                             .await;
+                    } else if event.kind == Kind::GiftWrap {
+                        if event.verify().is_ok() {
+                            let subscription_id = subscription_id.to_string();
+                            if let Ok(transport_event) =
+                                NostrTransportEvent::from_nostr_event(&event)
+                            {
+                                tracing::trace!(
+                                    target: "transport_nostr_adapter::sdk_client",
+                                    method = "dispatch_sdk_notification",
+                                    "forwarding SDK relay inbox event"
+                                );
+                                let relay_event = NostrRelayEvent {
+                                    endpoint,
+                                    subscription_id: Some(subscription_id.clone()),
+                                    event: transport_event,
+                                };
+                                // Account notifications feed only account/group delivery.
+                                // Public directory interests use the anonymous receiver.
+                                match relay_event.event.to_transport_message() {
+                                    Ok(message) => {
+                                        adapter
+                                            .observe_relay_event(
+                                                event.id.as_bytes(),
+                                                &relay_event.endpoint,
+                                                relay_event.subscription_id.as_deref(),
+                                                message.timestamp.0,
+                                            )
+                                            .await;
+                                        let _ = adapter
+                                            .admit_relay_message(
+                                                &relay_event,
+                                                message,
+                                                account_id,
+                                                crate::RelayCopy::RawInbox,
+                                            )
+                                            .await;
+                                    }
+                                    Err(_) => {
+                                        adapter
+                                            .observe_unconvertible_relay_event(
+                                                relay_event.endpoint,
+                                                subscription_id,
+                                                event.created_at.as_secs(),
+                                            )
+                                            .await;
+                                    }
+                                }
+                            } else {
+                                adapter
+                                    .observe_unconvertible_relay_event(
+                                        endpoint,
+                                        subscription_id,
+                                        event.created_at.as_secs(),
+                                    )
+                                    .await;
+                            }
+                        }
                     } else if event.verify_id() {
                         adapter
                             .observe_relay_event(
@@ -1987,6 +2013,18 @@ impl NostrSdkRelayClient {
         signer: Arc<dyn MarmotNostrSigner>,
     ) -> Self {
         Self::new(client).signed_as(account_id, signer)
+    }
+
+    /// Construct a client through [`Self::from_builder`] with one immutable
+    /// account signer. The builder must already carry the matching
+    /// authenticator so relay NIP-42 AUTH and scoped publish relays stay bound
+    /// to `account_id`.
+    pub fn from_builder_with_account_signer(
+        builder: ClientBuilder,
+        account_id: MemberId,
+        signer: Arc<dyn MarmotNostrSigner>,
+    ) -> Self {
+        Self::from_builder(builder).signed_as(account_id, signer)
     }
 
     /// This client, serving `account_id` with `signer`.
@@ -2831,12 +2869,17 @@ impl NostrSdkRelayClient {
                 match update {
                     NotificationUpdate::Notification(NostrSdkNotification::Shutdown) => break,
                     NotificationUpdate::Notification(notification) => {
-                        // Group admission uses the verified raw copy. Its SDK
-                        // deduplicated twin cannot deliver and only spends queue room.
-                        if matches!(&notification, NostrSdkNotification::Payload {
-                            notification: ClientNotification::Event { event, .. }, ..
-                        } if event.kind == Kind::MlsGroupMessage)
-                        {
+                        // Group and inbox admission both use verified raw
+                        // `RelayMessage::Event` copies. Their SDK deduplicated
+                        // `ClientNotification::Event` twins cannot deliver and
+                        // only spend queue room.
+                        if matches!(
+                            &notification,
+                            NostrSdkNotification::Payload {
+                                notification: ClientNotification::Event { .. },
+                                ..
+                            }
+                        ) {
                             continue;
                         }
                         pending.fetch_add(1, Ordering::SeqCst);
@@ -13780,5 +13823,196 @@ mod tests {
                 relay.shutdown();
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_inbox_admission_uses_verified_raw_relay_messages_and_rejects_forged_or_retired_copies()
+     {
+        use cgka_traits::{GroupId, TransportAccountActivation, TransportGroupSubscription};
+
+        #[derive(Default)]
+        struct NoopRelayClient;
+
+        #[async_trait]
+        impl NostrRelayClient for NoopRelayClient {
+            async fn subscribe(
+                &self,
+                _subscription: NostrSubscription,
+            ) -> Result<(), TransportAdapterError> {
+                Ok(())
+            }
+
+            async fn unsubscribe(
+                &self,
+                _subscription: NostrSubscription,
+            ) -> Result<(), TransportAdapterError> {
+                Ok(())
+            }
+
+            async fn unsubscribe_account(
+                &self,
+                _account_id: &MemberId,
+                _replacements: &[NostrSubscription],
+            ) -> Result<(), TransportAdapterError> {
+                Ok(())
+            }
+
+            async fn publish_event(
+                &self,
+                _endpoints: &[TransportEndpoint],
+                _event: &NostrTransportEvent,
+                _required_acks: usize,
+            ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+                Ok(NostrPublishOutcome::default())
+            }
+        }
+
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let group_id = GroupId::new(vec![0x42; 16]);
+        let transport_group_id = vec![0x77; 32];
+        let relay_a = TransportEndpoint("wss://inbox-a.example".into());
+        let relay_b = TransportEndpoint("wss://inbox-b.example".into());
+        let group_relay = TransportEndpoint("wss://group.example".into());
+
+        let sdk = NostrSdkRelayClient::from_builder_with_account_signer(
+            ClientBuilder::default(),
+            account_id.clone(),
+            Arc::new(keys.clone()),
+        );
+        assert!(
+            matches!(sdk.publication, SdkPublication::OwnedRelay { .. }),
+            "from_builder_with_account_signer must install the owned-relay publish path"
+        );
+        assert_eq!(sdk.account_id.as_ref(), Some(&account_id));
+
+        let adapter = NostrTransportAdapter::new(Arc::new(NoopRelayClient));
+        adapter
+            .activate_account(TransportAccountActivation {
+                account_id: account_id.clone(),
+                inbox_endpoints: vec![relay_a.clone(), relay_b.clone()],
+                group_subscriptions: vec![TransportGroupSubscription {
+                    group_id: group_id.clone(),
+                    transport_group_id: transport_group_id.clone(),
+                    endpoints: vec![group_relay.clone()],
+                    retained_since: None,
+                }],
+                since: None,
+            })
+            .await
+            .unwrap();
+
+        let (inbox_sub, group_sub) = {
+            let state = adapter.state.read().await;
+            let coverage = &state.account_replay_coverage[&account_id];
+            let inbox_sub = coverage
+                .windows
+                .iter()
+                .find_map(|(id, window)| {
+                    matches!(window.scope, crate::ReplayScope::Inbox).then(|| id.clone())
+                })
+                .unwrap();
+            let group_sub = coverage
+                .windows
+                .iter()
+                .find_map(|(id, window)| {
+                    matches!(window.scope, crate::ReplayScope::Groups(_)).then(|| id.clone())
+                })
+                .unwrap();
+            (inbox_sub, group_sub)
+        };
+
+        let wrap = EventBuilder::new(Kind::GiftWrap, "encrypted-welcome")
+            .tag(Tag::public_key(keys.public_key()))
+            .finalize(&Keys::generate())
+            .unwrap();
+        let relay_a_url = RelayUrl::parse(relay_a.as_str()).unwrap();
+        let relay_b_url = RelayUrl::parse(relay_b.as_str()).unwrap();
+        let group_url = RelayUrl::parse(group_relay.as_str()).unwrap();
+        let classify = |reason: &str| sdk.subscription_refusal(reason);
+
+        // 1. SDK first-seen `ClientNotification::Event` is ignored.
+        dispatch_sdk_notification(
+            ClientNotification::Event {
+                relay_url: relay_a_url.clone(),
+                subscription_id: SubscriptionId::new(&inbox_sub),
+                event: Box::new(wrap.clone()),
+            },
+            &adapter,
+            Some(&account_id),
+            &classify,
+        )
+        .await;
+        assert!(adapter.delivery_rx.lock().await.try_recv().is_err());
+
+        // 2. Forged/tampered raw copy (`event.verify()` fails) is rejected.
+        let mut forged = wrap.clone();
+        forged.content = "tampered-welcome".into();
+        dispatch_sdk_notification(
+            ClientNotification::Message {
+                relay_url: relay_a_url.clone(),
+                message: Box::new(RelayMessage::Event {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(&inbox_sub)),
+                    event: std::borrow::Cow::Owned(forged),
+                }),
+            },
+            &adapter,
+            Some(&account_id),
+            &classify,
+        )
+        .await;
+        assert!(adapter.delivery_rx.lock().await.try_recv().is_err());
+
+        // 3. Retired inbox REQ id and group REQ id both reject kind-1059 copies.
+        for (url, sub_id) in [
+            (relay_a_url.clone(), "retired-inbox-sub"),
+            (group_url, group_sub.as_str()),
+        ] {
+            dispatch_sdk_notification(
+                ClientNotification::Message {
+                    relay_url: url,
+                    message: Box::new(RelayMessage::Event {
+                        subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(sub_id)),
+                        event: std::borrow::Cow::Owned(wrap.clone()),
+                    }),
+                },
+                &adapter,
+                Some(&account_id),
+                &classify,
+            )
+            .await;
+        }
+        assert!(adapter.delivery_rx.lock().await.try_recv().is_err());
+
+        // 4. Verified raw copies from BOTH inbox relays are admitted independently.
+        for (url, expected_endpoint) in [
+            (relay_a_url, relay_a.clone()),
+            (relay_b_url, relay_b.clone()),
+        ] {
+            dispatch_sdk_notification(
+                ClientNotification::Message {
+                    relay_url: url,
+                    message: Box::new(RelayMessage::Event {
+                        subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(&inbox_sub)),
+                        event: std::borrow::Cow::Owned(wrap.clone()),
+                    }),
+                },
+                &adapter,
+                Some(&account_id),
+                &classify,
+            )
+            .await;
+            let delivery = adapter
+                .delivery_rx
+                .lock()
+                .await
+                .try_recv()
+                .expect("verified per-message inbox copy must be admitted");
+            assert_eq!(delivery.account_id, account_id);
+            assert_eq!(delivery.source.endpoint, Some(expected_endpoint));
+            assert_eq!(delivery.message.id.as_slice(), wrap.id.as_bytes());
+        }
+
+        sdk.shutdown().await;
     }
 }

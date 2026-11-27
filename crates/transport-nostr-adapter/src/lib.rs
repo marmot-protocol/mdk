@@ -3715,6 +3715,7 @@ struct BufferedReplay {
 enum RelayCopy {
     Deduplicated,
     RawGroup,
+    RawInbox,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6248,6 +6249,9 @@ impl AdapterState {
                 continue;
             }
             if copy == RelayCopy::RawGroup && !source.is_some_and(|source| source.0) {
+                continue;
+            }
+            if copy == RelayCopy::RawInbox && source.is_some_and(|source| source.0) {
                 continue;
             }
             let input = match source {

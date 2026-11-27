@@ -113,7 +113,10 @@ impl AccountDeliverySpill {
         handoff.items.push_back(delivery);
         if !handoff.writing {
             handoff.writing = true;
-            tokio::spawn(self.clone().write());
+            let handle = tokio::spawn(self.clone().write());
+            if let Some(transport) = self.transport.upgrade() {
+                transport.track_background_task(handle);
+            }
         }
         true
     }
@@ -195,8 +198,11 @@ impl AccountDeliverySpill {
     }
 
     fn omit(&self, created_at: Option<u64>, delivery_route: Option<super::DeliveryRoute>) {
+        let transport = self.transport.upgrade();
         match self.current_route() {
-            Some(route) => omit_account_delivery(&route, created_at, delivery_route),
+            Some(route) => {
+                omit_account_delivery(&route, created_at, delivery_route, transport.as_deref())
+            }
             // The route was retired while this batch was in flight. The loss
             // still fences any replacement, which shares this overflow state,
             // and becomes durable through the retired route's marker. A
@@ -206,7 +212,7 @@ impl AccountDeliverySpill {
                 self.overflow
                     .record_retired_drop(created_at, delivery_route);
                 if let Some(marker) = self.marker.clone() {
-                    persist_retired_queue_loss(&self.overflow, marker);
+                    persist_retired_queue_loss(&self.overflow, marker, transport.as_deref());
                 }
                 if let Some(route) = self.current_route()
                     && let Some(generation) = self.overflow.claim_retired_loss_signal()

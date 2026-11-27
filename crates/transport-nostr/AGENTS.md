@@ -86,9 +86,11 @@ drop: storage imports loss by count, so a token's count must cover every drop un
   `MarmotRelayPlaneAccountAdapter` to hosts, so methods on them that only the app calls are `#[doc(hidden)] pub`.
 - Construct `MarmotRelayPlane` inside a Tokio runtime. `spawn_router` returns early without one, so construction
   succeeds and nothing is routed. Follow-up: take an explicit runtime handle.
-- Shutdown aborts the router and the notification forwarders, but does not join the spill writer (`delivery_spill.rs`
-  spawns `write()`), the loss-marker task (`persist_marker_before_drop`) or the directory fetch tasks; the plane
-  registers nothing in the app's close registry (#2341). Follow-up: join or register them.
+- Shutdown tears down the SDK relay pool, directory client, `account_publish_clients`, and
+  `anonymous_publish_clients`, aborts/joins the router and notification forwarders, and joins tracked background tasks
+  (spill writers from `delivery_spill.rs`, loss-marker tasks from `persist_marker_before_drop`, and evicted
+  publish-client shutdowns). Directory fetch tasks are not yet joined here (tracked for coalesced fetch cancellation).
+  The plane registers nothing in the app's close registry (#2341).
 - Dropping the last plane handle without shutdown aborts the same router and forwarder tasks
   (`Drop for MarmotRelayPlaneInner`). They hold the transport, so without it every short-lived plane (one per `wnd`
   Execute request) stayed alive with its SDK clients. Never give those tasks a `MarmotRelayPlane` clone, or the
