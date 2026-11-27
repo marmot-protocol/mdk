@@ -246,10 +246,11 @@ fn a_new_database_starts_incremental() {
     assert!(!again.app_storage().database_space().unwrap().incremental);
 }
 
-/// Regression for #3798: a failed `VACUUM` must preserve the connection's
-/// prior `auto_vacuum` mode instead of unconditionally resetting it to `NONE`.
+/// Regression for #3798: a failed `VACUUM` must not reset `auto_vacuum` to
+/// `NONE` on an already-incremental database, and leaves a non-incremental
+/// database's on-disk header unchanged.
 #[test]
-fn failed_compaction_preserves_prior_auto_vacuum_mode() {
+fn failed_compaction_does_not_reset_auto_vacuum_to_none() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.sqlite");
     let key = key();
@@ -270,7 +271,7 @@ fn failed_compaction_preserves_prior_auto_vacuum_mode() {
         .unwrap();
     blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
-    // Case 1: already incremental -> failed VACUUM must not stage a pending
+    // Already incremental -> failed VACUUM must not stage a pending
     // `auto_vacuum = NONE` switch that a subsequent `VACUUM` would commit.
     let err = app.compact_database().unwrap_err();
     assert!(matches!(err, StorageError::Busy(_)), "{err:?}");
@@ -281,17 +282,19 @@ fn failed_compaction_preserves_prior_auto_vacuum_mode() {
         "failed compact_database must not downgrade an incremental database to auto_vacuum=NONE"
     );
 
-    // Case 2: non-incremental -> failed VACUUM must drop its pending
-    // `auto_vacuum = INCREMENTAL` switch so a plain `VACUUM` keeps `NONE`.
+    // Non-incremental -> failed VACUUM leaves the on-disk mode non-incremental.
     app.make_non_incremental_for_test().unwrap();
     assert!(!app.database_space().unwrap().incremental);
     blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
     let err = app.compact_database().unwrap_err();
     assert!(matches!(err, StorageError::Busy(_)), "{err:?}");
     blocker.execute_batch("ROLLBACK;").unwrap();
-    store.lock().unwrap().vacuum().unwrap();
+    drop(blocker);
+    store.close().unwrap();
+
+    let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     assert!(
-        !app.database_space().unwrap().incremental,
-        "failed compact_database must restore non-incremental auto_vacuum mode"
+        !reopened.app_storage().database_space().unwrap().incremental,
+        "failed compact_database must not rewrite a non-incremental header on disk"
     );
 }

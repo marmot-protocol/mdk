@@ -67,9 +67,10 @@ impl DirectoryCache {
         // sidecars left behind by earlier permissive builds.
         fs_private::ensure_private_db_files(&path)?;
         let conn = Connection::open(path)?;
-        // Mirror storage-sqlite's hardened open: pin cipher_compatibility and
-        // enable cipher_memory_security before keying, and scrub deleted rows /
-        // keep temp state in memory for this long-lived encrypted cache.
+        // Mirror storage-sqlite's hardened open: enable cipher_memory_security
+        // before keying, pin cipher_compatibility after keying, and scrub
+        // deleted rows / keep temp state in memory for this long-lived
+        // encrypted cache.
         open_hardened_sqlcipher(&conn, key, SqlCipherHardening::live_cache())?;
         Self::from_connection(conn)
     }

@@ -1475,6 +1475,11 @@ pub struct SqliteStorageOptions {
     /// in the process. Android receives a once-per-process diagnostic because
     /// its finite `mlock` budget makes page locking best effort.
     pub cipher_memory_security: bool,
+    /// Pin `PRAGMA cipher_compatibility` after `PRAGMA key` and before the
+    /// first page read, with no silent format fallback. Defaults to `4`
+    /// (unchanged on disk); callers that previously created a database with a
+    /// non-default value on an earlier build wrote a SQLCipher v4 file and must
+    /// reopen it with `4` (or migrate/rekey offline).
     pub cipher_compatibility: u8,
 }
 
@@ -1893,8 +1898,12 @@ fn apply_operational_pragmas(
 /// the two hardening paths cannot silently drift apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SqlCipherHardening {
-    /// Pin `cipher_compatibility` so a future SQLCipher default-compat bump
-    /// cannot silently change the on-disk format these databases require.
+    /// Pin `cipher_compatibility` after `PRAGMA key` so a future SQLCipher
+    /// default-compat bump cannot silently change the on-disk format these
+    /// databases require. Enforced fail-closed with no silent fallback; default
+    /// `4` databases are unchanged, while databases created with a non-default
+    /// value on an earlier build are SQLCipher v4 on disk and must be reopened
+    /// with `4` (or migrated/rekeyed offline).
     pub cipher_compatibility: u8,
     /// Enable `cipher_memory_security` so key/page material is wiped from the
     /// SQLCipher heap.
@@ -1935,6 +1944,11 @@ impl SqlCipherHardening {
 /// are set **before** `PRAGMA key`, `cipher_compatibility` is set **after**
 /// `PRAGMA key` and before the `sqlite_master` probe, and then the privacy
 /// PRAGMAs (`secure_delete`, `temp_store`) are applied after keying.
+///
+/// Setting `busy_timeout` applies `SqliteStorageOptions::default().busy_timeout_ms`
+/// (5,000 ms) and replaces any timeout or custom busy handler previously
+/// installed on `connection`; callers that need a different timeout or busy
+/// handler should install it afterwards.
 ///
 /// This is the shared entry point for SQLCipher databases opened outside
 /// [`SqliteAccountStorage`]. The cipher-pragma ordering invariant is exercised
@@ -3943,6 +3957,115 @@ mod tests {
         open_hardened_sqlcipher(&hardened_conn, &key, hardening).unwrap();
         assert_eq!(pragma_string(&hardened_conn, "kdf_iter"), "64000");
         assert_eq!(pragma_string(&hardened_conn, "cipher_page_size"), "1024");
+    }
+
+    /// Regression for #3798 upgrade compatibility:
+    /// - Populated files created under the legacy pre-key pragma sequence with
+    ///   default `cipher_compatibility = 4` reopen cleanly with no migration.
+    /// - Files created under the legacy pre-key pragma sequence with
+    ///   `cipher_compatibility = 3` were written as SQLCipher v4 on disk;
+    ///   enforcing `cipher_compatibility = 3` fails closed (no silent fallback),
+    ///   and reopening with `cipher_compatibility = 4` recovers the data.
+    #[test]
+    fn legacy_pre_key_pragma_databases_reopen_for_default_v4_and_fail_closed_for_v3() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::raw([0x34; 32]);
+        let create_with_legacy_order = |path: &Path, legacy_compat: i64| {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            // Old buggy order: `cipher_compatibility` ran before `PRAGMA key`
+            // and was silently ignored by SQLCipher, writing a v4 file.
+            conn.pragma_update(None, "cipher_compatibility", legacy_compat)
+                .unwrap();
+            conn.pragma_update(None, "cipher_memory_security", "ON")
+                .unwrap();
+            conn.pragma_update(None, "key", key.as_secret_str())
+                .unwrap();
+            let _: i64 = conn
+                .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE probe (value TEXT NOT NULL);
+                 INSERT INTO probe (value) VALUES ('preserved');",
+            )
+            .unwrap();
+        };
+
+        // 1. Default cipher_compatibility = 4 file created with old order
+        //    reopens seamlessly through `open_hardened_sqlcipher` and
+        //    `SqliteAccountStorage::open_encrypted`.
+        let default_v4_path = dir.path().join("legacy-default-v4.sqlite");
+        create_with_legacy_order(&default_v4_path, 4);
+        let reopened_hardened = rusqlite::Connection::open(&default_v4_path).unwrap();
+        open_hardened_sqlcipher(&reopened_hardened, &key, SqlCipherHardening::live_cache())
+            .unwrap();
+        let value: String = reopened_hardened
+            .query_row("SELECT value FROM probe", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, "preserved");
+        drop(reopened_hardened);
+
+        let account_v4_path = dir.path().join("legacy-account-v4.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&account_v4_path).unwrap();
+            conn.pragma_update(None, "cipher_compatibility", 4).unwrap();
+            conn.pragma_update(None, "cipher_memory_security", "ON")
+                .unwrap();
+            conn.pragma_update(None, "key", key.as_secret_str())
+                .unwrap();
+            let _: i64 = conn
+                .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+                .unwrap();
+            let store = SqliteAccountStorage::from_connection_with_options(
+                conn,
+                SqliteStorageOptions::default(),
+            )
+            .unwrap();
+            store
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "CREATE TABLE probe (value TEXT NOT NULL);
+                     INSERT INTO probe (value) VALUES ('account-preserved');",
+                )
+                .unwrap();
+            store.close().unwrap();
+        }
+        let reopened_account =
+            SqliteAccountStorage::open_encrypted(&account_v4_path, &key).unwrap();
+        let account_value: String = reopened_account
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM probe", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(account_value, "account-preserved");
+
+        // 2. Non-default `cipher_compatibility = 3` file created with old order
+        //    is v4 on disk: reopening with `3` must fail closed, and reopening
+        //    with `4` recovers all rows.
+        let legacy_v3_path = dir.path().join("legacy-v3-written-as-v4.sqlite");
+        create_with_legacy_order(&legacy_v3_path, 3);
+        let failed_v3 = rusqlite::Connection::open(&legacy_v3_path).unwrap();
+        let err = open_hardened_sqlcipher(
+            &failed_v3,
+            &key,
+            SqlCipherHardening {
+                cipher_compatibility: 3,
+                ..SqlCipherHardening::live_cache()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, StorageError::Backend(detail) if detail.contains("file is not a database")),
+            "enforcing cipher_compatibility = 3 must fail closed on a v4 file: {err:?}"
+        );
+        drop(failed_v3);
+
+        let recovered_v4 = rusqlite::Connection::open(&legacy_v3_path).unwrap();
+        open_hardened_sqlcipher(&recovered_v4, &key, SqlCipherHardening::live_cache()).unwrap();
+        let recovered: String = recovered_v4
+            .query_row("SELECT value FROM probe", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(recovered, "preserved");
     }
 
     /// Regression for #3798: `busy_timeout` is configured before `PRAGMA key`

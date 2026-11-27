@@ -3286,10 +3286,7 @@ fn scrub_retained_edit_bodies_tx(
         tx.execute_cached(
             &format!(
                 "UPDATE chat_list_rows
-                SET last_message_preview = CASE
-                    WHEN last_message_preview IS NULL THEN NULL
-                    ELSE zeroblob(octet_length(last_message_preview))
-                END
+                SET last_message_preview = zeroblob(octet_length(last_message_preview))
                 WHERE group_id_hex = ? AND last_message_id_hex IN ({placeholders})"
             ),
             params_from_iter(values.iter()),

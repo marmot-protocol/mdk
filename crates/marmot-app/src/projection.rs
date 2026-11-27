@@ -47,8 +47,9 @@ impl LegacyAccountProjectionDb {
         fs_private::ensure_private_db_files(&path)?;
         let conn = Connection::open(path)?;
         // Harden this legacy migration source the same way as storage-sqlite:
-        // pin cipher_compatibility and enable cipher_memory_security before
-        // keying so key/page material is wiped from the SQLCipher heap.
+        // enable cipher_memory_security before keying and pin
+        // cipher_compatibility after keying so key/page material is wiped from
+        // the SQLCipher heap.
         open_hardened_sqlcipher(&conn, key, SqlCipherHardening::cipher_only())?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS account_state (

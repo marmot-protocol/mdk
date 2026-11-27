@@ -25,6 +25,10 @@ const STATE_PENDING: i64 = 0;
 const STATE_READY: i64 = 1;
 const STATE_LOST: i64 = 2;
 pub(crate) const STATE_STAGED: i64 = 3;
+/// Exact `CatalogError::Backend` detail matched by `media_storage_error` and
+/// `outgoing_media::storage_from_catalog` to preserve `StorageError::Busy`
+/// without breaking `media-store`'s public error enum. Guarded by
+/// `media_catalog_tests::catalog_operations_retry_on_busy_and_preserve_busy_classification`.
 pub(crate) const CATALOG_BUSY_DETAIL: &str = "media catalog is busy";
 
 fn category_sql(category: Category) -> i64 {
@@ -71,6 +75,22 @@ fn id_from_sql(bytes: Vec<u8>) -> StorageResult<FileId> {
         .ok_or_else(|| StorageError::Corruption("invalid media file id".into()))
 }
 
+fn run_retrying_busy<T>(
+    storage: &SqliteAppStorage,
+    mut f: impl FnMut(&Connection) -> StorageResult<T>,
+) -> CatalogResult<T> {
+    let mut execute = || {
+        let conn = storage.lock()?;
+        f(&conn)
+    };
+    let result = if storage.connection.is_current_thread_transaction_owner() {
+        execute()
+    } else {
+        retry_on_busy(execute)
+    };
+    result.map_err(catalog_error)
+}
+
 /// `media_files` on one account database.
 #[derive(Clone)]
 pub struct SqliteMediaCatalog {
@@ -87,21 +107,8 @@ impl SqliteMediaCatalog {
         &self.storage
     }
 
-    fn run<T>(&self, mut f: impl FnMut(&Connection) -> StorageResult<T>) -> CatalogResult<T> {
-        let mut execute = || {
-            let conn = self.storage.lock()?;
-            f(&conn)
-        };
-        let result = if self
-            .storage
-            .connection
-            .is_current_thread_transaction_owner()
-        {
-            execute()
-        } else {
-            retry_on_busy(execute)
-        };
-        result.map_err(catalog_error)
+    fn run<T>(&self, f: impl FnMut(&Connection) -> StorageResult<T>) -> CatalogResult<T> {
+        run_retrying_busy(&self.storage, f)
     }
 }
 
@@ -390,20 +397,7 @@ impl SlotPublication {
 
 impl PublishTarget for SlotPublication {
     fn superseded(&self) -> CatalogResult<bool> {
-        let execute = || {
-            let conn = self.storage.lock()?;
-            self.slot_gone(&conn)
-        };
-        let result = if self
-            .storage
-            .connection
-            .is_current_thread_transaction_owner()
-        {
-            execute()
-        } else {
-            retry_on_busy(execute)
-        };
-        result.map_err(catalog_error)
+        run_retrying_busy(&self.storage, |conn| self.slot_gone(conn))
     }
 
     fn commit_existing(

@@ -666,29 +666,41 @@ impl SqliteSharedStorage {
                         marmot_search_rank(CASE WHEN json_valid(profile_json) THEN json_extract(profile_json, '$.about') END, ?1) * 6 + 3,
                         marmot_search_rank(npub, ?1) * 6 + 4,
                         marmot_search_rank(account_id_hex, ?1) * 6 + 5
-                    ) AS search_rank
+                    ) AS search_rank,
+                    min(
+                        marmot_search_rank(npub, ?1) * 6 + 4,
+                        marmot_search_rank(account_id_hex, ?1) * 6 + 5
+                    ) AS identity_rank
              FROM directory_users";
         let conn = self.lock()?;
-        let read_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Option<SearchProfile>> {
-            let created_at = match row.get::<_, Option<String>>(3)? {
-                None => None,
-                Some(value) => match value.parse::<u64>() {
-                    Ok(timestamp) => Some(timestamp),
-                    Err(_) => return Ok(None),
-                },
-            };
-            Ok(Some((
-                PublicDirectoryProfileRecord {
-                    account_id_hex: row.get(0)?,
-                    npub: row.get(1)?,
-                    profile_json: row.get(2)?,
-                },
-                created_at,
-                row.get(4)?,
-            )))
+        // Returns `(record, malformed_profile)`. A row with corrupt JSON or a
+        // non-u64 `created_at` degrades to `profile_json: None, created_at: None`
+        // with its `npub`/`account_id_hex` rank so the user stays findable by
+        // identity and a valid copy in another cache still wins on `created_at`.
+        let read_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(SearchProfile, bool)> {
+            let (profile_json, created_at, rank, malformed) =
+                match row.get::<_, Option<String>>(3)? {
+                    None => (None, None, row.get(4)?, false),
+                    Some(value) => match value.parse::<u64>() {
+                        Ok(timestamp) => (row.get(2)?, Some(timestamp), row.get(4)?, false),
+                        Err(_) => (None, None, row.get(5)?, true),
+                    },
+                };
+            Ok((
+                (
+                    PublicDirectoryProfileRecord {
+                        account_id_hex: row.get(0)?,
+                        npub: row.get(1)?,
+                        profile_json,
+                    },
+                    created_at,
+                    rank,
+                ),
+                malformed,
+            ))
         };
         let mut profiles = Vec::new();
-        let mut skipped_malformed = 0usize;
+        let mut malformed_profiles = 0usize;
         if account_ids.is_empty() {
             let mut statement = conn
                 .prepare_cached(&format!(
@@ -698,10 +710,15 @@ impl SqliteSharedStorage {
                 .storage()?;
             let rows = statement.query_map([query], read_row).storage()?;
             for row in rows {
-                match row.storage()? {
-                    Some(profile) => profiles.push(profile),
-                    None => skipped_malformed += 1,
+                let (profile, malformed) = row.storage()?;
+                if malformed {
+                    malformed_profiles += 1;
+                    // Discard rows that matched only via their corrupt profile JSON.
+                    if profile.2 >= 18 {
+                        continue;
+                    }
                 }
+                profiles.push(profile);
             }
         } else {
             for ids in account_ids.chunks(crate::SQLITE_BIND_PARAMETER_CHUNK - 1) {
@@ -722,19 +739,20 @@ impl SqliteSharedStorage {
                     )
                     .storage()?;
                 for row in rows {
-                    match row.storage()? {
-                        Some(profile) => profiles.push(profile),
-                        None => skipped_malformed += 1,
+                    let (profile, malformed) = row.storage()?;
+                    if malformed {
+                        malformed_profiles += 1;
                     }
+                    profiles.push(profile);
                 }
             }
         }
-        if skipped_malformed > 0 {
+        if malformed_profiles > 0 {
             tracing::warn!(
                 target: "storage_sqlite::shared",
                 method = "public_directory_profiles",
-                skipped_malformed,
-                "skipped directory profile rows with malformed JSON or created_at"
+                malformed_profiles,
+                "ignored malformed profile_json on directory profile rows"
             );
         }
         Ok(profiles)
@@ -1741,9 +1759,11 @@ mod tests {
     }
 
     /// Regression for #3798: malformed `created_at` values or invalid JSON in
-    /// one row's `profile_json` must not abort `public_directory_profiles`.
+    /// one row's `profile_json` must not abort `public_directory_profiles`,
+    /// while keeping affected users discoverable by `npub`/account id with
+    /// `profile_json: None, created_at: None`.
     #[test]
-    fn public_directory_profiles_skips_rows_with_malformed_created_at_or_json() {
+    fn public_directory_profiles_tolerates_malformed_created_at_or_json() {
         let storage = SqliteSharedStorage::in_memory().unwrap();
         let valid_id = "11".repeat(32);
         let null_profile_id = "12".repeat(32);
@@ -1798,6 +1818,9 @@ mod tests {
         );
         put(&broken_json_id, "npub1alicebroken", Some("{not valid json"));
 
+        // Unscoped scan returns valid matches plus malformed-profile users
+        // whose `npub` still matches (with `profile_json: None, created_at: None`),
+        // and excludes rows that only matched through discarded malformed JSON.
         let scanned = storage.public_directory_profiles("alice", &[]).unwrap();
         assert_eq!(
             scanned,
@@ -1820,20 +1843,47 @@ mod tests {
                     None,
                     16
                 ),
+                (
+                    PublicDirectoryProfileRecord {
+                        account_id_hex: broken_json_id.clone(),
+                        npub: "npub1alicebroken".into(),
+                        profile_json: None,
+                    },
+                    None,
+                    16
+                ),
             ]
         );
 
+        // Explicit ID lookup keeps every requested user row, degrading
+        // malformed profiles to `profile_json: None, created_at: None` with
+        // identity-only rank so a valid copy in another cache still wins.
         let ids = vec![
             valid_id.clone(),
             null_profile_id.clone(),
-            negative_id,
-            string_id,
-            null_ts_id,
-            float_id,
-            broken_json_id,
+            negative_id.clone(),
+            string_id.clone(),
+            null_ts_id.clone(),
+            float_id.clone(),
+            broken_json_id.clone(),
         ];
-        let by_ids = storage.public_directory_profiles("alice", &ids).unwrap();
-        assert_eq!(by_ids, scanned);
+        let mut by_ids = storage.public_directory_profiles("alice", &ids).unwrap();
+        by_ids.sort_by(|a, b| a.0.account_id_hex.cmp(&b.0.account_id_hex));
+        assert_eq!(by_ids.len(), 7);
+        assert_eq!(by_ids[0].1, Some(42));
+        assert_eq!(by_ids[1].1, None);
+        for degraded in &by_ids[2..6] {
+            assert_eq!(degraded.0.profile_json, None);
+            assert_eq!(degraded.1, None);
+            assert!(
+                degraded.2 >= 18,
+                "only discarded JSON matched: {degraded:?}"
+            );
+        }
+        assert_eq!(by_ids[6].0.account_id_hex, broken_json_id);
+        assert_eq!(by_ids[6].0.profile_json, None);
+        assert_eq!(by_ids[6].1, None);
+        assert_eq!(by_ids[6].2, 16);
     }
 
     // #761: the batched listing is defensively bounded. The uncapped path still

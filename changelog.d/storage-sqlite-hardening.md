@@ -1,3 +1,11 @@
+### Breaking changes
+
+- `storage-sqlite` now enforces `SqliteStorageOptions::cipher_compatibility` and
+  `SqlCipherHardening::cipher_compatibility` after `PRAGMA key` with no silent format fallback. Default
+  `cipher_compatibility = 4` databases are unaffected; callers that previously created a database with a non-default
+  value (such as `3`) produced a SQLCipher v4 file on disk and must reopen it with `cipher_compatibility = 4` (or
+  migrate/rekey it offline).
+
 ### Fixed
 
 - Hardened `storage-sqlite` database opening, deletion, compaction, and directory/media-catalog operations: SQLCipher
