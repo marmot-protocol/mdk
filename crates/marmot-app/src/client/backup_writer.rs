@@ -39,6 +39,18 @@
 //! itself as writer over the entry it read, through the roster's
 //! compare-and-set, so concurrent takeovers settle on one. Nothing secret is
 //! stored: the archive key lives only in the pass.
+//!
+//! Because pointer publication accepts a single relay ack (`min_acks = 1`) on
+//! a full-replacement NIP-01 replaceable event (`kind: 30078`), a read-modify-
+//! write pass requires every requested relay to finish (`discovery.complete`)
+//! so a stale partial view from one relay cannot overwrite a newer pointer
+//! accepted on an unreachable relay (unlike read-only `backup_restore`, which
+//! never replaces the pointer). An unreachable relay in the account's pointer
+//! endpoints therefore pauses passes with `warn!` logging and backoff until
+//! the relay recovers or is removed from the account's relay list. Likewise,
+//! `replaceable_record_floors` is keyed by `(pubkey, kind)`, so a far-future
+//! floor authored under an earlier recovery key pauses replacement pointers
+//! even after recovery-word rotation until wall time catches up.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -294,23 +306,13 @@ impl BackupPass {
         let now = unix_now_seconds();
         let (entry, index) = match (self.settle_runs(&listed, now).await?, &self.write) {
             (Some(entry), _) => {
-                let floor = self.app.replaceable_identity_floor(
-                    &self.account_label,
-                    &self.account_id_hex,
-                    KIND_BACKUP_POINTER,
-                )?;
-                backup_pointer_created_at(now, replaces.max(floor), "pass")?;
+                self.check_pointer_skew(replaces, now)?;
                 (entry, None)
             }
             (None, Some(write))
                 if newest.is_none_or(|at| now >= at.saturating_add(BACKUP_INTERVAL_SECS)) =>
             {
-                let floor = self.app.replaceable_identity_floor(
-                    &self.account_label,
-                    &self.account_id_hex,
-                    KIND_BACKUP_POINTER,
-                )?;
-                backup_pointer_created_at(now, replaces.max(floor), "pass")?;
+                self.check_pointer_skew(replaces, now)?;
                 let (entry, index) = self.write_backup(write, now).await?;
                 (entry, Some(index))
             }
@@ -326,6 +328,16 @@ impl BackupPass {
             newest,
             pointer: Some(pointer),
         })
+    }
+
+    fn check_pointer_skew(&self, replaces: u64, now: u64) -> Result<(), AppError> {
+        let floor = self.app.replaceable_identity_floor(
+            &self.account_label,
+            &self.account_id_hex,
+            KIND_BACKUP_POINTER,
+        )?;
+        backup_pointer_created_at(now, replaces.max(floor), "pass")?;
+        Ok(())
     }
 
     /// Run `f` on this pass's ledger, on the blocking pool.
@@ -670,9 +682,7 @@ impl BackupPass {
         self.ledger(move |storage| {
             let storage = storage.app_storage();
             for (id, blobs) in &condemned {
-                if !blobs.is_empty() {
-                    storage.condemn_backup_blobs(&key, id, blobs, now, now + DELETE_AFTER_SECS)?;
-                }
+                storage.condemn_backup_blobs(&key, id, blobs, now, now + DELETE_AFTER_SECS)?;
             }
             Ok(())
         })
