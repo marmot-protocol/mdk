@@ -21,57 +21,57 @@
         {
           "name": "marmot_account_relay_health",
           "signature": "MarmotStatus marmot_account_relay_health(const struct MarmotClient *client, const char *account_ref, struct MarmotAccountRelayHealth **out);",
-          "source": "include/marmot.h#L11163"
+          "source": "crates/marmot-c/abi.json"
         },
         {
           "name": "marmot_account_relay_health_free",
           "signature": "void marmot_account_relay_health_free(struct MarmotAccountRelayHealth *ptr);",
-          "source": "include/marmot.h#L17056"
+          "source": "crates/marmot-c/abi.json"
         },
         {
           "name": "marmot_begin_onboarding_with_options",
           "signature": "MarmotStatus marmot_begin_onboarding_with_options(const struct MarmotClient *client, const char *nsec, const char *const *default_relays, uintptr_t default_relays_len, const char *const *discovery_relays, uintptr_t discovery_relays_len, const char *const *inbox_relays, uintptr_t inbox_relays_len, uint32_t flags, struct MarmotOnboardingSnapshot **out);",
-          "source": "include/marmot.h#L13326"
+          "source": "crates/marmot-c/abi.json"
         },
         {
           "name": "marmot_check_account_relays",
           "signature": "MarmotStatus marmot_check_account_relays(const struct MarmotClient *client, const char *account_ref, struct MarmotAccountRelayHealth **out);",
-          "source": "include/marmot.h#L11185"
+          "source": "crates/marmot-c/abi.json"
         },
         {
           "name": "marmot_invite_deliveries",
           "signature": "MarmotStatus marmot_invite_deliveries(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, struct MarmotInviteDeliveryList **out);",
-          "source": "include/marmot.h#L9852"
+          "source": "crates/marmot-c/abi.json"
         },
         {
           "name": "marmot_invite_delivery_list_free",
           "signature": "void marmot_invite_delivery_list_free(struct MarmotInviteDeliveryList *list);",
-          "source": "include/marmot.h#L16531"
+          "source": "crates/marmot-c/abi.json"
         },
         {
           "name": "marmot_send_custom_event_with_client_token",
           "signature": "MarmotStatus marmot_send_custom_event_with_client_token(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, uint64_t kind, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *content, const char *client_token, struct MarmotLocalSendAcceptance **out);",
-          "source": "include/marmot.h#L13166"
+          "source": "crates/marmot-c/abi.json"
         },
         {
           "name": "marmot_submit_tagged_reply",
           "signature": "MarmotStatus marmot_submit_tagged_reply(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *target_message_id, const char *text, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *client_token, struct MarmotLocalSendAcceptance **out);",
-          "source": "include/marmot.h#L13125"
+          "source": "crates/marmot-c/abi.json"
         },
         {
           "name": "marmot_submit_tagged_sticker",
           "signature": "MarmotStatus marmot_submit_tagged_sticker(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *pack_coordinate, const char *shortcode, const char *plaintext_sha256, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *client_token, struct MarmotLocalSendAcceptance **out);",
-          "source": "include/marmot.h#L13931"
+          "source": "crates/marmot-c/abi.json"
         },
         {
           "name": "marmot_submit_tagged_text",
           "signature": "MarmotStatus marmot_submit_tagged_text(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *text, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *client_token, struct MarmotLocalSendAcceptance **out);",
-          "source": "include/marmot.h#L13107"
+          "source": "crates/marmot-c/abi.json"
         },
         {
           "name": "marmot_submit_thread_message",
           "signature": "MarmotStatus marmot_submit_thread_message(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *parent_message_id, const char *text, const struct MarmotMediaAttachmentReference *attachments, uintptr_t attachments_len, const struct MarmotStringArray *tags, uintptr_t tags_len, const char *client_token, struct MarmotLocalSendAcceptance **out);",
-          "source": "include/marmot.h#L12725"
+          "source": "crates/marmot-c/abi.json"
         }
       ],
       "changed": [],
@@ -251,7 +251,7 @@
     "crates/storage-sqlite/src/shared/migrations.rs"
   ],
   "target_base_version": "0.20.0",
-  "target_sha": "7847b7f7ae761d41dc07784cd0308c29127b7ff9",
+  "target_sha": "07567caf0814fa0f5688c5da83a7209f94c71e03",
   "uniffi": {
     "breaking": [
       "changed UniFFI type `LocalSendStatusFfi`",

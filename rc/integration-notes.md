@@ -1,9 +1,9 @@
-# MDK 0.19.0 → 0.20.0-rc.3 Integration Guide
+# MDK 0.19.0 → 0.20.0-rc.4 Integration Guide
 
 ## Scope and provenance
 
 - **Baseline:** `v0.19.0` (`3fce95465cdea1edc8456dbd1c6691d1c8dc1f2e`)
-- **Target:** `0.20.0-rc.3` (`7847b7f7ae761d41dc07784cd0308c29127b7ff9`)
+- **Target:** `0.20.0-rc.4` (`07567caf0814fa0f5688c5da83a7209f94c71e03`)
 - **Classified SemVer impact:** `minor`
 
 ## Impact triggers
@@ -458,6 +458,7 @@ This release advances the SQLite account schema. Downgrade across these migratio
 - Group creation, invites and direct-chat starts always discover the members' current relay routes after
   `marmot_prewarm_group_member_key_packages`; prewarmed outboxes only add hints to the KeyPackage read, so a prewarm
   no longer makes them skip discovery.
+- Source builds generate `marmot.h` with cbindgen. Release bundles still include the matching header.
 - A member's `MemberResolutionStatusFfi::IncompatibleKeyPackage` now requires completed relay-list discovery,
   complete KeyPackage reads and a completed read that finds no deletion request for the refused KeyPackage or its
   slot. If any is incomplete, the status is `MemberResolutionStatusFfi::Incomplete`.
@@ -744,7 +745,7 @@ This release advances the SQLite account schema. Downgrade across these migratio
 ## Binding surface delta
 
 - **Baseline:** `v0.19.0` (`3fce95465cdea1edc8456dbd1c6691d1c8dc1f2e`)
-- **Target:** `7847b7f7ae761d41dc07784cd0308c29127b7ff9` (classified `minor`, target `0.20.0`)
+- **Target:** `07567caf0814fa0f5688c5da83a7209f94c71e03` (classified `minor`, target `0.20.0`)
 
 ## UniFFI (`marmot-uniffi`)
 

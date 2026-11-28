@@ -423,6 +423,7 @@
       "- Group creation, invites and direct-chat starts always discover the members' current relay routes after",
       "  `marmot_prewarm_group_member_key_packages`; prewarmed outboxes only add hints to the KeyPackage read, so a prewarm",
       "  no longer makes them skip discovery.",
+      "- Source builds generate `marmot.h` with cbindgen. Release bundles still include the matching header.",
       "- A member's `MemberResolutionStatusFfi::IncompatibleKeyPackage` now requires completed relay-list discovery,",
       "  complete KeyPackage reads and a completed read that finds no deletion request for the refused KeyPackage or its",
       "  slot. If any is incomplete, the status is `MemberResolutionStatusFfi::Incomplete`.",
@@ -1268,13 +1269,23 @@
       "release_impact": null,
       "sha": "7847b7f7a",
       "subject": "Let hosts disable background public avatar acquisition (#3744)"
+    },
+    {
+      "release_impact": "patch",
+      "sha": "a4f59c74a",
+      "subject": "Generate binding artifacts in CI (#3746)"
+    },
+    {
+      "release_impact": "none",
+      "sha": "07567caf0",
+      "subject": "Stage and publish RC releases with RELEASE_TOKEN (#3851)"
     }
   ],
   "computed_impact": "minor",
   "impact": "minor",
   "layers": {
     "changelog_fragments": {
-      "fragment_count": 87,
+      "fragment_count": 88,
       "impact": "minor",
       "sections": [
         "Breaking changes",
@@ -1290,8 +1301,8 @@
       "impact": "minor",
       "minor_count": 8,
       "missing_count": 70,
-      "patch_count": 16,
-      "total_commits": 113
+      "patch_count": 17,
+      "total_commits": 115
     },
     "mechanical_abi": {
       "c_additive_count": 34,
@@ -1323,7 +1334,7 @@
   },
   "schema": 1,
   "target_base_version": "0.20.0",
-  "target_sha": "7847b7f7ae761d41dc07784cd0308c29127b7ff9",
+  "target_sha": "07567caf0814fa0f5688c5da83a7209f94c71e03",
   "triggers": [
     "UniFFI breaking ABI changes (11): changed UniFFI type `LocalSendStatusFfi`, changed UniFFI type `MarmotEventFfi`, changed UniFFI type `MarmotKitError`, changed UniFFI type `MarmotOptions`, changed UniFFI type `NotificationTrafficClassFfi`",
     "C ABI breaking changes (11): changed C type `MarmotClientOptions`, changed C type `MarmotEvent`, changed C type `MarmotEvent_Tag`, changed C type `MarmotLocalSendStatus`, changed C type `MarmotNotificationTrafficClass`",
