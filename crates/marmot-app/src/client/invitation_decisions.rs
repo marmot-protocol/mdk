@@ -590,11 +590,28 @@ impl AppClient {
     }
 
     /// Whether the worker's next turn drives invitation decisions: one
-    /// changed, or answers a settling epoch refused wait to be sent again.
-    /// The epoch settles in a worker unit, so a refusal is retried on the
-    /// turn after, whatever ran in between (mdk#3573).
+    /// changed, or answers a settling epoch refused are ready to be sent now
+    /// that the device group's epoch is no longer settling (mdk#3573).
     pub(crate) fn invitation_turn_owed(&self) -> bool {
-        self.invitation_decisions_changed || self.invitation_answers_await_epoch
+        self.invitation_decisions_changed
+            || (self.invitation_answers_await_epoch && !self.device_group_epoch_settling())
+    }
+
+    /// Whether the trusted device group is still settling its epoch — either
+    /// resolving a local commit or holding pending convergence inputs — so an
+    /// epoch-pinned small-state send would be refused with
+    /// [`EngineError::AppMessageEpochUnsettled`].
+    fn device_group_epoch_settling(&self) -> bool {
+        let Ok(Some(group_id)) = self.trusted_device_group() else {
+            return false;
+        };
+        self.runtime
+            .epoch_state(&group_id)
+            .is_some_and(|state| state.is_resolving_local_publish())
+            || self
+                .runtime
+                .has_pending_convergence_inputs(&group_id)
+                .unwrap_or(false)
     }
 
     pub(crate) async fn drive_invitation_decisions(&mut self) {
