@@ -317,8 +317,12 @@ impl AppClient {
             at(next);
         }
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        // An invitation answered here applies here, linked or not.
-        let mut owed = self.invitation_turn_owed() || self.invitation_work_held;
+        // An invitation answered here applies here, linked or not. Keep the
+        // 15 s maintenance fallback armed while answers wait for a settling
+        // device-group epoch even though per-turn retries pause until it settles.
+        let mut owed = self.invitation_decisions_changed
+            || self.invitation_answers_await_epoch
+            || self.invitation_work_held;
         // The rest only a linked device sends or applies: an unlinked one
         // keeps its decisions and edits unsent until it links. A sibling this
         // device added to a chat is owed that chat's history.

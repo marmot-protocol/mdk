@@ -1053,3 +1053,140 @@ async fn small_state_waits_out_this_devices_unsettled_device_group_commit() {
     deliver_all(&mut phone, &relay).await;
     assert!(holds_pin(&phone_app, false));
 }
+
+/// When an epoch-pinned invitation-answer send is refused because the device
+/// group is still settling (`PendingPublish` or pending convergence inputs),
+/// `invitation_turn_owed()` must wait until the device group settles instead
+/// of spinning on every unrelated worker turn, while keeping `device_group_due`
+/// armed as the 15 s fallback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invitation_answers_awaiting_epoch_do_not_spin_while_device_group_is_settling() {
+    let mut devices = phone_and_laptop().await;
+    let (_bob_dir, chat) =
+        chat_with_bob(&devices.phone_app, &mut devices.phone, &devices.relay).await;
+    link(&mut devices).await;
+    let group = devices.phone.trusted_device_group().unwrap().unwrap();
+    devices.phone.run_due_maintenance().await.unwrap();
+    let phone_app = devices.phone_app.clone();
+    let phone_storage = || phone_app.account_storage("alice").unwrap().app_storage();
+
+    // 1. Local PendingPublish on the device group: first turn records the
+    //    unsettled refusal, subsequent turns do not spin until it settles.
+    devices.relay.fail_publishes_as_possibly_exposed();
+    devices
+        .phone
+        .runtime
+        .send(cgka_traits::engine::SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        devices.phone.runtime.epoch_state(&group),
+        Some(cgka_traits::EpochState::PendingPublish(_))
+    ));
+    devices
+        .phone
+        .observe_device_group_event(&cgka_traits::engine::GroupEvent::GroupStateInvalidated {
+            group_id: group.clone(),
+            epoch: cgka_traits::EpochId(0),
+            invalidated_commit_id: MessageId::new(vec![0x51; 32]),
+            reason: cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection,
+        })
+        .unwrap();
+    assert_eq!(
+        phone_storage().unsent_invitation_decisions().unwrap().len(),
+        1
+    );
+    assert!(devices.phone.drive_changed_invitation_decisions().await);
+    assert!(
+        !devices.phone.invitation_turn_owed(),
+        "must not spin while device group is still PendingPublish"
+    );
+    assert!(!devices.phone.drive_changed_invitation_decisions().await);
+    assert!(
+        devices.phone.device_group_due(&[]).unwrap().owed,
+        "15 s maintenance fallback stays armed while answers await the epoch"
+    );
+
+    devices.relay.allow_publishes();
+    assert!(devices.phone.note_connectivity_restored().unwrap() > 0);
+    devices
+        .phone
+        .advance_convergence_after_runtime_sync(&group)
+        .await
+        .unwrap();
+    assert!(
+        devices.phone.invitation_turn_owed(),
+        "once PendingPublish settles, the next turn immediately sends the answer"
+    );
+    assert!(devices.phone.drive_changed_invitation_decisions().await);
+    assert!(
+        phone_storage()
+            .unsent_invitation_decisions()
+            .unwrap()
+            .is_empty()
+    );
+
+    // 2. Stable epoch with pending convergence inputs (the quiescence window):
+    //    first turn records AppMessageEpochUnsettled, subsequent turns do not
+    //    spin while pending convergence inputs remain buffered.
+    let mut cursor = devices.relay.published_events.lock().unwrap().len();
+    devices
+        .laptop
+        .runtime
+        .send(cgka_traits::engine::SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        phone,
+        ..
+    } = devices;
+    drop(phone);
+    phone_app.close_storage().unwrap();
+    drop(phone_app);
+
+    let phone_app = MarmotApp::with_relay_and_config(
+        _dirs[0].path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(60_000)
+            .with_dev_scheduled_convergence_delay_ms(0)
+            .with_device_groups(true),
+    )
+    .with_test_relay_client(relay.clone());
+    let mut phone = phone_app.client("alice").await.unwrap();
+    deliver_new(&mut phone, &relay, &mut cursor).await;
+    assert!(matches!(
+        phone.runtime.epoch_state(&group),
+        Some(cgka_traits::EpochState::Stable { .. })
+    ));
+    assert!(
+        phone
+            .runtime
+            .has_pending_convergence_inputs(&group)
+            .unwrap()
+    );
+
+    phone
+        .observe_device_group_event(&cgka_traits::engine::GroupEvent::GroupStateInvalidated {
+            group_id: group.clone(),
+            epoch: cgka_traits::EpochId(0),
+            invalidated_commit_id: MessageId::new(vec![0x52; 32]),
+            reason: cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection,
+        })
+        .unwrap();
+    let _ = chat;
+    assert!(phone.drive_changed_invitation_decisions().await);
+    assert!(
+        !phone.invitation_turn_owed(),
+        "must not spin while device group holds pending convergence inputs"
+    );
+    assert!(!phone.drive_changed_invitation_decisions().await);
+    assert!(phone.device_group_due(&[]).unwrap().owed);
+}
