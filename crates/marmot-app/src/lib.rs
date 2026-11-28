@@ -273,9 +273,10 @@ pub use client::compromise_warning::{CompromiseWarningItem, CompromiseWarningRea
 pub use client::device_group::ConfirmedDeviceLink;
 pub use client::device_group::{LinkedDevice, LinkedDeviceStatus};
 pub use client::device_pairing::{
-    DeviceGroupMoveSibling, DeviceGroupMoveState, DeviceGroupMoveView, DeviceLinkChoices,
-    DeviceLinkEmoji, DeviceLinkEndReason, DeviceLinkOp, DeviceLinkPrompt, DeviceLinkPromptState,
-    DeviceLinkSnapshot, LinkChatProgress, NewDeviceLinkState,
+    DeviceGroupMoveSibling, DeviceGroupMoveState, DeviceGroupMoveView, DeviceLinkAttempt,
+    DeviceLinkAttemptState, DeviceLinkChoices, DeviceLinkEmoji, DeviceLinkEndReason, DeviceLinkOp,
+    DeviceLinkPrompt, DeviceLinkPromptState, DeviceLinkSnapshot, LinkChatProgress,
+    NewDeviceLinkState,
 };
 pub use client::history_imports::{ChatHistoryImport, ChatHistoryImportState};
 pub use client::sign_ins::{SignInResponse, UnrecognizedSignIn, UnrecognizedSignInState};

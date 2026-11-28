@@ -1014,9 +1014,19 @@ On a device already signed in, Not now for the prompt `prompt_id`. Free the snap
 
 [Shared method and API guidance](../marmot-uniffi/API-GUIDE.md#marmotdecline_device_link)
 
+### `marmot_device_link_activity`
+
+Read incoming link requests from the account worker's published view. On success, a NULL result means the view is unavailable. A present list with zero entries means the worker knows of no requests. Refresh on `MARMOT_EVENT_DEVICE_LINK_CHANGED`. Free the list with `marmot_device_link_attempt_list_free`.
+
+[Shared method and API guidance](../marmot-uniffi/API-GUIDE.md#marmotdevice_link_activity)
+
+### `marmot_device_link_attempt_list_free`
+
+Free an activity list and all its entries. NULL is a no-op.
+
 ### `marmot_device_link_snapshot`
 
-Linking as this device shows it now, changing nothing. `new_device` is NULL unless this device asked to be linked; `prompts` lists the sign-ins it can link. The states are C tagged unions: `Comparing` carries `code`/`code_len` emoji, `CannotLink` carries `missing`/`missing_len` strings, and `AddedElsewhere` carries both labels. Re-read on `MARMOT_EVENT_DEVICE_LINK_CHANGED`. Free with `marmot_device_link_snapshot_free`. The snapshot's `chat_progress` gives the approver's remaining Adds or, on the new device, the remaining local joins among the reported chats. An absent entry means unavailable.
+Read the interactive linking snapshot after the account worker drives pairing. `new_device` is NULL unless this device asked to be linked; `prompts` lists the sign-ins it can link. The states are C tagged unions: `Comparing` carries `code`/`code_len` emoji, `CannotLink` carries `missing`/`missing_len` strings, and `AddedElsewhere` carries both labels. Re-read on `MARMOT_EVENT_DEVICE_LINK_CHANGED`. Free with `marmot_device_link_snapshot_free`. The snapshot's `chat_progress` gives the approver's remaining Adds or, on the new device, the remaining local joins among the reported chats. An absent entry means unavailable.
 
 [Shared method and API guidance](../marmot-uniffi/API-GUIDE.md#marmotdevice_link_snapshot)
 

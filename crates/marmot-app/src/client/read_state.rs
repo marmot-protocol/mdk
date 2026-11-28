@@ -142,6 +142,7 @@ pub(crate) struct AccountAnswers {
     /// (a column only it decodes holds another type), from the list's own
     /// statement: their status goes to the worker. Empty when the list failed.
     pub(crate) prepared_group_image_records_unread: HashSet<String>,
+    pub(crate) device_link_activity: Option<Vec<crate::DeviceLinkAttempt>>,
     pub(crate) started_fresh: ReadAnswer<bool>,
     pub(crate) chat_history_imports: ReadAnswer<Vec<ChatHistoryImport>>,
     /// The account's recovery status, whose notices `HistoryNotices` lists
@@ -163,6 +164,7 @@ impl AccountAnswers {
             backup_restore_updates,
             prepared_group_images,
             prepared_group_image_records_unread,
+            device_link_activity,
             started_fresh,
             chat_history_imports,
             recovery_status,
@@ -199,6 +201,7 @@ impl AccountAnswers {
                 PartialEq::eq,
             )
             && *prepared_group_image_records_unread == other.prepared_group_image_records_unread
+            && *device_link_activity == other.device_link_activity
             && same_answer(started_fresh, &other.started_fresh, PartialEq::eq)
             && same_answer(
                 chat_history_imports,
@@ -775,6 +778,7 @@ fn empty_account_answers() -> AccountAnswers {
         backup_restore_updates: watch::channel(BackupRestoreStatus::default()).1,
         prepared_group_images: Ok(Vec::new()),
         prepared_group_image_records_unread: HashSet::new(),
+        device_link_activity: None,
         started_fresh: Ok(false),
         chat_history_imports: Ok(Vec::new()),
         recovery_status: Ok(Arc::default()),
@@ -1537,6 +1541,7 @@ fn account_answers(
         backup_restore_updates: client.watch_backup_restore().receiver,
         prepared_group_images,
         prepared_group_image_records_unread,
+        device_link_activity: client.device_link_activity(),
         started_fresh: arc_err(client.started_fresh()),
         chat_history_imports: arc_err(client.chat_history_imports()),
         recovery_status,

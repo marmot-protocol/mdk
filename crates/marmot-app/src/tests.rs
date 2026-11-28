@@ -10957,6 +10957,26 @@ fn nip65_setter_round_trip_preserves_existing_roles() {
 #[derive(Clone, Debug)]
 struct TestExternalAccountSigner {
     keys: nostr::prelude::Keys,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl TestExternalAccountSigner {
+    fn new(keys: nostr::prelude::Keys) -> Self {
+        Self {
+            keys,
+            calls: Arc::default(),
+        }
+    }
+
+    fn record_call(&self) {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    fn call_count(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl transport_nostr_peeler::MarmotNostrSigner for TestExternalAccountSigner {
@@ -10966,6 +10986,7 @@ impl transport_nostr_peeler::MarmotNostrSigner for TestExternalAccountSigner {
         '_,
         Result<nostr::prelude::PublicKey, transport_nostr_peeler::MarmotSignerError>,
     > {
+        self.record_call();
         transport_nostr_peeler::MarmotNostrSigner::get_public_key(&self.keys)
     }
     fn sign_event(
@@ -10975,6 +10996,7 @@ impl transport_nostr_peeler::MarmotNostrSigner for TestExternalAccountSigner {
         '_,
         Result<nostr::prelude::Event, transport_nostr_peeler::MarmotSignerError>,
     > {
+        self.record_call();
         transport_nostr_peeler::MarmotNostrSigner::sign_event(&self.keys, unsigned)
     }
     fn nip04_encrypt<'a>(
@@ -10985,6 +11007,7 @@ impl transport_nostr_peeler::MarmotNostrSigner for TestExternalAccountSigner {
         'a,
         Result<String, transport_nostr_peeler::MarmotSignerError>,
     > {
+        self.record_call();
         transport_nostr_peeler::MarmotNostrSigner::nip04_encrypt(&self.keys, public_key, content)
     }
     fn nip04_decrypt<'a>(
@@ -10995,6 +11018,7 @@ impl transport_nostr_peeler::MarmotNostrSigner for TestExternalAccountSigner {
         'a,
         Result<String, transport_nostr_peeler::MarmotSignerError>,
     > {
+        self.record_call();
         transport_nostr_peeler::MarmotNostrSigner::nip04_decrypt(&self.keys, public_key, payload)
     }
     fn nip44_encrypt<'a>(
@@ -11005,6 +11029,7 @@ impl transport_nostr_peeler::MarmotNostrSigner for TestExternalAccountSigner {
         'a,
         Result<String, transport_nostr_peeler::MarmotSignerError>,
     > {
+        self.record_call();
         transport_nostr_peeler::MarmotNostrSigner::nip44_encrypt(&self.keys, public_key, content)
     }
     fn nip44_decrypt<'a>(
@@ -11015,6 +11040,7 @@ impl transport_nostr_peeler::MarmotNostrSigner for TestExternalAccountSigner {
         'a,
         Result<String, transport_nostr_peeler::MarmotSignerError>,
     > {
+        self.record_call();
         transport_nostr_peeler::MarmotNostrSigner::nip44_decrypt(&self.keys, public_key, payload)
     }
 }
@@ -11024,6 +11050,7 @@ impl cgka_engine::account_identity_proof::AccountIdentityProofSigner for TestExt
         &self,
         request: &cgka_engine::account_identity_proof::AccountIdentityProofRequest,
     ) -> Result<[u8; 64], String> {
+        self.record_call();
         if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
             return Err("request account identity does not match test signer".into());
         }
@@ -11995,7 +12022,7 @@ async fn register_external_signer_requires_matching_external_account() {
         home,
     );
 
-    let wrong_signer = TestExternalAccountSigner { keys: wrong_keys };
+    let wrong_signer = TestExternalAccountSigner::new(wrong_keys);
     assert!(matches!(
         app.register_external_signer(&account.account_id_hex, wrong_signer)
             .await,
@@ -12003,7 +12030,7 @@ async fn register_external_signer_requires_matching_external_account() {
     ));
     assert!(!app.has_external_signer(&account.account_id_hex));
 
-    let local_signer = TestExternalAccountSigner { keys: keys.clone() };
+    let local_signer = TestExternalAccountSigner::new(keys.clone());
     assert!(matches!(
         app.register_external_signer(&local_account.account_id_hex, local_signer)
             .await,
@@ -12011,7 +12038,7 @@ async fn register_external_signer_requires_matching_external_account() {
             if account == local_account.account_id_hex
     ));
 
-    let public_signer = TestExternalAccountSigner { keys: keys.clone() };
+    let public_signer = TestExternalAccountSigner::new(keys.clone());
     assert!(matches!(
         app.register_external_signer(&public_account.account_id_hex, public_signer)
             .await,
@@ -12019,7 +12046,7 @@ async fn register_external_signer_requires_matching_external_account() {
             if account == public_account.account_id_hex
     ));
 
-    let signer = TestExternalAccountSigner { keys };
+    let signer = TestExternalAccountSigner::new(keys);
     app.register_external_signer(&account.account_id_hex, signer)
         .await
         .unwrap();

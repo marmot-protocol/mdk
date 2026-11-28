@@ -2,7 +2,7 @@
 //! joining or moving to the answering device's group.
 
 use crate::Marmot;
-use crate::conversions::DeviceLinkSnapshotFfi;
+use crate::conversions::{DeviceLinkAttemptFfi, DeviceLinkSnapshotFfi};
 use crate::errors::MarmotKitError;
 
 #[marmot_uniffi_macros::on_tokio_runtime]
@@ -120,5 +120,19 @@ impl Marmot {
             .device_link_snapshot(&account_ref)
             .await?
             .into())
+    }
+
+    /// Read the account worker's published incoming link activity. Re-read on
+    /// `DeviceLinkChanged`. A missing value means unavailable. This call does
+    /// not start a worker, advance pairing, or ask the signer to do anything.
+    pub async fn device_link_activity(
+        &self,
+        account_ref: String,
+    ) -> Result<Option<Vec<DeviceLinkAttemptFfi>>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .device_link_activity(&account_ref)
+            .await?
+            .map(|attempts| attempts.into_iter().map(Into::into).collect()))
     }
 }

@@ -4,9 +4,10 @@
 use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
-    DeviceGroupMoveSiblingFfi, DeviceGroupMoveStateFfi, DeviceGroupMoveViewFfi, DeviceLinkEmojiFfi,
-    DeviceLinkEndReasonFfi, DeviceLinkPromptFfi, DeviceLinkPromptStateFfi, DeviceLinkSnapshotFfi,
-    LinkChatProgressFfi, NewDeviceLinkStateFfi,
+    DeviceGroupMoveSiblingFfi, DeviceGroupMoveStateFfi, DeviceGroupMoveViewFfi,
+    DeviceLinkAttemptFfi, DeviceLinkAttemptStateFfi, DeviceLinkEmojiFfi, DeviceLinkEndReasonFfi,
+    DeviceLinkPromptFfi, DeviceLinkPromptStateFfi, DeviceLinkSnapshotFfi, LinkChatProgressFfi,
+    NewDeviceLinkStateFfi,
 };
 
 use crate::macros::{c_enum, c_mirror};
@@ -253,6 +254,44 @@ c_mirror! {
     }
 }
 
+/// Display state for an incoming device link attempt.
+#[repr(C)]
+pub enum MarmotDeviceLinkAttemptState {
+    Pending,
+    Linking,
+    Linked,
+    CannotLink,
+    Ended { reason: MarmotDeviceLinkEndReason },
+}
+
+impl From<DeviceLinkAttemptStateFfi> for MarmotDeviceLinkAttemptState {
+    fn from(value: DeviceLinkAttemptStateFfi) -> Self {
+        match value {
+            DeviceLinkAttemptStateFfi::Pending => Self::Pending,
+            DeviceLinkAttemptStateFfi::Linking => Self::Linking,
+            DeviceLinkAttemptStateFfi::Linked => Self::Linked,
+            DeviceLinkAttemptStateFfi::CannotLink => Self::CannotLink,
+            DeviceLinkAttemptStateFfi::Ended { reason } => Self::Ended {
+                reason: reason.into(),
+            },
+        }
+    }
+}
+
+impl CFree for MarmotDeviceLinkAttemptState {
+    unsafe fn free_in_place(&mut self) {}
+}
+
+c_mirror! {
+    /// An incoming link request from the published activity view.
+    MarmotDeviceLinkAttempt from DeviceLinkAttemptFfi,
+    list(MarmotDeviceLinkAttemptList, marmot_device_link_attempt_list_free) {
+        str attempt_id,
+        copy requested_at: u64,
+        rec state: MarmotDeviceLinkAttemptState,
+    }
+}
+
 c_mirror! {
     /// Linking as this device shows it. `new_device` is NULL unless this
     /// device asked to be linked; `prompts` lists the sign-ins it can link.
@@ -274,6 +313,43 @@ mod tests {
     use super::*;
     use crate::memory::{audit, boxed};
     use marmot_uniffi::conversions::DeviceLinkEndReasonFfi as Reason;
+
+    #[test]
+    fn device_link_attempt_list_preserves_state_and_deep_frees() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let list = boxed(MarmotDeviceLinkAttemptList::from(vec![
+            DeviceLinkAttemptFfi {
+                attempt_id: "link-attempt".to_owned(),
+                requested_at: 42,
+                state: DeviceLinkAttemptStateFfi::Ended {
+                    reason: Reason::TimedOut,
+                },
+            },
+        ]));
+        let empty = boxed(MarmotDeviceLinkAttemptList::from(Vec::new()));
+        unsafe {
+            assert_eq!((*list).len, 1);
+            let first = &*(*list).items;
+            assert_eq!(
+                std::ffi::CStr::from_ptr(first.attempt_id).to_bytes(),
+                b"link-attempt"
+            );
+            assert_eq!(first.requested_at, 42);
+            assert!(matches!(
+                first.state,
+                MarmotDeviceLinkAttemptState::Ended {
+                    reason: MarmotDeviceLinkEndReason::TimedOut
+                }
+            ));
+            assert_eq!((*empty).len, 0);
+            assert!((*empty).items.is_null());
+            marmot_device_link_attempt_list_free(list);
+            marmot_device_link_attempt_list_free(empty);
+            marmot_device_link_attempt_list_free(std::ptr::null_mut());
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
 
     fn code() -> Vec<DeviceLinkEmojiFfi> {
         (0..7)

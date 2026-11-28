@@ -179,8 +179,8 @@ pub enum MarmotEventFfi {
         account_label: String,
     },
     /// Linking a new device may have changed as this device shows it:
-    /// re-read `device_link_snapshot`. Also fires once each time the
-    /// account's worker opens or reconnects. Live comparison sessions are
+    /// re-read `device_link_activity` for notices or `device_link_snapshot`
+    /// for the interactive flow. Also fires when the worker opens or reconnects. Live comparison sessions are
     /// lost then; admitted moves resume from durable progress. Carries no
     /// device, session or group identities, and may fire with no visible
     /// change.

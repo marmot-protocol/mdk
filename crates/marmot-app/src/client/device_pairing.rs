@@ -139,6 +139,50 @@ pub enum DeviceLinkPromptState {
     },
 }
 
+/// One observed incoming link request, without a comparison code or roster identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceLinkAttempt {
+    /// Opaque, local to the account worker's lifetime. Use to deduplicate notices.
+    pub attempt_id: String,
+    /// When the request arrived, in Unix seconds.
+    pub requested_at: u64,
+    pub state: DeviceLinkAttemptState,
+}
+
+/// Activity a host can display without participating in the pairing exchange.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceLinkAttemptState {
+    Pending,
+    Linking,
+    Linked,
+    CannotLink,
+    Ended { reason: DeviceLinkEndReason },
+}
+
+impl From<&DeviceLinkPrompt> for DeviceLinkAttempt {
+    fn from(prompt: &DeviceLinkPrompt) -> Self {
+        let state = match prompt.state {
+            DeviceLinkPromptState::Preparing
+            | DeviceLinkPromptState::Comparing { .. }
+            | DeviceLinkPromptState::CompetingRequests
+            | DeviceLinkPromptState::RateLimited { .. } => DeviceLinkAttemptState::Pending,
+            DeviceLinkPromptState::Linking => DeviceLinkAttemptState::Linking,
+            DeviceLinkPromptState::Linked | DeviceLinkPromptState::AddedElsewhere { .. } => {
+                DeviceLinkAttemptState::Linked
+            }
+            DeviceLinkPromptState::CannotLink { .. } | DeviceLinkPromptState::TooManyDevices => {
+                DeviceLinkAttemptState::CannotLink
+            }
+            DeviceLinkPromptState::Ended { reason } => DeviceLinkAttemptState::Ended { reason },
+        };
+        Self {
+            attempt_id: prompt.prompt_id.clone(),
+            requested_at: prompt.requested_at,
+            state,
+        }
+    }
+}
+
 /// What Link device sets for the new device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceLinkChoices {

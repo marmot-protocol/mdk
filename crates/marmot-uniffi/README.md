@@ -2074,10 +2074,14 @@ returns a `DeviceLinkSnapshotFfi`; a runtime with device groups off refuses ever
   arrives, then `Linked`; with none within an hour, the device is removed again and both sides show `LinkFailed`.
   Other states say why Link isn't offered, or `AddedElsewhere`: "<device_label> was added by <added_by_label>".
 - Each emoji carries an English `description` for screen readers. Users compare the pictures, not the descriptions.
-- `device_link_snapshot(account_ref)` reads linking without changing it. Re-read on `MarmotEventFfi::DeviceLinkChanged`,
+- `device_link_snapshot(account_ref)` drives pending pairing work and returns the interactive view. Re-read on
+  `MarmotEventFfi::DeviceLinkChanged`,
   which carries no device, session or group identities. With device groups on, it also fires once each time the
   account's worker opens or reconnects. Live comparison sessions are lost then; admitted moves resume from durable progress. Inspect `moves`
   rather than assuming an interrupted comparison undid an admitted move.
+- For an incoming-link notice, use `device_link_activity(account_ref)` on initial load and after
+  `DeviceLinkChanged`. It reads the latest published activity without driving pairing or invoking an external signer.
+  A missing value means the view is unavailable. Entries omit comparison codes and roster identities.
 
 ## Backup recovery and background conditions
 
