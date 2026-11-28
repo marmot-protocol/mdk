@@ -126,6 +126,8 @@ pub(crate) struct LocalMessageRequest {
     /// the engine when it encrypts (`SendIntent::AppMessage::only_to_members`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub only_to_members: Option<Vec<String>>,
+    #[serde(skip)]
+    pub media_upload_receipt_json: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -202,7 +204,7 @@ impl LocalMessageRequest {
             AppMessageIntent::Media {
                 attachments: self.attachments.clone(),
                 caption: Some(self.content.clone()),
-                message_tags: Vec::new(),
+                message_tags: self.tags.clone(),
             }
         } else if let Some(target) = &self.reply_to {
             AppMessageIntent::Reply {
@@ -432,9 +434,13 @@ impl MarmotApp {
             })?,
         );
         let request_hash = request_hash.finalize().to_vec();
+        let media_upload_receipt_json = request.media_upload_receipt_json.take();
         let result = StorageProvider::with_transaction(&storage, |storage| {
             if let Some(existing) = storage.app_storage().local_submission(&group_hex, &token)? {
-                if existing.request_hash != request_hash {
+                if existing.request_hash != request_hash
+                    || (media_upload_receipt_json.is_some()
+                        && existing.media_upload_receipt_json != media_upload_receipt_json)
+                {
                     return Err(AppError::InvalidAppMessagePayload(
                         "client token is already bound to another submission".into(),
                     ));
@@ -638,6 +644,7 @@ impl MarmotApp {
                 request_json: Some(request.encode_retained(edit_of_client_token)?),
                 state: 0,
                 outcome_json: None,
+                media_upload_receipt_json,
             };
             storage.app_storage().insert_local_submission(&submission)?;
             let projection = AppMessageProjection {

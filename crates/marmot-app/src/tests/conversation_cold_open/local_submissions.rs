@@ -39,6 +39,7 @@ async fn retained_submission_preserves_noncanonical_json_bytes_for_engine_handof
         payload: Some(payload.clone()),
         request_json: Some("{}".into()),
         state: 0,
+        media_upload_receipt_json: None,
         outcome_json: None,
     };
     let store = h.app.account_storage("alice").unwrap();

@@ -123,6 +123,7 @@ fn local_submission_handoff_rolls_back_with_engine_queue_write() {
             payload: Some(payload.to_vec()),
             request_json: Some("{}".into()),
             state: 0,
+            media_upload_receipt_json: None,
             outcome_json: None,
         })
         .unwrap();

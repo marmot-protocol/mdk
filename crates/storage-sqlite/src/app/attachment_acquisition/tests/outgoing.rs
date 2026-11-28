@@ -643,6 +643,7 @@ fn rejected_pending_submission_releases_outgoing_staging() {
             payload: Some(vec![3]),
             request_json: Some("{}".into()),
             state: 0,
+            media_upload_receipt_json: None,
             outcome_json: None,
         })
         .unwrap();
