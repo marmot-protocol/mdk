@@ -147,14 +147,23 @@ authoritative target ID.
 
 `upload_media_with_client_token` first uploads encrypted media and, when `send` is
 true, admits the resulting message with the token. It returns uploaded references
-plus optional acceptance. Upload completion must precede message acceptance;
+plus optional acceptance. Application tags in `message_tags` are part of the
+token-bound request. Upload completion must precede message acceptance;
 `send=false` creates no timeline row or token association. Cancellation of the wait
 does not abandon the owned upload task, but process restart before admission does
 not resume an upload.
 
-Uploads are not idempotent blob operations: repeating one may generate new
-encrypted references. After an unknown outcome, query `local_send_status` with the
-original token before uploading again. Media references remain epoch-bound and
+While the submission and its upload receipt are retained, retrying with the
+same caption, reply, application tags, upload endpoint, and ordered attachment
+metadata and bytes returns the original references and acceptance without
+another PUT, including after restart. Retention expiry or deletion of the
+source or group removes the submission and receipt. A later retry with the
+same token is a new request and uploads again if the group is still available.
+A changed request conflicts with a retained token. File-backed retries still
+require the original bytes. Use
+`local_send_status` to check admission without reopening the attachment sources
+or to reconcile tokens admitted by versions that did not store an upload receipt.
+Media references remain epoch-bound and
 can be rejected if the group changes before engine acceptance: the send fails
 with `MediaReferenceStaleEpoch` (upload the file again; a rejected submission
 needs freshly prepared references and a new token) or, while the group's epoch

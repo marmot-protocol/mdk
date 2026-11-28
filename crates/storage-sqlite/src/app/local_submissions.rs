@@ -16,6 +16,7 @@ pub struct LocalSubmission {
     pub payload_hash: Vec<u8>,
     pub payload: Option<Vec<u8>>,
     pub request_json: Option<String>,
+    pub media_upload_receipt_json: Option<String>,
     /// 0: app-owned queue; 1: engine-owned; 3: rejected before engine acceptance;
     /// 4: refused, never sent, because the group gained a member account the
     /// send's member list leaves out. Value 2 is reserved for the API's
@@ -43,9 +44,10 @@ fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalSubmission> {
         state: row.get(6)?,
         outcome_json: row.get(7)?,
         request_json: row.get(8)?,
+        media_upload_receipt_json: row.get(9)?,
     })
 }
-const COLUMNS: &str = "group_id_hex, client_token, message_id_hex, request_hash, payload_hash, payload, state, outcome_json, request_json";
+const COLUMNS: &str = "group_id_hex, client_token, message_id_hex, request_hash, payload_hash, payload, state, outcome_json, request_json, media_upload_receipt_json";
 
 impl SqliteAppStorage {
     pub fn local_submission(
@@ -71,11 +73,23 @@ impl SqliteAppStorage {
     pub fn insert_local_submission(&self, submission: &LocalSubmission) -> StorageResult<()> {
         let group_id_hex = canonical_group_id_hex(&submission.group_id_hex);
         let conn = self.lock()?;
-        let (count, bytes): (i64, i64) = conn.query_row_cached(
-            "SELECT count(*), COALESCE(sum(length(payload)+length(request_json)),0) FROM local_message_submissions WHERE state=0", [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).storage()?;
+        let (count, bytes): (i64, i64) = conn
+            .query_row_cached(
+                "SELECT count(*), COALESCE(sum(
+                COALESCE(length(payload), 0)
+                + COALESCE(length(CAST(request_json AS BLOB)), 0)
+                + COALESCE(length(CAST(media_upload_receipt_json AS BLOB)), 0)
+            ), 0) FROM local_message_submissions WHERE state=0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .storage()?;
         let incoming = submission.payload.as_ref().map_or(0, Vec::len)
-            + submission.request_json.as_ref().map_or(0, String::len);
+            + submission.request_json.as_ref().map_or(0, String::len)
+            + submission
+                .media_upload_receipt_json
+                .as_ref()
+                .map_or(0, String::len);
         if count >= MAX_PENDING_SUBMISSIONS
             || incoming > MAX_PENDING_BYTES as usize
             || bytes > MAX_PENDING_BYTES - incoming as i64
@@ -85,8 +99,8 @@ impl SqliteAppStorage {
             ));
         }
         conn.execute_cached(
-            "INSERT INTO local_message_submissions(group_id_hex,client_token,message_id_hex,request_hash,payload_hash,payload,request_json) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![group_id_hex.as_ref(), submission.client_token, submission.message_id_hex, submission.request_hash, submission.payload_hash, submission.payload, submission.request_json],
+            "INSERT INTO local_message_submissions(group_id_hex,client_token,message_id_hex,request_hash,payload_hash,payload,request_json,media_upload_receipt_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![group_id_hex.as_ref(), submission.client_token, submission.message_id_hex, submission.request_hash, submission.payload_hash, submission.payload, submission.request_json, submission.media_upload_receipt_json],
         ).storage()?;
         Ok(())
     }
@@ -182,6 +196,7 @@ mod tests {
             request_json: Some("{}".to_owned()),
             state: 0,
             outcome_json: Some("private outcome".to_owned()),
+            media_upload_receipt_json: None,
         }
     }
 
@@ -238,18 +253,30 @@ mod tests {
         .unwrap();
         app.insert_local_submission(&submission("next", 1)).unwrap();
 
-        // Each send carries a 2-byte request JSON beside its payload.
         let half = 8 * 1024 * 1024;
         let store = self::store();
         let app = store.app_storage();
-        app.insert_local_submission(&submission("first", half))
-            .unwrap();
+        let mut first = submission("first", half);
+        first.group_id_hex = "AA".to_owned();
+        first.request_json = None;
+        let receipt = r#"{"file":"שלום"}"#.to_owned();
+        let receipt_bytes = receipt.len();
+        first.media_upload_receipt_json = Some(receipt);
+        app.insert_local_submission(&first).unwrap();
+
+        let request = r#"{"caption":"שלום"}"#.to_owned();
+        let request_bytes = request.len();
+        let mut second = submission("second", half - receipt_bytes - request_bytes - 2);
+        second.request_json = Some(request);
+        app.insert_local_submission(&second).unwrap();
+
+        let over = submission("over", 1);
         assert_eq!(
-            refusal(app.insert_local_submission(&submission("over", half - 3))),
+            refusal(app.insert_local_submission(&over)),
             "local submission queue is full"
         );
         assert!(app.local_submission("aa", "over").unwrap().is_none());
-        app.insert_local_submission(&submission("exact", half - 4))
+        app.insert_local_submission(&submission("exact", 0))
             .unwrap();
     }
 }

@@ -723,7 +723,7 @@ pub struct MediaUploadRequest {
     pub message_tags: Vec<Vec<String>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MediaUploadAttachmentResult {
     pub reference: MediaAttachmentReference,
     pub encrypted_size_bytes: u64,

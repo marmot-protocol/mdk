@@ -13,8 +13,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::account_worker::GroupCreationRequest;
 use super::{
-    AccountManager, AccountWorkerCommand, Emit, ReadClass, ReadReply, Unpublished, WorkerCommands,
-    WorkerLane, account_worker_response, local_account_worker_response,
+    AccountManager, AccountSummary, AccountWorkerCommand, Emit, ReadClass, ReadReply, Unpublished,
+    WorkerCommands, WorkerLane, account_worker_response, local_account_worker_response,
     long_account_worker_catch_up_response, long_account_worker_response,
     publish_app_runtime_group_state_updated,
 };
@@ -2904,22 +2904,12 @@ impl AccountManager {
         group_id: &GroupId,
         request: MediaUploadRequest,
     ) -> Result<MediaUploadResult, AppError> {
-        let (command, admission) = self.media_worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::UploadMedia {
-                admission,
-                group_id: group_id.clone(),
-                request: crate::media::file_transfer::MediaUploadPayload::Bytes(request),
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        let result = long_account_worker_response(response).await?;
-        if result.sent.is_some() {
-            self.schedule_audit_log_tracker_update("upload_media_send");
-        }
-        Ok(result)
+        self.upload_media_payload(
+            self.resolve(account_ref)?,
+            group_id,
+            crate::media::file_transfer::MediaUploadPayload::Bytes(request),
+        )
+        .await
     }
 
     pub(crate) async fn upload_media_files(
@@ -2946,20 +2936,45 @@ impl AccountManager {
         control: std::sync::Arc<crate::MediaFileTransferControl>,
     ) -> Result<MediaUploadResult, AppError> {
         control.check()?;
-        let (command, admission) = self.media_worker_commands(account_ref).await?;
+        self.upload_media_payload(
+            self.resolve(account_ref)?,
+            group_id,
+            crate::media::file_transfer::MediaUploadPayload::Files(request, control),
+        )
+        .await
+    }
+
+    pub(super) async fn upload_media_payload(
+        &self,
+        account: AccountSummary,
+        group_id: &GroupId,
+        request: crate::media::file_transfer::MediaUploadPayload,
+    ) -> Result<MediaUploadResult, AppError> {
+        let (command, admission) = self
+            .media_worker_commands_for_account(account.clone())
+            .await?;
+        self.resolve_original(&account)?;
+        let file_backed = matches!(
+            request,
+            crate::media::file_transfer::MediaUploadPayload::Files(..)
+        );
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::UploadMedia {
                 admission,
                 group_id: group_id.clone(),
-                request: crate::media::file_transfer::MediaUploadPayload::Files(request, control),
+                request,
                 respond,
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
         // File preparation and ordered endpoint attempts can outlast the legacy
         // worker wait. Keep ownership until completion; HTTP bounds each attempt.
-        let result = response.await.map_err(|_| AppError::TransportClosed)??;
+        let result = if file_backed {
+            response.await.map_err(|_| AppError::TransportClosed)??
+        } else {
+            long_account_worker_response(response).await?
+        };
         if result.sent.is_some() {
             self.schedule_audit_log_tracker_update("upload_media_send");
         }

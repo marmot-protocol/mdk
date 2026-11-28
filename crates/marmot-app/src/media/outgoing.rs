@@ -207,6 +207,24 @@ impl HostSource {
             })
     }
 
+    pub(crate) fn plaintext_digest(mut self) -> Result<String, AppError> {
+        let mut hash = Sha256::new();
+        let mut buffer = Zeroizing::new(vec![0; FILE_TRANSFER_BUFFER_BYTES]);
+        while self.read < self.len {
+            self.control.check()?;
+            let len = (self.len - self.read).min(buffer.len() as u64) as usize;
+            self.read_exact(&mut buffer[..len]).map_err(source_error)?;
+            hash.update(&buffer[..len]);
+        }
+        if !self.unchanged() {
+            return Err(AppError::InvalidEncryptedMedia(
+                "media source changed during reading".into(),
+            ));
+        }
+        self.control.check()?;
+        Ok(hex::encode(hash.finalize()))
+    }
+
     /// A second handle on the source, for checking it is unchanged while the
     /// store still holds this one as the body it reads.
     pub(crate) fn watch(&self) -> Result<HostSourceWatch, AppError> {

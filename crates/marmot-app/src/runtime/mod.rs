@@ -60,6 +60,7 @@ use nostr::prelude::PublicKey;
 use nostr_directory::DirectorySyncHandle;
 
 const MEDIA_COMMAND_QUEUE_LIMIT: usize = 8;
+const MEDIA_REPLAY_LIMIT: usize = 4;
 /// Attachment downloads in flight at once across every account of a runtime.
 pub(crate) const ATTACHMENT_TRANSFER_LIMIT: usize = 4;
 
@@ -481,6 +482,8 @@ pub struct RuntimeSharedServices {
     // Private bounded observations and weak per-account gate lookup. This
     // global mutex is never held during storage, engine, or network work.
     local_submission_queue: Arc<StdMutex<local_submission_queue::LocalSubmissionQueue>>,
+    media_submission_gates: Arc<StdMutex<local_submissions::MediaSubmissionGates>>,
+    media_replay_slots: Arc<Semaphore>,
     attachment_transfer: Arc<tokio::sync::Semaphore>,
     /// The largest attachment transfer limit any account admitted under.
     attachment_limit_bound: Arc<std::sync::atomic::AtomicU64>,
@@ -596,6 +599,8 @@ impl Default for RuntimeSharedServices {
             attachment_limit_bound: Default::default(),
             local_submission_wakeups: watch::channel(()).0,
             local_submission_queue: Arc::new(StdMutex::new(Default::default())),
+            media_submission_gates: Arc::new(StdMutex::new(Default::default())),
+            media_replay_slots: Arc::new(Semaphore::new(MEDIA_REPLAY_LIMIT)),
             attachment_updates: Default::default(),
             attachment_cancellations: watch::channel(()).0,
             backup_background_conditions: watch::channel(BackupBackgroundConditions::default()).0,
@@ -702,6 +707,8 @@ impl RuntimeSharedServices {
             attachment_updates: Default::default(),
             local_submission_wakeups: watch::channel(()).0,
             local_submission_queue: Arc::new(StdMutex::new(Default::default())),
+            media_submission_gates: Arc::new(StdMutex::new(Default::default())),
+            media_replay_slots: Arc::new(Semaphore::new(MEDIA_REPLAY_LIMIT)),
             attachment_cancellations: watch::channel(()).0,
             backup_background_conditions: watch::channel(BackupBackgroundConditions::default()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
@@ -8930,6 +8937,15 @@ impl AccountManager {
     ) -> Result<(WorkerCommands, OwnedSemaphorePermit), AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
+        self.media_worker_commands_for_account(account).await
+    }
+
+    async fn media_worker_commands_for_account(
+        &self,
+        account: AccountSummary,
+    ) -> Result<(WorkerCommands, OwnedSemaphorePermit), AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.resolve_original(&account)?;
         self.setup_records()
             .require_onboarding_complete_for(&account)?;
         let (lane, admission) = self.worker_commands_for_account(account).await?;
