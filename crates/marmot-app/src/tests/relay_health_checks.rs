@@ -360,7 +360,7 @@ async fn a_refusal_under_a_remote_signer_is_only_suspected() {
     );
     app.register_external_signer(
         &account.account_id_hex,
-        super::TestExternalAccountSigner { keys },
+        super::TestExternalAccountSigner::new(keys),
     )
     .await
     .unwrap();

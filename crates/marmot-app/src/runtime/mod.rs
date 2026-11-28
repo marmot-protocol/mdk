@@ -1846,8 +1846,8 @@ pub enum MarmotAppEvent {
         account_label: String,
     },
     /// Linking a new device may have changed as this device shows it:
-    /// re-read `device_link_snapshot`. Also fires once each time the
-    /// account's worker opens or reconnects. Live comparison sessions are
+    /// re-read `device_link_activity` for notices or `device_link_snapshot`
+    /// for the interactive flow. Also fires when the worker opens or reconnects. Live comparison sessions are
     /// lost then; admitted moves resume from durable progress. Carries no
     /// device, session or group identities, and may fire with no visible
     /// change.
@@ -4947,6 +4947,19 @@ impl MarmotAppRuntime {
     ) -> Result<crate::DeviceLinkSnapshot, AppError> {
         self.device_link(account_ref, crate::DeviceLinkOp::Read)
             .await
+    }
+
+    /// Observe an existing account worker's last published incoming link requests.
+    ///
+    /// No worker is started and no pairing, signing, publication, or storage
+    /// work is scheduled. `None` means the activity view is unavailable.
+    /// A present empty list means the worker knows of no incoming requests.
+    /// Re-read on `DeviceLinkChanged`. This is an in-memory view, not an audit log.
+    pub async fn device_link_activity(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<Vec<crate::DeviceLinkAttempt>>, AppError> {
+        self.accounts.device_link_activity(account_ref).await
     }
 
     async fn device_link(

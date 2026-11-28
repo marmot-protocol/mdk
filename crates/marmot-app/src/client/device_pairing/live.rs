@@ -151,9 +151,9 @@ pub(crate) struct DevicePairing {
     outbox: VecDeque<(PairingMessage, u64)>,
     /// No KeyPackage fetch before this time.
     fetch_after: u64,
-    /// Linking as hosts were last told it changed; empty when the client
-    /// opens, which announces it.
-    last_view: DeviceLinkSnapshot,
+    /// Linking as hosts were last told it changed. None when disabled or
+    /// when a drive could not read the view.
+    last_view: Option<DeviceLinkSnapshot>,
     /// When each pending link was first seen missing from its quiet device
     /// group's roster, keyed by group and slot; the settlement window counts
     /// from then. In memory, so a restart starts the window again.
@@ -170,8 +170,11 @@ pub(crate) struct DevicePairing {
 
 impl DevicePairing {
     pub(crate) fn new(inbox: Option<PairingInbox>) -> Self {
+        // A fresh pairing inbox starts without any observed attempts.
+        let last_view = inbox.as_ref().map(|_| DeviceLinkSnapshot::default());
         Self {
             inbox,
+            last_view,
             // A failed link this device approved may still be listed: the
             // first drive after open reads the roster (mdk#3265).
             roster_changed: true,
@@ -508,12 +511,9 @@ impl AppClient {
     }
 
     /// Raise `DeviceLinkChanged` when linking, as hosts would read it,
-    /// differs from what they were last told. A view that can't be read now
-    /// is compared at the next drive.
+    /// differs from what they were last told, including when it becomes unavailable.
     fn note_device_link_view(&mut self) {
-        let Ok(view) = self.device_link_snapshot() else {
-            return;
-        };
+        let view = self.device_link_snapshot().ok();
         if view != self.device_pairing.last_view {
             self.device_pairing.last_view = view;
             self.device_link_changed = true;
@@ -2187,6 +2187,14 @@ impl AppClient {
             ));
         }
         Ok(())
+    }
+
+    /// Project the client's last observed pairing view. Reading it does no I/O.
+    pub(crate) fn device_link_activity(&self) -> Option<Vec<crate::DeviceLinkAttempt>> {
+        self.device_pairing
+            .last_view
+            .as_ref()
+            .map(|view| view.prompts.iter().map(Into::into).collect())
     }
 
     // The view.

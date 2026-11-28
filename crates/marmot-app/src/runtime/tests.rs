@@ -578,6 +578,84 @@ mod live_notifications {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn device_link_activity_reads_only_the_selected_workers_published_view() {
+    let root = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(root.path(), vec![]);
+    let keys = nostr::prelude::Keys::generate();
+    let account = app
+        .account_home()
+        .add_external_signer_account(&keys.public_key().to_hex())
+        .unwrap();
+    app.account_home().create_account("other").unwrap();
+    let runtime = app.runtime();
+    let manager = runtime.accounts();
+    let (commands, mut received) = crate::runtime::test_worker_channel(1);
+    let (sender, read_state) = crate::client::read_state::read_state_channel();
+    let (shutdown, stopped) = oneshot::channel();
+    manager.workers.lock().await.insert(
+        account.account_id_hex.clone(),
+        ManagedAccountWorker {
+            ready: true,
+            handle: tokio::spawn(async move {
+                let _ = stopped.await;
+            }),
+            commands,
+            media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
+            shutdown,
+            unit: Default::default(),
+            read_state,
+            relay_checks: tokio::sync::watch::channel(Default::default()).1,
+            tasks: Default::default(),
+        },
+    );
+
+    // The external account has no signer registered, and its worker does
+    // not answer commands. Reads complete without either of them.
+    let attempt = crate::DeviceLinkAttempt {
+        attempt_id: "known-attempt".to_owned(),
+        requested_at: 42,
+        state: crate::DeviceLinkAttemptState::Pending,
+    };
+    timeout(Duration::from_secs(5), async {
+        let transaction = manager.worker_transactions.lock().await;
+        assert_eq!(
+            runtime.device_link_activity(&account.label).await.unwrap(),
+            None
+        );
+        sender.publish_for_test(|account| {
+            account.device_link_activity = Some(vec![attempt.clone()]);
+        });
+        assert_eq!(runtime.device_link_activity("other").await.unwrap(), None);
+        assert_eq!(
+            runtime.device_link_activity(&account.label).await.unwrap(),
+            Some(vec![attempt])
+        );
+        sender.publish_for_test(|account| {
+            account.device_link_activity = Some(Vec::new());
+        });
+        assert_eq!(
+            runtime.device_link_activity(&account.label).await.unwrap(),
+            Some(Vec::new())
+        );
+        drop(sender);
+        assert_eq!(
+            runtime.device_link_activity(&account.label).await.unwrap(),
+            None
+        );
+        drop(transaction);
+    })
+    .await
+    .expect("reading activity must not wait for a worker or reconciliation");
+    assert!(matches!(
+        received.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(manager.workers.lock().await.len(), 1);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_lookup_skips_reconcile() {
     let root = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relays(root.path(), vec![]);

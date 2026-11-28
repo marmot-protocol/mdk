@@ -1,9 +1,9 @@
 //! Linking a new device of this account, as each device's screen shows it.
 
 use marmot_app::{
-    DeviceGroupMoveSibling, DeviceGroupMoveState, DeviceGroupMoveView, DeviceLinkEmoji,
-    DeviceLinkEndReason, DeviceLinkPrompt, DeviceLinkPromptState, DeviceLinkSnapshot,
-    LinkChatProgress, NewDeviceLinkState,
+    DeviceGroupMoveSibling, DeviceGroupMoveState, DeviceGroupMoveView, DeviceLinkAttempt,
+    DeviceLinkAttemptState, DeviceLinkEmoji, DeviceLinkEndReason, DeviceLinkPrompt,
+    DeviceLinkPromptState, DeviceLinkSnapshot, LinkChatProgress, NewDeviceLinkState,
 };
 
 /// One emoji of the code.
@@ -194,6 +194,44 @@ impl From<DeviceLinkPrompt> for DeviceLinkPromptFfi {
             slot_id_hex: value.slot_id_hex,
             requested_at: value.requested_at,
             state: value.state.into(),
+        }
+    }
+}
+
+/// Activity of one incoming request. It contains no pairing code.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DeviceLinkAttemptFfi {
+    /// Opaque id scoped to the account worker's lifetime.
+    pub attempt_id: String,
+    /// Unix timestamp in seconds.
+    pub requested_at: u64,
+    pub state: DeviceLinkAttemptStateFfi,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum DeviceLinkAttemptStateFfi {
+    Pending,
+    Linking,
+    Linked,
+    CannotLink,
+    Ended { reason: DeviceLinkEndReasonFfi },
+}
+
+impl From<DeviceLinkAttempt> for DeviceLinkAttemptFfi {
+    fn from(value: DeviceLinkAttempt) -> Self {
+        let state = match value.state {
+            DeviceLinkAttemptState::Pending => DeviceLinkAttemptStateFfi::Pending,
+            DeviceLinkAttemptState::Linking => DeviceLinkAttemptStateFfi::Linking,
+            DeviceLinkAttemptState::Linked => DeviceLinkAttemptStateFfi::Linked,
+            DeviceLinkAttemptState::CannotLink => DeviceLinkAttemptStateFfi::CannotLink,
+            DeviceLinkAttemptState::Ended { reason } => DeviceLinkAttemptStateFfi::Ended {
+                reason: reason.into(),
+            },
+        };
+        Self {
+            attempt_id: value.attempt_id,
+            requested_at: value.requested_at,
+            state,
         }
     }
 }

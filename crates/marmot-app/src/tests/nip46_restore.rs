@@ -30,7 +30,7 @@ async fn nip46_restore_and_signout() {
         let account = home
             .add_external_signer_account(&user.public_key().to_hex())
             .unwrap();
-        app.register_external_signer(&account.label, TestExternalAccountSigner { keys: user })
+        app.register_external_signer(&account.label, TestExternalAccountSigner::new(user))
             .await
             .unwrap();
         // Persist a genuine MLS identity proof before the remote signer goes offline.
@@ -466,9 +466,7 @@ async fn run_nip46_drop(settlement: DropSettlement) {
     let completed = runtime
         .login_external_signer(
             peer.user.public_key().to_hex(),
-            TestExternalAccountSigner {
-                keys: peer.user.clone(),
-            },
+            TestExternalAccountSigner::new(peer.user.clone()),
             AccountSetupRequest {
                 default_relays: endpoints(),
                 bootstrap_relays: endpoints(),
@@ -489,14 +487,9 @@ async fn run_nip46_drop(settlement: DropSettlement) {
         )
         .await
         .unwrap();
-    app.register_external_signer(
-        &id,
-        TestExternalAccountSigner {
-            keys: peer.user.clone(),
-        },
-    )
-    .await
-    .unwrap();
+    app.register_external_signer(&id, TestExternalAccountSigner::new(peer.user.clone()))
+        .await
+        .unwrap();
     let account = home.account(&id).unwrap();
     let originally_signed_out = account.signed_out;
     let cached = app
@@ -981,7 +974,7 @@ async fn external_login_ready_with_device_groups() {
         let completed = runtime
             .login_external_signer(
                 account.account_id_hex.clone(),
-                TestExternalAccountSigner { keys: user },
+                TestExternalAccountSigner::new(user),
                 AccountSetupRequest {
                     default_relays: endpoints(),
                     bootstrap_relays: endpoints(),
@@ -1037,9 +1030,7 @@ async fn nip46_login_restores_host() {
         runtime
             .login_external_signer(
                 account.account_id_hex.clone(),
-                TestExternalAccountSigner {
-                    keys: peer.user.clone(),
-                },
+                TestExternalAccountSigner::new(peer.user.clone()),
                 AccountSetupRequest {
                     default_relays: endpoints(),
                     bootstrap_relays: endpoints(),
@@ -1170,9 +1161,7 @@ async fn nip46_cold_rebind_failure() {
     let completed = runtime
         .login_external_signer(
             peer.user.public_key().to_hex(),
-            TestExternalAccountSigner {
-                keys: peer.user.clone(),
-            },
+            TestExternalAccountSigner::new(peer.user.clone()),
             AccountSetupRequest {
                 default_relays: endpoints(),
                 bootstrap_relays: endpoints(),
@@ -1231,14 +1220,9 @@ async fn nip46_cold_rebind_failure() {
         AccountSetupReadiness::NetworkReady
     );
     assert!(home.account_setup_state(&id).unwrap().is_none());
-    app.register_external_signer(
-        &id,
-        TestExternalAccountSigner {
-            keys: peer.user.clone(),
-        },
-    )
-    .await
-    .unwrap();
+    app.register_external_signer(&id, TestExternalAccountSigner::new(peer.user.clone()))
+        .await
+        .unwrap();
     runtime.start().await.unwrap();
     assert!(
         runtime

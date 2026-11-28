@@ -91,22 +91,28 @@ impl Device {
 /// KeyPackage, sharing one scripted relay.
 fn alice_devices<const N: usize>()
 -> impl Future<Output = (Arc<ScriptedPushRelayClient>, [Device; N])> {
-    boxed(|| alice_devices_settling_after::<N>(0))
+    boxed(|| alice_devices_settling_after::<N>(0, None))
 }
 
 /// [`alice_devices`], with a settlement window of `settlement_ms`.
 async fn alice_devices_settling_after<const N: usize>(
     settlement_ms: u64,
+    external_signer: Option<&TestExternalAccountSigner>,
 ) -> (Arc<ScriptedPushRelayClient>, [Device; N]) {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let dirs: [tempfile::TempDir; N] = std::array::from_fn(|_| tempfile::tempdir().unwrap());
     let home = AccountHome::open(dirs[0].path());
-    let alice_id = home.create_account("alice").unwrap().account_id_hex;
-    let secret = home
-        .load_signing_keys("alice")
-        .unwrap()
-        .secret_key()
-        .to_secret_hex();
+    let (alice_id, phone_account_ref, keys) = if let Some(signer) = external_signer {
+        let account = home
+            .add_external_signer_account(&signer.keys.public_key().to_hex())
+            .unwrap();
+        (account.account_id_hex, account.label, signer.keys.clone())
+    } else {
+        let account = home.create_account("alice").unwrap();
+        let keys = home.load_signing_keys("alice").unwrap();
+        (account.account_id_hex, account.label, keys)
+    };
+    let secret = keys.secret_key().to_secret_hex();
     let mut devices = Vec::with_capacity(N);
     for (index, dir) in dirs.into_iter().enumerate() {
         if index > 0 {
@@ -124,7 +130,17 @@ async fn alice_devices_settling_after<const N: usize>(
         )
         .with_test_relay_client(relay.clone());
         remember_test_member_inbox(&app, &alice_id, "wss://relay.example");
-        let mut client = boxed(|| app.client("alice")).await.unwrap();
+        let account_ref = if index == 0 {
+            if let Some(signer) = external_signer {
+                app.register_external_signer(&phone_account_ref, signer.clone())
+                    .await
+                    .unwrap();
+            }
+            phone_account_ref.as_str()
+        } else {
+            "alice"
+        };
+        let mut client = boxed(|| app.client(account_ref)).await.unwrap();
         boxed(|| published_key_package(&mut client, &relay)).await;
         devices.push(Device {
             _dir: dir,
@@ -2653,7 +2669,7 @@ async fn a_retained_link_commit_that_rolls_back_ends_the_link() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_link_commit_ends_the_link_on_both_devices() {
     let (relay, [mut phone, mut laptop, mut tablet]) =
-        boxed(|| alice_devices_settling_after::<3>(1_500)).await;
+        boxed(|| alice_devices_settling_after::<3>(1_500, None)).await;
     let (group, slot) =
         link_tablet_until_commit(&relay, &mut phone, &mut laptop, &mut tablet).await;
 
@@ -2771,7 +2787,9 @@ async fn linking_is_refused_without_device_groups() {
 /// raises none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_change_in_linking_is_announced_once() {
-    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let signer = TestExternalAccountSigner::new(nostr::prelude::Keys::generate());
+    let (relay, [mut phone, mut laptop]) =
+        boxed(|| alice_devices_settling_after::<2>(0, Some(&signer))).await;
     assert!(phone.client.take_device_link_changed());
     assert!(laptop.client.take_device_link_changed());
     phone.step(&relay).await;
@@ -2781,8 +2799,21 @@ async fn each_change_in_linking_is_announced_once() {
     assert!(laptop.client.take_device_link_changed());
     laptop.op(DeviceLinkOp::Read).await;
     assert!(!laptop.client.take_device_link_changed());
-    phone.step(&relay).await; // request in: a prompt
+    let received = phone.step(&relay).await; // request in: a prompt
     assert!(phone.client.take_device_link_changed());
+    let expected = crate::DeviceLinkAttempt {
+        attempt_id: received.prompts[0].prompt_id.clone(),
+        requested_at: received.prompts[0].requested_at,
+        state: crate::DeviceLinkAttemptState::Pending,
+    };
+    let signer_calls = signer.call_count();
+    let publish_attempts = relay.attempted_event_ids().len();
+    let activity = Some(vec![expected]);
+    assert_eq!(phone.client.device_link_activity(), activity);
+    assert_eq!(phone.client.device_link_activity(), activity);
+    assert_eq!(signer.call_count(), signer_calls);
+    assert_eq!(relay.attempted_event_ids().len(), publish_attempts);
+    assert!(!phone.client.take_device_link_changed());
     laptop.step(&relay).await; // answer in: the code
     assert!(laptop.client.take_device_link_changed());
     laptop.step(&relay).await;
@@ -2803,6 +2834,10 @@ async fn the_runtime_announces_linking() {
     let mut events = runtime.subscribe();
     runtime.reconcile_accounts().await.unwrap();
     next_device_link_changed(&mut events, &account_id_hex).await;
+    assert_eq!(
+        runtime.device_link_activity("alice").await.unwrap(),
+        Some(Vec::new())
+    );
 
     let started = runtime.start_device_link("alice").await.unwrap();
     assert_eq!(

@@ -47,7 +47,7 @@ use crate::types::chat_list::{
 };
 use crate::types::common::{MarmotMessageTag, MarmotStringArray, MarmotStringList};
 use crate::types::compromise_warning::MarmotCompromiseWarningItemList;
-use crate::types::device_link::MarmotDeviceLinkSnapshot;
+use crate::types::device_link::{MarmotDeviceLinkAttemptList, MarmotDeviceLinkSnapshot};
 use crate::types::directory::MarmotCachedIdentityProjectionList;
 use crate::types::directory::MarmotUserDirectorySearchResultList;
 use crate::types::draft::MarmotMessageDraftAttachmentInput;
@@ -1042,6 +1042,11 @@ c_cmd! {
     /// `DeviceLinkChanged` event. Free with
     /// `marmot_device_link_snapshot_free`.
     async fn marmot_device_link_snapshot(account_ref: str) -> rec(MarmotDeviceLinkSnapshot) = device_link_snapshot;
+
+    /// Read published incoming link activity. NULL means unavailable, while
+    /// an empty list means no known requests. Free with
+    /// `marmot_device_link_attempt_list_free`.
+    async fn marmot_device_link_activity(account_ref: str) -> opt_rec(MarmotDeviceLinkAttemptList) = device_link_activity;
 
     /// Accept a pending group invite; writes the now-confirmed group
     /// record. Free with `marmot_app_group_record_free`.

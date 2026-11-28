@@ -783,6 +783,26 @@ On the new device, record that the user says both screens show the same emoji. `
 
 On a device already signed in, Not now for the prompt `prompt_id`: the prompt goes and the new device's link ends with `CancelledElsewhere`. Refused with `unknown_prompt` for a stale prompt.
 
+### `Marmot::device_link_activity`
+
+**Current.**
+
+Read incoming link attempts from the selected account's last published view.
+Call on initial load and after `DeviceLinkChanged`. An absent value means
+unavailable, including when the worker is absent or has exited, device groups
+are disabled, or a pairing drive could not read the view. An empty list means
+the worker has observed no current attempts. Invalid, signed-out and
+public-only accounts return an error, as do a stopped runtime and closed
+storage. Each entry has an opaque id scoped to the worker, arrival time in
+Unix seconds, and a display state. Keep comparison codes and roster details in
+the interactive flow.
+
+Use this read for notices, including on accounts using an external signer.
+After resolving the account, the call reads the worker's published memory
+without starting a worker, requesting signing, advancing pairing, or sending
+anything. It reports observations retained by the worker. The list can change
+or disappear when the worker restarts.
+
 ### `Marmot::device_link_snapshot`
 
 **Current.**

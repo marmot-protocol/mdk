@@ -3124,6 +3124,21 @@ impl AccountManager {
         Ok(summary)
     }
 
+    pub(crate) async fn device_link_activity(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<Vec<crate::DeviceLinkAttempt>>, AppError> {
+        let Some(lane) = self.existing_worker_commands(account_ref).await? else {
+            return Ok(None);
+        };
+        match lane.read_state.version(&self.app.storage_closed) {
+            Ok(state) => Ok(state.and_then(|state| state.account.device_link_activity.clone())),
+            // A worker can exit before the next reconciliation removes its lane.
+            Err(AppError::TransportClosed) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) async fn device_link(
         &self,
         account_ref: &str,
