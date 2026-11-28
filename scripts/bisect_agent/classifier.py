@@ -647,7 +647,8 @@ def match_known_flake_issue(
     failed_test: str | None,
     open_issues: Iterable[dict],
 ) -> int | None:
-    """Match a failing test identity against open `Flaky:` issues without substring false positives.
+    """Match a failing test identity against open `Flaky:` or `New-Intermittent:` issues
+    without substring false positives.
 
     Pass 1 matches a complete test identifier (boundary-delimited) in `title` or `body`
     (supporting both `pkg::bin::test` and nextest/JUnit `pkg::bin test` forms).
@@ -673,8 +674,8 @@ def match_known_flake_issue(
             continue
         title = str(issue.get("title") or "")
         body = str(issue.get("body") or "")
-        is_flake_issue = title.lower().startswith("flaky:")
-        if not is_flake_issue:
+        # An open `New-Intermittent:` issue tracks a flake the agent already reported.
+        if not title.lower().startswith(("flaky:", "new-intermittent:")):
             continue
         if any(_contains_exact_test_token(title, tok) or _contains_exact_test_token(body, tok) for tok in full_tokens):
             return number

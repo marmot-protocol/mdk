@@ -485,6 +485,14 @@ class ClassifierTests(unittest.TestCase):
                 "body": "",
             }
         ]
+        # The agent's own `New-Intermittent:` issue tracks the test as surely as a `Flaky:` one.
+        intermittent = [
+            {
+                "number": 4002,
+                "title": "New-Intermittent: marmot-session::runtime::an_overdue_component_recheck_is_owed_not_due_now",
+                "body": "",
+            }
+        ]
 
         # 1. Deterministic regression (always fails tip, always passes baseline) MUST NOT be
         # suppressed by the leaderboard OR by an open individual `Flaky:` issue.
@@ -493,6 +501,7 @@ class ClassifierTests(unittest.TestCase):
         for label, issues, expected_shas, expected_issue in (
             ("leaderboard", leaderboard, [sig.tip_sha, sig.baseline_sha], None),
             ("individual", individual, [sig.tip_sha, sig.baseline_sha, sig.baseline_sha, sig.tip_sha], 4001),
+            ("intermittent", intermittent, [sig.tip_sha, sig.baseline_sha, sig.baseline_sha, sig.tip_sha], 4002),
         ):
             with self.subTest(issues=label):
                 seen_shas: list[str] = []
@@ -652,6 +661,13 @@ class ClassifierTests(unittest.TestCase):
         )
         self.assertEqual(both_fail_known.bucket, Bucket.KNOWN_FLAKE)
         self.assertEqual(both_fail_known.matched_issue, 4001)
+        both_fail_intermittent = classify_failure(
+            sig,
+            run_on_sha=lambda _s, _c: (RunVerdict.FAIL, "target test failed"),
+            open_flake_issues=intermittent,
+        )
+        self.assertEqual(both_fail_intermittent.bucket, Bucket.KNOWN_FLAKE)
+        self.assertEqual(both_fail_intermittent.matched_issue, 4002)
 
         # Without a matching individual `Flaky:` issue (including leaderboard-only), both failing
         # remains an INFRA_ERROR baseline break.
