@@ -8632,6 +8632,15 @@ fn member_resolution_key_package_event(
     account: &AccountSummary,
     key_package: KeyPackage,
 ) -> NostrTransportEvent {
+    member_resolution_key_package_publication(account, key_package)
+        .to_event()
+        .unwrap()
+}
+
+fn member_resolution_key_package_publication(
+    account: &AccountSummary,
+    key_package: KeyPackage,
+) -> transport_nostr_adapter::NostrKeyPackagePublication {
     let metadata = cgka_engine::key_package::key_package_metadata(&key_package).unwrap();
     transport_nostr_adapter::NostrKeyPackagePublication {
         client_name: None,
@@ -8658,8 +8667,6 @@ fn member_resolution_key_package_event(
             .collect(),
         publish_endpoints: vec![TransportEndpoint("wss://shared.example".into())],
     }
-    .to_event()
-    .unwrap()
 }
 
 pub(crate) async fn member_resolution_fixture(
@@ -9951,14 +9958,18 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
         Some(old.clone())
     );
 
+    // Each rotation is published a second after the one it replaces. A
+    // same-second replacement keeps the lower event id as the slot's current
+    // publication, which would leave the rotation unobserved half the time.
     let refreshed = fresh_key_package_for_account(&app, recipient, false).await;
     {
         let mut events = fetcher.events.lock().unwrap();
         events.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
-        events.push(member_resolution_key_package_event(
-            recipient,
-            refreshed.clone(),
-        ));
+        events.push(
+            member_resolution_key_package_publication(recipient, refreshed.clone())
+                .to_event_at(old_directory.created_at + 1)
+                .unwrap(),
+        );
     }
     let prewarm = app
         .directory()
@@ -9986,10 +9997,11 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
     {
         let mut events = fetcher.events.lock().unwrap();
         events.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
-        events.push(member_resolution_key_package_event(
-            recipient,
-            latest.clone(),
-        ));
+        events.push(
+            member_resolution_key_package_publication(recipient, latest.clone())
+                .to_event_at(old_directory.created_at + 2)
+                .unwrap(),
+        );
     }
     fetcher.requests.lock().unwrap().clear();
     assert_eq!(
