@@ -35,8 +35,8 @@ use std::collections::BTreeMap;
 
 use cgka_traits::storage::StorageResult;
 use storage_sqlite::{
-    RecoveryCoverageProof, RecoveryRecheckPass, RecoveryStagedSlice, RecoveryUnitOutcome,
-    SqliteAppStorage, TRANSPORT_RECONCILIATION_RETENTION_SECS,
+    RecoveryCoverageProof, RecoveryRecheckPass, RecoveryStagedSlice, RecoveryUnit,
+    RecoveryUnitOutcome, SqliteAppStorage, TRANSPORT_RECONCILIATION_RETENTION_SECS,
 };
 use transport_nostr_adapter::compare::CompareEnd;
 use transport_nostr_adapter::sweep::{RelayCaps, SweepRange};
@@ -97,12 +97,14 @@ pub(super) fn survey(
     policy: &RecoveryRunnerPolicy,
     stalled: &Stalled,
     admission: &mut Admission<'_>,
+    unit_states: &BTreeMap<UnitKey, RecoveryUnit>,
+    cooldowns: &mut BTreeMap<String, Option<u64>>,
 ) -> StorageResult<Vec<Candidate>> {
     let app = turn.app;
     let now = turn.now;
     let mut caps = BTreeMap::new();
-    let mut cooldowns = BTreeMap::new();
-    let mut candidates = Vec::new();
+    let mut entries = Vec::new();
+    let mut due_queries = Vec::new();
     for route in turn.routes {
         for (relay, best_effort) in route.relays() {
             if best_effort {
@@ -122,33 +124,48 @@ pub(super) fn survey(
                 route: route.route.clone(),
                 relay: relay.to_owned(),
             };
-            let unit = app.recovery_unit(&key.route, relay)?;
-            let pass = unit.as_ref().map(|unit| unit.recheck).unwrap_or_default();
+            let unit = unit_states.get(&key);
+            let pass = unit.map(|unit| unit.recheck).unwrap_or_default();
             let due = due_at(pass, policy);
-            let to_check = if due <= now {
-                let Some(seconds) = owed(turn, route, &key, pass)? else {
-                    continue;
-                };
-                seconds
+            let position = start(now, pass);
+            let due_index = if due <= now {
+                let index = due_queries.len();
+                due_queries.push((&route.route, relay, position, turn.checked_until(route)));
+                Some(index)
             } else {
-                0
+                None
             };
-            let cooldown = cooldown_until(app, &mut cooldowns, relay, now)?;
-            let held_back =
-                stalled.holds(route) || admission.backpressured(&key, &policy.staging, false)?;
-            candidates.push(Candidate {
-                key,
-                group_id: route.group_id.clone(),
-                best_effort: false,
-                fetch_until: None,
-                owed_seconds: to_check,
-                position: start(now, pass),
-                last_served_at: unit.as_ref().and_then(|unit| unit.last_served_at_seconds),
-                due_at: due.max(cooldown.unwrap_or(0)),
-                blocked: suspended(route) || held_back,
-                recheck: true,
-            });
+            entries.push((route, key, unit, pass, due, position, due_index));
         }
+    }
+    let owed_seconds = app.recovery_recheck_owed_seconds(&due_queries)?;
+    let mut candidates = Vec::new();
+    for (route, key, unit, pass, due, position, due_index) in entries {
+        let to_check = match due_index {
+            Some(index) => {
+                let seconds = owed_seconds[index];
+                if seconds == 0 && pass.position_seconds.is_none() {
+                    continue;
+                }
+                seconds
+            }
+            None => 0,
+        };
+        let cooldown = cooldown_until(app, cooldowns, &key.relay, now)?;
+        let held_back =
+            stalled.holds(route) || admission.backpressured(&key, &policy.staging, false)?;
+        candidates.push(Candidate {
+            key,
+            group_id: route.group_id.clone(),
+            best_effort: false,
+            fetch_until: None,
+            owed_seconds: to_check,
+            position,
+            last_served_at: unit.and_then(|unit| unit.last_served_at_seconds),
+            due_at: due.max(cooldown.unwrap_or(0)),
+            blocked: suspended(route) || held_back,
+            recheck: true,
+        });
     }
     Ok(candidates)
 }
@@ -172,15 +189,12 @@ pub(super) fn owed(
     key: &UnitKey,
     pass: RecoveryRecheckPass,
 ) -> StorageResult<Option<u64>> {
-    let seconds = ranges_to_check(
-        turn.app,
-        key,
+    let seconds = turn.app.recovery_recheck_owed_seconds(&[(
+        &key.route,
+        key.relay.as_str(),
         start(turn.now, pass),
         turn.checked_until(route),
-    )?
-    .iter()
-    .map(|planned| planned.range.until - planned.range.since + 1)
-    .fold(0u64, u64::saturating_add);
+    )])?[0];
     Ok((seconds > 0 || pass.position_seconds.is_some()).then_some(seconds))
 }
 

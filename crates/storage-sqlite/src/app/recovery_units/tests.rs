@@ -787,6 +787,38 @@ fn one_look_reads_each_units_debt_as_its_own_read_does() {
     assert!(read[0].1.as_ref().is_some_and(|unit| unit.probe));
 }
 
+/// One look at the ledger counts every unit's covered and retired seconds
+/// inside its re-check window, deduplicating overlaps, clipping at both ends,
+/// excluding parked spans, and returning zero for empty or inverted windows.
+#[test]
+fn one_look_reads_each_units_recheck_owed_seconds() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let (mixed, parked_only, untouched) = (group(1), group(2), group(3));
+
+    // `mixed`: retire [NOW - 700, NOW] and cover [NOW - 1_000, NOW - 600],
+    // overlapping on [NOW - 700, NOW - 600].
+    owing(&app, &mixed, NOW - 1_000, (NOW - 1_000, NOW - 701));
+    break_unit(&app, &mixed, NOW);
+    app.retire_route_park_as_converted(&mixed);
+    cover(&app, &mixed, RELAY, (NOW - 1_000, NOW - 600));
+
+    // `parked_only`: cover only NOW - 300 and park [NOW - 299, NOW].
+    owing(&app, &parked_only, NOW - 300, (NOW - 300, NOW - 300));
+    break_unit(&app, &parked_only, NOW);
+
+    let queries = [
+        (&mixed, RELAY, NOW - 900, NOW - 450),
+        (&mixed, RELAY, NOW - 450, NOW - 900),
+        (&parked_only, RELAY, NOW - 299, NOW),
+        (&parked_only, RELAY, NOW - 300, NOW),
+        (&untouched, RELAY, NOW - 1_000, NOW),
+    ];
+    let counts = app.recovery_recheck_owed_seconds(&queries).unwrap();
+    assert_eq!(counts, vec![451, 0, 0, 1, 0]);
+    assert!(app.recovery_recheck_owed_seconds(&[]).unwrap().is_empty());
+}
+
 /// Loss is per route (mdk#2660 row 9): importing a loss on one route
 /// un-covers that route and earns its parked unit a probe, while another
 /// route's coverage, goal, unit, spans and debt, and the account's budget,

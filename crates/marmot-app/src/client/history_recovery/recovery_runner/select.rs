@@ -327,7 +327,11 @@ pub(super) fn survey(
     )?;
     let mut candidates = Vec::new();
     let mut catching_up = BTreeSet::new();
+    let mut unit_states = BTreeMap::new();
     for ((route, key, best_effort, fetch_until, _), (debt, unit)) in units.into_iter().zip(debts) {
+        if let Some(unit) = &unit {
+            unit_states.insert(key.clone(), unit.clone());
+        }
         let Some(first) = debt.first() else {
             continue;
         };
@@ -384,7 +388,14 @@ pub(super) fn survey(
         .min();
     Ok(Survey {
         candidates,
-        rechecks: recheck::survey(turn, policy, stalled, &mut admission)?,
+        rechecks: recheck::survey(
+            turn,
+            policy,
+            stalled,
+            &mut admission,
+            &unit_states,
+            &mut cooldowns,
+        )?,
         paused_until,
         fenced: fenced.into_keys().collect(),
         window: turn

@@ -718,3 +718,58 @@ async fn recovery_runner_rechecks_a_retained_route_only_through_its_goal() {
     assert!(!comparisons.is_empty());
     assert!(comparisons.iter().all(|window| window.until <= ceiling));
 }
+
+/// Surveying due re-checks reads ledger state in a bounded number of storage
+/// lock acquisitions, independent of route count, while preserving every
+/// unit's owed re-check seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_recheck_survey_batches_storage_reads_across_routes() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let floor = t0 - HOUR;
+    let relay_a = ModelRelay::new(RELAY, caps(500, true)).build();
+    let relay_b = ModelRelay::new(OTHER_RELAY, caps(500, true)).build();
+    account.record_caps(RELAY, caps(500, true), t0);
+    account.record_caps(OTHER_RELAY, caps(500, true), t0);
+    let routes: Vec<RunnerRoute> = (1u8..=20)
+        .map(|byte| {
+            let route = group(byte);
+            account.goal(&route, floor);
+            account.live_boundary(&route, RELAY, floor, t0);
+            account.live_boundary(&route, OTHER_RELAY, floor, t0);
+            required(&route, &[RELAY, OTHER_RELAY])
+        })
+        .collect();
+    let host = TestHost::new(&account, &clock, routes, &[&relay_a, &relay_b]);
+    for byte in 1u8..=20 {
+        let route = group(byte);
+        host.tails.stand(&route, RELAY, t0);
+        host.tails.stand(&route, OTHER_RELAY, t0);
+    }
+
+    let lock_acquires = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&lock_acquires);
+    account
+        ._storage
+        .set_timing_observer(Some(Arc::new(move |operation, _, _| {
+            if operation == storage_sqlite::SqliteTimingOperation::ConnectionWait {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        })));
+    let survey = host.survey(test_policy()).await;
+    account._storage.set_timing_observer(None);
+
+    let acquires = lock_acquires.load(Ordering::Relaxed);
+    assert_eq!(survey.rechecks.len(), 40);
+    assert!(
+        survey
+            .rechecks
+            .iter()
+            .all(|candidate| candidate.owed_seconds == HOUR + 1)
+    );
+    assert!(
+        acquires <= 16,
+        "expected O(1) app-DB lock acquisitions across 40 due re-check units, got {acquires}"
+    );
+}
