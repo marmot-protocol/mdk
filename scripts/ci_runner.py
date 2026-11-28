@@ -23,6 +23,9 @@ RESERVE_BYTES = 2 * 1024**3
 # The measured workspace archive needs 16 GiB compressed plus expanded; leave
 # another 16 GiB for the toolchain and test writes before skipping SDK cleanup.
 ARCHIVE_FREE_BYTES = 32 * 1024**3
+# Recent prechecks used up to 28 GiB for setup, cache restore, and tests.
+# Keep extra headroom for temporary files and a cold cache build.
+PRECHECK_FREE_BYTES = 64 * 1024**3
 TAIL_BYTES = 1024**2
 # Only unused SDKs on disposable GitHub-hosted Linux runners. Keep Rust,
 # Java, Docker and its images, system libraries, and all repository artifacts.
@@ -228,6 +231,7 @@ def main() -> int:
     commands = parser.add_subparsers(dest="action", required=True)
     commands.add_parser("prepare")
     commands.add_parser("prepare-archive")
+    commands.add_parser("prepare-precheck")
     for action in ("manifest", "extract"):
         commands.add_parser(action).add_argument("archive", type=Path)
     child = commands.add_parser("run")
@@ -239,6 +243,8 @@ def main() -> int:
             prepare()
         elif args.action == "prepare-archive":
             prepare(ARCHIVE_FREE_BYTES)
+        elif args.action == "prepare-precheck":
+            prepare(PRECHECK_FREE_BYTES)
         elif args.action == "manifest":
             manifest(args.archive)
         elif args.action == "extract":

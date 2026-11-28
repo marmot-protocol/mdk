@@ -971,7 +971,14 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.source_sha }}
 
+      - name: Prepare runner disk for precheck
+        if: needs.changes.outputs.ci_mode == 'precheck'
+        env:
+          MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 scripts/ci_runner.py prepare-precheck
+
       - name: Prepare runner disk
+        if: needs.changes.outputs.ci_mode != 'precheck'
         env:
           MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: python3 scripts/ci_runner.py prepare

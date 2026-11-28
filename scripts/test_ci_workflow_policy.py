@@ -1506,19 +1506,25 @@ signal.pause()
         self.assertEqual(result.returncode, 1)
         self.assertIn(b"only for GitHub-hosted Linux CI runners", result.stderr)
 
-    def test_archive_cleanup_budget(self):
-        minimum = 32 * 1024**3
-        for available, budget, removed in ((minimum, minimum, False),
-                                           (minimum - 1, minimum, True),
-                                           (minimum, None, True)):
-            with self.subTest(available=available, budget=budget), tempfile.TemporaryDirectory() as tmp:
+    def test_sdk_cleanup_budgets(self):
+        archive_minimum = 32 * 1024**3
+        precheck_minimum = 64 * 1024**3
+        for command, available, removed in (
+            ("prepare-archive", archive_minimum, False),
+            ("prepare-archive", archive_minimum - 1, True),
+            ("prepare-precheck", precheck_minimum, False),
+            ("prepare-precheck", precheck_minimum - 1, True),
+            ("prepare", precheck_minimum, True),
+        ):
+            with self.subTest(command=command, available=available), tempfile.TemporaryDirectory() as tmp:
                 sdk = Path(tmp) / "unused-sdk"
                 sdk.mkdir()
                 (sdk / "payload").write_text("keep unless space is needed")
                 sudo = Path(tmp) / "sudo"
                 sudo.write_text('#!/bin/sh\nexec "$@"\n')
                 sudo.chmod(0o700)
-                usage = type("Usage", (), {"total": minimum * 2, "used": minimum,
+                total = 2 * precheck_minimum
+                usage = type("Usage", (), {"total": total, "used": total - available,
                                             "free": available})()
 
                 with unittest.mock.patch.dict(os.environ, {
@@ -1526,9 +1532,11 @@ signal.pause()
                     "MDK_RUNNER_ENVIRONMENT": "github-hosted",
                     "PATH": tmp + os.pathsep + os.environ["PATH"],
                 }), unittest.mock.patch.object(sys, "platform", "linux"), \
+                     unittest.mock.patch.object(sys, "argv", ["ci_runner.py", command]), \
+                     unittest.mock.patch.object(os, "umask", return_value=0o22), \
                      unittest.mock.patch.object(ci_runner, "UNUSED_SDKS", (str(sdk),)), \
                      unittest.mock.patch.object(ci_runner.shutil, "disk_usage", return_value=usage):
-                    ci_runner.prepare(budget)
+                    self.assertEqual(ci_runner.main(), 0)
                 self.assertEqual(sdk.exists(), not removed)
 
 
