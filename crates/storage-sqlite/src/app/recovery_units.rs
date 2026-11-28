@@ -608,6 +608,76 @@ fn unit_debt_tx(
     debt_from_goal_tx(conn, route, relay, goal, until_seconds, probing)
 }
 
+/// Seconds covered or retired on `(route, relay)` inside
+/// `[since_seconds, until_seconds]`. Parked spans are excluded.
+fn recheck_owed_seconds_tx(
+    conn: &Connection,
+    route: &TransportReconciliationRoute,
+    relay: &str,
+    since_seconds: u64,
+    until_seconds: u64,
+) -> StorageResult<u64> {
+    if since_seconds > until_seconds {
+        return Ok(0);
+    }
+    let (kind, id) = route.storage_key();
+    let since = integer(since_seconds)?;
+    let until = integer(until_seconds)?;
+    let mut ranges = Vec::new();
+    let mut push_clipped = |raw_since: i64, raw_until: i64| -> StorageResult<()> {
+        let from = i64_to_u64(raw_since)?.max(since_seconds);
+        let to = i64_to_u64(raw_until)?.min(until_seconds);
+        if from <= to {
+            ranges.push(RecoveryCoverageRange {
+                since_seconds: from,
+                until_seconds: to,
+            });
+        }
+        Ok(())
+    };
+    {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT since_seconds, until_seconds FROM account_recovery_coverage
+                 WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3
+                   AND since_seconds <= ?5 AND until_seconds >= ?4",
+            )
+            .storage()?;
+        let rows = stmt
+            .query_map(params![kind, id, relay, since, until], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .storage()?;
+        for row in rows {
+            let (raw_since, raw_until) = row.storage()?;
+            push_clipped(raw_since, raw_until)?;
+        }
+    }
+    {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT since_seconds, until_seconds FROM account_recovery_unit_spans
+                 WHERE route_kind = ?1 AND route_id = ?2 AND relay = ?3 AND kind = ?4
+                   AND since_seconds <= ?6 AND until_seconds >= ?5",
+            )
+            .storage()?;
+        let rows = stmt
+            .query_map(
+                params![kind, id, relay, RETIRED_SPAN, since, until],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .storage()?;
+        for row in rows {
+            let (raw_since, raw_until) = row.storage()?;
+            push_clipped(raw_since, raw_until)?;
+        }
+    }
+    Ok(union(ranges)
+        .into_iter()
+        .map(|range| range.until_seconds - range.since_seconds + 1)
+        .fold(0u64, u64::saturating_add))
+}
+
 /// The route's goal, if it has one.
 fn route_goal_tx(
     conn: &Connection,
@@ -2439,6 +2509,25 @@ impl SqliteAppStorage {
                     None => Vec::new(),
                 };
                 Ok((debt, unit))
+            })
+            .collect()
+    }
+
+    /// For each `(route, relay, since_seconds, until_seconds)` unit, the count
+    /// of seconds covered or retired in `[since_seconds, until_seconds]`, in
+    /// order and from one look at the ledger.
+    pub fn recovery_recheck_owed_seconds(
+        &self,
+        units: &[(&TransportReconciliationRoute, &str, u64, u64)],
+    ) -> StorageResult<Vec<u64>> {
+        if units.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock()?;
+        units
+            .iter()
+            .map(|(route, relay, since_seconds, until_seconds)| {
+                recheck_owed_seconds_tx(&conn, route, relay, *since_seconds, *until_seconds)
             })
             .collect()
     }
