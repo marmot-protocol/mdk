@@ -51,6 +51,7 @@ pub const PRODUCT_DURATION_BOUNDS_MS: [u64; 15] = [
     10, 25, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000, 60000, 300000, 900000, 3600000,
 ];
 const WINDOW_SECONDS: u64 = 900;
+const MAX_HOST_SCHEMAS: usize = 64;
 const MAX_CELLS: usize = 256;
 const MAX_EVENTS: usize = 512;
 const MAX_QUEUE_BYTES: usize = 256 * 1024;
@@ -179,7 +180,7 @@ impl std::fmt::Debug for ProductAnalyticsRuntimeConfig {
 impl ProductAnalyticsRuntimeConfig {
     fn validate(&self) -> Result<(), ProductAnalyticsError> {
         let invalid = || ProductAnalyticsError::InvalidConfiguration;
-        if self.registry.len() > 32 {
+        if self.registry.len() > MAX_HOST_SCHEMAS {
             return Err(invalid());
         }
         let mut names = BTreeSet::new();

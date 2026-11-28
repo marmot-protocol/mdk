@@ -1460,7 +1460,7 @@ fn directory_sources_are_closed_and_stale_resolution_results_are_discarded() {
 fn registry_limits_accept_boundaries_and_reject_one_past_without_echoing_values() {
     let (collector, _) = configured();
     let mut config = collector.lock().config.clone();
-    config.registry = (0..32)
+    config.registry = (0..64)
         .map(|index| ProductEventSchema {
             name: format!("app_{}_{index}", "n".repeat(53)),
             mode: ProductEventMode::Aggregate,
