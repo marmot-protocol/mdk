@@ -1457,6 +1457,45 @@ fn directory_sources_are_closed_and_stale_resolution_results_are_discarded() {
 }
 
 #[test]
+fn config_requires_acceptance_before_issuing_permits_for_a_changed_registry() {
+    let (collector, _) = configured();
+    let mut config = collector.lock().config.clone();
+    let origin = "http://127.0.0.1:9876";
+    grant(&collector);
+    let original = collector.permit().unwrap();
+
+    config.metadata.app_version = "2.0".into();
+    collector.configure(config.clone(), origin.into()).unwrap();
+    assert!(!original.valid());
+    let current = collector.permit().unwrap();
+
+    config.registry.push(ProductEventSchema {
+        name: "app_new_view".into(),
+        mode: ProductEventMode::Aggregate,
+        properties: vec![],
+    });
+    collector.configure(config, origin.into()).unwrap();
+    assert!(!current.valid());
+    assert_eq!(
+        collector.settings().decision,
+        UsageDiagnosticsDecision::AcceptanceRequired
+    );
+    assert!(collector.permit().is_none());
+    assert_eq!(
+        collector
+            .record(ProductEvent {
+                name: "app_new_view".into(),
+                properties: BTreeMap::new(),
+            })
+            .unwrap(),
+        ProductRecordResult::IgnoredDisabled
+    );
+
+    grant(&collector);
+    assert!(collector.permit().unwrap().valid());
+}
+
+#[test]
 fn registry_limits_accept_boundaries_and_reject_one_past_without_echoing_values() {
     let (collector, _) = configured();
     let mut config = collector.lock().config.clone();

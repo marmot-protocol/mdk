@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-15
+updated: 2026-11-28
 ---
 # Usage and diagnostics
 
@@ -102,7 +102,7 @@ The source catalogue is `crates/marmot-observability/src/product_analytics/catal
 `product-event-catalogue.json` is its versioned, machine-readable contract.
 `approved_host_product_schemas()` supplies the reviewed screen, onboarding,
 compose, search, attachment, settings, and notification-permission observations.
-Additional host `app_` schemas freeze before collection: at most 32 schemas,
+Additional host `app_` schemas freeze before collection: at most 64 schemas,
 eight properties per schema, 16 enum choices, 60-character names, 40-character
 keys, and 180-character registered string values. There is no free-text escape
 hatch. Hosts cannot override built-ins, identity, timestamps, or common metadata.

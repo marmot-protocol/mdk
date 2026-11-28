@@ -624,6 +624,12 @@ impl ProductAnalytics {
         let _consent = self.consent_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut s = self.lock();
         self.invalidate(&mut s);
+        if s.registry_revision != registry_revision
+            && s.settings.decision == UsageDiagnosticsDecision::Granted
+        {
+            // The app reloads its durable receipt after configure returns.
+            s.settings.decision = UsageDiagnosticsDecision::AcceptanceRequired;
+        }
         s.config = config;
         s.registry_revision = registry_revision;
         s.scope = Self::scope(&s.config, &scope, &s.telemetry_origin);
