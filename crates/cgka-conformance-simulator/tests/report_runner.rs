@@ -61,14 +61,75 @@ fn parse_custom_report_args() {
     );
 }
 
+/// Read by the storage precedence tests' child process: the report arguments
+/// to parse, space separated. Unset in an ordinary test run.
+const STORAGE_PROBE_ARGS: &str = "MDK_TEST_STORAGE_PRECEDENCE_ARGS";
+const STORAGE_MODE_ENV: &str = "MDK_CONFORMANCE_SQLITE_STORAGE";
+
+/// The child half of the storage precedence tests: parses the report arguments
+/// it was given in its own environment and prints the storage mode chosen.
+/// Without `STORAGE_PROBE_ARGS` it does nothing.
 #[test]
-fn explicit_storage_flag_overrides_environment_default() {
-    let command =
-        parse_report_command(["--storage".into(), "file".into()]).expect("storage mode args parse");
+fn storage_precedence_probe() {
+    let Ok(args) = std::env::var(STORAGE_PROBE_ARGS) else {
+        return;
+    };
+    let command = parse_report_command(args.split_whitespace().map(str::to_owned))
+        .expect("storage mode args parse");
     let ReportCommand::Run(args) = command else {
         panic!("expected run command");
     };
-    assert_eq!(args.storage_mode, HarnessStorageMode::TempFileBackedSqlite);
+    println!("storage-mode={}", args.storage_mode.report_label());
+}
+
+/// The storage mode a report run picks with `report_args` and the storage
+/// environment variable set to `env` (or unset), in a child process so this
+/// test process's environment never changes.
+fn storage_mode_in_child(env: Option<&str>, report_args: &str) -> String {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "storage_precedence_probe",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(STORAGE_PROBE_ARGS, report_args)
+        .env_remove(STORAGE_MODE_ENV);
+    if let Some(env) = env {
+        child.env(STORAGE_MODE_ENV, env);
+    }
+    let output = child.output().expect("run the storage precedence probe");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "probe failed: {stdout}");
+    stdout
+        .lines()
+        // libtest prints the test name on the same line, before the probe.
+        .find_map(|line| {
+            line.split_once("storage-mode=")
+                .map(|(_, mode)| mode.trim())
+        })
+        .unwrap_or_else(|| panic!("probe printed no storage mode: {stdout}"))
+        .to_owned()
+}
+
+#[test]
+fn explicit_storage_flag_overrides_environment_default() {
+    let file = HarnessStorageMode::TempFileBackedSqlite.report_label();
+    let memory = HarnessStorageMode::InMemorySqlite.report_label();
+    // An explicit flag wins over a conflicting environment value, either way.
+    assert_eq!(
+        storage_mode_in_child(Some("memory"), "--storage file"),
+        file
+    );
+    assert_eq!(
+        storage_mode_in_child(Some("file"), "--storage memory"),
+        memory
+    );
+    // Without a flag the environment decides, and the default is in memory.
+    assert_eq!(storage_mode_in_child(Some("file"), ""), file);
+    assert_eq!(storage_mode_in_child(Some("memory"), ""), memory);
+    assert_eq!(storage_mode_in_child(None, ""), memory);
 }
 
 #[test]
