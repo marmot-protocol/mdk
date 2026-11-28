@@ -57,8 +57,9 @@ async fn a_pass_leaves_out_delivered_applications_that_cannot_witness_a_branch()
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+    join_raw(&mut bob, welcome_for(&welcomes, b"bob"))
         .await
         .unwrap();
 
@@ -146,14 +147,14 @@ async fn a_lower_epoch_rival_admitted_mid_pass_takes_back_the_delivered_witnesse
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
     for (engine, name) in [
         (&mut bob, b"bob".as_slice()),
         (&mut carol, b"carol".as_slice()),
         (&mut frank, b"frank".as_slice()),
     ] {
-        engine
-            .join_welcome(welcome_for(&welcomes, name))
+        join_raw(engine, welcome_for(&welcomes, name))
             .await
             .unwrap();
     }
@@ -347,8 +348,9 @@ async fn sqlite_content_listing_matches_the_engines_projection() {
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+    join_raw(&mut bob, welcome_for(&welcomes, b"bob"))
         .await
         .unwrap();
 
@@ -495,12 +497,12 @@ async fn check_ratchet_dependency(arrival: PendingArrival) {
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+    join_raw(&mut bob, welcome_for(&welcomes, b"bob"))
         .await
         .unwrap();
-    carol
-        .join_welcome(welcome_for(&welcomes, b"carol"))
+    join_raw(&mut carol, welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
     let fork_epoch = alice.epoch(&group_id).unwrap();

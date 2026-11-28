@@ -366,6 +366,7 @@ impl Published {
                 welcomes,
                 pending,
             } => {
+                let welcomes = seal_and_bind(engine, &welcomes);
                 engine.confirm_published(pending).await.unwrap();
                 self.welcomes.extend(welcomes);
                 (msg, "commit")
@@ -451,14 +452,12 @@ async fn three_member_group(
     let SendResult::GroupCreated { pending, welcomes } = create else {
         panic!("expected GroupCreated, got {create:?}");
     };
+    let welcomes = seal_and_bind(alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    carol
-        .join_welcome(welcome_for(&welcomes, b"carol"))
+    join_raw(carol, welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
-    bob.join_welcome(welcome_for(&welcomes, b"bob"))
-        .await
-        .unwrap();
+    join_raw(bob, welcome_for(&welcomes, b"bob")).await.unwrap();
     group_id
 }
 
@@ -718,7 +717,7 @@ async fn an_invite_behind_a_queued_message_never_shows_it_to_the_invitee() {
     published.take(&mut alice, &group_id, invite).await;
     published.drain(&mut alice, &group_id).await;
 
-    dave.join_welcome(welcome_for(&published.welcomes, b"dave"))
+    join_raw(&mut dave, welcome_for(&published.welcomes, b"dave"))
         .await
         .unwrap();
     dave.drain_events();

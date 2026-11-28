@@ -1,6 +1,7 @@
 use super::*;
 use crate::{AppClient, AuditLogSettings, MarmotApp, MarmotAppConfig};
-use cgka_traits::{GroupId, MessageId};
+use cgka_traits::transport::EncryptedPayload;
+use cgka_traits::{GroupId, MessageId, SystemWallClock, WelcomeMetadata};
 use cgka_traits::{group::ProtocolProfile, storage::GroupStorage};
 use marmot_account::AccountHome;
 use nostr_relay_builder::MockRelay;
@@ -123,35 +124,40 @@ async fn blocked_inbox_demux() {
             &|_, _| false,
         )
         .unwrap();
-    let from = NostrMlsPeeler::default().with_welcome_signer(sender.clone());
+    let clock = Arc::new(SystemWallClock);
+    let from = NostrInboxSealer::new(Arc::new(sender.clone()), clock.clone());
     let target = MemberId::new(recipient.public_key().to_bytes().to_vec());
-    let peeler = ProbePeeler {
-        inner: NostrMlsPeeler::default().with_welcome_signer(OnceSigner {
-            keys: recipient,
-            consumed: Arc::new(Mutex::new(HashSet::new())),
-            denied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            gate: Arc::default(),
-        }),
+    let sealer = ProbeSealer {
+        inner: NostrInboxSealer::new(
+            Arc::new(OnceSigner {
+                keys: recipient,
+                consumed: Arc::new(Mutex::new(HashSet::new())),
+                denied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                gate: Arc::default(),
+            }),
+            clock,
+        ),
         slot: Arc::new(Mutex::new(PeelSlot::default())),
         storage: storage.clone(),
         pairing: None,
     };
     let welcome = from
-        .wrap_welcome_with_metadata(
-            &EncryptedPayload {
+        .seal_welcome(&OutboundWelcome {
+            local_id: MessageId::new(Vec::new()),
+            recipient: target.clone(),
+            payload: EncryptedPayload {
                 ciphertext: b"blocked invitation".to_vec(),
                 aad: Vec::new(),
             },
-            &target,
-            &WelcomeMetadata {
+            metadata: Some(WelcomeMetadata {
                 key_package_event_id: MessageId::new(vec![4; 32]),
                 relays: vec!["wss://relay.example".into()],
-            },
-        )
+            }),
+        })
         .await
         .unwrap();
     assert!(
-        peeler.peel_welcome(&welcome).await.is_err(),
+        sealer.unseal(&welcome).await.is_err(),
         "blocked invitation cannot reach MLS admission"
     );
     assert!(
@@ -167,16 +173,16 @@ async fn blocked_inbox_demux() {
             device_key_hash: [9; 32],
         },
     };
-    let wrapped = from.wrap_group_recovery(&control, &target).await.unwrap();
+    let wrapped = from.seal_group_recovery(&control, &target).await.unwrap();
     let id: [u8; 32] = wrapped.id.as_slice().try_into().unwrap();
-    peeler.slot.lock().unwrap().arm(
+    sealer.slot.lock().unwrap().arm(
         &wrapped,
         (
             "33".repeat(16).try_into().unwrap(),
             NostrEventRef::from_validated_event_id(&id),
         ),
     );
-    let peeled = peeler.peel_welcome(&wrapped).await.unwrap();
+    let peeled = sealer.unseal(&wrapped).await.unwrap();
     let PeeledContent::GroupRecovery { recovery } = peeled.content else {
         panic!("control must not become a Welcome");
     };
@@ -187,7 +193,7 @@ async fn blocked_inbox_demux() {
             .is_blocked_welcome_dismissed(&hex::encode(wrapped.id.as_slice()))
             .unwrap()
     );
-    let (is_recovery, completion) = peeler.slot.lock().unwrap().take();
+    let (is_recovery, completion) = sealer.slot.lock().unwrap().take();
     assert!(is_recovery);
     assert!(
         completion.is_none(),
@@ -312,9 +318,8 @@ async fn blocked_inbox_single_unseal() {
                 device_key_hash: [9; 32],
             },
         };
-        let wrapped = NostrMlsPeeler::default()
-            .with_welcome_signer_arc(sender)
-            .wrap_group_recovery(
+        let wrapped = NostrInboxSealer::new(sender, Arc::new(SystemWallClock))
+            .seal_group_recovery(
                 &control,
                 &MemberId::new(hex::decode(&bob_account.account_id_hex).unwrap()),
             )
@@ -534,8 +539,13 @@ mod rejoin_policy {
         else {
             panic!("expected a real membership Commit");
         };
+        let sealed = session.seal_welcomes(&welcomes).await.unwrap();
+        session.bind_sealed_welcomes(&sealed, None).unwrap();
         session.confirm_published(pending).await.unwrap();
-        (msg, welcomes)
+        (
+            msg,
+            sealed.into_iter().map(|welcome| welcome.message).collect(),
+        )
     }
 
     async fn receive_welcome(client: &mut AppClient, message: &TransportMessage, url: &str) {
@@ -1369,8 +1379,7 @@ async fn recovery_inbox_audit_metrics() {
                 .map(|probe| probe.rows.len());
             let bob = scenario.bob.app.account_home().account("bob").unwrap();
             let signer = scenario.bob.app.account_signer_for_summary(&bob).unwrap();
-            let peeler =
-                NostrMlsPeeler::default().with_welcome_signer_arc(signer.as_nostr_signer());
+            let sealer = NostrInboxSealer::new(signer.as_nostr_signer(), Arc::new(SystemWallClock));
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -1420,8 +1429,8 @@ async fn recovery_inbox_audit_metrics() {
                     },
                     ..request.clone()
                 };
-                let message = peeler
-                    .wrap_group_recovery(&control, &scenario.alice.runtime.self_id())
+                let message = sealer
+                    .seal_group_recovery(&control, &scenario.alice.runtime.self_id())
                     .await
                     .unwrap();
                 let result = scenario
@@ -1550,8 +1559,8 @@ async fn pairing_inbox_audit_metrics() {
             // survives that error before any app outcome is available, even
             // without an armed audit capture or an enabled pairing inbox.
             let slot = Arc::new(Mutex::new(PeelSlot::default()));
-            let peeler = ProbePeeler {
-                inner: NostrMlsPeeler::default().with_welcome_signer_arc(signer.as_nostr_signer()),
+            let sealer = ProbeSealer {
+                inner: NostrInboxSealer::new(signer.as_nostr_signer(), Arc::new(SystemWallClock)),
                 slot: slot.clone(),
                 storage: scenario
                     .alice
@@ -1561,7 +1570,7 @@ async fn pairing_inbox_audit_metrics() {
                     .app_storage(),
                 pairing: None,
             };
-            assert!(peeler.peel_welcome(&message).await.is_err());
+            assert!(sealer.unseal(&message).await.is_err());
             let (private_control, completion) = slot.lock().unwrap().take();
             assert!(private_control);
             assert!(completion.is_none());
@@ -2322,19 +2331,20 @@ async fn ambiguous_nip59_decrypt_error_is_failed_without_inner_refs() {
     let sender = nostr::prelude::Keys::generate();
     let recipient = nostr::prelude::Keys::generate();
     let wrong_key = nostr::prelude::Keys::generate();
-    let message = NostrMlsPeeler::default()
-        .with_welcome_signer(sender)
-        .wrap_welcome_with_metadata(
-            &EncryptedPayload {
+    let clock = Arc::new(SystemWallClock);
+    let message = NostrInboxSealer::new(Arc::new(sender), clock.clone())
+        .seal_welcome(&OutboundWelcome {
+            local_id: MessageId::new(Vec::new()),
+            recipient: MemberId::new(recipient.public_key().to_bytes().to_vec()),
+            payload: EncryptedPayload {
                 ciphertext: b"synthetic MLS bytes".to_vec(),
                 aad: Vec::new(),
             },
-            &MemberId::new(recipient.public_key().to_bytes().to_vec()),
-            &WelcomeMetadata {
+            metadata: Some(WelcomeMetadata {
                 key_package_event_id: cgka_traits::MessageId::new(vec![0x44; 32]),
                 relays: vec![cgka_traits::TransportEndpoint("wss://group.example".into())],
-            },
-        )
+            }),
+        })
         .await
         .unwrap();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(PeelSlot::default()));
@@ -2346,8 +2356,8 @@ async fn ambiguous_nip59_decrypt_error_is_failed_without_inner_refs() {
             NostrEventRef::from_validated_event_id(&id),
         ),
     );
-    let peeler = ProbePeeler {
-        inner: NostrMlsPeeler::default().with_welcome_signer(wrong_key),
+    let sealer = ProbeSealer {
+        inner: NostrInboxSealer::new(Arc::new(wrong_key), clock),
         slot: slot.clone(),
         storage: storage_sqlite::SqliteAccountStorage::in_memory_for_test()
             .unwrap()
@@ -2355,7 +2365,7 @@ async fn ambiguous_nip59_decrypt_error_is_failed_without_inner_refs() {
         pairing: None,
     };
     assert!(matches!(
-        peeler.peel_welcome(&message).await,
+        sealer.unseal(&message).await,
         Err(PeelerError::DecryptFailed)
     ));
     let (is_recovery, completion) = slot.lock().unwrap().take();

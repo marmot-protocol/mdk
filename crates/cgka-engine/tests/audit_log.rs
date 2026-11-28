@@ -7,15 +7,13 @@
 //!      (`IngestEntry` + `IngestOutcome`).
 //!   3. Default engine construction (no recorder) is a no-op — the audit
 //!      paths cost nothing when forensics is off.
-//!   4. A send or group creation dropped mid-await leaves no operation
+//!   4. A group creation dropped mid-await leaves no operation
 //!      context behind for later rows that carry none of their own.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use cgka_engine::{Engine, EngineBuilder};
-use cgka_traits::CgkaEngine;
 use cgka_traits::engine::{CreateGroupRequest, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -25,6 +23,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{GroupId, MemberId, MessageId};
+use cgka_traits::{CgkaEngine, EventSizeClass, OutboundWelcome, WelcomeSizeCheck};
 use marmot_forensics::{
     AuditEvent, AuditEventContext, AuditEventKind, AuditHumanActionContext, AuditRecord,
     AuditTransportContext, AuditTransportWire, ForensicRecorder, JsonlRecorder, SharedRecorder,
@@ -33,6 +32,7 @@ use storage_sqlite::SqliteAccountStorage;
 
 mod support;
 use support::proof_signer;
+use support::raw_inbox::{join_raw, raw_unseal, seal_and_bind};
 
 fn valid_identity(seed: &[u8]) -> Vec<u8> {
     use k256::schnorr::SigningKey;
@@ -54,19 +54,8 @@ fn valid_identity(seed: &[u8]) -> Vec<u8> {
 
 struct StubPeeler;
 
-#[async_trait]
 impl TransportPeeler for StubPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         _msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -74,78 +63,12 @@ impl TransportPeeler for StubPeeler {
         Err(PeelerError::Backend("test peeler".into()))
     }
 
-    async fn peel_welcome(&self, _msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Err(PeelerError::Backend("test peeler".into()))
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         _payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
         Err(PeelerError::Backend("test peeler".into()))
-    }
-
-    async fn wrap_welcome(
-        &self,
-        _payload: &EncryptedPayload,
-        _recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::Backend("test peeler".into()))
-    }
-}
-
-/// Parks every outbound wrap forever once the engine reaches it, so a test can
-/// stop a send or a group creation at the transport await deterministically.
-struct ParkingPeeler {
-    reached: Arc<AtomicBool>,
-}
-
-impl ParkingPeeler {
-    async fn park(&self) -> Result<TransportMessage, PeelerError> {
-        self.reached.store(true, Ordering::SeqCst);
-        std::future::pending().await
-    }
-}
-
-#[async_trait]
-impl TransportPeeler for ParkingPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
-        &self,
-        _msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
-        _ctx: &GroupContextSnapshot,
-    ) -> Result<PeeledMessage, PeelerError> {
-        Err(PeelerError::Backend("test peeler".into()))
-    }
-
-    async fn peel_welcome(&self, _msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Err(PeelerError::Backend("test peeler".into()))
-    }
-
-    async fn wrap_group_message(
-        &self,
-        _payload: &EncryptedPayload,
-        _ctx: &GroupContextSnapshot,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.park().await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        _payload: &EncryptedPayload,
-        _recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.park().await
     }
 }
 
@@ -590,6 +513,158 @@ async fn audit_log_records_transport_received_before_ingest_entry() {
     }
 }
 
+#[tokio::test]
+async fn overlapping_inbox_ingests_keep_each_deliveries_audit_context() {
+    use cgka_engine::engine::AuditedIngest;
+    use cgka_traits::ingest::InputRejectionCategory;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let audit = jsonl_audit(&path, "overlapping-inbox");
+    let mut sender = current_profile_engine(b"inbox-sender", Box::new(StubPeeler), None);
+    let mut receiver =
+        current_profile_engine(b"inbox-receiver", Box::new(StubPeeler), Some(&audit));
+    let mut messages = Vec::new();
+    for _ in 0..2 {
+        let key_package = receiver.fresh_key_package().await.unwrap();
+        let (_, SendResult::FoundingGroupCreated { welcomes }) = sender
+            .create_group(group_request(vec![key_package]))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a founding Welcome");
+        };
+        messages.extend(seal_and_bind(&mut sender, &welcomes));
+    }
+    let [first, second] = messages.as_slice() else {
+        panic!("expected two inbox messages");
+    };
+    assert_ne!(first.id, second.id);
+
+    let provenance = |msg: &TransportMessage, relay: &str| AuditTransportContext {
+        transport_source: "nostr".into(),
+        delivery_plane: Some("account_inbox".into()),
+        relay_url: Some(relay.into()),
+        wire: Some(AuditTransportWire {
+            wire_id: Some(hex::encode(msg.id.as_slice())),
+            relay_url: Some(relay.into()),
+            nostr_kind: Some(1059),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let duplicate = IngestOutcome::Ignored {
+        category: InputRejectionCategory::Duplicate,
+    };
+    let deliveries = [
+        (
+            first,
+            provenance(first, "wss://one.example"),
+            IngestOutcome::Processed,
+        ),
+        (
+            second,
+            provenance(second, "wss://two.example"),
+            IngestOutcome::Processed,
+        ),
+        (
+            first,
+            provenance(first, "wss://three.example"),
+            duplicate.clone(),
+        ),
+    ];
+    let mut pending = Vec::new();
+    for (msg, transport, _) in &deliveries {
+        let AuditedIngest::InboxSealed(continuation) = receiver
+            .begin_ingest_with_audit_context(msg, Some(transport.clone()))
+            .await
+            .unwrap()
+        else {
+            panic!("expected the delivery to wait for unseal");
+        };
+        pending.push(continuation);
+    }
+    for (continuation, (msg, _, expected)) in pending.into_iter().zip(&deliveries) {
+        let outcome = receiver
+            .ingest_unsealed_with_audit_context(continuation, Ok(raw_unseal(msg)))
+            .await
+            .unwrap();
+        assert_eq!(&outcome, expected);
+    }
+    let replay = provenance(first, "wss://four.example");
+    assert!(matches!(
+        receiver.begin_ingest_with_audit_context(first, Some(replay.clone())).await.unwrap(),
+        AuditedIngest::Complete(outcome) if outcome == duplicate
+    ));
+    drop(receiver);
+    drop(audit);
+
+    let events = read_events(&path);
+    let rows: Vec<_> = events
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.kind,
+                AuditEventKind::TransportReceived { .. }
+                    | AuditEventKind::IngestEntry { .. }
+                    | AuditEventKind::IngestOutcome { .. }
+                    | AuditEventKind::IngestError { .. }
+            )
+        })
+        .collect();
+    let mut operation_ids = std::collections::HashSet::new();
+    let [
+        wire_a,
+        entry_a,
+        wire_b,
+        entry_b,
+        wire_c,
+        entry_c,
+        done_a,
+        done_b,
+        done_c,
+        replay_row,
+    ] = rows.as_slice()
+    else {
+        panic!("expected one wire and entry row for each pending delivery, then four outcomes");
+    };
+    for ((msg, transport, expected), (wire, entry, done)) in deliveries.iter().zip([
+        (wire_a, entry_a, done_a),
+        (wire_b, entry_b, done_b),
+        (wire_c, entry_c, done_c),
+    ]) {
+        let id = hex::encode(msg.id.as_slice());
+        assert!(matches!(&wire.kind, AuditEventKind::TransportReceived {
+            msg_id: Some(msg_id), transport: actual, ..
+        } if msg_id == &id && Some(actual) == transport.wire.as_ref()));
+        assert!(matches!(&entry.kind, AuditEventKind::IngestEntry { msg_id, .. } if msg_id == &id));
+        let (kind, reason) = if expected == &duplicate {
+            ("ignored", Some("duplicate"))
+        } else {
+            ("processed", None)
+        };
+        assert!(
+            matches!(&done.kind, AuditEventKind::IngestOutcome { msg_id, outcome_kind, stale_reason, .. }
+            if msg_id == &id && outcome_kind == kind && stale_reason.as_deref() == reason)
+        );
+        let entry_context = entry.context.as_ref().unwrap();
+        let operation_id = entry_context.operation_id.as_deref().unwrap();
+        assert!(operation_ids.insert(operation_id));
+        for row in [wire, entry, done] {
+            let context = row.context.as_ref().unwrap();
+            assert_eq!(context.operation_id.as_deref(), Some(operation_id));
+            assert_eq!(context.transport.as_ref(), Some(transport));
+        }
+    }
+    assert!(
+        matches!(&replay_row.kind, AuditEventKind::IngestOutcome { stale_reason, .. }
+        if stale_reason.as_deref() == Some("duplicate"))
+    );
+    let replay_context = replay_row.context.as_ref().unwrap();
+    assert_eq!(replay_context.transport.as_ref(), Some(&replay));
+    assert!(operation_ids.insert(replay_context.operation_id.as_deref().unwrap()));
+}
+
 /// The wire context the session supplies for a Nostr group delivery.
 fn group_delivery_context(msg: &TransportMessage, group_id: &GroupId) -> AuditTransportContext {
     let event_id = hex::encode(msg.id.as_slice());
@@ -660,15 +735,12 @@ async fn ignored_replays_record_only_their_outcome() {
         .create_group(group_request(vec![bob_key_package]))
         .await
         .unwrap();
-    let SendResult::GroupCreated {
-        pending,
-        mut welcomes,
-    } = created
-    else {
+    let SendResult::GroupCreated { pending, welcomes } = created else {
         panic!("expected group creation");
     };
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    join_raw(&mut bob, welcomes.remove(0)).await.unwrap();
     let send = async |engine: &mut Engine<SqliteAccountStorage>, body: &str| {
         let payload = MarmotAppEvent::new(
             hex::encode(engine.self_id().as_slice()),
@@ -967,65 +1039,20 @@ async fn queued_application_audit_correlates_preparation_after_restart() {
     assert_ne!(operation(queued[1]), operation(application[2]));
 }
 
-/// A send dropped while suspended at the transport await must not leave its
-/// audit context behind: the next rows without a context of their own (an
-/// engine row and an app row) carry none.
-#[tokio::test]
-async fn dropping_a_suspended_send_leaves_no_operation_context_behind() {
-    use cgka_traits::{MarmotAppEvent, SendIntent};
-
-    let dir = tempfile::TempDir::new().unwrap();
-    let path = dir.path().join("audit.jsonl");
-    let audit = jsonl_audit(&path, "test-engine-dropped-send");
-    let reached = Arc::new(AtomicBool::new(false));
-    let mut engine = current_profile_engine(
-        b"dropped-send",
-        Box::new(ParkingPeeler {
-            reached: reached.clone(),
-        }),
-        Some(&audit),
-    );
-    // A founding group with no invitees wraps nothing, so it completes.
-    let (group_id, _) = engine
-        .create_group(group_request(vec![]))
-        .await
-        .expect("create group");
-    assert!(!reached.load(Ordering::SeqCst));
-
-    let payload = MarmotAppEvent::new(hex::encode(engine.self_id().as_slice()), 1, 9, vec![], "hi")
-        .encode()
-        .unwrap();
-    let mut send = Box::pin(engine.send_with_audit_context(
-        SendIntent::AppMessage {
-            group_id,
-            payload,
-            expected_epoch: None,
-            only_to_members: None,
-        },
-        Some(human_action_context("send_message")),
-    ));
-    assert!(
-        futures::poll!(send.as_mut()).is_pending(),
-        "the send must suspend at the parked wrap"
-    );
-    assert!(
-        reached.load(Ordering::SeqCst),
-        "the send is suspended at the transport await, not before it"
-    );
-    drop(send);
-
-    record_context_free_rows(&engine, &audit);
-    drop((engine, audit));
-
-    assert_operation_context_ends_with_operation(
-        &read_events(&path),
-        |kind| matches!(kind, AuditEventKind::SendEntry { .. }),
-        "send_message",
-    );
+#[derive(Default)]
+struct ParkingWelcomeSizeCheck {
+    started: AtomicBool,
 }
 
-/// A group creation dropped while suspended at the Welcome wrap must not leave
-/// its audit context behind.
+#[async_trait]
+impl WelcomeSizeCheck for ParkingWelcomeSizeCheck {
+    async fn oversized_welcome(&self, _welcomes: &[OutboundWelcome]) -> Option<EventSizeClass> {
+        self.started.store(true, Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+/// Dropping a group creation during the Welcome size check clears its audit context.
 #[tokio::test]
 async fn dropping_a_suspended_group_creation_leaves_no_operation_context_behind() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1033,26 +1060,21 @@ async fn dropping_a_suspended_group_creation_leaves_no_operation_context_behind(
     let audit = jsonl_audit(&path, "test-engine-dropped-create");
     let mut bob = current_profile_engine(b"dropped-create-bob", Box::new(StubPeeler), None);
     let bob_kp = bob.fresh_key_package().await.expect("bob key package");
-    let reached = Arc::new(AtomicBool::new(false));
-    let mut engine = current_profile_engine(
-        b"dropped-create",
-        Box::new(ParkingPeeler {
-            reached: reached.clone(),
-        }),
-        Some(&audit),
-    );
+    let size_check = ParkingWelcomeSizeCheck::default();
+    let mut engine = current_profile_engine(b"dropped-create", Box::new(StubPeeler), Some(&audit));
 
-    let mut create = Box::pin(engine.create_group_with_audit_context(
-        group_request(vec![bob_kp]),
-        Some(human_action_context("create_group")),
-    ));
-    assert!(
-        futures::poll!(create.as_mut()).is_pending(),
-        "the creation must suspend at the parked Welcome wrap"
+    let mut create = Box::pin(
+        engine.create_group_with_optional_app_components_and_audit_context(
+            group_request(vec![bob_kp]),
+            Vec::new(),
+            Some(&size_check),
+            Some(human_action_context("create_group")),
+        ),
     );
+    assert!(futures::poll!(create.as_mut()).is_pending());
     assert!(
-        reached.load(Ordering::SeqCst),
-        "the creation is suspended at the transport await, not before it"
+        size_check.started.load(Ordering::SeqCst),
+        "the creation suspended in the Welcome size check"
     );
     drop(create);
 

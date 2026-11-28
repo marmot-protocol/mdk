@@ -1,22 +1,23 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use cgka_engine::app_components::{
     CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS, CURRENT_PROFILE_REQUIRED_APP_COMPONENTS,
     CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_EXTENSIONS,
     CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_STATE_COMPONENTS, CURRENT_PROFILE_REQUIRED_PROPOSALS,
 };
-use cgka_traits::engine::WelcomeMetadata;
+use cgka_traits::engine::{OutboundWelcome, WelcomeMetadata};
 use cgka_traits::ingest::PeeledContent;
 use cgka_traits::transport::EncryptedPayload;
-use cgka_traits::{MemberId, MessageId, TransportEndpoint, TransportPeeler};
+use cgka_traits::{InboxSealer, MemberId, MessageId, SystemWallClock, TransportEndpoint};
 use nostr::nips::nip44;
 use nostr::prelude::{Event, Keys, UnsignedEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
+use transport_nostr_peeler::{NostrInboxSealer, NostrTransportEvent};
 
 #[test]
 fn vector_manifest_artifacts_exist_and_byte_fixtures_are_well_formed() {
@@ -453,11 +454,11 @@ async fn open_extended_length_welcome(receiver: &Keys, gift_wrap: &Event) -> Nos
         .expect("gift wrap maps to a transport event")
         .to_transport_message()
         .expect("gift wrap id verifies");
-    let (peeled, provenance) = NostrMlsPeeler::default()
-        .with_welcome_signer(receiver.clone())
-        .peel_welcome_with_provenance(&message)
+    let sealer = NostrInboxSealer::new(Arc::new(receiver.clone()), Arc::new(SystemWallClock));
+    let (peeled, provenance) = sealer
+        .unseal_with_provenance(&message)
         .await
-        .expect("the Welcome peeler unwraps the gift wrap");
+        .expect("the inbox sealer unwraps the gift wrap");
     let provenance = provenance.expect("Welcome has authenticated provenance");
     let PeeledContent::Welcome { bytes: welcome, .. } = peeled.content else {
         panic!("the peeler returns a Welcome");
@@ -485,22 +486,23 @@ async fn wrap_fixture_welcome(
     welcome_len: usize,
     relay_padding: usize,
 ) -> Event {
-    let wrapped = NostrMlsPeeler::default()
-        .with_welcome_signer(sender.clone())
-        .wrap_welcome_with_metadata(
-            &EncryptedPayload {
+    let sealer = NostrInboxSealer::new(Arc::new(sender.clone()), Arc::new(SystemWallClock));
+    let wrapped = sealer
+        .seal_welcome(&OutboundWelcome {
+            local_id: MessageId::new(Vec::new()),
+            recipient: MemberId::new(receiver.public_key().to_bytes().to_vec()),
+            payload: EncryptedPayload {
                 ciphertext: (0..welcome_len).map(|i| i as u8).collect(),
                 aad: vec![],
             },
-            &MemberId::new(receiver.public_key().to_bytes().to_vec()),
-            &WelcomeMetadata {
+            metadata: Some(WelcomeMetadata {
                 key_package_event_id: MessageId::new(vec![0x44; 32]),
                 relays: vec![TransportEndpoint(format!(
                     "wss://relay{}.example",
                     "x".repeat(relay_padding)
                 ))],
-            },
-        )
+            }),
+        })
         .await
         .expect("wrap succeeds");
     NostrTransportEvent::from_transport_message(&wrapped)

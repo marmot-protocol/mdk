@@ -3242,7 +3242,6 @@ fn decode_convergence_policy(
 pub(crate) mod tests {
     use std::sync::Arc;
 
-    use async_trait::async_trait;
     use cgka_traits::error::PeelerError;
     use cgka_traits::group_context::GroupContextSnapshot;
     use cgka_traits::ingest::{PeeledContent, PeeledMessage};
@@ -3250,7 +3249,7 @@ pub(crate) mod tests {
     use cgka_traits::transport::{
         EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
     };
-    use cgka_traits::types::{MemberId, MessageId};
+    use cgka_traits::types::MessageId;
     use sha2::{Digest, Sha256};
 
     struct PassthroughPeeler;
@@ -3259,19 +3258,8 @@ pub(crate) mod tests {
         MessageId::new(Sha256::digest(bytes).to_vec())
     }
 
-    #[async_trait]
     impl TransportPeeler for PassthroughPeeler {
-        async fn wrap_group_recovery(
-            &self,
-            _message: &cgka_traits::GroupRecoveryMessage,
-            _recipient: &cgka_traits::MemberId,
-        ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-            Err(cgka_traits::PeelerError::Malformed(
-                "pass-through fixture has no authenticated account channel".into(),
-            ))
-        }
-
-        async fn peel_group_message(
+        fn peel_group_message(
             &self,
             msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
             _ctx: &GroupContextSnapshot,
@@ -3286,20 +3274,7 @@ pub(crate) mod tests {
                 origin: msg.message.clone(),
             })
         }
-        async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-            Ok(PeeledMessage {
-                id: msg.id.clone(),
-                group_id: None,
-                sender: None,
-                content: PeeledContent::Welcome {
-                    created_at: None,
-                    bytes: msg.payload.clone(),
-                    key_package_event_id: None,
-                },
-                origin: msg.clone(),
-            })
-        }
-        async fn wrap_group_message(
+        fn wrap_group_message(
             &self,
             payload: &EncryptedPayload,
             _ctx: &GroupContextSnapshot,
@@ -3312,22 +3287,6 @@ pub(crate) mod tests {
                 source: TransportSource("test".into()),
                 envelope: TransportEnvelope::GroupMessage {
                     transport_group_id: vec![],
-                },
-            })
-        }
-        async fn wrap_welcome(
-            &self,
-            payload: &EncryptedPayload,
-            recipient: &MemberId,
-        ) -> Result<TransportMessage, PeelerError> {
-            Ok(TransportMessage {
-                id: hash_id(&payload.ciphertext),
-                payload: payload.ciphertext.clone(),
-                timestamp: Timestamp(0),
-                causal_deps: vec![],
-                source: TransportSource("test".into()),
-                envelope: TransportEnvelope::Welcome {
-                    recipient: recipient.clone(),
                 },
             })
         }

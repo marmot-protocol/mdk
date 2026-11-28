@@ -9,47 +9,56 @@ fn nostr_device_session(
     key: &SqlCipherKey,
     account: &[u8],
 ) -> AccountDeviceSession {
-    nostr_device_session_with_peeler(path, key, account, Box::new(nostr_peeler(account)))
+    nostr_device_session_with_sealer(path, key, account, Arc::new(nostr_sealer(account)))
 }
 
-fn nostr_peeler(account: &[u8]) -> transport_nostr_peeler::NostrMlsPeeler {
-    transport_nostr_peeler::NostrMlsPeeler::default()
-        .with_welcome_signer(deterministic_nostr_keys(account))
+fn nostr_sealer(account: &[u8]) -> transport_nostr_peeler::NostrInboxSealer {
+    transport_nostr_peeler::NostrInboxSealer::new(
+        Arc::new(deterministic_nostr_keys(account)),
+        Arc::new(marmot_session::SystemWallClock),
+    )
 }
 
 async fn recovery_control(
     account: &[u8],
     carrier: &TransportMessage,
 ) -> cgka_traits::AuthenticatedGroupRecovery {
-    let peeled = nostr_peeler(account).peel_welcome(carrier).await.unwrap();
+    let peeled = nostr_sealer(account).unseal(carrier).await.unwrap();
     let PeeledContent::GroupRecovery { recovery } = peeled.content else {
         panic!("expected authenticated recovery control");
     };
     *recovery
 }
 
-fn nostr_device_session_with_peeler(
+fn nostr_device_session_with_sealer(
     path: impl Into<std::path::PathBuf>,
     key: &SqlCipherKey,
     account: &[u8],
-    peeler: Box<dyn TransportPeeler>,
+    sealer: Arc<dyn InboxSealer>,
 ) -> AccountDeviceSession {
+    AccountDeviceSession::open(nostr_device_config(path, key, account, sealer)).unwrap()
+}
+
+fn nostr_device_config(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    account: &[u8],
+    sealer: Arc<dyn InboxSealer>,
+) -> SessionConfig {
     use cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID;
     let keys = deterministic_nostr_keys(account);
     let mut components = default_group_components();
     components.insert(NOSTR_ROUTING_COMPONENT_ID);
-    AccountDeviceSession::open(
-        SessionConfig::new(
-            path,
-            SqlCipherKey::new(key.as_secret_str()).unwrap(),
-            pad32(account),
-            peeler,
-        )
-        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
-        .protocol_profile(ProtocolProfile::Current)
-        .supported_app_components(components),
+    SessionConfig::new(
+        path,
+        SqlCipherKey::new(key.as_secret_str()).unwrap(),
+        pad32(account),
+        Box::new(transport_nostr_peeler::NostrMlsPeeler::default()),
+        sealer,
     )
-    .unwrap()
+    .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
+    .protocol_profile(ProtocolProfile::Current)
+    .supported_app_components(components)
 }
 
 fn nostr_routing() -> AppComponentData {
@@ -91,7 +100,17 @@ impl TransportRoutingPolicy for SharedRouting {
         &self,
         message: &TransportMessage,
     ) -> Result<TransportPublishTarget, TransportRoutingError> {
-        TransportRoutingPolicy::publish_target(&*self.0.lock().unwrap(), message)
+        match &message.envelope {
+            TransportEnvelope::Welcome { recipient } => self.inbox_target(recipient),
+            _ => self.0.lock().unwrap().publish_target(message),
+        }
+    }
+
+    fn inbox_target(
+        &self,
+        recipient: &MemberId,
+    ) -> Result<TransportPublishTarget, TransportRoutingError> {
+        self.0.lock().unwrap().inbox_target(recipient)
     }
 
     fn required_acks(&self, target: &TransportPublishTarget) -> usize {
@@ -241,9 +260,8 @@ fn joins(results: &[marmot_session::IngestEffects]) -> Vec<(GroupId, MessageId)>
 /// Peel `welcome` as a device of `account` would: the KeyPackage publication
 /// its rumor names, and the MLS Welcome it carries.
 async fn rumor(welcome: &TransportMessage, account: &[u8]) -> (MessageId, Vec<u8>) {
-    let (peeled, provenance) = transport_nostr_peeler::NostrMlsPeeler::default()
-        .with_welcome_signer(deterministic_nostr_keys(account))
-        .peel_welcome_with_provenance(welcome)
+    let (peeled, provenance) = nostr_sealer(account)
+        .unseal_with_provenance(welcome)
         .await
         .unwrap();
     let PeeledContent::Welcome { bytes, .. } = peeled.content else {
@@ -264,19 +282,19 @@ async fn rewrapped(
     welcome_bytes: Vec<u8>,
     key_package_event_id: MessageId,
 ) -> TransportMessage {
-    transport_nostr_peeler::NostrMlsPeeler::default()
-        .with_welcome_signer(deterministic_nostr_keys(inviter))
-        .wrap_welcome_with_metadata(
-            &EncryptedPayload {
+    nostr_sealer(inviter)
+        .seal_welcome(&OutboundWelcome {
+            local_id: MessageId::new(Vec::new()),
+            recipient: MemberId::new(pad32(account)),
+            payload: EncryptedPayload {
                 ciphertext: welcome_bytes,
                 aad: Vec::new(),
             },
-            &MemberId::new(pad32(account)),
-            &cgka_traits::engine::WelcomeMetadata {
+            metadata: Some(cgka_traits::engine::WelcomeMetadata {
                 key_package_event_id,
                 relays: vec![TransportEndpoint("wss://group.example".into())],
-            },
-        )
+            }),
+        })
         .await
         .unwrap()
 }
@@ -343,8 +361,9 @@ async fn create_group(
     let welcomes = match &created.effects.publish[..] {
         [PublishWork::FoundingGroupCreated { welcomes }] => welcomes.clone(),
         [PublishWork::GroupCreated { welcomes, pending }] => {
+            let welcomes = seal_and_bind(inviter, welcomes).await;
             inviter.confirm_published(*pending).await.unwrap();
-            welcomes.clone()
+            welcomes
         }
         _ => panic!("expected group creation publish work"),
     };
@@ -361,8 +380,9 @@ async fn evolve(inviter: &mut AccountDeviceSession, intent: SendIntent) -> Vec<T
     else {
         panic!("expected one group evolution");
     };
+    let welcomes = seal_and_bind(inviter, welcomes).await;
     inviter.confirm_published(*pending).await.unwrap();
-    welcomes.clone()
+    welcomes
 }
 
 /// A device's KeyPackage records changed only by the consumption of
@@ -385,35 +405,12 @@ fn assert_only_consumed(
 
 /// Peels as releases before this check did: the rumor's KeyPackage claim never
 /// reached the engine.
-struct ClaimlessPeeler(transport_nostr_peeler::NostrMlsPeeler);
+struct ClaimlessSealer(transport_nostr_peeler::NostrInboxSealer);
 
 #[async_trait]
-impl TransportPeeler for ClaimlessPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        message: &cgka_traits::GroupRecoveryMessage,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.0.wrap_group_recovery(message, recipient).await
-    }
-
-    fn prepare_group_message<'a>(
-        &self,
-        msg: &'a TransportMessage,
-    ) -> Result<cgka_traits::peeler::PreparedGroupMessage<'a>, PeelerError> {
-        self.0.prepare_group_message(msg)
-    }
-
-    async fn peel_group_message(
-        &self,
-        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
-        ctx: &GroupContextSnapshot,
-    ) -> Result<PeeledMessage, PeelerError> {
-        self.0.peel_group_message(msg, ctx).await
-    }
-
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        let mut peeled = self.0.peel_welcome(msg).await?;
+impl InboxSealer for ClaimlessSealer {
+    async fn unseal(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        let mut peeled = self.0.unseal(msg).await?;
         if let PeeledContent::Welcome {
             key_package_event_id,
             ..
@@ -424,20 +421,23 @@ impl TransportPeeler for ClaimlessPeeler {
         Ok(peeled)
     }
 
-    async fn wrap_group_message(
+    async fn seal_welcome(
         &self,
-        payload: &EncryptedPayload,
-        ctx: &GroupContextSnapshot,
+        welcome: &OutboundWelcome,
     ) -> Result<TransportMessage, PeelerError> {
-        self.0.wrap_group_message(payload, ctx).await
+        self.0.seal_welcome(welcome).await
     }
 
-    async fn wrap_welcome(
+    async fn seal_group_recovery(
         &self,
-        payload: &EncryptedPayload,
+        message: &cgka_traits::GroupRecoveryMessage,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
-        self.0.wrap_welcome(payload, recipient).await
+        self.0.seal_group_recovery(message, recipient).await
+    }
+
+    fn sealed_welcome_len(&self, welcome: &OutboundWelcome) -> usize {
+        self.0.sealed_welcome_len(welcome)
     }
 }
 
@@ -800,11 +800,11 @@ async fn rejoin_before_the_upgrade(
 ) -> (Device, GroupId, TransportMessage, TransportMessage) {
     let path = dir.path().join("alice-phone.sqlite");
     let mut phone = Device::with_session(
-        nostr_device_session_with_peeler(
+        nostr_device_session_with_sealer(
             path,
             key,
             b"alice",
-            Box::new(ClaimlessPeeler(nostr_peeler(b"alice"))),
+            Arc::new(ClaimlessSealer(nostr_sealer(b"alice"))),
         ),
         cgka_traits::engine::KeyPackage::new(Vec::new()),
     );
@@ -852,6 +852,139 @@ fn rejoin_required() -> cgka_traits::IngestOutcome {
     cgka_traits::IngestOutcome::LocalState {
         state: cgka_traits::LocalIngestState::RejoinConfirmationRequired,
     }
+}
+
+struct RejoinRecordingSealer {
+    inner: transport_nostr_peeler::NostrInboxSealer,
+    unseals: Mutex<Vec<MessageId>>,
+}
+
+#[async_trait]
+impl InboxSealer for RejoinRecordingSealer {
+    async fn unseal(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        self.unseals.lock().unwrap().push(msg.id.clone());
+        self.inner.unseal(msg).await
+    }
+
+    async fn seal_welcome(
+        &self,
+        welcome: &OutboundWelcome,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner.seal_welcome(welcome).await
+    }
+
+    async fn seal_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner.seal_group_recovery(message, recipient).await
+    }
+
+    fn sealed_welcome_len(&self, welcome: &OutboundWelcome) -> usize {
+        self.inner.sealed_welcome_len(welcome)
+    }
+}
+
+#[tokio::test]
+async fn automatic_rejoin_unseals_only_the_first_successful_offer_for_a_group() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("automatic rejoin offers").unwrap();
+    let clock = Arc::new(cgka_engine::convergence_clock::ManualConvergenceClock::new(
+        0,
+        unix_now() * 1_000,
+    ));
+    let sealer = Arc::new(RejoinRecordingSealer {
+        inner: nostr_sealer(b"alice"),
+        unseals: Mutex::default(),
+    });
+    let mut phone = Device::with_session(
+        AccountDeviceSession::open(
+            nostr_device_config(
+                dir.path().join("alice.sqlite"),
+                &key,
+                b"alice",
+                sealer.clone(),
+            )
+            .convergence_clock_for_test(clock.clone()),
+        )
+        .unwrap(),
+        cgka_traits::engine::KeyPackage::new(Vec::new()),
+    );
+    phone.publish().await;
+    let mut bob = nostr_device_session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let (group_id, welcomes) = create_group(&mut bob, &[&phone.key_package], "rejoin offers").await;
+    assert_eq!(
+        phone.ingest(&welcomes[0]).await.outcome,
+        cgka_traits::IngestOutcome::Processed
+    );
+
+    let mut first_removal = None;
+    let mut offers = Vec::new();
+    for _ in 0..2 {
+        let removal = bob
+            .send(SendIntent::RemoveMembers {
+                group_id: group_id.clone(),
+                members: vec![phone.runtime.self_id()],
+            })
+            .await
+            .unwrap();
+        let [PublishWork::GroupEvolution { msg, pending, .. }] = removal.publish.as_slice() else {
+            panic!("expected removal commit");
+        };
+        first_removal.get_or_insert_with(|| msg.clone());
+        bob.confirm_published(*pending).await.unwrap();
+
+        phone.publish().await;
+        let welcomes = evolve(
+            &mut bob,
+            SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![phone.key_package.clone()],
+                initial_admins: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(phone.ingest(&welcomes[0]).await.outcome, rejoin_required());
+        offers.push(welcomes[0].id.clone());
+    }
+    assert_eq!(phone.rejoin_offers(&group_id), offers);
+    sealer.unseals.lock().unwrap().clear();
+
+    let mut token = phone
+        .runtime
+        .pending_group_rejoins_for(&group_id)
+        .unwrap()
+        .remove(0)
+        .rejoin
+        .unwrap()
+        .local_state_token;
+    token[0] ^= 1;
+    let stale = phone
+        .runtime
+        .confirm_group_rejoin(&offers[0], &token)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale.as_engine_error(),
+        cgka_traits::error::EngineError::InvalidTransition(_)
+    ));
+    assert!(sealer.unseals.lock().unwrap().is_empty());
+
+    let session = phone.runtime.session_mut();
+    session.ingest(first_removal.unwrap()).await.unwrap();
+    if let Some(delay) = session
+        .prepare_convergence_cutoff_delay_ms(&group_id)
+        .unwrap()
+    {
+        clock.advance_ms(delay.saturating_add(1));
+        session.advance_convergence(&group_id).await.unwrap();
+    }
+    assert!(session.group_record(&group_id).unwrap().removed);
+    assert!(session.retry_rejoins_after_trusted_removal().await.unwrap());
+    assert!(!session.group_record(&group_id).unwrap().removed);
+    assert!(phone.rejoin_offers(&group_id).is_empty());
+    assert_eq!(*sealer.unseals.lock().unwrap(), offers[..1]);
 }
 
 #[tokio::test]
@@ -919,6 +1052,13 @@ async fn an_invite_prepared_row_names_the_key_package_its_welcome_answers() {
     )
     .await;
     phone.publish().await;
+    bob.routing.update(|routing| {
+        routing.with_group_route(
+            group_id.clone(),
+            vec![0x5a; 32],
+            vec![TransportEndpoint("wss://group.example".into())],
+        )
+    });
     let audit_path = dir.path().join("bob-audit-v5.jsonl");
     bob.runtime
         .audit_recorder()
@@ -944,12 +1084,40 @@ async fn an_invite_prepared_row_names_the_key_package_its_welcome_answers() {
     let laptop_ref = marmot_forensics::v5::NostrEventRef::from_validated_event_id(
         &<[u8; 32]>::try_from(publication_id(&laptop.key_package).as_slice()).unwrap(),
     );
-    let named = v5_audit_rows(&audit_path)
-        .into_iter()
-        .filter(|row| row["event"]["type"] == "welcome_prepared")
-        .map(|row| row["event"]["key_package_event_ref"].clone())
-        .collect::<Vec<_>>();
-    assert_eq!(named, [laptop_ref.as_str()]);
+    let preparations = || {
+        v5_audit_rows(&audit_path)
+            .into_iter()
+            .filter(|row| row["event"]["type"] == "welcome_prepared")
+            .collect::<Vec<_>>()
+    };
+    let before = preparations();
+    let [row] = before.as_slice() else {
+        panic!("one prepared Welcome")
+    };
+    assert_eq!(row["event"]["key_package_event_ref"], laptop_ref.as_str());
+    assert_eq!(row["event"]["retention"], "not_attempted");
+
+    let (effects, welcomes) = commit.into_effects_and_welcomes();
+    let published = bob
+        .runtime
+        .publish_prepared_session_effects_with_audit_context(effects, Default::default())
+        .await
+        .unwrap();
+    assert!(matches!(
+        published.pending.as_slice(),
+        [PendingResolution::Confirmed { .. }]
+    ));
+    assert!(
+        bob.runtime
+            .session()
+            .stored_sent_welcome(&welcomes[0].id)
+            .is_ok()
+    );
+    assert_eq!(
+        preparations(),
+        before,
+        "binding must not record another preparation"
+    );
 }
 
 /// A Welcome from a device of the joiner's own account, in a group that
@@ -983,7 +1151,8 @@ mod same_account_welcome {
                 storage.clone(),
                 Duration::ZERO,
                 pad32(account),
-                Box::new(nostr_peeler(account)),
+                Box::new(transport_nostr_peeler::NostrMlsPeeler::default()),
+                Arc::new(nostr_sealer(account)),
             )
             .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
                 keys: deterministic_nostr_keys(account),

@@ -3,6 +3,7 @@
 #[derive(Clone, Copy)]
 enum RecoveryFixtureMode {
     Staged,
+    Prepared,
     Confirmed,
     Superseded,
     Terminal,
@@ -63,6 +64,17 @@ async fn recovery_grant(
         )
         .unwrap();
     grant
+}
+
+async fn seal_native_welcomes(welcomes: &[OutboundWelcome]) -> Vec<cgka_traits::SealedWelcome> {
+    let mut sealed = Vec::with_capacity(welcomes.len());
+    for welcome in welcomes {
+        sealed.push(cgka_traits::SealedWelcome {
+            local_id: welcome.local_id.clone(),
+            message: MockSealer.seal_welcome(welcome).await.unwrap(),
+        });
+    }
+    sealed
 }
 
 async fn hydrated_recovery_fixture(
@@ -126,14 +138,19 @@ async fn hydrated_recovery_fixture(
         members.push(peer.fresh_key_package().await.unwrap());
     }
     let (b, created) = alice.create_group(request("B", members)).await.unwrap();
-    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("founding group")
     };
-    let founding = welcomes.remove(0);
-    bob.join_welcome(founding.clone()).await.unwrap();
+    let mut sealed = seal_native_welcomes(&welcomes).await;
+    alice.bind_sealed_welcomes(&sealed, None).unwrap();
+    let founding = sealed.remove(0).message;
+    let unsealed = MockSealer.unseal(&founding).await.unwrap();
+    bob.join_welcome(founding.clone(), unsealed).await.unwrap();
     alice.mark_sent_welcome_delivered(&founding.id).unwrap();
-    for ((peer, _), founding) in peers.iter_mut().zip(welcomes) {
-        peer.join_welcome(founding.clone()).await.unwrap();
+    for ((peer, _), sealed) in peers.iter_mut().zip(sealed) {
+        let founding = sealed.message;
+        let unsealed = MockSealer.unseal(&founding).await.unwrap();
+        peer.join_welcome(founding.clone(), unsealed).await.unwrap();
         alice.mark_sent_welcome_delivered(&founding.id).unwrap();
     }
     let grant = recovery_grant(&alice, &mut bob, &target_storage, &b, 87).await;
@@ -141,22 +158,51 @@ async fn hydrated_recovery_fixture(
     for (index, (peer, storage)) in peers.iter_mut().take(8).enumerate() {
         grants.push(recovery_grant(&alice, peer, storage, &b, index as u8).await);
     }
+    let recovery = SendIntent::RecoverMembers {
+        group_id: b.clone(),
+        members: grants,
+    };
+    if matches!(mode, RecoveryFixtureMode::Prepared) {
+        drop(alice);
+        let mut runtime = AccountDeviceRuntime::new(
+            current_session(&path, &key, b"hydrated-alice"),
+            RecordingAdapter::default(),
+            StaticTransportRouting::new(vec![]),
+            RecordingKeyPackages::default(),
+        );
+        let marmot_session::PreparedSessionSend::Commit(prepared) = runtime
+            .confirm_commit_without_publish_with_audit_context(recovery, Default::default())
+            .await
+            .unwrap()
+        else {
+            panic!("a recoverable group stages the recovery commit");
+        };
+        let (effects, mut welcomes) = prepared.into_effects_and_welcomes();
+        let commit = effects
+            .publish
+            .into_iter()
+            .find_map(|work| match work {
+                PublishWork::GroupEvolution { msg, .. } => Some(msg.id),
+                _ => None,
+            })
+            .unwrap();
+        let welcome = welcomes.pop().unwrap();
+        drop(runtime);
+        let reopened = current_session(&path, &key, b"hydrated-alice");
+        return (dir, reopened, a, b, welcome, commit);
+    }
     let SendResult::GroupEvolution {
-        mut welcomes,
+        welcomes,
         pending,
         msg,
-    } = alice
-        .send(SendIntent::RecoverMembers {
-            group_id: b.clone(),
-            members: grants,
-        })
-        .await
-        .unwrap()
+    } = alice.send(recovery).await.unwrap()
     else {
         panic!("native recovery")
     };
-    let welcome = welcomes.remove(0);
+    let sealed = seal_native_welcomes(&welcomes).await;
+    let welcome = sealed[0].message.clone();
     if !matches!(mode, RecoveryFixtureMode::Staged) {
+        alice.bind_sealed_welcomes(&sealed, None).unwrap();
         alice.confirm_published(pending).await.unwrap();
         assert!(
             alice
@@ -345,203 +391,4 @@ async fn recovery_branch_step(
         runtime.session().epoch(group).unwrap(),
         peer.epoch(group).unwrap()
     );
-}
-
-#[cfg(feature = "test-policy-overrides")]
-#[derive(Clone, Copy)]
-enum RecoveryPeelerGate {
-    Peel,
-    Wrap,
-}
-
-#[cfg(feature = "test-policy-overrides")]
-struct PausedRecoveryPeeler {
-    gate: RecoveryPeelerGate,
-    entered: Arc<AtomicBool>,
-    release: futures::future::Shared<futures::future::BoxFuture<'static, ()>>,
-}
-
-#[cfg(feature = "test-policy-overrides")]
-#[async_trait]
-impl TransportPeeler for PausedRecoveryPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        message: &cgka_traits::GroupRecoveryMessage,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_group_recovery(message, recipient).await
-    }
-
-    async fn peel_group_message(
-        &self,
-        message: &cgka_traits::peeler::PreparedGroupMessage<'_>,
-        context: &GroupContextSnapshot,
-    ) -> Result<PeeledMessage, PeelerError> {
-        if matches!(self.gate, RecoveryPeelerGate::Peel) {
-            self.entered.store(true, Ordering::SeqCst);
-            self.release.clone().await;
-        }
-        MockPeeler.peel_group_message(message, context).await
-    }
-
-    async fn peel_welcome(&self, message: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        MockPeeler.peel_welcome(message).await
-    }
-
-    async fn wrap_group_message(
-        &self,
-        payload: &EncryptedPayload,
-        context: &GroupContextSnapshot,
-    ) -> Result<TransportMessage, PeelerError> {
-        if matches!(self.gate, RecoveryPeelerGate::Wrap) {
-            self.entered.store(true, Ordering::SeqCst);
-            self.release.clone().await;
-        }
-        MockPeeler.wrap_group_message(payload, context).await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_welcome(payload, recipient).await
-    }
-}
-
-#[cfg(feature = "test-policy-overrides")]
-async fn native_wave_waits(native_gate: RecoveryPeelerGate) {
-    use futures::FutureExt;
-
-    let (dir, session, _, group, _, origin) =
-        hydrated_recovery_fixture(RecoveryFixtureMode::Queued).await;
-    drop(session);
-    let (release, resumed) = tokio::sync::oneshot::channel::<()>();
-    let entered = Arc::new(AtomicBool::new(false));
-    let peeler = PausedRecoveryPeeler {
-        gate: native_gate,
-        entered: entered.clone(),
-        release: async move { resumed.await.unwrap() }.boxed().shared(),
-    };
-    let key = SqlCipherKey::new("hydrated welcome ownership key").unwrap();
-    let session = AccountDeviceSession::open(
-        SessionConfig::new(
-            dir.path().join("alice.sqlite"),
-            SqlCipherKey::new(key.as_secret_str()).unwrap(),
-            pad32(b"hydrated-alice"),
-            Box::new(peeler),
-        )
-        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
-            keys: deterministic_nostr_keys(b"hydrated-alice"),
-        }))
-        .protocol_profile(ProtocolProfile::Current),
-    )
-    .unwrap();
-    let welcomes = session
-        .outstanding_sent_welcomes()
-        .unwrap()
-        .into_iter()
-        .map(|(_, message)| message)
-        .collect::<Vec<_>>();
-    assert_eq!(welcomes.len(), 9);
-    let mut routing = StaticTransportRouting::new(vec![]);
-    for welcome in &welcomes {
-        let TransportEnvelope::Welcome { recipient } = &welcome.envelope else {
-            panic!("recovery Welcome")
-        };
-        routing = routing.with_inbox_route(
-            recipient.clone(),
-            vec![TransportEndpoint("wss://recovery-inbox.example".into())],
-        );
-    }
-    let adapter = RecordingAdapter::default();
-    let mut runtime = AccountDeviceRuntime::new(
-        session,
-        adapter.clone(),
-        routing,
-        RecordingKeyPackages::default(),
-    );
-    let gate = adapter.gate_welcome_publishes();
-    let task = runtime
-        .prepare_welcome_retry_task_with_audit_context(welcomes.clone(), Default::default())
-        .unwrap();
-    let mut publishing = Box::pin(task.run());
-    assert!(futures::poll!(publishing.as_mut()).is_pending());
-    assert_eq!(welcome_publishes(&adapter).len(), 8);
-    let delivery = match native_gate {
-        RecoveryPeelerGate::Peel => {
-            let mut rival = current_session(dir.path().join("bob.sqlite"), &key, b"hydrated-bob");
-            Some(TransportDelivery {
-                account_id: runtime.self_id(),
-                group_id_hint: Some(group.clone()),
-                message: recovery_branch_message(&mut rival, &group).await,
-                received_at: Timestamp(unix_now()),
-                source: TransportDeliverySource {
-                    transport: TransportSource("marmot-account-test".into()),
-                    plane: TransportDeliveryPlane::Group,
-                    endpoint: None,
-                    subscription_id: None,
-                    wire: None,
-                },
-            })
-        }
-        RecoveryPeelerGate::Wrap => None,
-    };
-    let original_epoch = runtime.session().epoch(&group).unwrap();
-    let staged = {
-        let mut selecting = Box::pin(async {
-            match native_gate {
-                RecoveryPeelerGate::Peel => {
-                    runtime
-                        .ingest_delivery(delivery.as_ref().unwrap())
-                        .await
-                        .unwrap();
-                    None
-                }
-                RecoveryPeelerGate::Wrap => {
-                    let effects = runtime
-                        .session_mut()
-                        .send(SendIntent::SelfUpdate {
-                            group_id: group.clone(),
-                        })
-                        .await
-                        .unwrap();
-                    let PublishWork::GroupEvolution { pending, .. } =
-                        effects.publish.into_iter().next().unwrap()
-                    else {
-                        panic!("direct native self-update")
-                    };
-                    Some(pending)
-                }
-            }
-        });
-        assert!(futures::poll!(selecting.as_mut()).is_pending());
-        assert!(entered.load(Ordering::SeqCst));
-        gate.release.add_permits(9);
-        assert!(
-            futures::poll!(publishing.as_mut()).is_pending(),
-            "the ninth Welcome waits for native selection, rather than completing as skipped"
-        );
-        assert_eq!(welcome_publishes(&adapter).len(), 8);
-        release.send(()).unwrap();
-        selecting.await
-    };
-    assert_eq!(
-        runtime.session().stored_message_state(&origin).unwrap(),
-        Some(cgka_traits::MessageState::Processed)
-    );
-    runtime
-        .finish_welcome_publish_task(publishing.await)
-        .await
-        .unwrap();
-    let published = welcome_publishes(&adapter);
-    assert_eq!(published.len(), welcomes.len());
-    for welcome in welcomes {
-        assert!(published.contains(&welcome));
-    }
-    assert!(runtime.outstanding_welcome_deliveries().unwrap().is_empty());
-    if let Some(pending) = staged {
-        runtime.session_mut().publish_failed(pending).await.unwrap();
-        assert_eq!(runtime.session().epoch(&group).unwrap(), original_epoch);
-    }
 }

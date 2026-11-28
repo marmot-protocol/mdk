@@ -21,7 +21,8 @@ where
     R: TransportRoutingPolicy,
     K: KeyPackagePublisher,
 {
-    /// Publish previously deferred Welcome obligations with bounded concurrency.
+    /// Publish retained Welcome obligations with bounded concurrency. An id
+    /// that has not been bound or is no longer retained cannot be published.
     pub async fn publish_welcome_messages_with_audit_context(
         &mut self,
         welcomes: Vec<TransportMessage>,
@@ -347,7 +348,9 @@ where
         if !matches!(envelope, TransportEnvelope::Welcome { .. }) {
             return Ok(None);
         }
-        if self.session.sent_welcome_withdrawn(message_id)? {
+        if self.session.stored_message_state(message_id)?.is_none()
+            || self.session.sent_welcome_withdrawn(message_id)?
+        {
             return Ok(Some(WelcomeHold::Withdrawn));
         }
         if self.session.sent_welcome_awaits_commit(message_id)? {
@@ -492,6 +495,16 @@ where
         &self,
         message_id: &cgka_traits::MessageId,
     ) -> AccountResult<WelcomeWithdrawal> {
+        // A prepared Welcome has only a local row until the commit's fanout
+        // binds it. Binding preserves a withdrawn row's state.
+        if let Some(seal) = self
+            .prepared_welcome_seals
+            .values()
+            .flat_map(|seals| &seals.sealed)
+            .find(|seal| &seal.message.id == message_id)
+        {
+            return Ok(self.session.withdraw_sent_welcome(&seal.local_id)?);
+        }
         // Relays that already took it make it delivered, not withdrawn: a
         // saved acceptance that meets its policy, whose mark a stop
         // interrupted, is reconciled first. A record that cannot be read now
@@ -850,6 +863,16 @@ where
         Ok(())
     }
 
+    /// Seal and bind founding Welcomes a create left unsealed, because its
+    /// seal failed or the process stopped first, and watch them so this pass
+    /// publishes them. One that fails to seal stays owed for the next pass
+    /// and holds back none of the others.
+    async fn seal_owed_welcomes(&mut self) -> AccountResult<bool> {
+        let messages = self.session.seal_owed_founding_welcomes().await?;
+        self.note_retained_welcomes(messages.iter(), None);
+        Ok(!messages.is_empty())
+    }
+
     /// Publish each watched Welcome that is owed and that no attempt record
     /// holds. A Welcome stays watched until its row is settled. While a stored
     /// fanout or a detached wave holds it, that record retries it;
@@ -861,6 +884,21 @@ where
         output: &mut AccountDeviceEffects,
     ) -> AccountResult<()> {
         self.read_welcome_store()?;
+        self.drive_watched_welcomes(output).await?;
+        // The owner starts detached waves only after maintenance returns.
+        if !self.prepared_welcome_tasks.is_empty() {
+            return Ok(());
+        }
+        if self.seal_owed_welcomes().await? {
+            self.drive_watched_welcomes(output).await?;
+        }
+        Ok(())
+    }
+
+    async fn drive_watched_welcomes(
+        &mut self,
+        output: &mut AccountDeviceEffects,
+    ) -> AccountResult<()> {
         let mut due: Vec<(GroupId, Vec<TransportMessage>)> = Vec::new();
         let mut watching = Vec::with_capacity(self.watched_welcomes.len());
         // The recipients of every owed Welcome, unless a status read failed.

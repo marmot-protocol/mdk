@@ -46,7 +46,7 @@ async fn an_applied_sibling_self_remove_holds_private_adds() {
             DEVICE_ROSTER_COMPONENT_ID,
             cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID,
         ],
-        Box::<MockPeeler>::default(),
+        Box::new(MockPeeler),
         Some(&clock),
     );
     let (mut phone, mut siblings, device_group) =
@@ -417,9 +417,7 @@ async fn an_applied_sibling_self_remove_holds_private_adds() {
             .contains(&slot(2))
     );
     let SendResult::GroupEvolution {
-        pending,
-        mut welcomes,
-        ..
+        pending, welcomes, ..
     } = alice
         .engine
         .send(SendIntent::Invite {
@@ -432,8 +430,11 @@ async fn an_applied_sibling_self_remove_holds_private_adds() {
     else {
         panic!("fresh invitation");
     };
+    let mut welcomes = seal_and_bind(&mut alice.engine, &welcomes);
     alice.engine.confirm_published(pending).await.unwrap();
-    phone.engine.join_welcome(welcomes.remove(0)).await.unwrap();
+    join_raw(&mut phone.engine, welcomes.remove(0))
+        .await
+        .unwrap();
     assert!(
         phone
             .storage
@@ -742,7 +743,7 @@ fn reopen_at_time_recording(
         .protocol_profile(ProtocolProfile::Current)
         .feature_registry(registry())
         .supported_app_components(supported)
-        .peeler(Box::<MockPeeler>::default())
+        .peeler(Box::new(MockPeeler))
         .maintenance_sources(clock.clone(), clock);
     let builder = if let Some(recorder) = recorder {
         builder.recorder(recorder)
@@ -1975,7 +1976,7 @@ async fn a_sibling_add_the_chat_requires_more_for_is_named_by_the_pre_check() {
     let older = device_advertising(
         b"bob",
         &[ACCOUNT_DEVICES_COMPONENT_ID, DEVICE_ROSTER_COMPONENT_ID],
-        Box::<MockPeeler>::default(),
+        Box::new(MockPeeler),
     );
     let (bob, mut new, _) = tag_devices(vec![roster_device(b"bob"), older]).await;
     let mut m = routed_members(chat_device(b"alice"), bob).await;
@@ -2194,6 +2195,7 @@ async fn a_founding_add_keeps_sibling_and_transport_welcomes_independent() {
     let SendResult::FoundingGroupCreated { welcomes } = result else {
         panic!("canonical founding create")
     };
+    let welcomes = seal_and_bind(&mut creator.engine, &welcomes);
     assert_eq!(
         welcomes.len(),
         1,
@@ -2218,9 +2220,7 @@ async fn a_founding_add_keeps_sibling_and_transport_welcomes_independent() {
         )]
     ));
     assert_eq!(
-        other
-            .engine
-            .join_welcome(welcomes[0].clone())
+        join_raw(&mut other.engine, welcomes[0].clone())
             .await
             .unwrap(),
         gid
@@ -2287,12 +2287,11 @@ async fn an_inadmissible_founding_sibling_does_not_block_other_accounts() {
     let SendResult::FoundingGroupCreated { welcomes } = result else {
         panic!("canonical ordinary creation despite optional sibling refusal")
     };
+    let welcomes = seal_and_bind(&mut creator.engine, &welcomes);
     assert_eq!(welcomes.len(), 1);
     assert_eq!(creator.engine.members(&gid).unwrap().len(), 2);
     assert_eq!(
-        other
-            .engine
-            .join_welcome(welcomes[0].clone())
+        join_raw(&mut other.engine, welcomes[0].clone())
             .await
             .unwrap(),
         gid
@@ -2328,11 +2327,7 @@ fn founding_request(members: Vec<KeyPackage>) -> CreateGroupRequest {
 async fn founding_siblings_cannot_bypass_the_other_founders_capabilities() {
     use cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID;
     let (mut creator, mut siblings, _) = tagged_devices(b"alice", 1).await;
-    let mut other = device_advertising(
-        b"bob",
-        &[NOSTR_ROUTING_COMPONENT_ID],
-        Box::<MockPeeler>::default(),
-    );
+    let mut other = device_advertising(b"bob", &[NOSTR_ROUTING_COMPONENT_ID], Box::new(MockPeeler));
     let public = other.engine.fresh_key_package().await.unwrap();
     let private = handed(&mut siblings[0], slot(2), slot(1));
     let request = founding_request(vec![public]);
@@ -2383,12 +2378,11 @@ async fn a_founding_sibling_expiring_at_engine_admission_is_omitted() {
     let SendResult::FoundingGroupCreated { welcomes } = result else {
         panic!("ordinary founding creation")
     };
+    let welcomes = seal_and_bind(&mut creator.engine, &welcomes);
     assert_eq!(welcomes.len(), 1);
     assert_eq!(creator.engine.members(&gid).unwrap().len(), 2);
     assert_eq!(
-        other
-            .engine
-            .join_welcome(welcomes[0].clone())
+        join_raw(&mut other.engine, welcomes[0].clone())
             .await
             .unwrap(),
         gid

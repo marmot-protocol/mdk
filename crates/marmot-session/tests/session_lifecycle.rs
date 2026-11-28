@@ -9,6 +9,7 @@ use cgka_engine::account_identity_proof::{
 };
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_traits::OutboundWelcome;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
@@ -16,7 +17,7 @@ use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, PeeledContent, PeeledMessage};
-use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::peeler::{InboxSealer, TransportPeeler};
 use cgka_traits::storage::KeyPackageBundleStorage;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -85,19 +86,8 @@ fn hash_id(bytes: &[u8]) -> MessageId {
 
 struct MockPeeler;
 
-#[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::WrapFailed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -113,21 +103,7 @@ impl TransportPeeler for MockPeeler {
         })
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
@@ -143,25 +119,68 @@ impl TransportPeeler for MockPeeler {
             },
         })
     }
+}
 
-    async fn wrap_welcome(
+/// Pass-through account inbox: a sealed Welcome is its ciphertext, addressed
+/// to the recipient. Recovery control has no authenticated channel here.
+struct MockSealer;
+
+#[async_trait]
+impl InboxSealer for MockSealer {
+    async fn unseal(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        Ok(PeeledMessage {
+            id: msg.id.clone(),
+            group_id: None,
+            sender: None,
+            content: PeeledContent::Welcome {
+                created_at: None,
+                bytes: msg.payload.clone(),
+                key_package_event_id: None,
+            },
+            origin: msg.clone(),
+        })
+    }
+
+    async fn seal_welcome(
         &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
+        welcome: &OutboundWelcome,
     ) -> Result<TransportMessage, PeelerError> {
-        let mut id_material = payload.ciphertext.clone();
-        id_material.extend_from_slice(recipient.as_slice());
+        let mut id_material = welcome.payload.ciphertext.clone();
+        id_material.extend_from_slice(welcome.recipient.as_slice());
         Ok(TransportMessage {
             id: hash_id(&id_material),
-            payload: payload.ciphertext.clone(),
+            payload: welcome.payload.ciphertext.clone(),
             timestamp: Timestamp(0),
             causal_deps: vec![],
             source: TransportSource("session-test".into()),
             envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
+                recipient: welcome.recipient.clone(),
             },
         })
     }
+
+    async fn seal_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        Err(PeelerError::WrapFailed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
+    fn sealed_welcome_len(&self, welcome: &OutboundWelcome) -> usize {
+        welcome.payload.ciphertext.len()
+    }
+}
+
+async fn seal_and_bind(
+    session: &mut AccountDeviceSession,
+    welcomes: &[OutboundWelcome],
+) -> Vec<TransportMessage> {
+    let sealed = session.seal_welcomes(welcomes).await.unwrap();
+    session.bind_sealed_welcomes(&sealed, None).unwrap();
+    sealed.into_iter().map(|sealed| sealed.message).collect()
 }
 
 fn config(
@@ -175,6 +194,7 @@ fn config(
         SqlCipherKey::new(key.as_secret_str()).unwrap(),
         keys.public_key().to_bytes().to_vec(),
         Box::new(MockPeeler),
+        Arc::new(MockSealer),
     )
     .legacy_compatibility_profile()
     .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
@@ -196,6 +216,7 @@ async fn session_runs_on_a_host_opened_connection_the_host_can_close() {
         host_open,
         keys.public_key().to_bytes().to_vec(),
         Box::new(MockPeeler),
+        Arc::new(MockSealer),
     )
     .legacy_compatibility_profile()
     .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
@@ -257,6 +278,7 @@ async fn default_session_cutover_retires_legacy_key_packages_on_every_open() {
             SqlCipherKey::new(key.as_secret_str()).unwrap(),
             keys.public_key().to_bytes().to_vec(),
             Box::new(MockPeeler),
+            Arc::new(MockSealer),
         )
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
             keys: keys.clone(),
@@ -536,7 +558,10 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
         .await
         .unwrap();
     let (pending, welcome) = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        PublishWork::GroupCreated { pending, welcomes } => (
+            *pending,
+            seal_and_bind(&mut alice, welcomes).await.remove(0),
+        ),
         other => panic!("expected GroupCreated publish work, got {other:?}"),
     };
     alice.confirm_published(pending).await.unwrap();
@@ -651,7 +676,10 @@ async fn reopened_creator_can_send_valid_group_messages() {
         .await
         .unwrap();
     let (pending, welcome) = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        PublishWork::GroupCreated { pending, welcomes } => (
+            *pending,
+            seal_and_bind(&mut alice, welcomes).await.remove(0),
+        ),
         other => panic!("expected GroupCreated publish work, got {other:?}"),
     };
     alice.confirm_published(pending).await.unwrap();
@@ -734,7 +762,10 @@ async fn session_ingest_schedules_auto_publish_work() {
         .await
         .unwrap();
     let (pending, welcome) = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        PublishWork::GroupCreated { pending, welcomes } => (
+            *pending,
+            seal_and_bind(&mut alice, welcomes).await.remove(0),
+        ),
         other => panic!("expected GroupCreated publish work, got {other:?}"),
     };
     alice.confirm_published(pending).await.unwrap();
@@ -830,7 +861,10 @@ async fn session_advance_convergence_surfaces_auto_selfremove_reproposal() {
         .await
         .unwrap();
     let (pending, welcome) = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        PublishWork::GroupCreated { pending, welcomes } => (
+            *pending,
+            seal_and_bind(&mut alice, welcomes).await.remove(0),
+        ),
         other => panic!("expected GroupCreated publish work, got {other:?}"),
     };
     alice.confirm_published(pending).await.unwrap();
@@ -940,7 +974,9 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
         .await
         .unwrap();
     let (pending, welcomes) = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes.clone()),
+        PublishWork::GroupCreated { pending, welcomes } => {
+            (*pending, seal_and_bind(&mut alice, welcomes).await)
+        }
         other => panic!("expected GroupCreated publish work, got {other:?}"),
     };
     alice.confirm_published(pending).await.unwrap();
@@ -1094,7 +1130,9 @@ async fn session_advance_convergence_announces_a_refused_queued_intent() {
         .unwrap();
     let group_id = created.group_id.clone();
     let (pending, welcomes) = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes.clone()),
+        PublishWork::GroupCreated { pending, welcomes } => {
+            (*pending, seal_and_bind(&mut alice, welcomes).await)
+        }
         other => panic!("expected GroupCreated publish work, got {other:?}"),
     };
     alice.confirm_published(pending).await.unwrap();
@@ -1700,6 +1738,7 @@ async fn account_records_report_a_closed_store_as_the_engine_storage_failure() {
         std::time::Duration::ZERO,
         keys.public_key().to_bytes().to_vec(),
         Box::new(MockPeeler),
+        Arc::new(MockSealer),
     )
     .legacy_compatibility_profile()
     .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
@@ -1999,7 +2038,10 @@ async fn configured_recorder_preserves_delivery_source_and_open_health() {
         .await
         .unwrap();
     let (pending, welcome) = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        PublishWork::GroupCreated { pending, welcomes } => (
+            *pending,
+            seal_and_bind(&mut alice, welcomes).await.remove(0),
+        ),
         other => panic!("expected pending creation, got {other:?}"),
     };
     alice.confirm_published(pending).await.unwrap();
@@ -2273,7 +2315,10 @@ async fn regenerated_queued_proposal_keeps_its_original_intent() {
         .await
         .unwrap();
     let (pending, welcome) = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        PublishWork::GroupCreated { pending, welcomes } => (
+            *pending,
+            seal_and_bind(&mut alice, welcomes).await.remove(0),
+        ),
         other => panic!("expected pending creation, got {other:?}"),
     };
     alice.confirm_published(pending).await.unwrap();

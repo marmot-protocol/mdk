@@ -20,7 +20,6 @@
 // Tests read stored records directly (see the crate clippy.toml).
 #![allow(clippy::disallowed_methods)]
 
-use async_trait::async_trait;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
@@ -34,7 +33,7 @@ use cgka_traits::storage::{GroupStorage, MessageStorage};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use cgka_traits::types::{EpochId, GroupId, MessageId};
 use marmot_forensics::audit::{AuditEventKind, AuditRecord, ConvergencePhase, ForensicRecorder};
 use std::path::Path;
 use std::sync::Arc;
@@ -44,6 +43,7 @@ use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
 mod support;
 use support::proof_signer;
+use support::raw_inbox::{join_raw, seal_and_bind};
 
 const HISTORY_SIZES: &[usize] = &[0, 1_000, 5_000, 20_000, 50_000];
 const COMMITS_PER_SIZE: usize = 5;
@@ -74,19 +74,8 @@ fn hash_id(bytes: &[u8]) -> MessageId {
 
 struct MockPeeler;
 
-#[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -102,21 +91,7 @@ impl TransportPeeler for MockPeeler {
         })
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
@@ -129,23 +104,6 @@ impl TransportPeeler for MockPeeler {
             source: TransportSource("apply-history-bench".into()),
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: vec![],
-            },
-        })
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("apply-history-bench".into()),
-            envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
             },
         })
     }
@@ -294,10 +252,12 @@ async fn canonical_apply_cost_with_stored_history() {
     // Release builds only construct the current protocol profile, whose
     // founding create needs no publish confirmation.
     let welcome = match result {
-        SendResult::FoundingGroupCreated { mut welcomes } => welcomes.remove(0),
+        SendResult::FoundingGroupCreated { welcomes } => {
+            seal_and_bind(&mut alice, &welcomes).remove(0)
+        }
         other => panic!("expected FoundingGroupCreated, got {other:?}"),
     };
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
     bob.drain_events();
     alice.drain_events();
 

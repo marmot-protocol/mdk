@@ -185,18 +185,6 @@ async fn queued_recovery_origin() {
 }
 
 #[tokio::test]
-#[cfg(feature = "test-policy-overrides")]
-async fn canonical_wave_waits() {
-    native_wave_waits(RecoveryPeelerGate::Peel).await;
-}
-
-#[tokio::test]
-#[cfg(feature = "test-policy-overrides")]
-async fn direct_send_wave_waits() {
-    native_wave_waits(RecoveryPeelerGate::Wrap).await;
-}
-
-#[tokio::test]
 async fn hydrated_welcome_stays_owned() {
     let (_dir, session, a, b, welcome, _) =
         hydrated_recovery_fixture(RecoveryFixtureMode::Staged).await;
@@ -347,6 +335,47 @@ async fn lost_recovery_hides_welcome() {
 }
 
 #[tokio::test]
+async fn prepared_recovery_reopens() {
+    let (_dir, session, _, group, unbound, commit) =
+        hydrated_recovery_fixture(RecoveryFixtureMode::Prepared).await;
+    let adapter = RecordingAdapter::default();
+    let endpoint = TransportEndpoint("wss://resume-recovery.example".into());
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        StaticTransportRouting::new(vec![])
+            .with_group_route(
+                group.clone(),
+                group.as_slice().to_vec(),
+                vec![endpoint.clone()],
+            )
+            .with_inbox_route(MemberId::new(pad32(b"hydrated-bob")), vec![endpoint]),
+        RecordingKeyPackages::default(),
+    );
+    let premature = runtime
+        .prepare_welcome_retry_task_with_audit_context(vec![unbound], Default::default())
+        .unwrap();
+    assert!(
+        premature.message_ids().is_empty(),
+        "reopen must not release an unbound Welcome"
+    );
+    let recovered = runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        recovered
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. }))
+    );
+    assert!(
+        adapter
+            .commit_publishes()
+            .iter()
+            .any(|request| request.message.id == commit)
+    );
+    assert_eq!(staged_welcome_publishes(&adapter).len(), 1);
+}
+
+#[tokio::test]
 async fn recovery_welcome_reopens() {
     let (_dir, session, _a, _b, welcome, _) =
         hydrated_recovery_fixture(RecoveryFixtureMode::Confirmed).await;
@@ -390,10 +419,38 @@ async fn recovery_welcome_reopens() {
     );
 }
 
+// The staged recovery uses raw fixture Welcomes, but inbound control must
+// still authenticate the sender via NIP-59.
+struct RecoveryControlSealer(transport_nostr_peeler::NostrInboxSealer);
+
+#[async_trait]
+impl InboxSealer for RecoveryControlSealer {
+    async fn unseal(&self, message: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        self.0.unseal(message).await
+    }
+
+    async fn seal_welcome(
+        &self,
+        welcome: &OutboundWelcome,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockSealer.seal_welcome(welcome).await
+    }
+
+    async fn seal_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.0.seal_group_recovery(message, recipient).await
+    }
+
+    fn sealed_welcome_len(&self, welcome: &OutboundWelcome) -> usize {
+        MockSealer.sealed_welcome_len(welcome)
+    }
+}
+
 #[tokio::test]
 async fn recovery_ingest_drains_native() {
-    use cgka_traits::peeler::TransportPeeler as _;
-
     enum OpenMode {
         Eager,
         Deferred,
@@ -435,7 +492,8 @@ async fn recovery_ingest_drains_native() {
             dir.path().join("alice.sqlite"),
             SqlCipherKey::new("hydrated welcome ownership key").unwrap(),
             pad32(b"hydrated-alice"),
-            Box::new(nostr_peeler(b"hydrated-alice")),
+            Box::new(transport_nostr_peeler::NostrMlsPeeler::default()),
+            Arc::new(RecoveryControlSealer(nostr_sealer(b"hydrated-alice"))),
         )
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
             keys: deterministic_nostr_keys(b"hydrated-alice"),
@@ -481,8 +539,8 @@ async fn recovery_ingest_drains_native() {
                 device_key_hash: [0x93; 32],
             },
         };
-        let carrier = nostr_peeler(b"hydrated-bob")
-            .wrap_group_recovery(&control, &account)
+        let carrier = nostr_sealer(b"hydrated-bob")
+            .seal_group_recovery(&control, &account)
             .await
             .unwrap();
 

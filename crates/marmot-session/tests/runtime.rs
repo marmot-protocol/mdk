@@ -15,6 +15,7 @@ use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_traits::OutboundWelcome;
 use cgka_traits::app_components::{
     AppComponentData, GROUP_MESSAGE_RETENTION_COMPONENT_ID, default_group_components,
 };
@@ -27,7 +28,7 @@ use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
-use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::peeler::{InboxSealer, TransportPeeler};
 use cgka_traits::storage::{KeyPackageBundleStorage, MaintenanceStorage, OutboundFanoutStorage};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -164,19 +165,8 @@ impl EntropySource for TestRandom {
     }
 }
 
-#[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::WrapFailed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -192,21 +182,7 @@ impl TransportPeeler for MockPeeler {
         })
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
@@ -222,25 +198,115 @@ impl TransportPeeler for MockPeeler {
             },
         })
     }
+}
 
-    async fn wrap_welcome(
+/// Pass-through account inbox: a sealed Welcome is its ciphertext, addressed
+/// to the recipient. Recovery control has no authenticated channel here.
+struct MockSealer;
+
+#[async_trait]
+impl InboxSealer for MockSealer {
+    async fn unseal(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        Ok(PeeledMessage {
+            id: msg.id.clone(),
+            group_id: None,
+            sender: None,
+            content: PeeledContent::Welcome {
+                created_at: None,
+                bytes: msg.payload.clone(),
+                key_package_event_id: None,
+            },
+            origin: msg.clone(),
+        })
+    }
+
+    async fn seal_welcome(
         &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
+        welcome: &OutboundWelcome,
     ) -> Result<TransportMessage, PeelerError> {
-        let mut id_material = payload.ciphertext.clone();
-        id_material.extend_from_slice(recipient.as_slice());
+        let mut id_material = welcome.payload.ciphertext.clone();
+        id_material.extend_from_slice(welcome.recipient.as_slice());
         Ok(TransportMessage {
             id: hash_id(&id_material),
-            payload: payload.ciphertext.clone(),
+            payload: welcome.payload.ciphertext.clone(),
             timestamp: Timestamp(0),
             causal_deps: vec![],
             source: TransportSource("marmot-account-test".into()),
             envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
+                recipient: welcome.recipient.clone(),
             },
         })
     }
+
+    async fn seal_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        Err(PeelerError::WrapFailed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
+    fn sealed_welcome_len(&self, welcome: &OutboundWelcome) -> usize {
+        welcome.payload.ciphertext.len()
+    }
+}
+
+/// [`MockSealer`] whose Welcome sealing fails while `fail` is set and never
+/// finishes while `park` is set, as a remote signer left waiting; `parked`
+/// is notified when a seal parks.
+#[derive(Default)]
+struct SwitchableSealer {
+    fail: AtomicBool,
+    park: AtomicBool,
+    parked: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl InboxSealer for SwitchableSealer {
+    async fn unseal(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockSealer.unseal(msg).await
+    }
+
+    async fn seal_welcome(
+        &self,
+        welcome: &OutboundWelcome,
+    ) -> Result<TransportMessage, PeelerError> {
+        if self.park.load(Ordering::SeqCst) {
+            self.parked.notify_one();
+            std::future::pending::<()>().await;
+        }
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(PeelerError::WrapFailed(
+                "test sealer refuses Welcomes".into(),
+            ));
+        }
+        MockSealer.seal_welcome(welcome).await
+    }
+
+    async fn seal_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockSealer.seal_group_recovery(message, recipient).await
+    }
+
+    fn sealed_welcome_len(&self, welcome: &OutboundWelcome) -> usize {
+        MockSealer.sealed_welcome_len(welcome)
+    }
+}
+
+/// Seal and bind Welcomes the way the runtime does, for tests that drive the
+/// session directly and deliver its Welcomes.
+async fn seal_and_bind(
+    session: &mut AccountDeviceSession,
+    welcomes: &[OutboundWelcome],
+) -> Vec<TransportMessage> {
+    let sealed = session.seal_welcomes(welcomes).await.unwrap();
+    session.bind_sealed_welcomes(&sealed, None).unwrap();
+    sealed.into_iter().map(|sealed| sealed.message).collect()
 }
 
 fn session(
@@ -263,6 +329,7 @@ fn deferred_session(
             SqlCipherKey::new(key.as_secret_str()).unwrap(),
             pad32(identity),
             Box::new(MockPeeler),
+            Arc::new(MockSealer),
         )
         .legacy_compatibility_profile()
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
@@ -276,18 +343,30 @@ fn current_session(
     key: &SqlCipherKey,
     identity: &[u8],
 ) -> AccountDeviceSession {
-    let keys = deterministic_nostr_keys(identity);
-    AccountDeviceSession::open(
-        SessionConfig::new(
-            path,
-            SqlCipherKey::new(key.as_secret_str()).unwrap(),
-            pad32(identity),
-            Box::new(MockPeeler),
-        )
-        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
-        .protocol_profile(ProtocolProfile::Current),
-    )
+    AccountDeviceSession::open(mock_session_config(
+        path,
+        key,
+        identity,
+        Arc::new(MockSealer),
+    ))
     .unwrap()
+}
+
+fn mock_session_config(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    identity: &[u8],
+    sealer: Arc<dyn InboxSealer>,
+) -> SessionConfig {
+    let keys = deterministic_nostr_keys(identity);
+    SessionConfig::new(
+        path,
+        SqlCipherKey::new(key.as_secret_str()).unwrap(),
+        keys.public_key().to_bytes().to_vec(),
+        Box::new(MockPeeler),
+        sealer,
+    )
+    .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
 }
 
 /// [`current_session`] with the app runtime's deferred group hydration, so a
@@ -304,6 +383,7 @@ fn deferred_current_session(
             SqlCipherKey::new(key.as_secret_str()).unwrap(),
             pad32(identity),
             Box::new(MockPeeler),
+            Arc::new(MockSealer),
         )
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
         .protocol_profile(ProtocolProfile::Current)
@@ -337,6 +417,7 @@ fn session_with_registry_and_components(
             SqlCipherKey::new(key.as_secret_str()).unwrap(),
             pad32(identity),
             Box::new(MockPeeler),
+            Arc::new(MockSealer),
         )
         .legacy_compatibility_profile()
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
@@ -363,9 +444,10 @@ async fn welcome_for_key_package(
         })
         .await
         .unwrap();
-    let welcomes = match &created.effects.publish[0] {
+    let welcomes = match created.effects.publish.into_iter().next().unwrap() {
         PublishWork::GroupCreated { welcomes, pending } => {
-            inviter.confirm_published(*pending).await.unwrap();
+            let welcomes = seal_and_bind(inviter, &welcomes).await;
+            inviter.confirm_published(pending).await.unwrap();
             welcomes
         }
         PublishWork::FoundingGroupCreated { welcomes } => welcomes,
@@ -427,6 +509,7 @@ struct RecordingAdapterInner {
     commit_too_large: Mutex<Vec<TransportEndpoint>>,
     /// Inbox relays whose known limit every Welcome is over.
     welcome_too_large: Mutex<Vec<TransportEndpoint>>,
+    park_next_welcome_preflight: Mutex<Option<tokio::sync::oneshot::Sender<MessageId>>>,
     /// Each commit size check's target endpoints, in order.
     commit_size_checks: Mutex<Vec<Vec<TransportEndpoint>>>,
     commit_size_check_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
@@ -882,9 +965,30 @@ impl TransportAdapter for RecordingAdapter {
         message: &TransportMessage,
         target: &TransportPublishTarget,
     ) -> Option<cgka_traits::EventSizeClass> {
+        if !matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
+            return None;
+        }
+        let parked = self
+            .inner
+            .park_next_welcome_preflight
+            .lock()
+            .unwrap()
+            .take();
+        if let Some(parked) = parked {
+            parked.send(message.id.clone()).unwrap();
+            std::future::pending::<()>().await;
+        }
+        self.size_class_over_event_len(message.payload.len(), target)
+            .await
+    }
+
+    async fn size_class_over_event_len(
+        &self,
+        _event_len: usize,
+        target: &TransportPublishTarget,
+    ) -> Option<cgka_traits::EventSizeClass> {
         let refused = self.inner.welcome_too_large.lock().unwrap();
-        (matches!(message.envelope, TransportEnvelope::Welcome { .. })
-            && !target.endpoints().is_empty()
+        (!target.endpoints().is_empty()
             && target
                 .endpoints()
                 .iter()
@@ -1077,11 +1181,7 @@ impl TransportRoutingPolicy for MismatchedPendingGroupRouting {
     ) -> Result<TransportPublishTarget, TransportRoutingError> {
         let transport_group_id = match &message.envelope {
             TransportEnvelope::GroupMessage { transport_group_id } => transport_group_id.clone(),
-            TransportEnvelope::Welcome { .. } => {
-                return Err(TransportRoutingError::MissingInboxRoute(
-                    marmot_session::MissingInboxRouteCause::NoList,
-                ));
-            }
+            TransportEnvelope::Welcome { recipient } => return self.inbox_target(recipient),
         };
         Ok(TransportPublishTarget::Group {
             group_id: self.wrong_group_id.clone(),
@@ -1090,9 +1190,305 @@ impl TransportRoutingPolicy for MismatchedPendingGroupRouting {
         })
     }
 
+    fn inbox_target(
+        &self,
+        _recipient: &MemberId,
+    ) -> Result<TransportPublishTarget, TransportRoutingError> {
+        Err(TransportRoutingError::MissingInboxRoute(
+            marmot_session::MissingInboxRouteCause::NoList,
+        ))
+    }
+
     fn required_acks(&self, _target: &TransportPublishTarget) -> usize {
         1
     }
+}
+
+#[tokio::test]
+async fn invite_seal_failure_rolls_back_staged_commit() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("invite seal failure key").unwrap();
+    let sealer = Arc::new(SwitchableSealer::default());
+    let alice = AccountDeviceSession::open(mock_session_config(
+        dir.path().join("alice.sqlite"),
+        &key,
+        b"alice",
+        sealer.clone(),
+    ))
+    .unwrap();
+    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let bob_id = bob.self_id();
+    let key_package = bob.fresh_key_package().await.unwrap();
+    let adapter = RecordingAdapter::default();
+    let routing = SharedRouting(Arc::new(Mutex::new(StaticTransportRouting::new(vec![]))));
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        routing.clone(),
+        RecordingKeyPackages::default(),
+    );
+    let (group, _) = runtime
+        .create_group(CreateGroupRequest {
+            name: "invite seal failure".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let relay = TransportEndpoint("wss://group.example".into());
+    let inbox = TransportEndpoint("wss://bob-inbox.example".into());
+    routing.update(|_| {
+        staged_invite_routing(&group, &relay).with_inbox_route(bob_id.clone(), vec![inbox])
+    });
+    let members = runtime.members(&group).unwrap();
+    let invite = SendIntent::Invite {
+        group_id: group.clone(),
+        key_packages: vec![key_package],
+        initial_admins: Vec::new(),
+    };
+    sealer.fail.store(true, Ordering::SeqCst);
+    let error = runtime.send(invite.clone()).await.unwrap_err();
+    assert!(matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::EngineError::Peeler(PeelerError::WrapFailed(reason)))
+            if reason == "test sealer refuses Welcomes"
+    ));
+    assert!(adapter.publishes().is_empty());
+    assert!(adapter.inner.commit_publishes.lock().unwrap().is_empty());
+    assert_eq!(runtime.members(&group).unwrap(), members);
+
+    sealer.fail.store(false, Ordering::SeqCst);
+    let sent = runtime.send(invite).await.unwrap();
+    assert!(matches!(
+        sent.pending.as_slice(),
+        [PendingResolution::Confirmed { .. }]
+    ));
+    assert!(
+        runtime
+            .members(&group)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == bob_id)
+    );
+    assert_eq!(staged_welcome_publishes(&adapter).len(), 1);
+}
+
+/// A send dropped while its Welcomes are sealed (a remote signer can hold
+/// the seal for minutes) leaves its commit staged with no fanout. Maintenance
+/// rolls it back, so the group takes a new change again, even after another
+/// group's invite sealed in the meantime.
+#[tokio::test]
+async fn invite_dropped_mid_seal_is_rolled_back_by_maintenance() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("invite dropped mid seal key").unwrap();
+    let sealer = Arc::new(SwitchableSealer::default());
+    let alice = AccountDeviceSession::open(mock_session_config(
+        dir.path().join("alice.sqlite"),
+        &key,
+        b"alice",
+        sealer.clone(),
+    ))
+    .unwrap();
+    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let mut carol = current_session(dir.path().join("carol.sqlite"), &key, b"carol");
+    let bob_id = bob.self_id();
+    let carol_id = carol.self_id();
+    let key_package = bob.fresh_key_package().await.unwrap();
+    let adapter = RecordingAdapter::default();
+    let routing = SharedRouting(Arc::new(Mutex::new(StaticTransportRouting::new(vec![]))));
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        routing.clone(),
+        RecordingKeyPackages::default(),
+    );
+    let mut groups = Vec::new();
+    for name in ["invite dropped mid seal", "invite sealed meanwhile"] {
+        let (group, _) = runtime
+            .create_group(CreateGroupRequest {
+                name: name.into(),
+                description: String::new(),
+                members: Vec::new(),
+                required_features: Vec::new(),
+                app_components: Vec::new(),
+                initial_admins: Vec::new(),
+            })
+            .await
+            .unwrap();
+        groups.push(group);
+    }
+    let [group, other] = <[GroupId; 2]>::try_from(groups).unwrap();
+    let relay = TransportEndpoint("wss://group.example".into());
+    let other_relay = TransportEndpoint("wss://other-group.example".into());
+    routing.update(|_| {
+        staged_invite_routing(&group, &relay)
+            .with_group_route(other.clone(), other.as_slice().to_vec(), vec![other_relay])
+            .with_inbox_route(
+                bob_id.clone(),
+                vec![TransportEndpoint("wss://bob-inbox.example".into())],
+            )
+            .with_inbox_route(
+                carol_id.clone(),
+                vec![TransportEndpoint("wss://carol-inbox.example".into())],
+            )
+    });
+    let members = runtime.members(&group).unwrap();
+    let invite = SendIntent::Invite {
+        group_id: group.clone(),
+        key_packages: vec![key_package],
+        initial_admins: Vec::new(),
+    };
+    runtime.pause_maintenance();
+    runtime.run_due_maintenance().await.unwrap();
+    assert!(!runtime.maintenance_due(&[]).unwrap().retry_while_owed);
+    sealer.park.store(true, Ordering::SeqCst);
+    // Drop the send once its seal parks.
+    tokio::select! {
+        _ = runtime.send(invite.clone()) => panic!("the parked seal holds the send"),
+        () = sealer.parked.notified() => {}
+    }
+    assert!(adapter.inner.commit_publishes.lock().unwrap().is_empty());
+    assert!(runtime.maintenance_due(&[]).unwrap().retry_while_owed);
+
+    sealer.park.store(false, Ordering::SeqCst);
+    // Another group's seal starts and finishes before maintenance runs.
+    runtime
+        .send(SendIntent::Invite {
+            group_id: other.clone(),
+            key_packages: vec![carol.fresh_key_package().await.unwrap()],
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(runtime.maintenance_due(&[]).unwrap().retry_while_owed);
+    let maintained = runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        maintained
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, PendingResolution::RolledBack { .. }))
+    );
+    assert_eq!(runtime.members(&group).unwrap(), members);
+
+    let sent = runtime.send(invite).await.unwrap();
+    assert!(matches!(
+        sent.pending.as_slice(),
+        [PendingResolution::Confirmed { .. }]
+    ));
+    assert!(
+        runtime
+            .members(&group)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == bob_id)
+    );
+    assert_eq!(staged_welcome_publishes(&adapter).len(), 2);
+}
+
+#[tokio::test]
+async fn cancel_welcome_preflight() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("invite preflight cancellation key").unwrap();
+    let sealer = Arc::new(SwitchableSealer::default());
+    let mut alice = AccountDeviceSession::open(mock_session_config(
+        dir.path().join("alice.sqlite"),
+        &key,
+        b"alice",
+        sealer.clone(),
+    ))
+    .unwrap();
+    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let bob_id = bob.self_id();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "invite preflight cancellation".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group = created.group_id;
+    sealer.fail.store(true, Ordering::SeqCst);
+    alice
+        .create_group(CreateGroupRequest {
+            name: "founding seal owed".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    sealer.fail.store(false, Ordering::SeqCst);
+    let routing = staged_invite_routing(&group, &TransportEndpoint("wss://group.example".into()))
+        .with_inbox_route(
+            bob_id.clone(),
+            vec![TransportEndpoint("wss://bob-inbox.example".into())],
+        );
+    let adapter = RecordingAdapter::default();
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        routing,
+        RecordingKeyPackages::default(),
+    );
+    let invite = SendIntent::Invite {
+        group_id: group.clone(),
+        key_packages: vec![bob.fresh_key_package().await.unwrap()],
+        initial_admins: Vec::new(),
+    };
+
+    let (parked, preflight) = tokio::sync::oneshot::channel();
+    *adapter.inner.park_next_welcome_preflight.lock().unwrap() = Some(parked);
+    let abandoned_welcome = tokio::select! {
+        _ = runtime.confirm_commit_without_publish_with_audit_context(
+            invite.clone(), Default::default(),
+        ) => panic!("the invite returned before parking in Welcome preflight"),
+        result = preflight => result.unwrap(),
+    };
+
+    sealer.park.store(true, Ordering::SeqCst);
+    tokio::select! {
+        _ = runtime.run_due_maintenance() => panic!("the founding seal did not park"),
+        () = sealer.parked.notified() => {}
+    }
+    assert!(matches!(
+        runtime.epoch_state(&group),
+        Some(cgka_traits::EpochState::Stable { .. })
+    ));
+    sealer.park.store(false, Ordering::SeqCst);
+    sealer.fail.store(true, Ordering::SeqCst);
+    let maintained = runtime.run_due_maintenance().await.unwrap();
+    assert!(matches!(
+        maintained.pending.as_slice(),
+        [PendingResolution::RolledBack { .. }]
+    ));
+    assert!(adapter.commit_publishes().is_empty());
+    assert!(adapter.publishes().is_empty());
+
+    sealer.fail.store(false, Ordering::SeqCst);
+    let sent = runtime.send(invite).await.unwrap();
+    assert!(matches!(
+        sent.pending.as_slice(),
+        [PendingResolution::Confirmed { .. }]
+    ));
+    assert_eq!(adapter.commit_publishes().len(), 1);
+    let welcomes = staged_welcome_publishes(&adapter);
+    let [welcome] = welcomes.as_slice() else {
+        panic!("the replacement invite should publish one Welcome");
+    };
+    assert_ne!(welcome.id, abandoned_welcome);
+    assert!(matches!(
+        &welcome.envelope,
+        TransportEnvelope::Welcome { recipient } if *recipient == bob_id
+    ));
 }
 
 include!("runtime/frozen_fanout.rs");
@@ -1430,6 +1826,7 @@ async fn open_builds_the_transport_only_after_the_session_opens() {
             SqlCipherKey::new(key.as_secret_str()).unwrap(),
             pad32(b"alice"),
             Box::new(MockPeeler),
+            Arc::new(MockSealer),
         )
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
             keys: deterministic_nostr_keys(b"alice"),
@@ -3001,6 +3398,7 @@ async fn publish_fresh_key_package_retains_bundle_when_publish_fails_after_expos
         .unwrap();
     let welcome = match &created.effects.publish[0] {
         PublishWork::GroupCreated { welcomes, pending } => {
+            let welcomes = seal_and_bind(&mut bob_session, welcomes).await;
             bob_session.confirm_published(*pending).await.unwrap();
             welcomes
                 .iter()
@@ -3066,6 +3464,7 @@ async fn post_join_rotation_does_not_block_application_send_and_returns_disposit
         .unwrap();
     let welcome = match &created.effects.publish[0] {
         PublishWork::GroupCreated { welcomes, pending } => {
+            let welcomes = seal_and_bind(&mut bob, welcomes).await;
             bob.confirm_published(*pending).await.unwrap();
             welcomes
                 .iter()
@@ -3201,6 +3600,7 @@ async fn a_post_join_history_fetch_outlives_commits_until_its_deadline() {
     let group_id = created.group_id.clone();
     let welcome = match &created.effects.publish[0] {
         PublishWork::GroupCreated { welcomes, pending } => {
+            let welcomes = seal_and_bind(&mut bob, welcomes).await;
             bob.confirm_published(*pending).await.unwrap();
             welcomes
                 .iter()
@@ -6414,7 +6814,10 @@ async fn auto_publish_confirms_pending_when_commit_was_partially_exposed() {
         .unwrap();
     let group_id = created.group_id.clone();
     let (create_pending, welcome) = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        PublishWork::GroupCreated { pending, welcomes } => (
+            *pending,
+            seal_and_bind(&mut alice, welcomes).await.remove(0),
+        ),
         other => panic!("expected GroupCreated publish work, got {other:?}"),
     };
     alice.confirm_published(create_pending).await.unwrap();
@@ -6563,7 +6966,10 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         .unwrap();
     let group_id = created.group_id.clone();
     let (create_pending, welcome) = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        PublishWork::GroupCreated { pending, welcomes } => (
+            *pending,
+            seal_and_bind(&mut alice, welcomes).await.remove(0),
+        ),
         other => panic!("expected GroupCreated publish work, got {other:?}"),
     };
     alice.confirm_published(create_pending).await.unwrap();

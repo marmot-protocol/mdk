@@ -6,8 +6,11 @@ between engine, peeler, transport adapter, storage, and caller imports from here
 ## What lives in here
 
 - `CgkaEngine` — the engine trait the rest of the system depends on.
-- `TransportPeeler` — crypto-boundary trait: `prepare_group_message`, `peel_group_message`, `peel_welcome`, `wrap_group_message`,
-  `wrap_welcome`, plus `wrap_group_message_with_metadata` / `wrap_welcome_with_metadata` (default to the plain wraps).
+- `TransportPeeler` — synchronous group-message crypto boundary: `prepare_group_message`, `peel_group_message`,
+  `wrap_group_message`, plus `wrap_group_message_with_metadata` (defaults to the plain wrap).
+- `InboxSealer` — async account-inbox boundary the session owns, over the account signer: `unseal`, `seal_welcome`,
+  `seal_group_recovery` and `sealed_welcome_len`. The engine never calls it; it hands out `OutboundWelcome`s and the
+  session binds the `SealedWelcome`s back.
 - `TransportAdapter` — account-aware network boundary for activation, subscription refresh, publish receipts, and
   inbound deliveries.
 - `InvitationAdmission` — the installed local copy's original validated invitation generation and exact local Welcome

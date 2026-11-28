@@ -225,6 +225,7 @@ async fn orphan_recovery_mirror_failure_remains_retryable() {
             let SendResult::GroupEvolution { welcomes, .. } = result else {
                 panic!("expected staged invite");
             };
+            let welcomes = seal_and_bind(&mut alice, &welcomes);
             assert_eq!(welcomes.len(), 1);
             welcome_id = welcomes[0].id.clone();
             assert!(

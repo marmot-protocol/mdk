@@ -82,6 +82,7 @@ pub(crate) fn ingest_outcome_kind_str(outcome: &IngestOutcome) -> &'static str {
     match outcome {
         IngestOutcome::Processed => "processed",
         IngestOutcome::GroupRecovery { .. } => "account_control",
+        IngestOutcome::InboxSealed => "inbox_sealed",
         IngestOutcome::Buffered { .. } => "buffered",
         IngestOutcome::Ignored { .. } => "ignored",
         IngestOutcome::LocalState { .. } => "local_state",
@@ -538,31 +539,33 @@ pub(crate) fn deferred_peel_resource_refused_event(
 /// because they need the engine's authenticated membership roster, which is not
 /// available from the `SendResult` alone.
 pub(crate) fn send_outbound_messages(result: &SendResult) -> Vec<OutboundMessage> {
-    fn outbound(msg: &TransportMessage, artifact_kind: MessageArtifactKind) -> OutboundMessage {
+    fn outbound(id: &MessageId, artifact_kind: MessageArtifactKind) -> OutboundMessage {
         OutboundMessage {
-            msg_id: hex::encode(msg.id.as_slice()),
+            msg_id: hex::encode(id.as_slice()),
             artifact_kind,
             transport: None,
             recipient_expectation: None,
         }
     }
+    // An unsealed Welcome is named by its local id until the session binds
+    // its sealed message, whose persist row names the transport id.
     let mut messages = Vec::new();
     match result {
         SendResult::NoChange { .. }
         | SendResult::DisbandRequested { .. }
         | SendResult::LeaveRequested { .. } => {}
         SendResult::ApplicationMessage { msg, .. } => {
-            messages.push(outbound(msg, MessageArtifactKind::ApplicationMessage));
+            messages.push(outbound(&msg.id, MessageArtifactKind::ApplicationMessage));
         }
         SendResult::Proposal { msg } => {
-            messages.push(outbound(msg, MessageArtifactKind::Proposal));
+            messages.push(outbound(&msg.id, MessageArtifactKind::Proposal));
         }
         SendResult::GroupEvolution { msg, welcomes, .. } => {
-            messages.push(outbound(msg, MessageArtifactKind::Commit));
+            messages.push(outbound(&msg.id, MessageArtifactKind::Commit));
             messages.extend(
                 welcomes
                     .iter()
-                    .map(|w| outbound(w, MessageArtifactKind::Welcome)),
+                    .map(|w| outbound(&w.local_id, MessageArtifactKind::Welcome)),
             );
         }
         SendResult::GroupCreated { welcomes, .. }
@@ -570,7 +573,7 @@ pub(crate) fn send_outbound_messages(result: &SendResult) -> Vec<OutboundMessage
             messages.extend(
                 welcomes
                     .iter()
-                    .map(|w| outbound(w, MessageArtifactKind::Welcome)),
+                    .map(|w| outbound(&w.local_id, MessageArtifactKind::Welcome)),
             );
         }
         SendResult::Queued { .. } => {}

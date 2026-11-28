@@ -1,7 +1,8 @@
 //! Shared unit-test identity and pass-through transport fixtures for engine tests.
 
+use crate::Engine;
 use crate::account_identity_proof::{AccountIdentityProofRequest, AccountIdentityProofSigner};
-use async_trait::async_trait;
+use cgka_traits::engine::{CgkaEngine, OutboundWelcome, SealedWelcome};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
@@ -9,9 +10,10 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{MemberId, MessageId};
+use cgka_traits::types::MessageId;
 use k256::schnorr::{SigningKey, signature::hazmat::PrehashSigner};
 use sha2::{Digest, Sha256};
+use storage_sqlite::SqliteAccountStorage;
 
 pub(crate) fn signing_key(seed: &[u8]) -> SigningKey {
     for counter in 0u64.. {
@@ -59,18 +61,8 @@ pub(crate) fn carried(
 /// Carries every message verbatim.
 pub(crate) struct PassthroughPeeler;
 
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl TransportPeeler for PassthroughPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::Malformed("no account channel".into()))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -86,21 +78,7 @@ impl TransportPeeler for PassthroughPeeler {
         })
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
@@ -113,26 +91,50 @@ impl TransportPeeler for PassthroughPeeler {
             },
         ))
     }
+}
 
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        let mut message = carried(
-            "engine-unit-test",
-            &payload.ciphertext,
-            TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
+pub(crate) fn seal_and_bind(
+    engine: &mut Engine<SqliteAccountStorage>,
+    welcomes: &[OutboundWelcome],
+) -> Vec<TransportMessage> {
+    let sealed: Vec<_> = welcomes
+        .iter()
+        .map(|welcome| SealedWelcome {
+            local_id: welcome.local_id.clone(),
+            message: TransportMessage {
+                id: MessageId::new(
+                    Sha256::new()
+                        .chain_update(welcome.local_id.as_slice())
+                        .chain_update(welcome.recipient.as_slice())
+                        .chain_update(&welcome.payload.ciphertext)
+                        .finalize()
+                        .to_vec(),
+                ),
+                payload: welcome.payload.ciphertext.clone(),
+                timestamp: Timestamp(0),
+                causal_deps: vec![],
+                source: TransportSource("engine-unit-test".into()),
+                envelope: TransportEnvelope::Welcome {
+                    recipient: welcome.recipient.clone(),
+                },
             },
-        );
-        message.id = MessageId::new(
-            Sha256::new()
-                .chain_update(&payload.ciphertext)
-                .chain_update(recipient.as_slice())
-                .finalize()
-                .to_vec(),
-        );
-        Ok(message)
-    }
+        })
+        .collect();
+    engine.bind_sealed_welcomes(&sealed, None).unwrap();
+    sealed.into_iter().map(|welcome| welcome.message).collect()
+}
+
+pub(crate) async fn join_raw(engine: &mut Engine<SqliteAccountStorage>, welcome: TransportMessage) {
+    let unsealed = PeeledMessage {
+        id: welcome.id.clone(),
+        group_id: None,
+        sender: None,
+        content: PeeledContent::Welcome {
+            created_at: None,
+            bytes: welcome.payload.clone(),
+            key_package_event_id: None,
+        },
+        origin: welcome.clone(),
+    };
+    engine.join_welcome(welcome, unsealed).await.unwrap();
 }

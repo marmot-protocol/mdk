@@ -6,7 +6,6 @@
 // Tests read stored records directly (see the crate clippy.toml).
 #![allow(clippy::disallowed_methods)]
 
-use async_trait::async_trait;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP;
 use cgka_engine::openmls_projection::project_mls_message;
@@ -47,6 +46,7 @@ use storage_sqlite::SqliteAccountStorage;
 mod support;
 use support::epoch_sealed_peeler::EpochSealedPeeler;
 use support::proof_signer;
+use support::raw_inbox::{join_raw, seal_and_bind};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     use k256::schnorr::SigningKey;
@@ -100,20 +100,6 @@ fn epoch_gated_group_message(
     })
 }
 
-fn passthrough_welcome(msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-    Ok(PeeledMessage {
-        id: msg.id.clone(),
-        group_id: None,
-        sender: None,
-        content: PeeledContent::Welcome {
-            created_at: None,
-            bytes: msg.payload.clone(),
-            key_package_event_id: None,
-        },
-        origin: msg.clone(),
-    })
-}
-
 fn wrapped_group_message(payload: &EncryptedPayload) -> Result<TransportMessage, PeelerError> {
     Ok(TransportMessage {
         id: hash_id(&payload.ciphertext),
@@ -123,22 +109,6 @@ fn wrapped_group_message(payload: &EncryptedPayload) -> Result<TransportMessage,
         source: TransportSource("mock".into()),
         envelope: TransportEnvelope::GroupMessage {
             transport_group_id: vec![],
-        },
-    })
-}
-
-fn wrapped_welcome(
-    payload: &EncryptedPayload,
-    recipient: &MemberId,
-) -> Result<TransportMessage, PeelerError> {
-    Ok(TransportMessage {
-        id: hash_id(&payload.ciphertext),
-        payload: payload.ciphertext.clone(),
-        timestamp: Timestamp(0),
-        causal_deps: vec![],
-        source: TransportSource("mock".into()),
-        envelope: TransportEnvelope::Welcome {
-            recipient: recipient.clone(),
         },
     })
 }
@@ -170,19 +140,8 @@ impl CountingEpochGatePeeler {
     }
 }
 
-#[async_trait]
 impl TransportPeeler for CountingEpochGatePeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
@@ -196,24 +155,12 @@ impl TransportPeeler for CountingEpochGatePeeler {
         epoch_gated_group_message(msg.message, ctx)
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        passthrough_welcome(msg)
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
         wrapped_group_message(payload)
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        wrapped_welcome(payload, recipient)
     }
 }
 
@@ -226,19 +173,8 @@ struct UnavailableEpochGatePeeler {
 }
 
 #[cfg(feature = "test-policy-overrides")]
-#[async_trait]
 impl TransportPeeler for UnavailableEpochGatePeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
@@ -249,35 +185,22 @@ impl TransportPeeler for UnavailableEpochGatePeeler {
         epoch_gated_group_message(msg.message, ctx)
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        passthrough_welcome(msg)
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
         wrapped_group_message(payload)
     }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        wrapped_welcome(payload, recipient)
-    }
 }
 
-/// Epoch-gated peeler whose foreground retry attempt can be held indefinitely.
-/// Initial ingest remains fast; tests arm the gate only after the deferred
-/// backlog is durable.
+/// Epoch-gated peeler that advances the clock on a selected foreground attempt.
 #[derive(Clone)]
-struct NotifyEpochGatePeeler {
+struct BudgetedEpochGatePeeler {
     gated: Arc<AtomicBool>,
     gated_attempts: Arc<AtomicU64>,
-    block_on_attempt: Arc<AtomicU64>,
+    exhaust_budget_on_attempt: Arc<AtomicU64>,
+    clock: Arc<ManualMonotonicClock>,
 }
 
 /// Monotonic clock that moves only when a test advances it.
@@ -296,102 +219,56 @@ impl MonotonicClock for ManualMonotonicClock {
     }
 }
 
-/// Epoch-faithful peeler that can suspend before any supplied context is
-/// attempted. Used to cancel a sweep after candidate enumeration but before a
-/// deferred row receives a definitive result. Each peel also moves `clock`
-/// forward by `peel_cost_ms`, so an engine built on that clock sees a slow
-/// peel without anything sleeping.
+/// Epoch-faithful peeler that charges each peel to the injected monotonic clock.
 #[derive(Clone)]
-struct CancellableEpochSealedPeeler {
-    blocked: Arc<AtomicBool>,
-    blocked_attempts: Arc<AtomicU64>,
+struct ClockedEpochSealedPeeler {
     clock: Arc<ManualMonotonicClock>,
     peel_cost_ms: Arc<AtomicU64>,
 }
 
-impl CancellableEpochSealedPeeler {
+impl ClockedEpochSealedPeeler {
     fn new() -> Self {
         Self {
-            blocked: Arc::new(AtomicBool::new(false)),
-            blocked_attempts: Arc::new(AtomicU64::new(0)),
             clock: Arc::new(ManualMonotonicClock::default()),
             peel_cost_ms: Arc::new(AtomicU64::new(0)),
         }
     }
-
-    fn block(&self) {
-        self.blocked_attempts.store(0, Ordering::SeqCst);
-        self.blocked.store(true, Ordering::SeqCst);
-    }
-
-    fn unblock(&self) {
-        self.blocked.store(false, Ordering::SeqCst);
-    }
-
-    fn blocked_attempts(&self) -> u64 {
-        self.blocked_attempts.load(Ordering::SeqCst)
-    }
 }
 
-#[async_trait]
-impl TransportPeeler for CancellableEpochSealedPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        message: &cgka_traits::GroupRecoveryMessage,
-        recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        EpochSealedPeeler
-            .wrap_group_recovery(message, recipient)
-            .await
-    }
-
-    async fn peel_group_message(
+impl TransportPeeler for ClockedEpochSealedPeeler {
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
-        if self.blocked.load(Ordering::SeqCst) {
-            self.blocked_attempts.fetch_add(1, Ordering::SeqCst);
-            std::future::pending::<()>().await;
-        }
         self.clock
             .advance_ms(self.peel_cost_ms.load(Ordering::SeqCst));
-        EpochSealedPeeler.peel_group_message(msg, ctx).await
+        EpochSealedPeeler.peel_group_message(msg, ctx)
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        EpochSealedPeeler.peel_welcome(msg).await
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
-        EpochSealedPeeler.wrap_group_message(payload, ctx).await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        EpochSealedPeeler.wrap_welcome(payload, recipient).await
+        EpochSealedPeeler.wrap_group_message(payload, ctx)
     }
 }
 
-impl NotifyEpochGatePeeler {
+impl BudgetedEpochGatePeeler {
     fn new() -> Self {
         Self {
             gated: Arc::new(AtomicBool::new(false)),
             gated_attempts: Arc::new(AtomicU64::new(0)),
-            block_on_attempt: Arc::new(AtomicU64::new(u64::MAX)),
+            exhaust_budget_on_attempt: Arc::new(AtomicU64::new(u64::MAX)),
+            clock: Arc::new(ManualMonotonicClock::default()),
         }
     }
 
-    fn block_on_attempt(&self, attempt: u64) {
+    fn exhaust_budget_on_attempt(&self, attempt: u64) {
         self.gated_attempts.store(0, Ordering::SeqCst);
-        self.block_on_attempt.store(attempt, Ordering::SeqCst);
+        self.exhaust_budget_on_attempt
+            .store(attempt, Ordering::SeqCst);
         self.gated.store(true, Ordering::SeqCst);
     }
 
@@ -404,50 +281,27 @@ impl NotifyEpochGatePeeler {
     }
 }
 
-#[async_trait]
-impl TransportPeeler for NotifyEpochGatePeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+impl TransportPeeler for BudgetedEpochGatePeeler {
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         if self.gated.load(Ordering::SeqCst) {
             let attempt = self.gated_attempts.fetch_add(1, Ordering::SeqCst) + 1;
-            if attempt >= self.block_on_attempt.load(Ordering::SeqCst) {
-                std::future::pending::<()>().await;
+            if attempt == self.exhaust_budget_on_attempt.load(Ordering::SeqCst) {
+                self.clock.advance_ms(25);
             }
         }
         epoch_gated_group_message(msg.message, ctx)
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        passthrough_welcome(msg)
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
         wrapped_group_message(payload)
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        wrapped_welcome(payload, recipient)
     }
 }
 
@@ -471,12 +325,13 @@ fn build_counting_client(
     CountingEpochGatePeeler,
 ) {
     let peeler = CountingEpochGatePeeler::new();
-    build_gated_client(name, peeler)
+    build_gated_client(name, peeler, Arc::new(SystemMonotonicClock::default()))
 }
 
 fn build_gated_client<P>(
     name: &[u8],
     peeler: P,
+    clock: Arc<dyn MonotonicClock>,
 ) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage, P)
 where
     P: TransportPeeler + Clone + 'static,
@@ -487,6 +342,7 @@ where
         .identity(pad32(name))
         .account_identity_proof_signer(proof_signer(name))
         .peeler(Box::new(peeler.clone()))
+        .monotonic_clock(clock)
         .build()
         .unwrap();
     engine
@@ -525,15 +381,15 @@ fn build_counting_client_with_storage_and_clock(
     (engine, storage, peeler)
 }
 
-fn build_notify_client(
+fn build_budgeted_client(
     name: &[u8],
 ) -> (
     Engine<SqliteAccountStorage>,
     SqliteAccountStorage,
-    NotifyEpochGatePeeler,
+    BudgetedEpochGatePeeler,
 ) {
-    let peeler = NotifyEpochGatePeeler::new();
-    build_gated_client(name, peeler)
+    let peeler = BudgetedEpochGatePeeler::new();
+    build_gated_client(name, peeler.clone(), peeler.clock.clone())
 }
 
 fn build_epoch_sealed_client_with_storage(
@@ -693,9 +549,9 @@ async fn carol_behind_two_epochs_with<P>(
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    carol
-        .join_welcome(welcome_for(&welcomes, b"carol"))
+    join_raw(&mut carol, welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
     carol.drain_events();
@@ -759,9 +615,9 @@ async fn add_group_two_epochs_ahead(
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcomes = seal_and_bind(alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    carol
-        .join_welcome(welcome_for(&welcomes, b"carol"))
+    join_raw(carol, welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
     carol.drain_events();
@@ -850,9 +706,9 @@ where
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut incumbent, &welcomes);
     incumbent.confirm_published(pending).await.unwrap();
-    rival
-        .join_welcome(welcome_for(&welcomes, b"candidate-cache-rival"))
+    join_raw(&mut rival, welcome_for(&welcomes, b"candidate-cache-rival"))
         .await
         .unwrap();
 
@@ -874,14 +730,17 @@ where
         } => (msg, pending, welcomes),
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
+    let incumbent_welcomes = seal_and_bind(&mut incumbent, &incumbent_welcomes);
     incumbent
         .confirm_published(incumbent_pending)
         .await
         .unwrap();
-    david
-        .join_welcome(welcome_for(&incumbent_welcomes, b"candidate-cache-david"))
-        .await
-        .unwrap();
+    join_raw(
+        &mut david,
+        welcome_for(&incumbent_welcomes, b"candidate-cache-david"),
+    )
+    .await
+    .unwrap();
 
     let eve_kp = eve.fresh_key_package().await.unwrap();
     let (rival_root, rival_pending) = evolution(
@@ -1267,52 +1126,7 @@ async fn restart_discards_candidate_context_cache_and_recomputes_once() {
 }
 
 #[tokio::test]
-async fn cancelled_sweep_keeps_untried_rows_eligible_and_reuses_enumeration() {
-    let peeler = CancellableEpochSealedPeeler::new();
-    let (mut incumbent, storage, group_id, _same_branch_peer) =
-        contested_rival_app_backlog_with_peeler(192, peeler.clone(), peeler.clock.clone()).await;
-
-    peeler.block();
-    let cancelled = tokio::time::timeout(
-        std::time::Duration::from_millis(25),
-        incumbent.retry_deferred_peels(&group_id),
-    )
-    .await;
-    assert!(
-        cancelled.is_err(),
-        "the blocked peel must exhaust the caller budget"
-    );
-    assert_eq!(peeler.blocked_attempts(), 1);
-    let deferred = storage
-        .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
-        .unwrap();
-    assert_eq!(deferred.len(), 192);
-    assert!(deferred.iter().all(|record| {
-        record
-            .deferred_peel
-            .as_ref()
-            .and_then(|lifecycle| lifecycle.last_context_fingerprint)
-            .is_none()
-    }));
-    assert_eq!(
-        incumbent
-            .engine_metrics()
-            .deferred_peel_candidate_enumerations,
-        1
-    );
-
-    peeler.unblock();
-    assert_eq!(incumbent.retry_deferred_peels(&group_id).await.unwrap(), 64);
-    let metrics = incumbent.engine_metrics();
-    assert_eq!(
-        metrics.deferred_peel_candidate_enumerations, 1,
-        "cancellation retains the safe memory-only enumeration"
-    );
-    assert_eq!(metrics.deferred_peel_candidate_cache_hits, 1);
-}
-
-#[tokio::test]
-async fn foreground_send_budget_queues_47_and_64_row_notify_gated_backlogs() {
+async fn foreground_send_budget_queues_47_and_64_row_backlogs() {
     assert_eq!(
         cgka_engine::message_processor::FOREGROUND_DEFERRED_PEEL_BUDGET_MS,
         250
@@ -1323,7 +1137,7 @@ async fn foreground_send_budget_queues_47_and_64_row_notify_gated_backlogs() {
     );
 
     for backlog in [47_usize, 64] {
-        let client = build_notify_client(b"carol");
+        let client = build_budgeted_client(b"carol");
         let (mut alice, mut carol, storage, peeler, group_id, _commit2, _commit3) =
             carol_behind_two_epochs_with(client).await;
 
@@ -1349,7 +1163,7 @@ async fn foreground_send_budget_queues_47_and_64_row_notify_gated_backlogs() {
         );
 
         carol.set_foreground_deferred_peel_budget(25, 4);
-        peeler.block_on_attempt(1);
+        peeler.exhaust_budget_on_attempt(1);
 
         let result = carol
             .send(SendIntent::AppMessage {
@@ -1380,7 +1194,7 @@ async fn foreground_send_budget_queues_47_and_64_row_notify_gated_backlogs() {
 
         // The same shared preflight queues proposal- and commit-producing
         // requests without constructing either wire artifact.
-        peeler.block_on_attempt(1);
+        peeler.exhaust_budget_on_attempt(1);
         let leave = carol
             .send(SendIntent::Leave {
                 group_id: group_id.clone(),
@@ -1394,7 +1208,7 @@ async fn foreground_send_budget_queues_47_and_64_row_notify_gated_backlogs() {
         storage
             .delete_queued_outbound_intent(&leave_intent_id)
             .unwrap();
-        peeler.block_on_attempt(1);
+        peeler.exhaust_budget_on_attempt(1);
         assert!(matches!(
             carol
                 .send(SendIntent::SelfUpdate {
@@ -1664,7 +1478,7 @@ async fn queued_intent_drains_before_historical_only_maintenance() {
 
 #[tokio::test]
 async fn deferred_peel_restart_resumes_first_uncompleted_row_not_numeric_offset() {
-    let client = build_notify_client(b"carol");
+    let client = build_budgeted_client(b"carol");
     let (mut alice, mut carol, storage, peeler, group_id, _commit2, _commit3) =
         carol_behind_two_epochs_with(client).await;
     let template = send_app(&mut alice, &group_id, "restart resume backlog").await;
@@ -1683,10 +1497,9 @@ async fn deferred_peel_restart_resumes_first_uncompleted_row_not_numeric_offset(
             IngestOutcome::TransportDeferred { .. }
         ));
     }
-    // The notify gate determines the cancellation point. Leave enough wall
-    // time for enumeration even when other file-backed tests are running.
-    carol.set_foreground_deferred_peel_budget(5_000, 4);
-    peeler.block_on_attempt(4);
+    // Finish a prefix, then exhaust the injected time budget between rows.
+    carol.set_foreground_deferred_peel_budget(25, 4);
+    peeler.exhaust_budget_on_attempt(3);
     assert!(matches!(
         carol
             .send(SendIntent::AppMessage {
@@ -1719,7 +1532,7 @@ async fn deferred_peel_restart_resumes_first_uncompleted_row_not_numeric_offset(
         .collect::<Vec<_>>();
     assert!(
         !completed_ids.is_empty(),
-        "the cancellation fixture must complete a prefix before testing that restart skips it"
+        "the budget fixture must complete a prefix before testing that restart skips it"
     );
     let first_uncompleted_id = deferred_after_send
         .get(completed_ids.len())
@@ -1744,7 +1557,7 @@ async fn deferred_peel_restart_resumes_first_uncompleted_row_not_numeric_offset(
     assert_eq!(
         restarted_peeler.attempts_for(&first_uncompleted_id),
         1,
-        "the timed-out row must be the first resumed attempt"
+        "the first unexamined row must be the first resumed attempt"
     );
     assert_eq!(
         restarted_peeler.attempts_for(ids.last().unwrap()),
@@ -1813,7 +1626,7 @@ async fn contested_generation_barrier_survives_restart_and_blocks_prefix_converg
 
 #[tokio::test]
 async fn uncontested_partial_sweep_blocks_commit_replay_across_restart() {
-    let client = build_notify_client(b"carol");
+    let client = build_budgeted_client(b"carol");
     let (mut alice, mut carol, storage, peeler, group_id, commit2, commit3) =
         carol_behind_two_epochs_with(client).await;
     let template = send_app(&mut alice, &group_id, "uncontested restart backlog").await;
@@ -1830,10 +1643,10 @@ async fn uncontested_partial_sweep_blocks_commit_replay_across_restart() {
         ));
     }
 
-    // Cancel the first foreground peel after enumeration, leaving a real
-    // partially examined generation rather than injecting its storage marker.
-    carol.set_foreground_deferred_peel_budget(5_000, 4);
-    peeler.block_on_attempt(1);
+    // Finish just one foreground row, leaving a real partially examined
+    // generation rather than injecting its storage marker.
+    carol.set_foreground_deferred_peel_budget(25, 4);
+    peeler.exhaust_budget_on_attempt(1);
     assert!(matches!(
         carol
             .send(SendIntent::AppMessage {
@@ -1856,7 +1669,7 @@ async fn uncontested_partial_sweep_blocks_commit_replay_across_restart() {
     assert_eq!(
         peeler.gated_attempts(),
         1,
-        "the sweep must reach the blocked peel"
+        "the sweep must finish only the first row"
     );
     peeler.unblock();
     assert!(matches!(
@@ -2628,7 +2441,11 @@ async fn replay_still_retires_a_deferred_row_it_resolves() {
 async fn retained_peeler_failure_preserves_bytes_capacity_and_confirmation_retry() {
     use cgka_traits::storage::StorageProvider;
 
-    let client = build_gated_client(b"carol", UnavailableEpochGatePeeler::default());
+    let client = build_gated_client(
+        b"carol",
+        UnavailableEpochGatePeeler::default(),
+        Arc::new(SystemMonotonicClock::default()),
+    );
     let (mut alice, mut carol, storage, peeler, group_id, commit2, commit3) =
         carol_behind_two_epochs_with(client).await;
     carol.set_deferred_peel_limits_for_tests(1, usize::MAX, usize::MAX);
@@ -4049,10 +3866,10 @@ async fn pre_membership_application_message_is_terminal_not_deferred() {
         } => (welcomes, pending),
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
 
-    carol
-        .join_welcome(welcome_for(&welcomes, b"carol"))
+    join_raw(&mut carol, welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
     let join_epoch = carol.epoch(&group_id).unwrap();
@@ -4118,8 +3935,9 @@ async fn rejoin_does_not_generalize_latest_welcome_into_pre_membership() {
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcome_for(&welcomes, b"bob-rejoin-history"))
+    join_raw(&mut bob, welcome_for(&welcomes, b"bob-rejoin-history"))
         .await
         .unwrap();
 
@@ -4152,8 +3970,9 @@ async fn rejoin_does_not_generalize_latest_welcome_into_pre_membership() {
         } => (welcomes, pending),
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcome_for(&welcomes, b"bob-rejoin-history"))
+    join_raw(&mut bob, welcome_for(&welcomes, b"bob-rejoin-history"))
         .await
         .unwrap();
     assert_eq!(
@@ -4197,9 +4016,9 @@ async fn join_epoch_recorded_on_welcome_join() {
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    carol
-        .join_welcome(welcome_for(&welcomes, b"carol"))
+    join_raw(&mut carol, welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
 
@@ -4248,14 +4067,17 @@ async fn carol_removed_while_holding_a_future_epoch_deferred_row() -> (
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcome_for(&welcomes, b"bob-deferred-self-evict"))
+    join_raw(&mut bob, welcome_for(&welcomes, b"bob-deferred-self-evict"))
         .await
         .unwrap();
-    carol
-        .join_welcome(welcome_for(&welcomes, b"carol-deferred-self-evict"))
-        .await
-        .unwrap();
+    join_raw(
+        &mut carol,
+        welcome_for(&welcomes, b"carol-deferred-self-evict"),
+    )
+    .await
+    .unwrap();
     carol.drain_events();
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
 
@@ -4379,9 +4201,9 @@ async fn deferred_peel_row_terminalized_by_ingest_stays_failed_not_swept_process
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    carol
-        .join_welcome(welcome_for(&welcomes, b"carol-sweep-terminal"))
+    join_raw(&mut carol, welcome_for(&welcomes, b"carol-sweep-terminal"))
         .await
         .unwrap();
     carol.drain_events();
@@ -4493,7 +4315,7 @@ async fn background_advance_bounds_work_across_sweeps_and_resumes_after_restart(
 /// runs out with nothing sleeping.
 #[tokio::test]
 async fn background_advance_yields_on_elapsed_budget_without_abandoning_rows() {
-    let peeler = CancellableEpochSealedPeeler::new();
+    let peeler = ClockedEpochSealedPeeler::new();
     let (mut engine, storage, group_id, _peer) =
         contested_rival_app_backlog_with_peeler(64, peeler.clone(), peeler.clock.clone()).await;
     // Setup peels cost nothing, so the clock still reads zero here.
@@ -4542,7 +4364,7 @@ async fn background_advance_yields_on_elapsed_budget_without_abandoning_rows() {
 /// a second, twice the budget. The next slice remains row-bounded.
 #[tokio::test]
 async fn explicit_time_advance_ignores_wall_budget_but_keeps_row_bound() {
-    let peeler = CancellableEpochSealedPeeler::new();
+    let peeler = ClockedEpochSealedPeeler::new();
     let (mut engine, storage, group_id, _peer) =
         contested_rival_app_backlog_with_peeler(96, peeler.clone(), peeler.clock.clone()).await;
     peeler.peel_cost_ms.store(1_000, Ordering::SeqCst);
@@ -4751,7 +4573,8 @@ async fn alice_disbanding_with_future_epoch_deferred_row() -> (
         SendResult::FoundingGroupCreated { welcomes } => welcomes,
         other => panic!("expected FoundingGroupCreated, got {other:?}"),
     };
-    bob.join_welcome(welcome_for(&welcomes, b"bob-disband-deferred"))
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
+    join_raw(&mut bob, welcome_for(&welcomes, b"bob-disband-deferred"))
         .await
         .unwrap();
     alice.drain_events();
@@ -4921,9 +4744,9 @@ async fn wedged_victim_crawling_a_rival_branch() -> (
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut victim, &welcomes);
     victim.confirm_published(pending).await.unwrap();
-    rival
-        .join_welcome(welcome_for(&welcomes, b"crawl-rival"))
+    join_raw(&mut rival, welcome_for(&welcomes, b"crawl-rival"))
         .await
         .unwrap();
 

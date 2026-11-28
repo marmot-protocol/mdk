@@ -36,7 +36,7 @@ pub(super) fn roster_device(account: &[u8]) -> Device {
 /// [`roster_device`] over `storage`, as a reopened session builds it. The
 /// caller hydrates its groups.
 pub(super) fn roster_device_on(storage: SqliteAccountStorage, account: &[u8]) -> Device {
-    build_roster_device(storage, account, None, Box::<MockPeeler>::default(), None)
+    build_roster_device(storage, account, None, Box::new(MockPeeler), None)
 }
 
 /// [`roster_device_on`] with its forensic rows going to `recorder`.
@@ -45,27 +45,7 @@ pub(super) fn recorded_roster_device_on(
     account: &[u8],
     recorder: Box<dyn marmot_forensics::ForensicRecorder>,
 ) -> Device {
-    build_roster_device(
-        storage,
-        account,
-        None,
-        Box::<MockPeeler>::default(),
-        Some(recorder),
-    )
-}
-
-/// [`roster_device`] with `peeler` in place of the [`MockPeeler`].
-pub(super) fn roster_device_with_peeler(
-    account: &[u8],
-    peeler: Box<dyn TransportPeeler>,
-) -> Device {
-    build_roster_device(
-        SqliteAccountStorage::in_memory_for_test().unwrap(),
-        account,
-        None,
-        peeler,
-        None,
-    )
+    build_roster_device(storage, account, None, Box::new(MockPeeler), Some(recorder))
 }
 
 /// [`roster_device`] on a manual convergence clock.
@@ -74,7 +54,7 @@ pub(super) fn clocked_roster_device(account: &[u8], clock: &ManualConvergenceClo
         SqliteAccountStorage::in_memory_for_test().unwrap(),
         account,
         Some(clock),
-        Box::<MockPeeler>::default(),
+        Box::new(MockPeeler),
         None,
     )
 }
@@ -245,6 +225,7 @@ pub(super) async fn found_device_group(
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
+    let welcomes = seal_and_bind(&mut creator.engine, &welcomes);
     assert_joins(first, &welcomes[0], &gid, creator).await;
     for index in 0..rest.len() {
         let (joined, waiting) = rest.split_at_mut(index);
@@ -273,6 +254,7 @@ pub(super) async fn found_device_group(
         else {
             panic!("a link is a group evolution")
         };
+        let welcomes = seal_and_bind(&mut creator.engine, &welcomes);
         creator.engine.confirm_published(pending).await.unwrap();
         let commit = route_to_group(&msg, &gid);
         assert_accepted(first, &commit, &gid).await;
@@ -470,6 +452,7 @@ async fn a_device_group_is_created_under_the_id_its_link_chose() {
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
+    let welcomes = seal_and_bind(&mut phone.engine, &welcomes);
     expect_link_welcome(&mut laptop, &chosen, &phone, &key_package);
     assert_joins(&mut laptop, &welcomes[0], &chosen, &phone).await;
     let mut expected = initial.clone();
@@ -628,6 +611,7 @@ async fn a_device_groups_founding_add_sets_exactly_its_one_devices_entry() {
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
+    let welcomes = seal_and_bind(&mut phone.engine, &welcomes);
     expect_link_welcome(&mut laptop, &gid, &phone, &key_package);
     assert_joins(&mut laptop, &welcomes[0], &gid, &phone).await;
 }

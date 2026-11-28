@@ -25,7 +25,6 @@
 // Tests read stored records and OpenMLS state directly (see the crate clippy.toml).
 #![allow(clippy::disallowed_methods)]
 
-use async_trait::async_trait;
 use cgka_engine::account_identity_proof::account_identity_proof_component;
 use cgka_engine::canonicalization::{CanonicalizationResult, DroppedMessageReason};
 use cgka_engine::commit_class::{CommitAuthorityError, CommitClass, authorize_staged_commit};
@@ -45,7 +44,7 @@ use cgka_traits::app_components::{
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
     CgkaEngine, CommitOrderingPriority, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent,
-    SendResult, SiblingKeyPackage, WelcomeMetadata,
+    SendResult, SiblingKeyPackage,
 };
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
@@ -81,6 +80,7 @@ use tls_codec::{Deserialize as _, Serialize as _};
 
 mod support;
 use support::proof_signer;
+use support::raw_inbox::{ingest_raw, join_raw, seal_and_bind};
 
 #[path = "account_devices/send_intents.rs"]
 mod send_intents;
@@ -163,24 +163,9 @@ fn hash_id(bytes: &[u8]) -> MessageId {
     MessageId::new(Sha256::digest(bytes).to_vec())
 }
 
-/// Pass-through peeler. Every Welcome gets its own id, as the Nostr adapter's
-/// gift wraps do: one founding Welcome goes to several devices of one account.
-#[derive(Default)]
-struct MockPeeler(std::sync::atomic::AtomicU64);
-
-#[async_trait]
+struct MockPeeler;
 impl TransportPeeler for MockPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -195,22 +180,7 @@ impl TransportPeeler for MockPeeler {
             origin: msg.message.clone(),
         })
     }
-
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
@@ -225,87 +195,6 @@ impl TransportPeeler for MockPeeler {
                 transport_group_id: vec![],
             },
         })
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(TransportMessage {
-            id: hash_id(&[payload.ciphertext.as_slice(), &n.to_be_bytes()].concat()),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("mock".into()),
-            envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
-            },
-        })
-    }
-}
-
-/// [`MockPeeler`], except that it wraps a Welcome only for a KeyPackage that
-/// names its publication, as the Nostr binding does: a Welcome for a private
-/// KeyPackage cannot be wrapped (joining.md, "Delivery").
-#[derive(Default)]
-struct PublishedWelcomesOnly(MockPeeler);
-
-#[async_trait]
-impl TransportPeeler for PublishedWelcomesOnly {
-    async fn wrap_group_recovery(
-        &self,
-        message: &cgka_traits::GroupRecoveryMessage,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.0.wrap_group_recovery(message, recipient).await
-    }
-
-    fn prepare_group_message<'a>(
-        &self,
-        msg: &'a TransportMessage,
-    ) -> Result<cgka_traits::peeler::PreparedGroupMessage<'a>, PeelerError> {
-        self.0.prepare_group_message(msg)
-    }
-
-    async fn peel_group_message(
-        &self,
-        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
-        ctx: &GroupContextSnapshot,
-    ) -> Result<PeeledMessage, PeelerError> {
-        self.0.peel_group_message(msg, ctx).await
-    }
-
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        self.0.peel_welcome(msg).await
-    }
-
-    async fn wrap_group_message(
-        &self,
-        payload: &EncryptedPayload,
-        ctx: &GroupContextSnapshot,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.0.wrap_group_message(payload, ctx).await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        _payload: &EncryptedPayload,
-        _recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::MissingContext {
-            label: "welcome_metadata".into(),
-        })
-    }
-
-    async fn wrap_welcome_with_metadata(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-        _metadata: &WelcomeMetadata,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.0.wrap_welcome(payload, recipient).await
     }
 }
 
@@ -338,25 +227,12 @@ struct Device {
 /// A current-profile device of `account`. Devices built from one label share
 /// the account identity and differ in their MLS signature keys.
 fn device(account: &[u8], advertises_account_devices: bool) -> Device {
-    device_with_peeler(
-        account,
-        advertises_account_devices,
-        Box::<MockPeeler>::default(),
-    )
-}
-
-/// [`device`] with `peeler` in place of the [`MockPeeler`].
-fn device_with_peeler(
-    account: &[u8],
-    advertises_account_devices: bool,
-    peeler: Box<dyn TransportPeeler>,
-) -> Device {
     let extra: &[u16] = if advertises_account_devices {
         &[ACCOUNT_DEVICES_COMPONENT_ID]
     } else {
         &[]
     };
-    device_advertising(account, extra, peeler)
+    device_advertising(account, extra, Box::new(MockPeeler))
 }
 
 /// [`device`] advertising `extra` components beside the defaults.
@@ -508,7 +384,7 @@ async fn create(
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
-    Ok((gid, welcomes))
+    Ok((gid, seal_and_bind(&mut creator.engine, &welcomes)))
 }
 
 /// `alice` founds a group with `members` and each of `joiners` joins from the
@@ -545,7 +421,7 @@ async fn found_group_with_admins(
     }
     let (gid, welcomes) = create(alice, members, initial_admins).await.unwrap();
     for (joiner, welcome) in joiners.iter_mut().zip(welcomes) {
-        joiner.engine.join_welcome(welcome).await.unwrap();
+        join_raw(&mut joiner.engine, welcome).await.unwrap();
     }
     if let Some(outsider) = outsider {
         let remove = send_commit(
@@ -1221,7 +1097,7 @@ fn try_build(supported: Vec<u16>) -> Result<Engine<SqliteAccountStorage>, Engine
         .account_identity_proof_signer(proof_signer(b"builder"))
         .feature_registry(registry())
         .supported_app_components(supported)
-        .peeler(Box::<MockPeeler>::default())
+        .peeler(Box::new(MockPeeler))
         .build()
 }
 
@@ -1633,7 +1509,7 @@ async fn legacy_groups_are_not_subject_to_the_rules() {
             .account_identity_proof_signer(proof_signer(account))
             .feature_registry(registry())
             .supported_app_components(supported)
-            .peeler(Box::<MockPeeler>::default())
+            .peeler(Box::new(MockPeeler))
             .build()
             .unwrap();
         Device { engine, storage }
@@ -1656,9 +1532,9 @@ async fn legacy_groups_are_not_subject_to_the_rules() {
     let SendResult::GroupCreated { pending, welcomes } = created else {
         panic!("legacy founding group")
     };
+    let welcomes = seal_and_bind(&mut alice.engine, &welcomes);
     alice.engine.confirm_published(pending).await.unwrap();
-    bob.engine
-        .join_welcome(welcomes.into_iter().next().unwrap())
+    join_raw(&mut bob.engine, welcomes.into_iter().next().unwrap())
         .await
         .unwrap();
 
@@ -1730,7 +1606,9 @@ async fn legacy_groups_are_not_subject_to_the_rules() {
 // ── Welcome acceptance ──────────────────────────────────────────────────────
 
 async fn join_outcome(joiner: &mut Device, welcome: &TransportMessage) -> IngestOutcome {
-    joiner.engine.ingest(welcome.clone()).await.unwrap()
+    ingest_raw(&mut joiner.engine, welcome.clone())
+        .await
+        .unwrap()
 }
 
 fn refused(category: InputRejectionCategory) -> IngestOutcome {
@@ -2338,14 +2216,14 @@ async fn the_stamp_and_replay_give_every_class_the_same_priority() {
         SqliteAccountStorage::in_memory_for_test().unwrap(),
         b"alice",
         &[ACCOUNT_DEVICES_COMPONENT_ID],
-        Box::<MockPeeler>::default(),
+        Box::new(MockPeeler),
         Some(&clock),
     );
     let bob = build_device(
         SqliteAccountStorage::in_memory_for_test().unwrap(),
         b"bob",
         &[ACCOUNT_DEVICES_COMPONENT_ID],
-        Box::<MockPeeler>::default(),
+        Box::new(MockPeeler),
         Some(&bob_clock),
     );
     let mut m = members_with_initial_devices(true, alice, bob).await;

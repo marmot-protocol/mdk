@@ -442,6 +442,8 @@ mod migration_0226_local_submission_refused;
 mod migration_0227_welcome_expiry_mark;
 #[path = "migrations/0228_canonicalize_group_id_hex.rs"]
 mod migration_0228_canonicalize_group_id_hex;
+#[path = "migrations/0229_unsealed_welcome.rs"]
+mod migration_0229_unsealed_welcome;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1664,6 +1666,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0228_canonicalize_group_id_hex",
         suspend_foreign_keys: &[],
         apply: migration_0228_canonicalize_group_id_hex::apply,
+    },
+    Migration {
+        version: 229,
+        name: "0229_unsealed_welcome",
+        suspend_foreign_keys: &[],
+        apply: migration_0229_unsealed_welcome::apply,
     },
 ];
 

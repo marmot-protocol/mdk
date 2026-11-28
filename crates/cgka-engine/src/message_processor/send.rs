@@ -9,7 +9,7 @@ use crate::engine::Engine;
 use crate::group_lifecycle::{self};
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
-use cgka_traits::engine::{EpochPin, SendIntent, SendResult};
+use cgka_traits::engine::{EpochPin, OutboundWelcome, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
 use cgka_traits::message::OwnApplicationConvergenceStamp;
@@ -24,10 +24,10 @@ use openmls_traits::OpenMlsProvider as _;
 use std::collections::HashSet;
 use tls_codec::Serialize as _;
 
-/// A staged Commit's Welcome wrapped for one added KeyPackage, not yet
-/// recorded ([`Engine::wrap_staged_welcomes`]).
+/// A staged Commit's Welcome for one added KeyPackage, not yet recorded
+/// ([`Engine::wrap_staged_welcomes`]).
 pub(crate) struct WrappedWelcome {
-    pub(super) message: TransportMessage,
+    pub(super) welcome: OutboundWelcome,
     pub(super) key_package_ref: Vec<u8>,
     /// The transport event of the KeyPackage it answers, when it came from
     /// one.
@@ -573,18 +573,16 @@ impl<S: StorageProvider> Engine<S> {
                 },
                 &pre_commit_ctx,
             )
-            .await
             .map_err(EngineError::Peeler)?;
         let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
-        let welcomes = self
-            .wrap_staged_welcomes(
-                &mls_group,
-                &welcome_bytes,
-                &key_packages,
-                &recovery_sources,
-                &parsed_kps,
-            )
-            .await?;
+        let welcomes = self.wrap_staged_welcomes(
+            &commit_msg.id,
+            &mls_group,
+            &welcome_bytes,
+            &key_packages,
+            &recovery_sources,
+            &parsed_kps,
+        )?;
         crate::capability_manager::check_key_package_profiles(
             self.storage.as_ref(),
             &group_id,
@@ -697,9 +695,6 @@ impl<S: StorageProvider> Engine<S> {
         }
         self.sent_message_ids.insert(commit_msg.id.clone());
         self.sent_message_ids.insert(content_id);
-        for welcome in &welcomes {
-            self.sent_message_ids.insert(welcome.id.clone());
-        }
         self.invalidate_deferred_peel_candidate_cache(&group_id);
         self.epoch_manager.commit_pending(prepared_pending);
         self.audit_group(
@@ -725,15 +720,15 @@ impl<S: StorageProvider> Engine<S> {
         })
     }
 
-    /// Wrap a staged Commit's Welcome once per added KeyPackage, addressed to
-    /// that KeyPackage's account and naming its publication (joining.md,
-    /// "Delivery"). This writes nothing, and a caller wraps every Welcome
-    /// before it records its Commit: a Welcome that cannot be wrapped, as one
-    /// for a KeyPackage that names no publication, refuses the intent with
-    /// nothing written. [`Self::persist_staged_welcomes`] records them.
+    /// Address a staged Commit's Welcome once per added KeyPackage to that
+    /// KeyPackage's account, naming its publication (joining.md,
+    /// "Delivery"), unsealed: the session seals it. This writes nothing;
+    /// [`Self::persist_staged_welcomes`] records them. Each is keyed by a
+    /// local id derived from `origin_commit_id` and its KeyPackage.
     /// Parsed packages follow ordinary packages, then recovery packages.
-    pub(crate) async fn wrap_staged_welcomes(
+    pub(crate) fn wrap_staged_welcomes(
         &self,
+        origin_commit_id: &MessageId,
         mls_group: &MlsGroup,
         welcome_bytes: &[u8],
         key_packages: &[cgka_traits::engine::KeyPackage],
@@ -753,27 +748,27 @@ impl<S: StorageProvider> Engine<S> {
                     .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
                 MemberId::new(bc.identity().to_vec())
             };
-            let payload = EncryptedPayload {
-                ciphertext: welcome_bytes.to_vec(),
-                aad: vec![],
-            };
-            let message = if let Some(metadata) =
-                crate::group_lifecycle::welcome_metadata_for_key_package(
+            let key_package_ref = crate::key_package::key_package_ref(parsed_kp)?
+                .as_slice()
+                .to_vec();
+            let welcome = OutboundWelcome {
+                local_id: super::store::welcome_local_id(
+                    origin_commit_id.as_slice(),
+                    &key_package_ref,
+                ),
+                recipient,
+                payload: EncryptedPayload {
+                    ciphertext: welcome_bytes.to_vec(),
+                    aad: vec![],
+                },
+                metadata: crate::group_lifecycle::welcome_metadata_for_key_package(
                     source_kp,
                     welcome_relays.as_deref(),
-                )? {
-                self.peeler
-                    .wrap_welcome_with_metadata(&payload, &recipient, &metadata)
-                    .await
-            } else {
-                self.peeler.wrap_welcome(&payload, &recipient).await
-            }
-            .map_err(EngineError::Peeler)?;
+                )?,
+            };
             welcomes.push(WrappedWelcome {
-                message,
-                key_package_ref: crate::key_package::key_package_ref(parsed_kp)?
-                    .as_slice()
-                    .to_vec(),
+                welcome,
+                key_package_ref,
                 key_package_event_id: source_kp
                     .source
                     .as_ref()
@@ -796,12 +791,12 @@ impl<S: StorageProvider> Engine<S> {
         commit_id: &MessageId,
         source_epoch: EpochId,
         link_deliver_until: Option<cgka_traits::transport::Timestamp>,
-    ) -> Result<Vec<TransportMessage>, EngineError> {
+    ) -> Result<Vec<OutboundWelcome>, EngineError> {
         let now = self.wall_clock.now();
         welcomes
             .into_iter()
             .map(|welcome| {
-                let message = welcome.message.clone();
+                let outbound = welcome.welcome.clone();
                 let deliver_until = link_deliver_until.unwrap_or_else(|| {
                     crate::welcome_deadline::welcome_deliver_until(
                         now,
@@ -815,7 +810,7 @@ impl<S: StorageProvider> Engine<S> {
                     group_id,
                     source_epoch,
                 )?;
-                Ok(message)
+                Ok(outbound)
             })
             .collect()
     }
@@ -1012,7 +1007,6 @@ impl<S: StorageProvider> Engine<S> {
                 },
                 &pre_commit_ctx,
             )
-            .await
             .map_err(EngineError::Peeler)?;
         let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
 
@@ -1275,7 +1269,6 @@ impl<S: StorageProvider> Engine<S> {
                 },
                 &ctx,
             )
-            .await
             .map_err(EngineError::Peeler)?;
         let wrapped = route_wrapped_group_message(wrapped, &ctx);
 
@@ -1575,7 +1568,6 @@ impl<S: StorageProvider> Engine<S> {
                 &ctx,
                 &wrap_metadata,
             )
-            .await
             .map_err(EngineError::Peeler)?;
 
         let wrapped = route_wrapped_group_message(wrapped, &ctx);

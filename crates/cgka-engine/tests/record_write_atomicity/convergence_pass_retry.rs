@@ -218,20 +218,18 @@ async fn failing_catch_up_on_storage(
         .await
         .unwrap();
     let (welcome, frank_welcome) = match create {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let mut welcomes = seal_and_bind(&mut alice, &welcomes);
             alice.confirm_published(pending).await.unwrap();
             let frank_welcome = (welcomes.len() > 1).then(|| welcomes.remove(1));
             (welcomes.remove(0), frank_welcome)
         }
         other => panic!("expected GroupCreated, got {other:?}"),
     };
-    carol.join_welcome(welcome).await.unwrap();
+    join_raw(&mut carol, welcome).await.unwrap();
     let mut frank_leave = None;
     if let (Some(frank), Some(welcome)) = (frank.as_mut(), frank_welcome) {
-        frank.join_welcome(welcome).await.unwrap();
+        join_raw(frank, welcome).await.unwrap();
         frank_leave = match frank
             .send(SendIntent::Leave {
                 group_id: group_id.clone(),

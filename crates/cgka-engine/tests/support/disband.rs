@@ -26,10 +26,13 @@ pub async fn found_and_join(
         })
         .await
         .unwrap();
-    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group");
     };
-    member.join_welcome(welcomes.remove(0)).await.unwrap();
+    let mut welcomes = super::raw_inbox::seal_and_bind(founder, &welcomes);
+    super::raw_inbox::join_raw(member, welcomes.remove(0))
+        .await
+        .unwrap();
     member.drain_events();
     group_id
 }

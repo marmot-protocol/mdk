@@ -11,18 +11,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use cgka_traits::engine::WelcomeMetadata;
+use cgka_traits::engine::OutboundWelcome;
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::{Group, ProtocolProfile};
-use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::PeeledMessage;
-use cgka_traits::peeler::{GroupMessageMetadata, TransportPeeler};
-use cgka_traits::transport::EncryptedPayload;
+use cgka_traits::peeler::InboxSealer;
 use cgka_traits::types::MemberId;
 use cgka_traits::{GroupEvent, TransportMessage};
 use marmot_forensics::v5::*;
 use transport_nostr_peeler::AccountGiftWrap;
-use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent, WelcomePeelProvenance};
+use transport_nostr_peeler::{NostrInboxSealer, NostrTransportEvent, WelcomePeelProvenance};
 
 use crate::AppGroupRecord;
 
@@ -66,15 +64,15 @@ impl PeelSlot {
 
 /// App-owned inbox boundary: apply invitation policy only after the one
 /// authenticated inner decode, and observe that same peel without repeating it.
-pub(crate) struct ProbePeeler {
-    pub inner: NostrMlsPeeler,
+pub(crate) struct ProbeSealer {
+    pub inner: NostrInboxSealer,
     pub slot: Arc<Mutex<PeelSlot>>,
     pub storage: storage_sqlite::SqliteAppStorage,
     /// Takes the pairing messages among the gift wraps to the account.
     pub pairing: Option<super::device_pairing::PairingInbox>,
 }
 
-impl ProbePeeler {
+impl ProbeSealer {
     /// Open a gift wrap to the account once: a Welcome peels as before, and
     /// a pairing message goes to the pairing inbox and recovery keeps its
     /// authenticated control payload. Other rumors are still refused.
@@ -82,7 +80,7 @@ impl ProbePeeler {
         &self,
         msg: &TransportMessage,
     ) -> Result<(PeeledMessage, Option<WelcomePeelProvenance>), PeelerError> {
-        let opened = self.inner.peel_account_gift_wrap(msg).await?;
+        let opened = self.inner.open_account_gift_wrap(msg).await?;
         if let AccountGiftWrap::Other(unwrapped) = &opened {
             // Remember the authenticated inner kind before the engine
             // refuses this non-Welcome, even when pairing is disabled or
@@ -100,23 +98,8 @@ impl ProbePeeler {
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-impl TransportPeeler for ProbePeeler {
-    fn prepare_group_message<'a>(
-        &self,
-        msg: &'a TransportMessage,
-    ) -> Result<cgka_traits::peeler::PreparedGroupMessage<'a>, PeelerError> {
-        self.inner.prepare_group_message(msg)
-    }
-
-    async fn peel_group_message(
-        &self,
-        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
-        ctx: &GroupContextSnapshot,
-    ) -> Result<PeeledMessage, PeelerError> {
-        self.inner.peel_group_message(msg, ctx).await
-    }
-
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+impl InboxSealer for ProbeSealer {
+    async fn unseal(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
         let started = Instant::now();
         let result = self
             .open_welcome(msg)
@@ -194,50 +177,23 @@ impl TransportPeeler for ProbePeeler {
         result.map(|(peeled, _)| peeled)
     }
 
-    async fn wrap_group_recovery(
+    async fn seal_welcome(
+        &self,
+        welcome: &OutboundWelcome,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner.seal_welcome(welcome).await
+    }
+
+    async fn seal_group_recovery(
         &self,
         message: &cgka_traits::GroupRecoveryMessage,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
-        self.inner.wrap_group_recovery(message, recipient).await
+        self.inner.seal_group_recovery(message, recipient).await
     }
 
-    async fn wrap_group_message(
-        &self,
-        payload: &EncryptedPayload,
-        ctx: &GroupContextSnapshot,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.inner.wrap_group_message(payload, ctx).await
-    }
-
-    async fn wrap_group_message_with_metadata(
-        &self,
-        payload: &EncryptedPayload,
-        ctx: &GroupContextSnapshot,
-        metadata: &GroupMessageMetadata,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.inner
-            .wrap_group_message_with_metadata(payload, ctx, metadata)
-            .await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.inner.wrap_welcome(payload, recipient).await
-    }
-
-    async fn wrap_welcome_with_metadata(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-        metadata: &WelcomeMetadata,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.inner
-            .wrap_welcome_with_metadata(payload, recipient, metadata)
-            .await
+    fn sealed_welcome_len(&self, welcome: &OutboundWelcome) -> usize {
+        self.inner.sealed_welcome_len(welcome)
     }
 }
 

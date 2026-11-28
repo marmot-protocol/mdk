@@ -6,7 +6,7 @@
 //! of the new device's wait (D40); every other one's is
 //! [`welcome_deliver_until`].
 
-use cgka_traits::message::StoredMessagePayload;
+use cgka_traits::message::{StoredMessagePayload, UnsealedWelcomeOrigin};
 use cgka_traits::transport::Timestamp;
 
 /// How long an invite's or a founding create's Welcome stays deliverable
@@ -32,12 +32,17 @@ pub(crate) fn welcome_deliver_until(staged_at: Timestamp, key_package_not_after:
 }
 
 /// The delivery deadline a stored staged or owed Welcome is held to; `None`
-/// for any other payload. A Welcome stored before Welcomes kept a deadline is
-/// held to its transport timestamp plus the window: when it was staged is
+/// for any other payload. A sealed Welcome stored before Welcomes kept a
+/// deadline is held to its transport timestamp plus the window: when it was staged is
 /// not stored, and a transport may date a wrap earlier than that (a Nostr
 /// gift wrap by up to two days), never later.
 pub(crate) fn stored_welcome_deliver_until(payload: &StoredMessagePayload) -> Option<Timestamp> {
     match payload {
+        StoredMessagePayload::UnsealedWelcome {
+            origin: UnsealedWelcomeOrigin::Founding,
+            deliver_until,
+            ..
+        } => *deliver_until,
         StoredMessagePayload::OutboundWelcome {
             message,
             deliver_until,

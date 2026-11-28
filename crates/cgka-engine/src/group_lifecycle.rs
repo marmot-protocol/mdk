@@ -25,14 +25,18 @@ use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceSlotId, decode_device_roster_v1, default_group_components,
 };
 use cgka_traits::capabilities::GroupCapabilities;
-use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMetadata};
+use cgka_traits::engine::{
+    CreateGroupRequest, KeyPackage, OutboundWelcome, SendResult, WelcomeMetadata,
+};
 use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::maintenance::{
     GroupMaintenanceState, KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase,
     MaintenanceTrigger, PeriodicMaintenancePolicy, PostJoinHistoryFetch,
 };
-use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
+use cgka_traits::message::{
+    MessageRecord, MessageState, StoredMessagePayload, UnsealedWelcomeOrigin,
+};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
@@ -826,9 +830,8 @@ impl<S: StorageProvider> Engine<S> {
             device_roster_departures: Vec::new(),
         };
 
-        // 5. Wrap welcomes via the peeler, before the group record or any
-        //    Welcome is written: a Welcome that cannot be wrapped refuses the
-        //    creation.
+        // 5. Address one unsealed Welcome to each invitee, before the group
+        //    record or any Welcome is written. The session seals them.
         //
         // Note: we intentionally do NOT emit the commit. The creator is the
         // only party who'd care about the "commit that creates the group at
@@ -841,22 +844,22 @@ impl<S: StorageProvider> Engine<S> {
         let mut welcomes = Vec::with_capacity(parsed_kps.len());
         if let Some(welcome_bytes) = &welcome_bytes {
             for (source_kp, parsed_kp) in req.members.iter().zip(parsed_kps.iter()) {
-                let recipient = member_id_of_key_package(parsed_kp)?;
-                let payload = EncryptedPayload {
-                    ciphertext: welcome_bytes.clone(),
-                    aad: vec![],
-                };
-                let wrapped = if let Some(metadata) =
-                    welcome_metadata_for_key_package(source_kp, welcome_relays.as_deref())?
-                {
-                    self.peeler
-                        .wrap_welcome_with_metadata(&payload, &recipient, &metadata)
-                        .await
-                } else {
-                    self.peeler.wrap_welcome(&payload, &recipient).await
-                }
-                .map_err(EngineError::Peeler)?;
-                welcomes.push(wrapped);
+                let key_package_ref = crate::key_package::key_package_ref(parsed_kp)?;
+                welcomes.push(OutboundWelcome {
+                    local_id: crate::message_processor::welcome_local_id(
+                        group_id.as_slice(),
+                        key_package_ref.as_slice(),
+                    ),
+                    recipient: member_id_of_key_package(parsed_kp)?,
+                    payload: EncryptedPayload {
+                        ciphertext: welcome_bytes.clone(),
+                        aad: vec![],
+                    },
+                    metadata: welcome_metadata_for_key_package(
+                        source_kp,
+                        welcome_relays.as_deref(),
+                    )?,
+                });
             }
         }
         // A founder's Welcome that fits none of the relays its publish would
@@ -896,12 +899,12 @@ impl<S: StorageProvider> Engine<S> {
 
         if self.new_protocol_profile == ProtocolProfile::Current {
             let enrolled_at = self.wall_clock.now();
-            let unique_welcome_ids = welcomes
+            let unique_local_ids = welcomes
                 .iter()
-                .map(|welcome| welcome.id.as_slice().to_vec())
+                .map(|welcome| welcome.local_id.as_slice().to_vec())
                 .collect::<BTreeSet<_>>();
             if welcomes.len() != ordinary_member_count
-                || unique_welcome_ids.len() != ordinary_member_count
+                || unique_local_ids.len() != ordinary_member_count
                 || sibling_welcomes.len() != siblings.len()
             {
                 return Err(EngineError::Backend(
@@ -974,15 +977,15 @@ impl<S: StorageProvider> Engine<S> {
                         for ((welcome, parsed_kp), source_kp) in
                             welcomes.iter().zip(&parsed_kps).zip(&req.members)
                         {
-                            let payload = StoredMessagePayload::outbound_welcome(
-                                welcome.clone(),
-                                None,
-                                Some(
+                            let payload = StoredMessagePayload::UnsealedWelcome {
+                                welcome: welcome.clone(),
+                                origin: UnsealedWelcomeOrigin::Founding,
+                                key_package_ref: Some(
                                     crate::key_package::key_package_ref(parsed_kp)?
                                         .as_slice()
                                         .to_vec(),
                                 ),
-                                Some(chosen.as_ref().map_or_else(
+                                deliver_until: Some(chosen.as_ref().map_or_else(
                                     || {
                                         crate::welcome_deadline::welcome_deliver_until(
                                             enrolled_at,
@@ -991,13 +994,12 @@ impl<S: StorageProvider> Engine<S> {
                                     },
                                     |chosen| chosen.welcome_deliver_until,
                                 )),
-                            )
-                            .with_key_package_event_id(
-                                source_kp
+                                key_package_event_id: source_kp
                                     .source
                                     .as_ref()
                                     .map(|source| source.event_id.clone()),
-                            )
+                                expiry: None,
+                            }
                             .encode()
                             .map_err(|error| {
                                 EngineError::Serialize(format!(
@@ -1005,7 +1007,7 @@ impl<S: StorageProvider> Engine<S> {
                                 ))
                             })?;
                             storage.put_message(&MessageRecord {
-                                id: welcome.id.clone(),
+                                id: welcome.local_id.clone(),
                                 group_id: group_id.clone(),
                                 epoch: canonical_epoch,
                                 state: MessageState::Sent,
@@ -1058,23 +1060,6 @@ impl<S: StorageProvider> Engine<S> {
             // failure must not delete or roll back the canonical group.
             new_group_guard.disarm();
 
-            for welcome in &welcomes {
-                // `Sent` deliberately means "durable outbound obligation",
-                // not "transport delivery completed". Account orchestration
-                // moves an acknowledged Welcome to `Processed`; until then it
-                // remains discoverable after a crash for independent retry.
-                self.sent_message_ids.insert(welcome.id.clone());
-                self.audit_group(
-                    &group_id,
-                    crate::audit_helpers::message_state_transition_event(
-                        hex::encode(welcome.id.as_slice()),
-                        None,
-                        MessageState::Sent,
-                        Some(canonical_epoch),
-                        "founding_welcome_persisted",
-                    ),
-                );
-            }
             if let Ok(transport_group_id) =
                 crate::app_components::transport_group_id_of_group(&mls_group)
             {
@@ -1146,7 +1131,18 @@ impl<S: StorageProvider> Engine<S> {
                 );
             }
             for welcome in &welcomes {
-                self.persist_transport_message(welcome, &group_id, EpochId(0), MessageState::Sent)?;
+                self.persist_unsealed_welcome(
+                    StoredMessagePayload::UnsealedWelcome {
+                        welcome: welcome.clone(),
+                        origin: UnsealedWelcomeOrigin::LegacyCreate,
+                        key_package_ref: None,
+                        deliver_until: None,
+                        key_package_event_id: None,
+                        expiry: None,
+                    },
+                    &group_id,
+                    EpochId(0),
+                )?;
             }
             Ok::<_, EngineError>(())
         })?;
@@ -1174,9 +1170,6 @@ impl<S: StorageProvider> Engine<S> {
         {
             self.transport_group_id_index
                 .insert(transport_group_id, group_id.clone());
-        }
-        for welcome in &welcomes {
-            self.sent_message_ids.insert(welcome.id.clone());
         }
 
         // The caller now owns the legacy creation through its pending ref;
@@ -1264,70 +1257,118 @@ impl<S: StorageProvider> Engine<S> {
             .any(|candidate| candidate.rejoin.is_some()))
     }
 
-    /// Retry owned offers once trusted removal (or Unrecoverable repair) makes
-    /// ordinary joining legal. Hosts call this on their maintenance seam, so
-    /// recovery does not depend on another relay copy passing app deduplication.
-    pub async fn retry_rejoins_after_trusted_removal(&mut self) -> Result<bool, EngineError> {
-        let mut joined = false;
-        for candidate in self.storage.list_welcomes()? {
-            if candidate.rejoin.is_none() {
-                continue;
-            }
-            let group = match self.stored_group_record(&candidate.group_id) {
-                Ok(Some(group)) => group,
-                Ok(None) => continue,
-                Err(_) => {
-                    tracing::debug!(target: "cgka_engine::group_lifecycle",
-                        method = "retry_rejoins_after_trusted_removal", "skipping an unreadable group");
-                    continue;
-                }
-            };
-            if (!group.removed && !group.unrecoverable) || group.disbanded.is_some() {
-                continue;
-            }
-            let welcome: TransportMessage = match serde_json::from_slice(&candidate.welcome_bytes) {
-                Ok(welcome) => welcome,
-                Err(_) => {
-                    // This stored payload can never be retried successfully.
-                    self.storage.take_welcome(&candidate.message_id)?;
-                    tracing::debug!(target: "cgka_engine::group_lifecycle",
-                        method = "retry_rejoins_after_trusted_removal", "retired an undecodable offer");
-                    continue;
-                }
-            };
-            if self.ensure_hydrated(&candidate.group_id).is_err()
-                || self.quarantined_reason(&candidate.group_id).is_some()
-            {
-                tracing::debug!(target: "cgka_engine::group_lifecycle",
-                    method = "retry_rejoins_after_trusted_removal", "skipping a group awaiting hydration repair");
-                continue;
-            }
-            match self
-                .do_join_welcome(welcome, None, WelcomeRoute::Delivery)
-                .await
-            {
-                Ok(_) => joined = true,
-                Err(error) if terminal_welcome_error(&error) => {
-                    self.storage.take_welcome(&candidate.message_id)?;
-                }
-                Err(_) => {
-                    // Keep retryable material owned, but isolate this offer's
-                    // failure from other rejoins and inviter-side recovery.
-                    tracing::debug!(target: "cgka_engine::group_lifecycle",
-                        method = "retry_rejoins_after_trusted_removal", "rejoin remains pending");
-                }
-            }
+    /// Retry stored offers after trusted removal or Unrecoverable repair.
+    /// The caller unseals each eligible offer before asking for the next one.
+    pub fn rejoin_retry(&mut self) -> Result<RejoinRetry<'_, S>, EngineError> {
+        let candidates = self.storage.list_welcomes()?.into_iter();
+        Ok(RejoinRetry {
+            engine: self,
+            candidates,
+        })
+    }
+
+    fn prepare_rejoin_after_trusted_removal(
+        &mut self,
+        candidate: &PendingWelcome,
+    ) -> Result<Option<TransportMessage>, EngineError> {
+        if candidate.rejoin.is_none() {
+            return Ok(None);
         }
-        Ok(joined)
+        let group = match self.stored_group_record(&candidate.group_id) {
+            Ok(Some(group)) => group,
+            Ok(None) => return Ok(None),
+            Err(_) => {
+                tracing::debug!(target: "cgka_engine::group_lifecycle",
+                    method = "prepare_rejoin_after_trusted_removal", "skipping an unreadable group");
+                return Ok(None);
+            }
+        };
+        if (!group.removed && !group.unrecoverable) || group.disbanded.is_some() {
+            return Ok(None);
+        }
+        let Ok(welcome) = serde_json::from_slice(&candidate.welcome_bytes) else {
+            self.storage.take_welcome(&candidate.message_id)?;
+            tracing::debug!(target: "cgka_engine::group_lifecycle",
+                method = "prepare_rejoin_after_trusted_removal", "retired an undecodable offer");
+            return Ok(None);
+        };
+        if self.ensure_hydrated(&candidate.group_id).is_err()
+            || self.quarantined_reason(&candidate.group_id).is_some()
+        {
+            tracing::debug!(target: "cgka_engine::group_lifecycle",
+                method = "prepare_rejoin_after_trusted_removal", "skipping a group awaiting hydration repair");
+            return Ok(None);
+        }
+        if let Err(error) = self.check_welcome_delivery(&welcome) {
+            self.finish_failed_rejoin(&candidate.message_id, &error)?;
+            return Ok(None);
+        }
+        Ok(Some(welcome))
+    }
+
+    fn finish_failed_rejoin(
+        &self,
+        welcome_id: &MessageId,
+        error: &EngineError,
+    ) -> Result<(), EngineError> {
+        if terminal_welcome_error(error) {
+            self.storage.take_welcome(welcome_id)?;
+        } else {
+            tracing::debug!(target: "cgka_engine::group_lifecycle",
+                method = "rejoin_retry", "rejoin remains pending");
+        }
+        Ok(())
     }
 
     /// Explicit recipient consent to discard the exact local branch shown by
     /// the offer. Validation and replacement share a transaction; history stays.
+    /// `unsealed` is the session's unseal of [`Self::stored_welcome`].
     pub async fn confirm_group_rejoin(
         &mut self,
         welcome_id: &MessageId,
         local_state_token: &[u8],
+        unsealed: cgka_traits::ingest::PeeledMessage,
     ) -> Result<GroupId, EngineError> {
+        let candidate = self.consented_rejoin_offer(welcome_id, local_state_token)?;
+        self.ensure_hydrated(&candidate.group_id)?;
+        // Recheck the live token inside the replacement transaction below.
+        let welcome: TransportMessage = serde_json::from_slice(&candidate.welcome_bytes)
+            .map_err(|error| EngineError::Serialize(error.to_string()))?;
+        if unsealed.id != candidate.message_id {
+            return Err(EngineError::InvalidWelcome);
+        }
+        let content_id = WelcomeContentId::of(&unsealed)?;
+        self.join_peeled_welcome_with_consent(
+            welcome,
+            unsealed,
+            content_id,
+            Some((&candidate.group_id, local_state_token)),
+            WelcomeRoute::Delivery,
+        )
+        .await
+    }
+
+    /// The sealed delivery of the stored rejoin offer `welcome_id`, for the
+    /// session to unseal before [`Self::confirm_group_rejoin`]. It answers only
+    /// while `local_state_token` still names the local branch, so a stale
+    /// confirmation never reaches the signer.
+    pub fn stored_welcome(
+        &self,
+        welcome_id: &MessageId,
+        local_state_token: &[u8],
+    ) -> Result<TransportMessage, EngineError> {
+        let candidate = self.consented_rejoin_offer(welcome_id, local_state_token)?;
+        serde_json::from_slice(&candidate.welcome_bytes)
+            .map_err(|error| EngineError::Serialize(error.to_string()))
+    }
+
+    /// The stored rejoin offer `welcome_id`, while `local_state_token` names
+    /// the local branch it would replace.
+    fn consented_rejoin_offer(
+        &self,
+        welcome_id: &MessageId,
+        local_state_token: &[u8],
+    ) -> Result<PendingWelcome, EngineError> {
         let candidate = self
             .storage
             .list_welcomes()?
@@ -1346,24 +1387,7 @@ impl<S: StorageProvider> Engine<S> {
         if Sha256::digest(group.epoch_authenticator().as_slice()).as_slice() != local_state_token {
             return Err(rejoin_confirmation_required());
         }
-        self.ensure_hydrated(&candidate.group_id)?;
-        // Recheck the live token inside the replacement transaction below.
-        let welcome: TransportMessage = serde_json::from_slice(&candidate.welcome_bytes)
-            .map_err(|error| EngineError::Serialize(error.to_string()))?;
-        let peeled = self
-            .peeler
-            .peel_welcome(&welcome)
-            .await
-            .map_err(EngineError::Peeler)?;
-        let content_id = WelcomeContentId::of(&peeled)?;
-        self.join_peeled_welcome_with_consent(
-            welcome,
-            peeled,
-            content_id,
-            Some((&candidate.group_id, local_state_token)),
-            WelcomeRoute::Delivery,
-        )
-        .await
+        Ok(candidate)
     }
 
     /// Reject only the selected offer. Redelivery cannot re-open it.
@@ -1378,7 +1402,7 @@ impl<S: StorageProvider> Engine<S> {
     /// Flow:
     /// 1. Dedupe against prior ingest of this welcome
     /// 2. Verify the welcome envelope targets this client
-    /// 3. Peel via `TransportPeeler::peel_welcome`
+    /// 3. Take the caller's unsealed content
     /// 4. Deserialize the inner MLS Welcome
     /// 5. Stage the welcome into an `MlsGroup` (ratchet tree is embedded)
     /// 6. Persist the Marmot `Group` record
@@ -1388,9 +1412,15 @@ impl<S: StorageProvider> Engine<S> {
     pub(crate) async fn do_join_welcome(
         &mut self,
         welcome_msg: TransportMessage,
-        prepeeled: Option<(cgka_traits::ingest::PeeledMessage, WelcomeContentId)>,
+        (peeled, content_id): (cgka_traits::ingest::PeeledMessage, WelcomeContentId),
         route: WelcomeRoute,
     ) -> Result<GroupId, EngineError> {
+        self.check_welcome_delivery(&welcome_msg)?;
+        self.join_checked_welcome(welcome_msg, peeled, content_id, route)
+            .await
+    }
+
+    fn check_welcome_delivery(&self, welcome_msg: &TransportMessage) -> Result<(), EngineError> {
         // 1. Dedupe. The ingest-path welcome handler already guards with
         // `seen_message_ids`; direct `CgkaEngine::join_welcome` callers
         // skipped that. Without this check, a re-call would re-stage a
@@ -1428,21 +1458,17 @@ impl<S: StorageProvider> Engine<S> {
                 ));
             }
         }
-        let welcome_id = welcome_msg.id.clone();
+        Ok(())
+    }
 
-        // 3. Peel.
-        let (peeled, content_id) = match prepeeled {
-            Some(prepared) => prepared,
-            None => {
-                let peeled = self
-                    .peeler
-                    .peel_welcome(&welcome_msg)
-                    .await
-                    .map_err(EngineError::Peeler)?;
-                let content_id = WelcomeContentId::of(&peeled)?;
-                (peeled, content_id)
-            }
-        };
+    async fn join_checked_welcome(
+        &mut self,
+        welcome_msg: TransportMessage,
+        peeled: cgka_traits::ingest::PeeledMessage,
+        content_id: WelcomeContentId,
+        route: WelcomeRoute,
+    ) -> Result<GroupId, EngineError> {
+        let welcome_id = welcome_msg.id.clone();
         if content_id.is_settled(self.storage.as_ref())? {
             self.storage.put_ingress_dedup_marker(&welcome_id)?;
             return Err(EngineError::WelcomeAlreadyProcessed);
@@ -2749,6 +2775,70 @@ fn rejoin_confirmation_required() -> EngineError {
         to: "JoinWelcome",
         reason: "replacement Welcome requires trusted removal evidence or explicit recipient confirmation",
     })
+}
+
+/// A pass over stored rejoin offers in storage order ([`Engine::rejoin_retry`]).
+pub struct RejoinRetry<'a, S: StorageProvider> {
+    engine: &'a mut Engine<S>,
+    candidates: std::vec::IntoIter<PendingWelcome>,
+}
+
+impl<S: StorageProvider> RejoinRetry<'_, S> {
+    /// Check each offer against the current group state, including any rejoin
+    /// applied earlier in this pass.
+    pub fn next_offer(&mut self) -> Result<Option<PreparedRejoin<'_, S>>, EngineError> {
+        for candidate in self.candidates.by_ref() {
+            if let Some(welcome) = self
+                .engine
+                .prepare_rejoin_after_trusted_removal(&candidate)?
+            {
+                return Ok(Some(PreparedRejoin {
+                    engine: self.engine,
+                    message_id: candidate.message_id,
+                    welcome,
+                }));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// An automatic rejoin ready for the caller to unseal.
+pub struct PreparedRejoin<'a, S: StorageProvider> {
+    engine: &'a mut Engine<S>,
+    message_id: MessageId,
+    welcome: TransportMessage,
+}
+
+impl<S: StorageProvider> PreparedRejoin<'_, S> {
+    pub fn welcome(&self) -> &TransportMessage {
+        &self.welcome
+    }
+
+    /// Apply the unseal result. Returns true if the offer joined.
+    pub async fn apply(
+        self,
+        unsealed: Result<cgka_traits::ingest::PeeledMessage, cgka_traits::error::PeelerError>,
+    ) -> Result<bool, EngineError> {
+        let outcome = match unsealed.map_err(EngineError::Peeler).and_then(|peeled| {
+            let content_id = WelcomeContentId::of(&peeled)?;
+            Ok((peeled, content_id))
+        }) {
+            Ok((peeled, content_id)) => {
+                self.engine
+                    .join_checked_welcome(self.welcome, peeled, content_id, WelcomeRoute::Delivery)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                self.engine.finish_failed_rejoin(&self.message_id, &error)?;
+                Ok(false)
+            }
+        }
+    }
 }
 
 /// Re-join offers with their consent tokens ([`Engine::rejoin_offers`]).

@@ -621,7 +621,7 @@ impl<S: StorageProvider> Engine<S> {
         let joined = self
             .do_join_welcome(
                 msg.clone(),
-                Some((peeled, content_id.clone())),
+                (peeled, content_id.clone()),
                 crate::group_lifecycle::WelcomeRoute::Sibling {
                     from: welcome.from,
                     key_package_ref: welcome.key_package_ref.clone(),

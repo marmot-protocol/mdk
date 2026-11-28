@@ -10,7 +10,6 @@
 //! CI and `just fast-ci` / `just ci` invoke that recipe separately from the
 //! feature-enabled integration-test matrix.
 
-use async_trait::async_trait;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 #[cfg(not(feature = "test-policy-overrides"))]
 use cgka_engine::openmls_projection::OpenMlsProjectionError;
@@ -22,7 +21,6 @@ use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::PeeledMessage;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
-use cgka_traits::types::MemberId;
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
@@ -48,19 +46,8 @@ fn valid_identity(seed: &[u8]) -> Vec<u8> {
 
 struct StubPeeler;
 
-#[async_trait]
 impl TransportPeeler for StubPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         _msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -68,22 +55,10 @@ impl TransportPeeler for StubPeeler {
         Err(PeelerError::Backend("test peeler".into()))
     }
 
-    async fn peel_welcome(&self, _msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Err(PeelerError::Backend("test peeler".into()))
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         _payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
-    ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::Backend("test peeler".into()))
-    }
-
-    async fn wrap_welcome(
-        &self,
-        _payload: &EncryptedPayload,
-        _recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
         Err(PeelerError::Backend("test peeler".into()))
     }

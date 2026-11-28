@@ -39,12 +39,15 @@ carries no epoch hint, so a device that never entered that epoch state reads opa
 (`tests/epoch_sealed_transport.rs` owns the resulting behaviors). Reach for it whenever a scenario turns on branch- or
 epoch-scoped readability; `MockPeeler` stays right for everything else.
 
+**Account inbox.** The engine never seals or unseals Welcomes; the session does (mdk#3498). Tests stand in for it with
+`support::raw_inbox`: `seal_and_bind` a sender's `OutboundWelcome`s where a test first delivers, joins or reads the
+id of one, and deliver with `ingest_raw` / `join_raw`, which finish an `InboxSealed` delivery with `raw_unseal`.
+
 - **File:** `scaffold.rs`
   - **Owns:** `EngineBuilder` validation and empty-engine behavior
 
 - **File:** `group_creation.rs`
-  - **Owns:** Fresh KeyPackage, create, join welcome, confirm; a legacy create whose Welcome cannot be wrapped
-    writes no group or orphaned OpenMLS state (encrypted reopen and successful retry); cancelled founding creation
+  - **Owns:** Fresh KeyPackage, create, join welcome, confirm; cancelled founding creation
     in both profiles restores independently read encrypted MLS rows before reopen/retry; a late second Welcome-write
     failure cleans group/message/route rows in both profiles and permits same-engine retry and recipient joins; creator component admission,
     exact-length and staged-source exporter assembly, and snapshot-name privacy.
@@ -67,8 +70,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   before a public send prepares its wire, plus pre-due sendability and ordered retained sends after confirmation.
 
   A Welcome into a forgotten group, judged by the delivery's authenticated time and sender, and the rule that a refused
-  delivery leaves the same Welcome joinable (mdk#3514): `SealingPeeler` surfaces the sender and time a gift wrap
-  authenticates for the deliveries a test seals with `WelcomeSeals`, and nothing for any other.
+  delivery leaves the same Welcome joinable (mdk#3514): `WelcomeSeals::unseal` surfaces the sender and time a gift
+  wrap authenticates for the deliveries a test seals with `WelcomeSeals`, and nothing for any other.
 
 - **File:** `invite_leave/admin_leave.rs`
   - **Owns:** `StepDownAndLeave`: an admin's leave request is durable before anything is published and the re-drive
@@ -352,7 +355,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     tag signature key, any `removed` record while the removed leaf is still its link's KeyPackage leaf and did not
     found the group, so a pending link is never recorded as `removed` (mdk#3679) while the founder is, or
     while an own Commit is in flight or an intent waits in the queue. A device it removed that forgot its copy joins again through the next link's Welcome, which no forget
-    cutoff dates. A link whose Welcome cannot be wrapped writes nothing.
+    cutoff dates.
 
   `account_devices/staging_atomicity.rs` owns late LinkDevice, AddOwnAccountDevices and UnlinkDevice projection
   faults before a pending ref is exposed: real SQLCipher faults after outbound staging, complete independent prior
@@ -393,8 +396,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     only KeyPackages tagged as its sender's slot (D33; the tagged case runs in test-policy builds only). A sibling
     Welcome (3.5b) consumes only the private KeyPackage it names, issued to its sender, and one back into a chat still
     held active is held, writing nothing, until that copy reads removed or unrecoverable. One carried no later than a
-    local forget is refused for that carrier alone, so the same Welcome in a later carrier joins. An invite with a
-    private KeyPackage, whose Welcome the Nostr binding cannot wrap, writes nothing.
+    local forget is refused for that carrier alone, so the same Welcome in a later carrier joins.
     Failed private issuance is checked with a real second-insertion SQLCipher fault after earlier stock and bundle
     writes, complete independent rows, two physical encrypted reopens and a healed retry. Keep those boundaries.
 

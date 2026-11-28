@@ -15,8 +15,9 @@ wraps / peels Marmot group MLS bytes for Nostr kind `445`.
   empty AAD) using the engine exporter snapshot.
 - Carries no source-epoch hint in the kind `445` envelope: an undecryptable message returns `DecryptFailed`, and the
   engine falls back to retained-epoch snapshots / deferred-peel retry rather than a transport-carried epoch.
-- Wraps and peels MLS Welcome bytes as NIP-59 gift wraps when a local Nostr signer/decrypter is injected through the
-  `MarmotNostrSigner` boundary (`SdkSigner` adapts it to rust-nostr's signer traits).
+- Seals and unseals MLS Welcome bytes as NIP-59 gift wraps in `NostrInboxSealer`, over a Nostr signer/decrypter
+  injected through the `MarmotNostrSigner` boundary (`SdkSigner` adapts it to rust-nostr's signer traits). The
+  engine never calls it; the account session does. `NostrMlsPeeler` handles group messages only and holds no signer.
 
 ## What this crate does not do
 
@@ -27,7 +28,7 @@ wraps / peels Marmot group MLS bytes for Nostr kind `445`.
 
 ## Welcome validation
 
-Welcome peeling fails closed unless all of these hold:
+Welcome unsealing fails closed unless all of these hold:
 
 - the outer event is kind `1059` and verifies as a signed Nostr event,
 - the event `p` tag matches the `TransportEnvelope::Welcome` recipient,
@@ -40,9 +41,9 @@ Welcome peeling fails closed unless all of these hold:
 
 ## Private recovery control
 
-`wrap_group_recovery` uses the same NIP-59 construction and recipient-only outer tags as Welcomes. It carries the
+`seal_group_recovery` uses the same NIP-59 construction and recipient-only outer tags as Welcomes. It carries the
 MDK-private proposed kind `1159` and singleton `mdk_group_recovery` version tag inside the authenticated rumor, never
-as a public recovery marker. `peel_welcome` unwraps once before dispatching either inner kind.
+as a public recovery marker. `unseal` unwraps once before dispatching either inner kind.
 
 Recovery admission requires agreement between the transport recipient, outer `p` tag, local signer and inner `p`
 tag, plus bounded carrier and body sizes. The authenticated seal author is returned in `AuthenticatedGroupRecovery`;
@@ -68,19 +69,21 @@ Welcome peeling still decodes an SDK event for NIP-59, whose unwrap verifies the
 Inbound:
 
 ```text
-real Nostr event -> NostrTransportEvent -> TransportMessage -> NostrMlsPeeler -> PeeledMessage
+kind 445:  real Nostr event -> NostrTransportEvent -> TransportMessage -> NostrMlsPeeler   -> PeeledMessage
+kind 1059: real Nostr event -> NostrTransportEvent -> TransportMessage -> NostrInboxSealer -> PeeledMessage
 ```
 
 Outbound:
 
 ```text
-EncryptedPayload + GroupContextSnapshot -> NostrMlsPeeler -> TransportMessage
+kind 445:  EncryptedPayload + GroupContextSnapshot -> NostrMlsPeeler   -> TransportMessage
+kind 1059: OutboundWelcome                         -> NostrInboxSealer -> TransportMessage
 ```
 
 The outbound `TransportMessage` carries a Nostr DTO payload. Outbound kind `445` events are signed at wrap time with a
 fresh ephemeral Nostr key generated per event, so the event id is final and the adapter publishes the event as-is (no
-pre-signing-id replacement). Welcome outputs are already signed NIP-59 gift wraps because NIP-59 construction needs the
-local signer.
+pre-signing-id replacement). `NostrInboxSealer` returns Welcomes as signed NIP-59 gift wraps, because NIP-59
+construction needs the account signer.
 
 ## Run tests
 

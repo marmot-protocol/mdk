@@ -10,16 +10,18 @@
 use super::activation::{buffer_unsettled, queued_intents};
 use super::device_roster::{
     NO_WELCOME_DEADLINE, create_under, entry, expect_link_welcome, found_device_group,
-    key_package_ref, leaf_signature_key, phone_and_laptop, roster, roster_device,
-    roster_device_with_peeler, roster_of, roster_update, slot,
+    key_package_ref, leaf_signature_key, phone_and_laptop, roster, roster_device, roster_of,
+    roster_update, slot,
 };
 use super::send_intents::{pending_proposals, queue, store_pending_add};
+use super::support::raw_inbox::raw_seal;
 use super::*;
-use cgka_engine::engine::OutboundWelcomeStatus;
+use cgka_engine::engine::{OutboundWelcomeStatus, WelcomeWithdrawal};
 use cgka_traits::app_components::{
     DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1, MAX_LEAVES_PER_ACCOUNT,
     RejectedSlotReasonV1, RejectedSlotV1, encode_device_roster_update_v1,
 };
+use cgka_traits::engine::SealedWelcome;
 use openmls::prelude::ProposalOrRefType;
 
 /// The sender rule's refusal of an Add without its roster entry.
@@ -83,6 +85,7 @@ async fn a_links_welcome_keeps_its_delivery_deadline() {
     else {
         panic!("expected GroupEvolution")
     };
+    let welcomes = seal_and_bind(&mut phone.engine, &welcomes);
     let id = &welcomes[0].id;
     assert!(phone.engine.sent_welcome_awaits_commit(id).unwrap());
     assert_eq!(
@@ -134,6 +137,7 @@ async fn a_link_adds_the_device_and_writes_its_entry_in_one_commit() {
     else {
         panic!("expected GroupEvolution")
     };
+    let welcomes = seal_and_bind(&mut phone.engine, &welcomes);
     assert_eq!(welcomes.len(), 1, "one Welcome, for the linked device");
     phone.engine.confirm_published(pending).await.unwrap();
     let commit = route_to_group(&msg, &gid);
@@ -344,51 +348,6 @@ async fn a_refused_link_leaves_the_group_as_it_was() {
         &gid,
     )
     .await;
-}
-
-/// A link whose Welcome cannot be wrapped is refused before anything is
-/// written. The KeyPackage names no publication, so a peeler that wraps a
-/// Welcome only for a published KeyPackage cannot wrap it. The device group
-/// keeps every row and its record, and no commit is left pending.
-#[tokio::test]
-async fn a_link_whose_welcome_cannot_be_wrapped_writes_nothing() {
-    let mut phone = roster_device_with_peeler(b"alice", Box::<PublishedWelcomesOnly>::default());
-    let gid = found_device_group(&mut phone, &roster(&[(1, "Phone")]), &mut []).await;
-    let key_package = roster_device(b"alice")
-        .engine
-        .fresh_key_package()
-        .await
-        .unwrap();
-    let rows = phone
-        .storage
-        .list_messages(&gid, cgka_traits::types::EpochId(0))
-        .unwrap();
-    let record = phone.engine.group_record(&gid).unwrap();
-
-    let refused = phone
-        .engine
-        .send(link(
-            &gid,
-            &key_package,
-            vec![DeviceRosterOperationV1::SetDevice(
-                slot(2),
-                linked_entry("Laptop", &key_package),
-            )],
-        ))
-        .await;
-    assert!(
-        matches!(refused, Err(EngineError::Peeler(_))),
-        "{refused:?}"
-    );
-    assert_eq!(
-        phone
-            .storage
-            .list_messages(&gid, cgka_traits::types::EpochId(0))
-            .unwrap(),
-        rows
-    );
-    assert_eq!(phone.engine.group_record(&gid).unwrap(), record);
-    assert!(load_group(&phone, &gid).pending_commit().is_none());
 }
 
 /// A link, and a removed slot's lone record (mdk#2761), each need a group
@@ -721,6 +680,46 @@ async fn a_device_group_commit_takes_no_add_from_the_proposal_store() {
     .await;
 }
 
+/// A device group's founding Welcome its session could not seal yet (its
+/// signer failed, or the process stopped first) is found by its
+/// `KeyPackageRef` and withdrawn, so a link cancelled meanwhile leaves no
+/// Welcome for maintenance to seal and send later (mdk#3498).
+#[tokio::test]
+async fn an_unsealed_founding_welcome_is_withdrawn_by_its_key_package_ref() {
+    let mut first = roster_device(b"alice");
+    let laptop_key_package = roster_device(b"alice")
+        .engine
+        .fresh_key_package()
+        .await
+        .unwrap();
+    let founding_ref = key_package_ref(&laptop_key_package);
+    let (founded, created) = create_under(
+        &mut first,
+        &roster(&[(1, "Phone"), (2, "Laptop")]),
+        vec![laptop_key_package],
+        &GroupId::new(vec![0x43; 16]),
+    )
+    .await
+    .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
+        panic!("current-profile founding group")
+    };
+    let (owed, unread) = first.engine.unsealed_owed_welcomes().unwrap();
+    assert_eq!(owed, welcomes);
+    assert!(!unread);
+
+    let found = first
+        .engine
+        .sent_welcomes_for_key_package(&founded, &founding_ref)
+        .unwrap();
+    assert_eq!(found, vec![welcomes[0].local_id.clone()]);
+    assert_eq!(
+        first.engine.withdraw_sent_welcome(&found[0]).unwrap(),
+        WelcomeWithdrawal::Withdrawn
+    );
+    assert!(first.engine.unsealed_owed_welcomes().unwrap().0.is_empty());
+}
+
 /// A link's Welcome keeps the `KeyPackageRef` of the KeyPackage it answers
 /// while staged, once owed and once withdrawn, and so does a device group's
 /// founding Welcome, so a device that lost a Welcome's id after the commit
@@ -748,6 +747,7 @@ async fn a_welcome_is_found_by_its_key_package_ref() {
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
+    let welcomes = seal_and_bind(&mut first.engine, &welcomes);
     assert_eq!(
         first
             .engine
@@ -777,19 +777,31 @@ async fn a_welcome_is_found_by_its_key_package_ref() {
             .sent_welcomes_for_key_package(&gid, &link_ref)
             .unwrap()
     };
-    let attempt = async |phone: &mut Device| {
+    let attempt = async |phone: &mut Device, carrier_id: MessageId| {
         let SendResult::GroupEvolution {
             welcomes, pending, ..
         } = phone.engine.send(intent.clone()).await.unwrap()
         else {
             panic!("expected GroupEvolution")
         };
-        (welcomes[0].id.clone(), pending)
+        let mut message = raw_seal(&welcomes[0]);
+        message.id = carrier_id.clone();
+        phone
+            .engine
+            .bind_sealed_welcomes(
+                &[SealedWelcome {
+                    local_id: welcomes[0].local_id.clone(),
+                    message,
+                }],
+                None,
+            )
+            .unwrap();
+        (carrier_id, pending)
     };
-    let (rolled_back, pending) = attempt(&mut phone).await;
+    let (rolled_back, pending) = attempt(&mut phone, hash_id(b"rolled-back link")).await;
     assert_eq!(found(&phone), vec![rolled_back.clone()], "staged");
     phone.engine.publish_failed(pending).await.unwrap();
-    let (welcome, pending) = attempt(&mut phone).await;
+    let (welcome, pending) = attempt(&mut phone, hash_id(b"confirmed link")).await;
     let both = vec![rolled_back, welcome.clone()];
     assert_eq!(found(&phone), both, "retried");
     phone.engine.confirm_published(pending).await.unwrap();
@@ -850,6 +862,7 @@ async fn link_welcome(
     else {
         panic!("expected GroupEvolution")
     };
+    let welcomes = seal_and_bind(&mut phone.engine, &welcomes);
     phone.engine.confirm_published(pending).await.unwrap();
     assert_accepted(laptop, &route_to_group(&msg, gid), gid).await;
     expect_link_welcome(tablet, gid, phone, &key_package);

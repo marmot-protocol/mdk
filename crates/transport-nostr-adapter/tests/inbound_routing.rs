@@ -3767,8 +3767,10 @@ async fn signed_welcome_event_becomes_account_inbox_delivery() {
 
 #[tokio::test]
 async fn recovery_account_inbox() {
-    use cgka_traits::{GroupId, GroupRecoveryBody, GroupRecoveryMessage, TransportPeeler};
-    use transport_nostr_peeler::NostrMlsPeeler;
+    use cgka_traits::{
+        GroupId, GroupRecoveryBody, GroupRecoveryMessage, InboxSealer, SystemWallClock,
+    };
+    use transport_nostr_peeler::NostrInboxSealer;
 
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());
@@ -3804,9 +3806,8 @@ async fn recovery_account_inbox() {
             device_key_hash: [9; 32],
         },
     };
-    let message = NostrMlsPeeler::default()
-        .with_welcome_signer(sender.clone())
-        .wrap_group_recovery(&body, &receiver_id)
+    let message = NostrInboxSealer::new(Arc::new(sender.clone()), Arc::new(SystemWallClock))
+        .seal_group_recovery(&body, &receiver_id)
         .await
         .unwrap();
     let event = NostrTransportEvent::from_transport_message(&message).unwrap();
@@ -3848,9 +3849,8 @@ async fn recovery_account_inbox() {
             recipient: receiver_id
         }
     );
-    let peeled = NostrMlsPeeler::default()
-        .with_welcome_signer(receiver)
-        .peel_welcome(&delivery.message)
+    let peeled = NostrInboxSealer::new(Arc::new(receiver), Arc::new(SystemWallClock))
+        .unseal(&delivery.message)
         .await
         .unwrap();
     let cgka_traits::PeeledContent::GroupRecovery {

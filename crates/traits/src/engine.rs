@@ -23,12 +23,12 @@ use crate::app_components::{
 use crate::app_event::AppMessageRetentionDecision;
 use crate::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use crate::engine_state::PendingStateRef;
-use crate::error::EngineError;
+use crate::error::{EngineError, PeelerError};
 use crate::group::{Member, ProtocolProfile};
 use crate::group_context::{GroupContext, SecretBytes};
 use crate::group_recovery::{GroupMemberRecovery, GroupRecoverySource};
-use crate::ingest::IngestOutcome;
-use crate::transport::{Timestamp, TransportMessage};
+use crate::ingest::{IngestOutcome, PeeledMessage};
+use crate::transport::{EncryptedPayload, Timestamp, TransportMessage};
 use crate::transport_adapter::TransportEndpoint;
 use crate::types::{EpochId, GroupId, MemberId, MessageId};
 use async_trait::async_trait;
@@ -51,6 +51,24 @@ pub struct KeyPackageSource {
 pub struct WelcomeMetadata {
     pub key_package_event_id: MessageId,
     pub relays: Vec<TransportEndpoint>,
+}
+
+/// A Welcome the engine staged and the session has not sealed yet.
+/// `local_id` names its stored row until the session binds the sealed
+/// message; it is never a transport id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboundWelcome {
+    pub local_id: MessageId,
+    pub recipient: MemberId,
+    pub payload: EncryptedPayload,
+    pub metadata: Option<WelcomeMetadata>,
+}
+
+/// A sealed Welcome and the unsealed row it replaces.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedWelcome {
+    pub local_id: MessageId,
+    pub message: TransportMessage,
 }
 
 /// Opaque KeyPackage bytes plus optional transport provenance.
@@ -567,7 +585,7 @@ pub enum SendResult {
     /// independent: a failed welcome must not roll back a live commit.
     GroupEvolution {
         msg: TransportMessage,
-        welcomes: Vec<TransportMessage>,
+        welcomes: Vec<OutboundWelcome>,
         pending: PendingStateRef,
     },
     /// Legacy-profile initial group creation. Only `welcomes` need publishing;
@@ -575,7 +593,7 @@ pub enum SendResult {
     /// Retained temporarily for explicit legacy-profile compatibility until
     /// strict creation cutover removes this path.
     GroupCreated {
-        welcomes: Vec<TransportMessage>,
+        welcomes: Vec<OutboundWelcome>,
         pending: PendingStateRef,
     },
     /// Current-profile founding creation. The epoch-0 group and its optional
@@ -584,7 +602,7 @@ pub enum SendResult {
     /// an independent delivery obligation whose failure cannot roll back the
     /// group. This result alone does not imply any Welcome was delivered:
     /// callers must publish and acknowledge every entry independently.
-    FoundingGroupCreated { welcomes: Vec<TransportMessage> },
+    FoundingGroupCreated { welcomes: Vec<OutboundWelcome> },
 }
 
 /// What happened to a send the engine *accepted*, as reported back to the
@@ -631,7 +649,7 @@ pub struct AutoPublish {
     /// Exact retained Welcomes to fan out only after commit confirmation.
     /// Restarted member recovery must resume these with its immutable commit.
     #[serde(default)]
-    pub welcomes: Vec<TransportMessage>,
+    pub welcomes: Vec<OutboundWelcome>,
 }
 
 /// Why an application message did not become canonical group output.
@@ -1168,6 +1186,15 @@ pub trait CgkaEngine: Send + Sync {
     /// none are `Err`.
     async fn ingest(&mut self, msg: TransportMessage) -> Result<IngestOutcome, EngineError>;
 
+    /// Finish ingesting an account-inbox delivery that [`Self::ingest`]
+    /// returned as [`IngestOutcome::InboxSealed`]. `unsealed` is the caller's
+    /// unseal result; a failed unseal gets the disposition a failed peel got.
+    async fn ingest_unsealed(
+        &mut self,
+        msg: TransportMessage,
+        unsealed: Result<PeeledMessage, PeelerError>,
+    ) -> Result<IngestOutcome, EngineError>;
+
     /// Drain ordered `GroupEvent`s produced since the last drain. Application
     /// typically calls this right after every `ingest` batch.
     fn drain_events(&mut self) -> Vec<GroupEvent>;
@@ -1369,12 +1396,16 @@ pub trait CgkaEngine: Send + Sync {
         ))
     }
 
-    /// Accept a welcome addressed to the local identity.
+    /// Accept a welcome addressed to the local identity. `unsealed` is the
+    /// caller's unsealed content of `welcome_msg`.
     ///
     /// **Errors.** Returns `Peeler(...)` if the welcome was not addressed to
     /// us; `UnknownGroup` if the welcome references an already-joined group.
-    async fn join_welcome(&mut self, welcome_msg: TransportMessage)
-    -> Result<GroupId, EngineError>;
+    async fn join_welcome(
+        &mut self,
+        welcome_msg: TransportMessage,
+        unsealed: PeeledMessage,
+    ) -> Result<GroupId, EngineError>;
 
     // ── Capabilities ────────────────────────────────────────────────────────
 

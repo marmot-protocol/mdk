@@ -165,12 +165,16 @@ impl<S: StorageProvider> Engine<S> {
                 },
                 &pre_commit_ctx,
             )
-            .await
             .map_err(EngineError::Peeler)?;
         let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
-        let welcomes = self
-            .wrap_staged_welcomes(&mls_group, &welcome_bytes, &[key_package], &[], &parsed_kps)
-            .await?;
+        let welcomes = self.wrap_staged_welcomes(
+            &commit_msg.id,
+            &mls_group,
+            &welcome_bytes,
+            &[key_package],
+            &[],
+            &parsed_kps,
+        )?;
         // `members()` shows the linked device while the publish is pending;
         // `confirm_published` and `publish_failed` re-derive the record from
         // MLS state.
@@ -200,9 +204,6 @@ impl<S: StorageProvider> Engine<S> {
         })?;
         self.sent_message_ids.insert(commit_msg.id.clone());
         self.sent_message_ids.insert(content_id);
-        for welcome in &welcomes {
-            self.sent_message_ids.insert(welcome.id.clone());
-        }
 
         let pending_ref = self.commit_device_group_commit(prepared_pending, &commit_msg);
         pending_commit_guard.disarm();
@@ -332,7 +333,6 @@ impl<S: StorageProvider> Engine<S> {
                 },
                 &pre_commit_ctx,
             )
-            .await
             .map_err(EngineError::Peeler)?;
         let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
 

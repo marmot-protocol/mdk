@@ -237,7 +237,6 @@ impl<S: StorageProvider> Engine<S> {
                 },
                 &pre_commit_ctx,
             )
-            .await
             .map_err(EngineError::Peeler)?;
         let wrapped = TransportMessage {
             envelope: TransportEnvelope::GroupMessage {

@@ -20,8 +20,8 @@ use cgka_engine::RollbackPass;
 use cgka_traits::AppComponentId;
 use cgka_traits::app_components::{DeviceRosterV1, DeviceTagClaim};
 use cgka_traits::engine::{
-    CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, KeyPackage, SendIntent,
-    SupersededIntentReport,
+    CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, KeyPackage, OutboundWelcome,
+    SealedWelcome, SendIntent, SupersededIntentReport,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
@@ -35,6 +35,7 @@ use cgka_traits::maintenance::{
     PostJoinHistoryFetchOutcome, RetainedKeyPackagePrivateMaterial, SendMaintenanceDisposition,
     TransportFanoutAttemptState, TransportFanoutTarget,
 };
+use cgka_traits::peeler::InboxSealer;
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, RosterTagKey};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
@@ -243,6 +244,40 @@ struct PendingFanoutContinuation {
     pending: PendingStateRef,
     kind: FanoutPendingKind,
     post_confirmation_welcomes: Vec<TransportMessage>,
+    /// Sealed Welcomes whose unsealed rows the first fanout write replaces,
+    /// in the same transaction.
+    bind: CommitWelcomeSeals,
+}
+
+#[derive(Default)]
+struct CommitWelcomeSeals {
+    sealed: Vec<SealedWelcome>,
+    audited: HashSet<cgka_traits::MessageId>,
+}
+
+struct QueuedSealRefusal {
+    refusal: InviteRefusal,
+    welcome_ids: Vec<cgka_traits::MessageId>,
+}
+
+#[derive(Default)]
+struct SealRollbackBatch {
+    output: AccountDeviceEffects,
+    queue: VecDeque<PublishWork>,
+}
+
+struct SealRollbackDelivery {
+    parked: Arc<std::sync::Mutex<SealRollbackBatch>>,
+    batch: SealRollbackBatch,
+}
+
+impl Drop for SealRollbackDelivery {
+    fn drop(&mut self) {
+        *self
+            .parked
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = std::mem::take(&mut self.batch);
+    }
 }
 
 enum PreparedLegacyPublish {
@@ -733,6 +768,17 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     entropy: Arc<dyn EntropySource>,
     maintenance_timing: MaintenanceTiming,
     maintenance_paused: bool,
+    /// Commits noted before their Welcome seal. They stay here until returned
+    /// to a caller, durably staged for fanout, or rolled back. Maintenance
+    /// rolls back any commit left here when a call is dropped.
+    sealing_commits: Vec<PendingStateRef>,
+    queued_seal_refusals: HashMap<PendingStateRef, QueuedSealRefusal>,
+    /// A maintenance pass can be dropped after a rollback has returned its
+    /// effects. Retain them until a pass can deliver them to the host.
+    seal_rollback_batch: Option<Arc<std::sync::Mutex<SealRollbackBatch>>>,
+    /// The exact Welcome bytes shown to a caller at prepare time. Keep the
+    /// native rows unsealed until the first commit fanout is also durable.
+    prepared_welcome_seals: HashMap<PendingStateRef, CommitWelcomeSeals>,
     /// This runtime was asked to withdraw the device's slot for sign-out, so
     /// it publishes nothing more, whether or not a relay accepted. The next
     /// runtime for the account republishes.
@@ -860,6 +906,10 @@ where
             entropy: Arc::new(OsEntropy),
             maintenance_timing: MaintenanceTiming::default(),
             maintenance_paused: false,
+            sealing_commits: Vec::new(),
+            queued_seal_refusals: HashMap::new(),
+            seal_rollback_batch: None,
+            prepared_welcome_seals: HashMap::new(),
             key_package_slot_withdrawn: false,
             key_package_announcement_group: None,
             slot_superseded_through: None,
@@ -902,6 +952,7 @@ where
         monotonic_clock: Arc<dyn MonotonicClock>,
         entropy: Arc<dyn EntropySource>,
     ) -> Self {
+        self.session.set_founding_welcome_clock(wall_clock.clone());
         self.wall_clock = wall_clock;
         self.monotonic_clock = monotonic_clock;
         self.entropy = entropy;
@@ -2987,6 +3038,24 @@ where
         self.sweep_expired_key_package_private_material()?;
         self.reconcile_confirmed_own_leaf_rotations(&[]);
         let mut output = AccountDeviceEffects::default();
+        if !self.sealing_commits.is_empty() {
+            self.seal_rollback_batch
+                .get_or_insert_with(Default::default);
+        }
+        let mut rollbacks = self
+            .seal_rollback_batch
+            .as_ref()
+            .map(|parked| SealRollbackDelivery {
+                parked: Arc::clone(parked),
+                batch: std::mem::take(
+                    &mut *parked.lock().unwrap_or_else(|error| error.into_inner()),
+                ),
+            });
+        if let Some(delivery) = &mut rollbacks {
+            let batch = &mut delivery.batch;
+            boxed(|| self.settle_dropped_seals(batch)).await;
+            boxed(|| self.publish_queue(&mut batch.output, &mut batch.queue, None)).await?;
+        }
         // Hydration recreates the publication edge for a surviving staged
         // evolution. Consume that edge before consulting the semantic
         // obligation below. Otherwise a successful retry can confirm the
@@ -3597,6 +3666,12 @@ where
                 }
             }
         }
+        if let Some(mut delivery) = rollbacks {
+            self.seal_rollback_batch = None;
+            let mut recovered = std::mem::take(&mut delivery.batch.output);
+            recovered.extend(output);
+            return Ok(recovered);
+        }
         Ok(output)
     }
 
@@ -3922,9 +3997,11 @@ where
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
         context: AuditEventContext,
     ) -> AccountResult<CreateGroupEffects> {
+        let sealer = Arc::clone(&self.session.sealer);
         let welcome_sizes = WelcomeSizes {
             adapter: &self.adapter,
             routing: &self.routing,
+            sealer: sealer.as_ref(),
         };
         let created = self
             .session
@@ -3949,9 +4026,11 @@ where
         siblings: Vec<cgka_traits::engine::SiblingKeyPackage>,
         context: AuditEventContext,
     ) -> AccountResult<CreateGroupEffects> {
+        let sealer = Arc::clone(&self.session.sealer);
         let welcome_sizes = WelcomeSizes {
             adapter: &self.adapter,
             routing: &self.routing,
+            sealer: sealer.as_ref(),
         };
         let created = self
             .session
@@ -4098,8 +4177,10 @@ where
         intent: SendIntent,
         context: AuditEventContext,
     ) -> AccountResult<PreparedSessionSend> {
-        self.confirm_commit_without_publish_from(intent, context, SendOrigin::Automatic)
-            .await
+        let prepared = self
+            .confirm_commit_without_publish_from(intent, context, SendOrigin::Automatic)
+            .await?;
+        Ok(self.hand_off_prepared_send(prepared))
     }
 
     /// Accept a group change the host asked for without publishing it, as
@@ -4110,8 +4191,17 @@ where
         intent: SendIntent,
         context: AuditEventContext,
     ) -> AccountResult<PreparedSessionSend> {
-        self.confirm_commit_without_publish_from(intent, context, SendOrigin::Host)
-            .await
+        let prepared = self
+            .confirm_commit_without_publish_from(intent, context, SendOrigin::Host)
+            .await?;
+        Ok(self.hand_off_prepared_send(prepared))
+    }
+
+    fn hand_off_prepared_send(&mut self, prepared: PreparedSessionSend) -> PreparedSessionSend {
+        if let PreparedSessionSend::Commit(commit) = &prepared {
+            self.forget_sealing_commit(commit.pending);
+        }
+        prepared
     }
 
     async fn confirm_commit_without_publish_from(
@@ -4131,12 +4221,21 @@ where
         // devices) keep their own handling of a Welcome that cannot be sent.
         let invite = matches!(intent, SendIntent::Invite { .. });
         let session_effects = self.send_session_intent(intent, context, origin).await?;
-        let prepared = classify_prepared_session_send(session_effects)?;
+        let prepared = self.classify_prepared_session_send(session_effects).await?;
         let PreparedSessionSend::Commit(commit) = prepared else {
             return Ok(prepared);
         };
-        self.note_retained_welcomes(commit.welcomes());
         if invite && let Some((message_id, refusal)) = self.oversized_invite(&commit).await {
+            // This invite will never get a fanout. Retain its sealed ids for
+            // the refusal audit, then retire the rows with the commit.
+            if let Some(seals) = self.prepared_welcome_seals.remove(&commit.pending) {
+                match self.session.bind_sealed_welcomes(&seals.sealed, None) {
+                    Ok(()) => {
+                        self.note_retained_welcomes(commit.welcomes().iter(), Some(&seals.audited))
+                    }
+                    Err(error) => log_refused_welcome_bind(&error),
+                }
+            }
             let oversized = refusal.oversized;
             let mut output = self
                 .rollback_prepared_session_commit_refused(commit, Some(refusal))
@@ -4202,6 +4301,7 @@ where
             let welcome_sizes = WelcomeSizes {
                 adapter,
                 routing: &self.routing,
+                sealer: self.session.sealer.as_ref(),
             };
             let oversized_welcomes = welcome_sizes.oversized_welcomes(welcomes).await;
             let (_, size_class) = oversized_welcomes.first()?.clone();
@@ -4213,6 +4313,58 @@ where
                 oversized_welcomes: oversized_welcomes.into_iter().collect(),
             })
         })
+    }
+
+    /// Split a prepared send into its commit and its sealed Welcomes. Bind
+    /// them only when the first commit fanout is stored. A Welcome that
+    /// cannot be sealed rolls the commit back before any relay I/O.
+    async fn classify_prepared_session_send(
+        &mut self,
+        mut effects: SessionEffects,
+    ) -> AccountResult<PreparedSessionSend> {
+        let pending = effects.publish.iter().find_map(|work| match work {
+            PublishWork::GroupEvolution { pending, .. }
+            | PublishWork::GroupCreated { pending, .. } => Some(*pending),
+            _ => None,
+        });
+        let Some(pending) = pending else {
+            if !effects.queued.is_empty() {
+                return Ok(PreparedSessionSend::Queued(effects));
+            }
+            return Err(cgka_traits::EngineError::Backend(
+                "prepared send contained neither a pending MLS evolution nor a queued intent"
+                    .into(),
+            )
+            .into());
+        };
+        let welcomes = take_deferred_welcomes(&mut effects);
+        let sealed = match self.seal_commit_welcomes(pending, &welcomes).await {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                let commit = PreparedSessionCommit {
+                    effects,
+                    welcomes: Vec::new(),
+                    pending,
+                };
+                self.rollback_prepared_session_commit_refused(commit, None)
+                    .await?;
+                return Err(EngineError::Peeler(error).into());
+            }
+        };
+        let welcomes = sealed.iter().map(|seal| seal.message.clone()).collect();
+        if !sealed.is_empty() {
+            let audited = self.note_prepared_seals(&sealed);
+            // A prepared commit can be superseded before its caller returns.
+            self.prepared_welcome_seals
+                .retain(|pending, _| self.session.pending_group_id(*pending).is_ok());
+            self.prepared_welcome_seals
+                .insert(pending, CommitWelcomeSeals { sealed, audited });
+        }
+        Ok(PreparedSessionSend::Commit(PreparedSessionCommit {
+            effects,
+            welcomes,
+            pending,
+        }))
     }
 
     /// Roll back a prepared commit before that commit has any transport side
@@ -4247,6 +4399,7 @@ where
         output.absorb_session_effects(prepared_effects, &mut queue);
 
         let rollback = self.session.publish_failed(pending).await;
+        self.finish_unstaged_rollback(pending, &rollback);
         // A rollback can commit, retiring Welcomes, and fail after: record
         // what it retired either way.
         if let (Some(refusal), Some(unretired)) = (refusal, unretired) {
@@ -4301,7 +4454,7 @@ where
             _ => None,
         };
         let prepared = self
-            .confirm_commit_without_publish_with_audit_context(intent, context.clone())
+            .confirm_commit_without_publish_from(intent, context.clone(), SendOrigin::Automatic)
             .await?;
         let (session_effects, welcomes) = match prepared {
             PreparedSessionSend::Commit(prepared) => {
@@ -6105,27 +6258,43 @@ where
 
     async fn publish_group_created(
         &mut self,
-        welcomes: Vec<TransportMessage>,
+        welcomes: Vec<OutboundWelcome>,
         pending: PendingStateRef,
         output: &mut AccountDeviceEffects,
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
-        let mut welcomes = welcomes.into_iter();
-        let Some(first_welcome) = welcomes.next() else {
+        if welcomes.is_empty() {
             let effects = self.confirm_published_retrying(pending).await?;
             output
                 .pending
                 .push(PendingResolution::Confirmed { pending });
             output.absorb_session_effects(effects, queue);
             return Ok(());
+        }
+        let sealed = match self.seal_commit_welcomes(pending, &welcomes).await {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                // Legacy creation already staged the founding Add. No Welcome
+                // reached a relay, so roll back to the solo group.
+                self.rollback_unstaged_pending(Some(pending), output, queue)
+                    .await?;
+                return Err(EngineError::Peeler(error).into());
+            }
         };
+        let mut messages = sealed.iter().map(|sealed| sealed.message.clone());
+        let first_welcome = messages.next().expect("a nonempty create sealed a Welcome");
+        let post_confirmation_welcomes = messages.collect();
         Box::pin(self.publish_one_with_post_confirmation_welcomes(
             first_welcome,
             Some(PendingFanoutContinuation {
                 pending,
                 kind: FanoutPendingKind::CreateGroup,
-                post_confirmation_welcomes: welcomes.collect(),
+                post_confirmation_welcomes,
+                bind: CommitWelcomeSeals {
+                    sealed,
+                    ..Default::default()
+                },
             }),
             None,
             output,
@@ -6154,7 +6323,7 @@ where
     async fn publish_group_evolution(
         &mut self,
         commit: TransportMessage,
-        welcomes: Vec<TransportMessage>,
+        welcomes: Vec<OutboundWelcome>,
         pending: PendingStateRef,
         output: &mut AccountDeviceEffects,
         queue: &mut VecDeque<PublishWork>,
@@ -6186,29 +6355,60 @@ where
             return Ok(());
         }
 
-        // Welcomes of a drained or automatic commit first reach the runtime
-        // here; a host's reached it when its commit was accepted.
-        self.note_retained_welcomes(&welcomes);
+        if let Some(sealed) = self.prepared_welcome_seals.remove(&pending) {
+            self.note_sealing_commit(pending);
+            let kind = self.session.pending_fanout_kind(pending)?;
+            // The host owns delivery of these exact bytes after confirmation.
+            Box::pin(self.publish_one_with_post_confirmation_welcomes(
+                commit,
+                Some(PendingFanoutContinuation {
+                    pending,
+                    kind,
+                    post_confirmation_welcomes: Vec::new(),
+                    bind: sealed,
+                }),
+                None,
+                output,
+                queue,
+                context,
+            ))
+            .await?;
+            return Ok(());
+        }
+
+        // A Welcome that cannot be sealed rolls its commit back before any
+        // relay I/O, as a publish that reached no relay would.
+        let sealed = match self.seal_commit_welcomes(pending, &welcomes).await {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                self.rollback_unstaged_pending(Some(pending), output, queue)
+                    .await?;
+                return Err(EngineError::Peeler(error).into());
+            }
+        };
+        let welcomes: Vec<TransportMessage> =
+            sealed.iter().map(|sealed| sealed.message.clone()).collect();
         // A queued invite the drain prepared is judged as a direct invite
         // is, before its commit is published: one whose commit or Welcome
         // fits none of its relays is retired unsent (mdk#2334).
         if self.session.pending_is_queued_invite(pending)?
             && let Some(refusal) = self.oversized_invite_events(&commit, &welcomes).await
         {
-            let unretired =
-                self.unretired_welcomes(welcomes.iter().map(|welcome| welcome.id.clone()));
-            let effects = refuse_too_large(
-                &mut self.session,
+            self.note_sealing_commit(pending);
+            self.queued_seal_refusals.insert(
                 pending,
-                None,
-                refusal.oversized,
-                RollbackPass::Staging,
-            )
-            .await;
-            // Recorded even when the rollback fails after it committed.
-            let retired = self.retired_welcomes(unretired);
-            self.record_v5_welcomes_refused(&retired, &refusal);
-            let effects = effects?;
+                QueuedSealRefusal {
+                    refusal,
+                    welcome_ids: welcomes.iter().map(|welcome| welcome.id.clone()).collect(),
+                },
+            );
+            // Bind for the refusal audit if possible. A bind error does not
+            // undo the size verdict or let the queue stage the invite again.
+            match self.session.bind_sealed_welcomes(&sealed, None) {
+                Ok(()) => self.note_retained_welcomes(welcomes.iter(), None),
+                Err(error) => log_refused_welcome_bind(&error),
+            }
+            let effects = self.rollback_sealing_commit(pending).await?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
@@ -6222,6 +6422,10 @@ where
                 pending,
                 kind: self.session.pending_fanout_kind(pending)?,
                 post_confirmation_welcomes: welcomes,
+                bind: CommitWelcomeSeals {
+                    sealed,
+                    ..Default::default()
+                },
             }),
             None,
             output,
@@ -6566,6 +6770,7 @@ where
                 pending,
                 kind: self.session.pending_fanout_kind(pending)?,
                 post_confirmation_welcomes: Vec::new(),
+                bind: CommitWelcomeSeals::default(),
             }),
             None => None,
         };
@@ -6590,13 +6795,14 @@ where
         context: Option<AuditEventContext>,
     ) -> AccountResult<PublishStatus> {
         let stage_started = application_message.as_ref().map(|_| Instant::now());
-        let (pending, pending_kind, post_confirmation_welcomes) = match continuation {
+        let (pending, pending_kind, post_confirmation_welcomes, bind) = match continuation {
             Some(continuation) => (
                 Some(continuation.pending),
                 Some(continuation.kind),
                 continuation.post_confirmation_welcomes,
+                continuation.bind,
             ),
-            None => (None, None, Vec::new()),
+            None => (None, None, Vec::new(), CommitWelcomeSeals::default()),
         };
         if matches!(message.envelope, TransportEnvelope::GroupMessage { .. }) || pending.is_some() {
             let target = match self.routing.publish_target(&message) {
@@ -6697,11 +6903,31 @@ where
                     .await?;
                 return Err(error.into());
             }
-            if let Err(error) = self.session.put_outbound_fanout(&fanout) {
+            // The first fanout write binds its sealed Welcomes in the same
+            // transaction, so a restart finds both or neither.
+            let frozen = if bind.sealed.is_empty() {
+                self.session.put_outbound_fanout(&fanout)
+            } else {
+                self.session
+                    .bind_sealed_welcomes(&bind.sealed, Some(&fanout))
+            };
+            if let Err(error) = frozen {
                 self.rollback_unstaged_pending(pending, output, queue)
                     .await?;
                 return Err(error.into());
             }
+            if let Some(pending) = pending {
+                self.forget_sealing_commit(pending);
+            }
+            // Welcomes of a create or commit first reach the runtime here,
+            // once their sealed rows exist.
+            if !bind.sealed.is_empty() {
+                self.note_retained_welcomes(
+                    bind.sealed.iter().map(|seal| &seal.message),
+                    Some(&bind.audited),
+                );
+            }
+            drop(bind);
             if let Some(started) = stage_started {
                 // Sum only local application-message preparation, before relay I/O.
                 output.local_accept_duration =
@@ -6727,13 +6953,116 @@ where
         queue: &mut VecDeque<PublishWork>,
     ) -> AccountResult<()> {
         if let Some(pending) = pending {
-            let effects = self.session.publish_failed(pending).await?;
+            let rollback = self.session.publish_failed(pending).await;
+            self.finish_unstaged_rollback(pending, &rollback);
+            let effects = rollback?;
             output
                 .pending
                 .push(PendingResolution::RolledBack { pending });
             output.absorb_session_effects(effects, queue);
         }
         Ok(())
+    }
+
+    /// Note the commit before asking the signer. A seal does not transfer
+    /// ownership: a later size check or a rollback can still wait before the
+    /// commit has a fanout.
+    async fn seal_commit_welcomes(
+        &mut self,
+        pending: PendingStateRef,
+        welcomes: &[OutboundWelcome],
+    ) -> Result<Vec<SealedWelcome>, cgka_traits::error::PeelerError> {
+        if !welcomes.is_empty() {
+            self.note_sealing_commit(pending);
+        }
+        self.session.seal_welcomes(welcomes).await
+    }
+
+    fn note_sealing_commit(&mut self, pending: PendingStateRef) {
+        if !self.sealing_commits.contains(&pending) {
+            self.sealing_commits.push(pending);
+        }
+    }
+
+    /// Drop the note [`Self::seal_commit_welcomes`] keeps for `pending`.
+    fn forget_sealing_commit(&mut self, pending: PendingStateRef) {
+        self.sealing_commits.retain(|noted| *noted != pending);
+    }
+
+    fn finish_unstaged_rollback(
+        &mut self,
+        pending: PendingStateRef,
+        rollback: &SessionResult<SessionEffects>,
+    ) {
+        if rollback.is_ok()
+            || rollback
+                .as_ref()
+                .is_err_and(|error| matches!(error.as_engine_error(), EngineError::UnknownPending))
+        {
+            self.forget_sealing_commit(pending);
+            self.prepared_welcome_seals.remove(&pending);
+            self.queued_seal_refusals.remove(&pending);
+        }
+    }
+
+    async fn rollback_sealing_commit(
+        &mut self,
+        pending: PendingStateRef,
+    ) -> SessionResult<SessionEffects> {
+        let rollback = if let Some(refused) = self.queued_seal_refusals.get(&pending) {
+            let unretired = self.unretired_welcomes(refused.welcome_ids.iter().cloned());
+            let oversized = refused.refusal.oversized;
+            let rollback = refuse_too_large(
+                &mut self.session,
+                pending,
+                None,
+                oversized,
+                RollbackPass::Staging,
+            )
+            .await;
+            let retired = self.retired_welcomes(unretired);
+            if !retired.is_empty() {
+                let refused = self
+                    .queued_seal_refusals
+                    .remove(&pending)
+                    .expect("known refusal");
+                self.record_v5_welcomes_refused(&retired, &refused.refusal);
+                self.queued_seal_refusals.insert(pending, refused);
+            }
+            rollback
+        } else {
+            self.session.publish_failed(pending).await
+        };
+        self.finish_unstaged_rollback(pending, &rollback);
+        rollback
+    }
+
+    /// Roll back commits whose call dropped before handing them off. A
+    /// failed or canceled rollback stays owed until the engine no longer
+    /// holds the commit.
+    async fn settle_dropped_seals(&mut self, batch: &mut SealRollbackBatch) {
+        for pending in self.sealing_commits.clone() {
+            match self.rollback_sealing_commit(pending).await {
+                Ok(effects) => {
+                    batch
+                        .output
+                        .pending
+                        .push(PendingResolution::RolledBack { pending });
+                    batch
+                        .output
+                        .absorb_session_effects(effects, &mut batch.queue);
+                }
+                Err(error) if matches!(error.as_engine_error(), EngineError::UnknownPending) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        method = "settle_dropped_seals",
+                        error_kind = error.as_engine_error().privacy_safe_kind(),
+                        "dropped-seal rollback failed; retried next pass"
+                    );
+                }
+            }
+        }
     }
 
     /// Drive one frozen fanout's pass. `pass` says whether it runs inside the
@@ -8721,6 +9050,7 @@ fn transport_retry_delay_ms(target: &TransportFanoutTarget, now_ms: u64) -> Opti
 struct WelcomeSizes<'a, A, R> {
     adapter: &'a A,
     routing: &'a R,
+    sealer: &'a dyn InboxSealer,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
@@ -8732,13 +9062,23 @@ where
 {
     async fn oversized_welcome(
         &self,
-        welcomes: &[TransportMessage],
+        welcomes: &[OutboundWelcome],
     ) -> Option<cgka_traits::EventSizeClass> {
-        self.oversized_welcomes(welcomes)
-            .await
-            .into_iter()
-            .next()
-            .map(|(_, size_class)| size_class)
+        for welcome in welcomes {
+            // A Welcome without a route fails when it is published.
+            let Ok(target) = self.routing.inbox_target(&welcome.recipient) else {
+                continue;
+            };
+            let event_len = self.sealer.sealed_welcome_len(welcome);
+            if let Some(size_class) = self
+                .adapter
+                .size_class_over_event_len(event_len, &target)
+                .await
+            {
+                return Some(size_class);
+            }
+        }
+        None
     }
 }
 
@@ -8771,6 +9111,15 @@ where
     }
 }
 
+fn log_refused_welcome_bind(error: &SessionError) {
+    tracing::warn!(
+        target: TRACE_TARGET,
+        method = "log_refused_welcome_bind",
+        error_kind = error.as_engine_error().privacy_safe_kind(),
+        "refused invite Welcome could not be bound for audit"
+    );
+}
+
 fn refused_before_publishing(
     message_id: cgka_traits::MessageId,
     oversized: OversizedEvent,
@@ -8794,7 +9143,7 @@ fn refused_before_publishing(
 /// without waiting for recipient delivery. Empty Welcome vectors remain on the
 /// original work items so later publish still confirms the commit. Automatic
 /// work retains its Welcomes until its own commit is acknowledged.
-fn take_deferred_welcomes(effects: &mut SessionEffects) -> Vec<TransportMessage> {
+fn take_deferred_welcomes(effects: &mut SessionEffects) -> Vec<OutboundWelcome> {
     let mut welcomes = Vec::new();
     for work in &mut effects.publish {
         match work {
@@ -8803,8 +9152,7 @@ fn take_deferred_welcomes(effects: &mut SessionEffects) -> Vec<TransportMessage>
             }
             | PublishWork::GroupCreated {
                 welcomes: items, ..
-            }
-            | PublishWork::FoundingGroupCreated { welcomes: items } => {
+            } => {
                 welcomes.append(items);
             }
             _ => {}
@@ -8834,32 +9182,6 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
             | SendIntent::ImportDeviceGroupRejections { .. }
             | SendIntent::MarkDeviceGroupMoved { .. }
     )
-}
-
-fn classify_prepared_session_send(
-    mut effects: SessionEffects,
-) -> AccountResult<PreparedSessionSend> {
-    let pending = effects.publish.iter().find_map(|work| match work {
-        PublishWork::GroupEvolution { pending, .. } | PublishWork::GroupCreated { pending, .. } => {
-            Some(*pending)
-        }
-        _ => None,
-    });
-    let Some(pending) = pending else {
-        if !effects.queued.is_empty() {
-            return Ok(PreparedSessionSend::Queued(effects));
-        }
-        return Err(cgka_traits::EngineError::Backend(
-            "prepared send contained neither a pending MLS evolution nor a queued intent".into(),
-        )
-        .into());
-    };
-    let welcomes = take_deferred_welcomes(&mut effects);
-    Ok(PreparedSessionSend::Commit(PreparedSessionCommit {
-        effects,
-        welcomes,
-        pending,
-    }))
 }
 
 /// The welcome recipient carried in the message's transport envelope, if the
@@ -9897,31 +10219,6 @@ mod tests {
             combined.superseded_intents,
             vec![first_superseded, second_superseded]
         );
-    }
-
-    #[test]
-    fn prepared_send_preserves_a_durably_queued_invite() {
-        let queued = QueuedIntentRef {
-            group_id: GroupId::new(vec![7]),
-            intent_id: cgka_traits::MessageId::new(vec![9]),
-        };
-        let classified = classify_prepared_session_send(SessionEffects {
-            events: Vec::new(),
-            publish: Vec::new(),
-            queued: vec![queued.clone()],
-            pending_convergence: vec![queued.group_id.clone()],
-        })
-        .expect("queued acceptance is not a malformed prepared commit");
-
-        match classified {
-            PreparedSessionSend::Queued(effects) => {
-                assert_eq!(effects.queued, vec![queued]);
-                assert_eq!(effects.pending_convergence.len(), 1);
-            }
-            PreparedSessionSend::Commit(_) | PreparedSessionSend::Refused(_) => {
-                panic!("queued invite must not pretend to be staged")
-            }
-        }
     }
 
     #[test]

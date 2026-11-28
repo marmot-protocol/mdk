@@ -386,7 +386,6 @@ impl<S: StorageProvider> Engine<S> {
                 },
                 &pre_commit_ctx,
             )
-            .await
             .map_err(EngineError::Peeler)?;
         let commit_msg =
             crate::message_processor::route_wrapped_group_message(commit_msg, &pre_commit_ctx);

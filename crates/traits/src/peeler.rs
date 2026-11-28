@@ -1,13 +1,16 @@
-//! The `TransportPeeler` trait is the crypto boundary between the engine and
-//! transport-specific wrapping below it.
+//! The crypto boundaries below the engine.
 //!
-//! Welcomes and group messages are separate operations: they use different
-//! keys and addressing rules, so they get separate methods.
+//! [`TransportPeeler`] wraps and unwraps group messages with group exporter
+//! keys. It is synchronous: the engine calls it while it holds group state.
+//!
+//! [`InboxSealer`] seals and unseals account-inbox messages (Welcomes and
+//! recovery control) with the account signer, which may be remote. The session
+//! owns it; the engine never calls it.
 //!
 //! The peeler takes a [`GroupContextSnapshot`] (value type) rather than
-//! `&dyn GroupContext` so async peeler calls do not borrow live engine state.
+//! `&dyn GroupContext` so peeler calls do not borrow live engine state.
 
-use crate::engine::WelcomeMetadata;
+use crate::engine::OutboundWelcome;
 use crate::error::PeelerError;
 use crate::group_context::GroupContextSnapshot;
 use crate::group_recovery::GroupRecoveryMessage;
@@ -97,7 +100,7 @@ impl GroupMessageMetadata {
     }
 }
 
-/// Unwrap and rewrap transport-layer envelopes. A single peeler typically
+/// Unwrap and rewrap group-message envelopes. A single peeler typically
 /// handles one transport (e.g. `NostrMlsPeeler`).
 ///
 /// ### Method invariants
@@ -111,17 +114,10 @@ impl GroupMessageMetadata {
 ///   maps a potentially recoverable miss to
 ///   `IngestOutcome::TransportDeferred`; authenticated epoch evidence can
 ///   instead establish a terminal stale classification.
-/// - `peel_welcome` MUST fail cleanly for welcomes not addressed to the
-///   local identity — the engine maps that to
-///   `InputRejectionCategory::WrongRecipient`.
 /// - `wrap_group_message` MUST be deterministic given the same input
 ///   (same `EncryptedPayload` + same `GroupContextSnapshot.epoch` →
 ///   reproducible wire bytes modulo outer-layer nonces/timestamps). The
 ///   harness asserts on this where applicable.
-/// - Implementations are `Send + Sync`; the `#[async_trait]` macro handles
-///   the lifetime gymnastics.
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait TransportPeeler: Send + Sync {
     /// Validate and decode the transport envelope before trying any group key.
     /// Raw transports need no decoding and borrow their admitted payload.
@@ -137,52 +133,51 @@ pub trait TransportPeeler: Send + Sync {
 
     /// Try one group key against bytes returned by this peeler's preparation.
     /// Callers must not substitute another message or transport's prepared bytes.
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError>;
 
-    /// Unseal an account-inbox delivery once and classify its authenticated
-    /// inner content as a Welcome or private account control. Outer routing
-    /// metadata must not determine the inner message type.
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError>;
-
-    /// Wrap recovery control to one account's ordinary inbox, independently of
-    /// group exporter keys. Callers persist these exact bytes for retry.
-    async fn wrap_group_recovery(
-        &self,
-        message: &GroupRecoveryMessage,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError>;
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError>;
 
-    async fn wrap_group_message_with_metadata(
+    fn wrap_group_message_with_metadata(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
         _metadata: &GroupMessageMetadata,
     ) -> Result<TransportMessage, PeelerError> {
-        self.wrap_group_message(payload, ctx).await
+        self.wrap_group_message(payload, ctx)
     }
+}
 
-    async fn wrap_welcome(
+/// Seals and unseals account-inbox messages with the account signer, which
+/// may be remote. The session owns it; the engine never calls it.
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait InboxSealer: Send + Sync {
+    /// Open an account-inbox delivery once. Authenticated inner content,
+    /// not outer routing, decides Welcome versus account control. A
+    /// delivery for another account fails with `WrongRecipient`.
+    async fn unseal(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError>;
+
+    async fn seal_welcome(
         &self,
-        payload: &EncryptedPayload,
+        welcome: &OutboundWelcome,
+    ) -> Result<TransportMessage, PeelerError>;
+
+    /// Seal recovery control to one account's ordinary inbox, independently
+    /// of group exporter keys. Callers persist these exact bytes for retry.
+    async fn seal_group_recovery(
+        &self,
+        message: &GroupRecoveryMessage,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError>;
 
-    async fn wrap_welcome_with_metadata(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-        _metadata: &WelcomeMetadata,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.wrap_welcome(payload, recipient).await
-    }
+    /// Exact byte length of the event `seal_welcome` would produce.
+    fn sealed_welcome_len(&self, welcome: &OutboundWelcome) -> usize;
 }

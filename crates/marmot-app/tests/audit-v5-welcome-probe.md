@@ -13,7 +13,7 @@ Run the bounded scenarios (also included in ordinary library tests):
 cargo test -p marmot-app --lib audit_v5_probe -- --nocapture --test-threads=1
 ```
 
-Every session wraps its Nostr peeler in the delegating `ProbePeeler`, and a
+Every session wraps its Nostr inbox sealer in the delegating `ProbeSealer`, and a
 session with an enabled v5 recorder installs `WelcomeProbe::live`. The live probe
 queues at most 128 pending events and flushes them to the installed recorder,
 which assigns source, session and sequence alongside the engine audit rows and

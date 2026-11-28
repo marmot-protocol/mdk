@@ -231,6 +231,7 @@ async fn late_staging_failure(kind: StagingKind) {
     else {
         panic!("{kind:?}: expected staged retry")
     };
+    let welcomes = seal_and_bind(&mut sender.engine, &welcomes);
     sender.engine.confirm_published(pending).await.unwrap();
     match kind {
         StagingKind::Link => {

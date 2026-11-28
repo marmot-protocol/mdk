@@ -32,6 +32,7 @@ use support::epoch_sealed_peeler::{
     EpochSealedPeeler, GROUP_EVENT_EXPORTER_KEY, seal_group_payload, unseal_group_payload,
 };
 use support::proof_signer;
+use support::raw_inbox::{join_raw, seal_and_bind};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
@@ -137,16 +138,14 @@ async fn ordinary_delivery_still_converges_when_the_transport_seals_per_epoch() 
         .await
         .unwrap();
     let welcome = match create {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
             alice.confirm_published(pending).await.unwrap();
-            welcomes.remove(0)
+            welcome
         }
         other => panic!("unexpected create result: {other:?}"),
     };
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
     assert!(
         bob_storage
             .list_group_snapshots(&group_id)
@@ -230,16 +229,14 @@ async fn incumbent_adopts_a_deeper_rival_branch_whose_traffic_only_it_can_read()
         .await
         .unwrap();
     let welcome = match create {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let welcome = seal_and_bind(&mut incumbent, &welcomes).remove(0);
             incumbent.confirm_published(pending).await.unwrap();
-            welcomes.remove(0)
+            welcome
         }
         other => panic!("unexpected create result: {other:?}"),
     };
-    rival.join_welcome(welcome).await.unwrap();
+    join_raw(&mut rival, welcome).await.unwrap();
     assert_eq!(incumbent.epoch(&group_id).unwrap().0, 1);
     assert_eq!(rival.epoch(&group_id).unwrap().0, 1);
 
@@ -436,16 +433,14 @@ async fn a_reopened_row_this_copy_can_no_longer_peel_lands_in_the_deferred_peel_
         .await
         .unwrap();
     let welcome = match create {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
             alice.confirm_published(pending).await.unwrap();
-            welcomes.remove(0)
+            welcome
         }
         other => panic!("unexpected create result: {other:?}"),
     };
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
 
     // Alice removes bob and he realizes it.
     let removal = match alice
@@ -513,16 +508,15 @@ async fn a_reopened_row_this_copy_can_no_longer_peel_lands_in_the_deferred_peel_
         .unwrap()
     {
         SendResult::GroupEvolution {
-            mut welcomes,
-            pending,
-            ..
+            welcomes, pending, ..
         } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
             alice.confirm_published(pending).await.unwrap();
-            welcomes.remove(0)
+            welcome
         }
         other => panic!("unexpected invite result: {other:?}"),
     };
-    bob.join_welcome(rejoin_welcome).await.unwrap();
+    join_raw(&mut bob, rejoin_welcome).await.unwrap();
     let events = bob.drain_events();
 
     let state = bob_storage.get_message(&routed_era.id).unwrap().state;
@@ -643,16 +637,14 @@ async fn alice_and_a_removed_bob(
         .await
         .unwrap();
     let welcome = match create {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
             alice.confirm_published(pending).await.unwrap();
-            welcomes.remove(0)
+            welcome
         }
         other => panic!("unexpected create result: {other:?}"),
     };
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
 
     let removal = evolve(
         &mut alice,
@@ -689,12 +681,11 @@ async fn readd(
         .unwrap()
     {
         SendResult::GroupEvolution {
-            mut welcomes,
-            pending,
-            ..
+            welcomes, pending, ..
         } => {
+            let welcome = seal_and_bind(alice, &welcomes).remove(0);
             alice.confirm_published(pending).await.unwrap();
-            welcomes.remove(0)
+            welcome
         }
         other => panic!("unexpected invite result: {other:?}"),
     };
@@ -721,7 +712,7 @@ async fn unopenable_traffic_from_an_epoch_this_copy_has_not_reached_still_defers
     let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"future").await;
 
     let welcome = readd(&mut alice, &mut bob, &group_id, WELCOME_CREATED_AT).await;
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
     let mut events = bob.drain_events();
 
     // Alice advances the group and speaks from the new epoch. Bob is served
@@ -809,7 +800,7 @@ async fn a_released_row_older_than_this_copys_welcome_raises_no_refusal() {
     let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"release").await;
 
     let welcome = readd(&mut alice, &mut bob, &group_id, WELCOME_CREATED_AT).await;
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
     bob.drain_events();
 
     // Alice advances and speaks from the new epoch; the commit is withheld, so
@@ -883,7 +874,7 @@ async fn a_released_row_older_than_this_copys_welcome_arms_no_epoch_gap() {
     let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"journal").await;
 
     let welcome = readd(&mut alice, &mut bob, &group_id, WELCOME_CREATED_AT).await;
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
     bob.drain_events();
     // From here on an application owns this database's released messages.
     bob_storage
@@ -978,7 +969,7 @@ async fn a_welcome_dated_in_the_future_is_clamped_to_this_devices_clock() {
     let far_future = u64::MAX;
     let welcome = readd(&mut alice, &mut bob, &group_id, far_future).await;
     let before_join = unix_seconds_now();
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
     let after_join = unix_seconds_now();
 
     let recorded = bob_storage
@@ -1010,7 +1001,7 @@ async fn deferred_stall_evidence_lists_current_epoch_rows_newer_than_the_welcome
     let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"evidence").await;
 
     let welcome = readd(&mut alice, &mut bob, &group_id, WELCOME_CREATED_AT).await;
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
     bob.drain_events();
     let bob_epoch = bob.group_record(&group_id).unwrap().epoch;
 
@@ -1091,7 +1082,7 @@ async fn expired_deferred_row_arms_no_epoch_gap_and_keeps_inventory() {
     let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"expired").await;
 
     let welcome = readd(&mut alice, &mut bob, &group_id, WELCOME_CREATED_AT).await;
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await.unwrap();
     bob.drain_events();
     bob_storage
         .app_storage()
@@ -1240,16 +1231,14 @@ async fn candidate_branch_recovery_enforces_copy_history_floor() {
         .await
         .unwrap();
     let bob_welcome = match create {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => {
+        SendResult::GroupCreated { pending, welcomes } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
             alice.confirm_published(pending).await.unwrap();
-            welcomes.remove(0)
+            welcome
         }
         other => panic!("unexpected create result: {other:?}"),
     };
-    bob.join_welcome(bob_welcome).await.unwrap();
+    join_raw(&mut bob, bob_welcome).await.unwrap();
     assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(1));
 
     let snapshot_of = |engine: &Engine<SqliteAccountStorage>| {
@@ -1281,14 +1270,15 @@ async fn candidate_branch_recovery_enforces_copy_history_floor() {
         SendResult::GroupEvolution {
             msg,
             pending,
-            mut welcomes,
+            welcomes,
         } => {
+            let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
             alice.confirm_published(pending).await.unwrap();
-            (msg, welcomes.remove(0))
+            (msg, welcome)
         }
         other => panic!("unexpected invite result: {other:?}"),
     };
-    carol.join_welcome(carol_welcome).await.unwrap();
+    join_raw(&mut carol, carol_welcome).await.unwrap();
     carol.drain_events();
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
     assert_eq!(

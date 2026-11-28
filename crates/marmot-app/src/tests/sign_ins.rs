@@ -1173,12 +1173,14 @@ async fn welcomes_ordered(
 ) -> Vec<NostrTransportEvent> {
     let events = account.relay.published_events.lock().unwrap()[*cursor..].to_vec();
     *cursor += events.len();
-    let peeler =
-        transport_nostr_peeler::NostrMlsPeeler::default().with_welcome_signer(account.keys.clone());
+    let sealer = NostrInboxSealer::new(
+        Arc::new(account.keys.clone()),
+        Arc::new(cgka_traits::SystemWallClock),
+    );
     let (mut named, mut own_rumors, mut other_rumors) = (Vec::new(), 0, 0);
     for event in events {
-        let names_own = match peeler
-            .peel_welcome_with_provenance(&event.to_transport_message().unwrap())
+        let names_own = match sealer
+            .unseal_with_provenance(&event.to_transport_message().unwrap())
             .await
         {
             Ok((_, Some(provenance))) => {

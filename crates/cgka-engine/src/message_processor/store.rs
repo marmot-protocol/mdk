@@ -8,11 +8,24 @@ use cgka_traits::error::EngineError;
 use cgka_traits::ingest::{InboundResourceLimit, IngestOutcome, InputRejectionCategory};
 use cgka_traits::message::{
     DeferredMessageMetadata, DeferredPeelLifecycle, MessageRecord, MessageState,
-    OwnApplicationConvergenceStamp, StoredMessagePayload,
+    OwnApplicationConvergenceStamp, StoredMessagePayload, UnsealedWelcomeOrigin,
 };
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
+use sha2::{Digest, Sha256};
+
+/// The local id of the Welcome staged for `key_package_ref` by `origin` (its
+/// Commit's transport id, or a create's group id), which keys its unsealed row
+/// until binding replaces it with the sealed transport id. Never a transport id.
+pub(crate) fn welcome_local_id(origin: &[u8], key_package_ref: &[u8]) -> MessageId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mdk/unsealed-welcome/v1");
+    hasher.update((origin.len() as u32).to_be_bytes());
+    hasher.update(origin);
+    hasher.update(key_package_ref);
+    MessageId::new(hasher.finalize().to_vec())
+}
 
 fn fresh_deferred_peel_lifecycle(
     now: crate::convergence_clock::ConvergenceTime,
@@ -93,6 +106,32 @@ pub(crate) fn transition_staged_invite_welcomes<S: StorageProvider>(
         }
         let payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+        // Cold rollback can also find a legacy founding Add that stopped
+        // before its first fanout. Its unsealed rows were never published.
+        if origin_commit_id.is_none()
+            && state == MessageState::Failed
+            && matches!(
+                payload,
+                StoredMessagePayload::UnsealedWelcome {
+                    origin: UnsealedWelcomeOrigin::LegacyCreate,
+                    ..
+                }
+            )
+        {
+            storage.delete_message(&record.id)?;
+            continue;
+        }
+        // Binding precedes any publish of its Commit, so a staged Welcome
+        // still unsealed at a confirm or rollback was never sent.
+        if let StoredMessagePayload::UnsealedWelcome {
+            origin: UnsealedWelcomeOrigin::StagedCommit(_),
+            ..
+        } = &payload
+        {
+            record.state = MessageState::Failed;
+            storage.put_message(&record)?;
+            continue;
+        }
         if let Some(message) = payload.as_raw_transport()
             && matches!(message.envelope, TransportEnvelope::Welcome { .. })
         {
@@ -334,18 +373,37 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         epoch: EpochId,
     ) -> Result<(), EngineError> {
+        self.persist_unsealed_welcome(
+            StoredMessagePayload::UnsealedWelcome {
+                welcome: welcome.welcome,
+                origin: UnsealedWelcomeOrigin::StagedCommit(origin_commit_id.clone()),
+                key_package_ref: Some(welcome.key_package_ref),
+                deliver_until: Some(deliver_until),
+                key_package_event_id: welcome.key_package_event_id,
+                expiry: None,
+            },
+            group_id,
+            epoch,
+        )
+    }
+
+    /// Record an [`StoredMessagePayload::UnsealedWelcome`] under its local id,
+    /// `Sent` until the session binds its sealed message.
+    pub(crate) fn persist_unsealed_welcome(
+        &self,
+        payload: StoredMessagePayload,
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        let StoredMessagePayload::UnsealedWelcome { welcome, .. } = &payload else {
+            return Err(EngineError::Backend("not an unsealed Welcome".into()));
+        };
         self.persist_stored_message_payload(
-            welcome.message.id.clone(),
+            welcome.local_id.clone(),
             group_id,
             RowEpochs::at(epoch),
             MessageState::Sent,
-            StoredMessagePayload::staged_invite_welcome(
-                welcome.message,
-                origin_commit_id.clone(),
-                Some(welcome.key_package_ref),
-                Some(deliver_until),
-            )
-            .with_key_package_event_id(welcome.key_package_event_id),
+            payload,
             None,
         )
     }
@@ -1292,7 +1350,6 @@ mod tests {
     use super::RowEpochs;
     use crate::account_identity_proof::{AccountIdentityProofRequest, AccountIdentityProofSigner};
     use crate::engine::EngineBuilder;
-    use async_trait::async_trait;
     use cgka_traits::error::PeelerError;
     use cgka_traits::group_context::GroupContextSnapshot;
     use cgka_traits::ingest::PeeledMessage;
@@ -1302,7 +1359,7 @@ mod tests {
     use cgka_traits::transport::{
         EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
     };
-    use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+    use cgka_traits::types::{EpochId, GroupId, MessageId};
     use k256::schnorr::{SigningKey, signature::hazmat::PrehashSigner};
     use sha2::{Digest, Sha256};
     use std::sync::Arc;
@@ -1310,20 +1367,8 @@ mod tests {
 
     struct UnreachablePeeler;
 
-    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     impl TransportPeeler for UnreachablePeeler {
-        async fn wrap_group_recovery(
-            &self,
-            _message: &cgka_traits::GroupRecoveryMessage,
-            _recipient: &cgka_traits::MemberId,
-        ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-            Err(cgka_traits::PeelerError::Malformed(
-                "pass-through fixture has no authenticated account channel".into(),
-            ))
-        }
-
-        async fn peel_group_message(
+        fn peel_group_message(
             &self,
             _msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
             _ctx: &GroupContextSnapshot,
@@ -1331,25 +1376,10 @@ mod tests {
             Err(PeelerError::DecryptFailed)
         }
 
-        async fn peel_welcome(
-            &self,
-            _msg: &TransportMessage,
-        ) -> Result<PeeledMessage, PeelerError> {
-            Err(PeelerError::DecryptFailed)
-        }
-
-        async fn wrap_group_message(
+        fn wrap_group_message(
             &self,
             _payload: &EncryptedPayload,
             _ctx: &GroupContextSnapshot,
-        ) -> Result<TransportMessage, PeelerError> {
-            Err(PeelerError::DecryptFailed)
-        }
-
-        async fn wrap_welcome(
-            &self,
-            _payload: &EncryptedPayload,
-            _recipient: &MemberId,
         ) -> Result<TransportMessage, PeelerError> {
             Err(PeelerError::DecryptFailed)
         }

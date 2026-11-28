@@ -432,23 +432,32 @@ impl<S: StorageProvider> Engine<S> {
         ))
     }
 
-    pub(crate) async fn ingest_welcome(
-        &mut self,
-        msg: &TransportMessage,
-        recipient: MemberId,
-    ) -> Result<IngestOutcome, EngineError> {
+    /// Route an account-inbox delivery: one for another client is ignored, and
+    /// one for this client stops here for the caller to unseal, since the
+    /// engine never calls the account signer.
+    pub(crate) fn ingest_welcome(&self, recipient: &MemberId) -> IngestOutcome {
         // Welcome recipients are checked at the engine layer as well as the
         // transport layer. Test harnesses broadcast messages to all clients,
         // and multi-device or broadcast transports may break a one-pubkey-per-
         // member assumption. `NotForThisClient` also makes routing failures
         // easier to distinguish from decryption failures.
-        if &recipient != self.identity.self_id() {
-            return Ok(IngestOutcome::Ignored {
+        if recipient != self.identity.self_id() {
+            return IngestOutcome::Ignored {
                 category: InputRejectionCategory::WrongRecipient,
-            });
+            };
         }
+        IngestOutcome::InboxSealed
+    }
 
-        let peeled = match self.peeler.peel_welcome(msg).await {
+    /// Finish an account-inbox delivery addressed to this client, given the
+    /// caller's unseal result. A failed unseal gets the disposition a failed
+    /// peel got before sealing left the engine.
+    pub(crate) async fn ingest_welcome_unsealed(
+        &mut self,
+        msg: &TransportMessage,
+        unsealed: Result<cgka_traits::ingest::PeeledMessage, PeelerError>,
+    ) -> Result<IngestOutcome, EngineError> {
+        let peeled = match unsealed {
             Ok(cgka_traits::ingest::PeeledMessage {
                 content: PeeledContent::GroupRecovery { recovery },
                 ..
@@ -488,7 +497,7 @@ impl<S: StorageProvider> Engine<S> {
             Ok(prepared) => {
                 self.do_join_welcome(
                     msg.clone(),
-                    Some(prepared),
+                    prepared,
                     group_lifecycle::WelcomeRoute::Delivery,
                 )
                 .await
@@ -861,7 +870,7 @@ impl<S: StorageProvider> Engine<S> {
         let msg_id_hex = hex::encode(raw_msg_id.as_slice());
         let (prepared, peel_result) = match self.peeler.prepare_group_message(msg) {
             Ok(prepared) => {
-                let result = self.peeler.peel_group_message(&prepared, &ctx).await;
+                let result = self.peeler.peel_group_message(&prepared, &ctx);
                 (Some(prepared), result)
             }
             Err(error) => (None, Err(error)),
@@ -2361,7 +2370,6 @@ impl<S: StorageProvider> Engine<S> {
                 },
                 &pre_commit_ctx,
             )
-            .await
             .map_err(EngineError::Peeler)?;
         let wrapped = route_wrapped_group_message(wrapped, &pre_commit_ctx);
         // Derive the pending membership projection before exposing any sent
@@ -2844,7 +2852,7 @@ impl<S: StorageProvider> Engine<S> {
             });
         };
         for (index, branch) in sweep.branch_contexts().iter().enumerate() {
-            match self.peeler.peel_group_message(msg, &branch.context).await {
+            match self.peeler.peel_group_message(msg, &branch.context) {
                 Ok(peeled) => {
                     return Ok(RecoveryPeel {
                         recovery: Some(PastPeelRecovery {
@@ -2905,7 +2913,7 @@ impl<S: StorageProvider> Engine<S> {
             let Some(context) = context else {
                 continue;
             };
-            let peeled = self.peeler.peel_group_message(msg, &context.context).await;
+            let peeled = self.peeler.peel_group_message(msg, &context.context);
             match peeled {
                 Ok(peeled) => {
                     return Ok(RecoveryPeel {

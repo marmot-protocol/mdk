@@ -19,7 +19,6 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use cgka_engine::canonicalization::{CanonicalizationPolicy, CanonicalizationState};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{
@@ -38,7 +37,9 @@ use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::maintenance::{
     DurableGroupEvolution, GroupEvolutionPhase, GroupEvolutionSemantic,
 };
-use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
+use cgka_traits::message::{
+    MessageRecord, MessageState, StoredMessagePayload, UnsealedWelcomeOrigin,
+};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerStorage, ConvergencePassStorage, GroupStorage, MaintenanceStorage,
@@ -49,6 +50,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use cgka_traits::{OutboundWelcome, SealedWelcome};
 use sha2::{Digest, Sha256};
 use storage_sqlite::{
     GroupRecoveryPhase, GroupRecoveryRecord, GroupRecoveryRole, SqlCipherKey, SqliteAccountStorage,
@@ -56,6 +58,7 @@ use storage_sqlite::{
 
 mod support;
 use support::proof_signer;
+use support::raw_inbox::{join_raw, raw_seal, raw_unseal, seal_and_bind};
 
 #[path = "crash_recovery_sqlite/disband_settle.rs"]
 mod disband_settle;
@@ -84,19 +87,8 @@ const QUEUED_INTENT_ID: &[u8] = b"crash-queued-intent";
 
 struct MockPeeler;
 
-#[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -112,21 +104,7 @@ impl TransportPeeler for MockPeeler {
         })
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
@@ -142,23 +120,6 @@ impl TransportPeeler for MockPeeler {
             },
         })
     }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("crash-test".into()),
-            envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
-            },
-        })
-    }
 }
 
 /// Models the production shape the retained-anchor fallback exists for: traffic
@@ -166,19 +127,8 @@ impl TransportPeeler for MockPeeler {
 /// read.
 struct UnreadablePeeler;
 
-#[async_trait]
 impl TransportPeeler for UnreadablePeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &cgka_traits::MemberId,
-    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
-        Err(cgka_traits::PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         _msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -186,24 +136,12 @@ impl TransportPeeler for UnreadablePeeler {
         Err(PeelerError::DecryptFailed)
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        MockPeeler.peel_welcome(msg).await
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_group_message(payload, ctx).await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_welcome(payload, recipient).await
+        MockPeeler.wrap_group_message(payload, ctx)
     }
 }
 
@@ -723,15 +661,15 @@ async fn run_child_case(database: &Path) {
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice
         .confirm_published(pending)
         .await
         .expect("confirm group");
-    bob.join_welcome(welcome_for(&welcomes, bob_seed))
+    join_raw(&mut bob, welcome_for(&welcomes, bob_seed))
         .await
         .expect("bob joins");
-    carol
-        .join_welcome(welcome_for(&welcomes, CAROL_SEED))
+    join_raw(&mut carol, welcome_for(&welcomes, CAROL_SEED))
         .await
         .expect("carol joins");
 
@@ -1172,9 +1110,9 @@ async fn run_probe_child(database: &Path) {
     let SendResult::GroupCreated { pending, welcomes } = created else {
         panic!("legacy fixture");
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    carol
-        .join_welcome(welcomes.into_iter().next().unwrap())
+    join_raw(&mut carol, welcomes.into_iter().next().unwrap())
         .await
         .unwrap();
     let (commit, _) = evolution(
@@ -1444,9 +1382,9 @@ async fn run_application_child(database: &Path) {
     let SendResult::GroupCreated { pending, welcomes } = created else {
         panic!("group creation")
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    carol
-        .join_welcome(welcome_for(&welcomes, CAROL_SEED))
+    join_raw(&mut carol, welcome_for(&welcomes, CAROL_SEED))
         .await
         .unwrap();
     for index in 0..6 {
@@ -1514,7 +1452,7 @@ struct RecoveryPreparedExpected {
     descriptor: DurableGroupEvolution,
     msg: TransportMessage,
     pending: cgka_traits::engine_state::PendingStateRef,
-    welcomes: Vec<TransportMessage>,
+    welcomes: Vec<OutboundWelcome>,
 }
 
 #[test]
@@ -1591,11 +1529,11 @@ async fn run_stale_ordinary_recovery(phase: GroupEvolutionPhase) {
         })
         .await
         .unwrap();
-    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
-    let founding = welcomes.remove(0);
-    target.join_welcome(founding.clone()).await.unwrap();
+    let founding = seal_and_bind(&mut coordinator, &welcomes).remove(0);
+    join_raw(&mut target, founding.clone()).await.unwrap();
     coordinator
         .mark_sent_welcome_delivered(&founding.id)
         .unwrap();
@@ -1785,7 +1723,7 @@ async fn run_stale_ordinary_recovery(phase: GroupEvolutionPhase) {
     );
     assert!(coordinator.outstanding_sent_welcomes().unwrap().is_empty());
     assert_eq!(
-        storage.get_message(&welcomes[0].id).unwrap().state,
+        storage.get_message(&welcomes[0].local_id).unwrap().state,
         MessageState::Failed
     );
     let mut fresh = grant;
@@ -1805,11 +1743,12 @@ async fn run_stale_ordinary_recovery(phase: GroupEvolutionPhase) {
     else {
         panic!("retried remove-and-add member recovery")
     };
+    let welcomes = seal_and_bind(&mut coordinator, &welcomes);
     assert_eq!(welcomes.len(), 1);
     coordinator.confirm_published(pending).await.unwrap();
     assert_eq!(storage.group_evolution(&orphan.id).unwrap(), Some(orphan));
     assert!(matches!(
-        target.join_welcome(welcomes[0].clone()).await,
+        join_raw(&mut target, welcomes[0].clone()).await,
         Err(cgka_traits::EngineError::InvalidTransition(error))
             if error.from == "ActiveMember" && error.to == "JoinWelcome"
     ));
@@ -1818,8 +1757,10 @@ async fn run_stale_ordinary_recovery(phase: GroupEvolutionPhase) {
         .unwrap()
         .pop()
         .unwrap();
+    let token = offer.rejoin.unwrap().local_state_token;
+    let stored = target.stored_welcome(&offer.message_id, &token).unwrap();
     target
-        .confirm_group_rejoin(&offer.message_id, &offer.rejoin.unwrap().local_state_token)
+        .confirm_group_rejoin(&offer.message_id, &token, raw_unseal(&stored))
         .await
         .unwrap();
     assert_eq!(
@@ -1901,6 +1842,22 @@ async fn run_pending_ref_restart(mode: &str) {
             .unwrap();
     assert_recovery_pending(&storage, &expected);
     let frozen_before = storage.list_outbound_fanouts().unwrap();
+    if mode != "fanout" {
+        assert!(frozen_before.is_empty());
+        assert_eq!(prepared.welcomes.len(), 1);
+        for welcome in &prepared.welcomes {
+            let row = storage.get_message(&welcome.local_id).unwrap();
+            assert_eq!(row.state, MessageState::Sent);
+            assert!(matches!(
+                StoredMessagePayload::decode(&row.payload).unwrap(),
+                StoredMessagePayload::UnsealedWelcome {
+                    welcome: stored,
+                    origin: UnsealedWelcomeOrigin::StagedCommit(commit),
+                    ..
+                } if &stored == welcome && commit == prepared.msg.id
+            ));
+        }
+    }
     let mut restarted = build_recovery_client(RECOVERY_COORDINATOR, storage.clone());
     let (ordinary_group, ordinary_msg) = if mode == "direct" {
         // No seeding or hydration has run: construction itself must reserve
@@ -1934,7 +1891,7 @@ async fn run_pending_ref_restart(mode: &str) {
         assert!(ordinary.welcomes.is_empty());
         ordinary.pending
     };
-    let recovery_pending = if mode == "fanout" {
+    let (recovery_pending, welcomes) = if mode == "fanout" {
         let frozen_after = restarted.outbound_fanouts().unwrap();
         assert_eq!(frozen_after, frozen_before);
         assert_eq!(frozen_after.len(), 1);
@@ -1942,16 +1899,20 @@ async fn run_pending_ref_restart(mode: &str) {
             frozen_after[0].pending_origin_message_id(),
             Some(&prepared.msg.id)
         );
+        let welcomes = frozen_after[0].pending_post_confirmation_welcomes();
         assert_eq!(
-            frozen_after[0].pending_post_confirmation_welcomes(),
-            prepared.welcomes
+            welcomes,
+            prepared.welcomes.iter().map(raw_seal).collect::<Vec<_>>()
         );
         assert!(!work.iter().any(|item| item.msg == prepared.msg));
-        frozen_after[0].pending_ref().unwrap()
+        (frozen_after[0].pending_ref().unwrap(), welcomes.to_vec())
     } else {
         let recovery = work.iter().find(|item| item.msg == prepared.msg).unwrap();
         assert_eq!(recovery.welcomes, prepared.welcomes);
-        recovery.pending
+        (
+            recovery.pending,
+            seal_and_bind(&mut restarted, &recovery.welcomes),
+        )
     };
     assert_eq!(recovery_pending, prepared.pending);
     assert_ne!(ordinary_pending, recovery_pending);
@@ -1970,7 +1931,7 @@ async fn run_pending_ref_restart(mode: &str) {
         "acknowledging A must not confirm or rebind B's evolution"
     );
     assert!(restarted.outstanding_sent_welcomes().unwrap().is_empty());
-    for welcome in &prepared.welcomes {
+    for welcome in &welcomes {
         assert!(restarted.stored_sent_welcome(&welcome.id).is_err());
     }
     restarted.confirm_published(recovery_pending).await.unwrap();
@@ -1989,7 +1950,7 @@ async fn run_pending_ref_restart(mode: &str) {
     );
     assert_eq!(
         restarted.outstanding_sent_welcomes().unwrap(),
-        vec![(expected.group_id.clone(), prepared.welcomes[0].clone())]
+        vec![(expected.group_id.clone(), welcomes[0].clone())]
     );
     let target_storage = SqliteAccountStorage::open_encrypted(
         database.with_extension("target.sqlite3"),
@@ -1998,19 +1959,20 @@ async fn run_pending_ref_restart(mode: &str) {
     .unwrap();
     let mut target = build_recovery_client(RECOVERY_TARGET, target_storage.clone());
     target.hydrate_all_stored_groups().unwrap();
-    assert!(
-        target
-            .join_welcome(prepared.welcomes[0].clone())
-            .await
-            .is_err()
-    );
+    assert!(matches!(
+        join_raw(&mut target, welcomes[0].clone()).await,
+        Err(cgka_traits::EngineError::InvalidTransition(error))
+            if error.from == "ActiveMember" && error.to == "JoinWelcome"
+    ));
     let offer = target
         .pending_group_rejoins_for(Some(&expected.group_id))
         .unwrap()
         .pop()
         .unwrap();
+    let token = offer.rejoin.unwrap().local_state_token;
+    let stored = target.stored_welcome(&offer.message_id, &token).unwrap();
     target
-        .confirm_group_rejoin(&offer.message_id, &offer.rejoin.unwrap().local_state_token)
+        .confirm_group_rejoin(&offer.message_id, &token, raw_unseal(&stored))
         .await
         .unwrap();
     assert_eq!(
@@ -2113,10 +2075,13 @@ fn run_recovery_parent(point: &str) {
         .unwrap()
         .into_iter()
         .filter(|record| {
-            StoredMessagePayload::decode(&record.payload)
-                .unwrap()
-                .as_staged_invite_welcome()
-                .is_some()
+            matches!(
+                StoredMessagePayload::decode(&record.payload).unwrap(),
+                StoredMessagePayload::UnsealedWelcome {
+                    origin: UnsealedWelcomeOrigin::StagedCommit(_),
+                    ..
+                }
+            )
         })
         .collect::<Vec<_>>();
     if point == "recovery_after_preparing" {
@@ -2184,11 +2149,16 @@ fn run_recovery_parent(point: &str) {
         assert_eq!(staged_welcomes.len(), prepared.welcomes.len());
         for (row, welcome) in staged_welcomes.iter().zip(&prepared.welcomes) {
             assert_eq!(storage.get_message(&row.id).unwrap().payload, row.payload);
-            let payload = StoredMessagePayload::decode(&row.payload).unwrap();
-            assert_eq!(
-                payload.as_staged_invite_welcome(),
-                Some((welcome, &prepared.msg.id))
-            );
+            assert_eq!(row.id, welcome.local_id);
+            assert!(matches!(
+                StoredMessagePayload::decode(&row.payload).unwrap(),
+                StoredMessagePayload::UnsealedWelcome {
+                    welcome: stored, origin: UnsealedWelcomeOrigin::StagedCommit(commit), ..
+                } if &stored == welcome && commit == prepared.msg.id
+            ));
+        }
+        let welcomes = seal_and_bind(&mut restarted, &work.welcomes);
+        for welcome in &welcomes {
             assert!(
                 restarted.stored_sent_welcome(&welcome.id).is_err(),
                 "a staged Welcome cannot escape before confirmation"
@@ -2211,7 +2181,7 @@ fn run_recovery_parent(point: &str) {
             );
             assert_eq!(
                 restarted.outstanding_sent_welcomes().unwrap(),
-                vec![(group_id.clone(), prepared.welcomes[0].clone())]
+                vec![(group_id.clone(), welcomes[0].clone())]
             );
 
             // This fixture raw-signs with a healthy target only to isolate
@@ -2226,7 +2196,7 @@ fn run_recovery_parent(point: &str) {
             target.hydrate_all_stored_groups().unwrap();
             let target_before = target_storage.get_group(group_id).unwrap();
             assert!(matches!(
-                &target.join_welcome(prepared.welcomes[0].clone()).await,
+                &join_raw(&mut target, welcomes[0].clone()).await,
                 Err(cgka_traits::EngineError::InvalidTransition(error))
                     if error.from == "ActiveMember" && error.to == "JoinWelcome"
             ));
@@ -2234,8 +2204,10 @@ fn run_recovery_parent(point: &str) {
             let mut offers = target.pending_group_rejoins_for(Some(group_id)).unwrap();
             assert_eq!(offers.len(), 1);
             let offer = offers.pop().unwrap();
+            let token = offer.rejoin.unwrap().local_state_token;
+            let stored = target.stored_welcome(&offer.message_id, &token).unwrap();
             target
-                .confirm_group_rejoin(&offer.message_id, &offer.rejoin.unwrap().local_state_token)
+                .confirm_group_rejoin(&offer.message_id, &token, raw_unseal(&stored))
                 .await
                 .unwrap();
             assert_eq!(target.epoch(group_id).unwrap(), descriptor.target_epoch);
@@ -2249,7 +2221,7 @@ fn run_recovery_parent(point: &str) {
                 "the resumed exact Welcome joins the confirmed MLS state"
             );
             restarted
-                .mark_sent_welcome_delivered(&prepared.welcomes[0].id)
+                .mark_sent_welcome_delivered(&welcomes[0].id)
                 .unwrap();
             assert!(restarted.outstanding_sent_welcomes().unwrap().is_empty());
             let SendResult::ApplicationMessage { msg, .. } = restarted
@@ -2308,12 +2280,7 @@ fn run_recovery_parent(point: &str) {
         for row in staged_welcomes {
             let retired = storage.get_message(&row.id).unwrap();
             assert_eq!(retired.state, MessageState::Failed);
-            assert!(
-                StoredMessagePayload::decode(&retired.payload)
-                    .unwrap()
-                    .as_outbound_welcome()
-                    .is_some()
-            );
+            assert_eq!(retired.payload, row.payload);
             assert!(restarted.stored_sent_welcome(&row.id).is_err());
         }
         // No send returned and no transport/fanout was invoked in this child.
@@ -2351,6 +2318,7 @@ fn run_recovery_parent(point: &str) {
                 "new grant payloads cannot reuse an old descriptor identity"
             );
             assert_recovery_pending(&storage, &expected);
+            let welcomes = seal_and_bind(&mut restarted, &welcomes);
             restarted.confirm_published(pending).await.unwrap();
             assert!(
                 recovery_mls_group(&storage, group_id)
@@ -2419,11 +2387,11 @@ async fn run_recovery_child(database: &Path) {
         })
         .await
         .unwrap();
-    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
-    let founding = welcomes.remove(0);
-    target.join_welcome(founding.clone()).await.unwrap();
+    let founding = seal_and_bind(&mut coordinator, &welcomes).remove(0);
+    join_raw(&mut target, founding.clone()).await.unwrap();
     coordinator
         .mark_sent_welcome_delivered(&founding.id)
         .unwrap();
@@ -2541,6 +2509,17 @@ async fn run_recovery_child(database: &Path) {
             let TransportEnvelope::GroupMessage { transport_group_id } = &msg.envelope else {
                 panic!("recovery commit envelope")
             };
+            let sealed: Vec<_> = expected
+                .prepared
+                .as_ref()
+                .unwrap()
+                .welcomes
+                .iter()
+                .map(|welcome| SealedWelcome {
+                    local_id: welcome.local_id.clone(),
+                    message: raw_seal(welcome),
+                })
+                .collect();
             let fanout = OutboundFanout::stage_with_post_confirmation_welcomes(
                 TransportPublishRequest {
                     account_id: coordinator.self_id(),
@@ -2557,10 +2536,15 @@ async fn run_recovery_child(database: &Path) {
                 0,
                 Some(msg.id.clone()),
                 Some(cgka_traits::FanoutPendingKind::GroupEvolution),
-                expected.prepared.as_ref().unwrap().welcomes.clone(),
+                sealed
+                    .iter()
+                    .map(|welcome| welcome.message.clone())
+                    .collect(),
             )
             .unwrap();
-            storage.put_outbound_fanout(&fanout).unwrap();
+            coordinator
+                .bind_sealed_welcomes(&sealed, Some(&fanout))
+                .unwrap();
         }
     }
     std::fs::write(

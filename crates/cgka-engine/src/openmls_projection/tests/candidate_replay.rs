@@ -9,7 +9,9 @@ use super::{
 // Stands still at zero: a zero deadline has passed, and a later one never comes.
 use super::resumable::StoppedClock;
 use crate::convergence::V1_MAX_REWIND_COMMITS;
-use crate::engine::test_support::{PassthroughPeeler, SeedProofSigner, carried, signing_key};
+use crate::engine::test_support::{
+    PassthroughPeeler, SeedProofSigner, carried, join_raw, seal_and_bind, signing_key,
+};
 use crate::message_processor::MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS;
 use crate::provider::EngineOpenMlsProvider;
 use crate::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
@@ -83,9 +85,10 @@ async fn group_with(
     let SendResult::GroupCreated { pending, welcomes } = created else {
         panic!("expected GroupCreated");
     };
+    let welcomes = seal_and_bind(creator, &welcomes);
     creator.confirm_published(pending).await.unwrap();
     for (joiner, welcome) in joiners.iter_mut().zip(welcomes) {
-        joiner.join_welcome(welcome).await.unwrap();
+        join_raw(joiner, welcome).await;
     }
     group_id
 }
@@ -141,13 +144,10 @@ async fn genuine_non_protocol_bodies_keep_their_projection_choices() {
         })
         .await
         .unwrap();
-    let SendResult::GroupCreated {
-        pending,
-        mut welcomes,
-    } = created
-    else {
+    let SendResult::GroupCreated { pending, welcomes } = created else {
         panic!("legacy compatibility creation returns its real Welcome");
     };
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
     assert_eq!(welcomes.len(), 1);
     let welcome = welcomes.remove(0);
@@ -159,7 +159,7 @@ async fn genuine_non_protocol_bodies_keep_their_projection_choices() {
         protocol.is_none(),
         "a genuine Welcome is not a protocol message"
     );
-    bob.join_welcome(welcome).await.unwrap();
+    join_raw(&mut bob, welcome).await;
 
     let crypto = RustCrypto::default();
     let provider =
@@ -657,8 +657,9 @@ async fn encrypted_replay_graph_fixture_with_apps(
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group");
     };
+    let welcomes = seal_and_bind(&mut alice, &welcomes);
     for (joiner, welcome) in joiners.iter_mut().zip(welcomes) {
-        joiner.join_welcome(welcome).await.unwrap();
+        join_raw(joiner, welcome).await;
     }
     let mut messages = Vec::new();
     for _ in 0..width {

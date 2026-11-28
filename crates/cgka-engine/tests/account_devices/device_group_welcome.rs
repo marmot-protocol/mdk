@@ -34,6 +34,7 @@ async fn found_under_chosen(creator: &mut Device, key_package: KeyPackage) -> Tr
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
+    let welcomes = seal_and_bind(&mut creator.engine, &welcomes);
     welcomes.into_iter().next().expect("one Welcome")
 }
 
@@ -241,6 +242,7 @@ async fn a_waiting_links_key_package_joins_no_other_group() {
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
+    let welcomes = seal_and_bind(&mut bob.engine, &welcomes);
     assert_eq!(
         join_outcome(&mut laptop, &welcomes[0]).await,
         refused(InputRejectionCategory::AuthorizationFailed)
@@ -265,6 +267,7 @@ async fn a_waiting_links_key_package_joins_no_other_group() {
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
+    let welcomes = seal_and_bind(&mut bob.engine, &welcomes);
     assert_joins(&mut tablet, &welcomes[0], &chat_id, &bob).await;
 }
 
@@ -299,6 +302,7 @@ async fn a_chat_welcome_under_the_reserved_id_is_refused() {
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
+    let welcomes = seal_and_bind(&mut key_holder.engine, &welcomes);
     assert_eq!(
         join_outcome(&mut laptop, &welcomes[0]).await,
         refused(InputRejectionCategory::AuthorizationFailed)
@@ -336,6 +340,7 @@ async fn a_founding_welcome_keeps_its_delivery_deadline() {
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("current-profile founding group")
     };
+    let welcomes = seal_and_bind(&mut phone.engine, &welcomes);
     let id = &welcomes[0].id;
     assert_eq!(
         phone.engine.sent_welcome_deliver_until(id).unwrap(),
@@ -427,6 +432,7 @@ async fn link_under_chosen(
     else {
         panic!("a link is a group evolution")
     };
+    let welcomes = seal_and_bind(&mut linker.engine, &welcomes);
     linker.engine.confirm_published(pending).await.unwrap();
     let welcome = welcomes.into_iter().next().expect("one Welcome");
     (route_to_group(&msg, &chosen()), welcome)
@@ -526,6 +532,7 @@ async fn a_move_welcome_joins_without_cutting_original_trust() {
     let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("founding Welcome")
     };
+    let welcomes = seal_and_bind(&mut original_creator.engine, &welcomes);
     assert_joins(&mut moving, &welcomes[0], &original, &original_creator).await;
     moving
         .engine
@@ -592,7 +599,7 @@ async fn a_move_welcome_joins_without_cutting_original_trust() {
     )
     .unwrap();
     fault.execute_batch("CREATE TRIGGER fail_move_join BEFORE UPDATE OF phase ON device_group_moves WHEN NEW.phase = 1 BEGIN SELECT RAISE(ABORT, 'native move joined checkpoint failed'); END;").unwrap();
-    let failed = moving.engine.ingest(welcome.clone()).await;
+    let failed = ingest_raw(&mut moving.engine, welcome.clone()).await;
     assert!(
         matches!(failed, Err(EngineError::Storage(cgka_traits::storage::StorageError::Backend(ref message))) if message.contains("native move joined checkpoint failed")),
         "{failed:?}"

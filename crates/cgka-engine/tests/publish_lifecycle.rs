@@ -15,12 +15,11 @@
 // Tests read stored records and OpenMLS state directly (see the crate clippy.toml).
 #![allow(clippy::disallowed_methods)]
 
-use async_trait::async_trait;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::message_processor::MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP;
-use cgka_engine::{ConvergenceClock, EngineBuilder, ManualConvergenceClock};
+use cgka_engine::{ConvergenceClock, Engine, EngineBuilder, ManualConvergenceClock};
 use cgka_traits::EngineError;
 use cgka_traits::OutboundFanout;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -53,7 +52,7 @@ use cgka_traits::transport::{
 use cgka_traits::types::{Backend, EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::welcome::PendingWelcome;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use storage_sqlite::SqliteAccountStorage;
 
 #[path = "publish_lifecycle/change_not_delivered.rs"]
@@ -64,6 +63,7 @@ mod late_descriptor;
 mod support;
 use support::committed_roster::checked_committed_roster;
 use support::proof_signer;
+use support::raw_inbox::{ingest_raw, join_raw, raw_unseal, seal_and_bind};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
@@ -96,52 +96,6 @@ fn hash_id(bytes: &[u8]) -> MessageId {
 }
 
 struct MockPeeler;
-
-// Suspend at the transport await, after the real commit has been staged.
-struct ParkGroupWrapPeeler {
-    park: Arc<AtomicBool>,
-    reached: Arc<AtomicBool>,
-}
-
-#[async_trait]
-impl TransportPeeler for ParkGroupWrapPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        message: &cgka_traits::GroupRecoveryMessage,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_group_recovery(message, recipient).await
-    }
-
-    async fn peel_group_message(
-        &self,
-        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
-        ctx: &GroupContextSnapshot,
-    ) -> Result<PeeledMessage, PeelerError> {
-        MockPeeler.peel_group_message(msg, ctx).await
-    }
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        MockPeeler.peel_welcome(msg).await
-    }
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        MockPeeler.wrap_welcome(payload, recipient).await
-    }
-    async fn wrap_group_message(
-        &self,
-        payload: &EncryptedPayload,
-        ctx: &GroupContextSnapshot,
-    ) -> Result<TransportMessage, PeelerError> {
-        if self.park.load(Ordering::SeqCst) {
-            self.reached.store(true, Ordering::SeqCst);
-            std::future::pending::<()>().await;
-        }
-        MockPeeler.wrap_group_message(payload, ctx).await
-    }
-}
 
 fn stored_mls_group(
     storage: &SqliteAccountStorage,
@@ -232,15 +186,16 @@ async fn active_rival_rearms_disband_then_terminal_retry_keeps_authenticated_ros
         })
         .await
         .unwrap();
-    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("founding create")
     };
-    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
+    join_raw(&mut bob, welcomes.remove(0)).await.unwrap();
     // A real second leaf of the requester's account makes roster dedup observable.
     let SendResult::GroupEvolution {
         msg,
         pending,
-        mut welcomes,
+        welcomes,
     } = alice
         .send(SendIntent::Invite {
             group_id: gid.clone(),
@@ -252,8 +207,9 @@ async fn active_rival_rearms_disband_then_terminal_retry_keeps_authenticated_ros
     else {
         panic!("real sibling invite")
     };
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
-    sibling.join_welcome(welcomes.remove(0)).await.unwrap();
+    join_raw(&mut sibling, welcomes.remove(0)).await.unwrap();
     bob.ingest(msg).await.unwrap();
     clock.advance_ms(1_000);
     // Explicit clock time, through the same drain: the host entry point's
@@ -531,10 +487,11 @@ async fn own_disband_roster_comes_from_the_tree_it_ends_not_the_record() {
         })
         .await
         .unwrap();
-    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("founding create")
     };
-    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
+    join_raw(&mut bob, welcomes.remove(0)).await.unwrap();
     let joined = checked_committed_roster(&alice, &storage, &gid);
     assert_eq!(joined.members.ids().len(), 2);
     let mut stripped = storage.get_group(&gid).unwrap();
@@ -621,10 +578,11 @@ async fn own_disband_realized_from_its_checkpoint_writes_the_members_it_ends() {
         })
         .await
         .unwrap();
-    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("founding create")
     };
-    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
+    join_raw(&mut bob, welcomes.remove(0)).await.unwrap();
     let joined = checked_committed_roster(&alice, &storage, &gid);
     assert_eq!(joined.members.ids().len(), 2);
     let source_epoch = storage.get_group(&gid).unwrap().epoch.0;
@@ -727,10 +685,11 @@ async fn demoted_disband_request_fails_durably_and_is_acknowledged_once() {
         })
         .await
         .unwrap();
-    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
         panic!("founding create")
     };
-    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
+    join_raw(&mut bob, welcomes.remove(0)).await.unwrap();
     assert!(!alice.acknowledge_disband_failure(&gid).unwrap());
     // A real co-admin's signed policy change removes authority, not membership.
     let mut admins = Vec::new();
@@ -946,19 +905,8 @@ impl FailFirstGroupWrapPeeler {
     }
 }
 
-#[async_trait]
 impl TransportPeeler for MockPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        _message: &cgka_traits::GroupRecoveryMessage,
-        _recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::Malformed(
-            "pass-through fixture has no authenticated account channel".into(),
-        ))
-    }
-
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         _ctx: &GroupContextSnapshot,
@@ -974,21 +922,7 @@ impl TransportPeeler for MockPeeler {
         })
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Ok(PeeledMessage {
-            id: msg.id.clone(),
-            group_id: None,
-            sender: None,
-            content: PeeledContent::Welcome {
-                created_at: None,
-                bytes: msg.payload.clone(),
-                key_package_event_id: None,
-            },
-            origin: msg.clone(),
-        })
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         _ctx: &GroupContextSnapshot,
@@ -1004,37 +938,9 @@ impl TransportPeeler for MockPeeler {
             },
         })
     }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        let mut id_material = payload.ciphertext.clone();
-        id_material.extend_from_slice(recipient.as_slice());
-        Ok(TransportMessage {
-            id: hash_id(&id_material),
-            payload: payload.ciphertext.clone(),
-            timestamp: Timestamp(0),
-            causal_deps: vec![],
-            source: TransportSource("mock".into()),
-            envelope: TransportEnvelope::Welcome {
-                recipient: recipient.clone(),
-            },
-        })
-    }
 }
 
-#[async_trait]
 impl TransportPeeler for FailFirstGroupWrapPeeler {
-    async fn wrap_group_recovery(
-        &self,
-        message: &cgka_traits::GroupRecoveryMessage,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.inner.wrap_group_recovery(message, recipient).await
-    }
-
     fn prepare_group_message<'a>(
         &self,
         msg: &'a TransportMessage,
@@ -1042,19 +948,15 @@ impl TransportPeeler for FailFirstGroupWrapPeeler {
         self.inner.prepare_group_message(msg)
     }
 
-    async fn peel_group_message(
+    fn peel_group_message(
         &self,
         msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
-        self.inner.peel_group_message(msg, ctx).await
+        self.inner.peel_group_message(msg, ctx)
     }
 
-    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        self.inner.peel_welcome(msg).await
-    }
-
-    async fn wrap_group_message(
+    fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
         ctx: &GroupContextSnapshot,
@@ -1070,15 +972,7 @@ impl TransportPeeler for FailFirstGroupWrapPeeler {
                 "injected group-wrap failure".into(),
             ));
         }
-        self.inner.wrap_group_message(payload, ctx).await
-    }
-
-    async fn wrap_welcome(
-        &self,
-        payload: &EncryptedPayload,
-        recipient: &MemberId,
-    ) -> Result<TransportMessage, PeelerError> {
-        self.inner.wrap_welcome(payload, recipient).await
+        self.inner.wrap_group_message(payload, ctx)
     }
 }
 
@@ -1103,11 +997,11 @@ fn registry_with_reactions() -> FeatureRegistry {
     r
 }
 
-fn build(id: &[u8]) -> impl CgkaEngine {
+fn build(id: &[u8]) -> Engine<SqliteAccountStorage> {
     build_with_peeler(id, Box::new(MockPeeler))
 }
 
-fn build_with_clock(id: &[u8], clock: ManualConvergenceClock) -> impl CgkaEngine {
+fn build_with_clock(id: &[u8], clock: ManualConvergenceClock) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
@@ -1119,7 +1013,7 @@ fn build_with_clock(id: &[u8], clock: ManualConvergenceClock) -> impl CgkaEngine
         .unwrap()
 }
 
-fn build_with_peeler(id: &[u8], peeler: Box<dyn TransportPeeler>) -> impl CgkaEngine {
+fn build_with_peeler(id: &[u8], peeler: Box<dyn TransportPeeler>) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
@@ -1156,110 +1050,6 @@ fn retained_anchor_snapshot_names(
         .collect::<Vec<_>>();
     names.sort();
     names
-}
-
-#[tokio::test]
-async fn cancelling_a_staged_self_update_cleans_mls_and_preparing_intent() {
-    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
-    let park = Arc::new(AtomicBool::new(false));
-    let reached = Arc::new(AtomicBool::new(false));
-    let mut alice = EngineBuilder::new(storage.clone())
-        .legacy_compatibility_profile()
-        .identity(pad32(b"cancel-update"))
-        .account_identity_proof_signer(proof_signer(b"cancel-update"))
-        .peeler(Box::new(ParkGroupWrapPeeler {
-            park: park.clone(),
-            reached: reached.clone(),
-        }))
-        .build()
-        .unwrap();
-    let (gid, created) = alice
-        .create_group(CreateGroupRequest {
-            name: "cancel".into(),
-            description: String::new(),
-            members: vec![],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-    let SendResult::GroupCreated { pending, .. } = created else {
-        panic!("legacy creation")
-    };
-    alice.confirm_published(pending).await.unwrap();
-    let original = storage.get_group(&gid).unwrap();
-    let source_epoch = stored_mls_group(&storage, &gid).epoch();
-    let source_messages = sorted_message_rows(&storage, &gid, EpochId(source_epoch.as_u64()));
-
-    park.store(true, Ordering::SeqCst);
-    let mut send = Box::pin(alice.send(SendIntent::SelfUpdate {
-        group_id: gid.clone(),
-    }));
-    assert!(futures::poll!(send.as_mut()).is_pending());
-    assert!(
-        reached.load(Ordering::SeqCst),
-        "the actual transport await was reached"
-    );
-    let staged = stored_mls_group(&storage, &gid);
-    assert_eq!(staged.epoch(), source_epoch);
-    assert!(
-        staged.pending_commit().is_some(),
-        "cancellation must follow actual MLS staging"
-    );
-    let preparing = storage.list_group_evolutions_for_group(&gid).unwrap();
-    assert_eq!(preparing.len(), 1);
-    assert_eq!(preparing[0].phase, GroupEvolutionPhase::Preparing);
-    assert_eq!(preparing[0].source_epoch, EpochId(source_epoch.as_u64()));
-    assert!(preparing[0].signed_message_id.is_none());
-    assert!(preparing[0].pending_ref.is_none());
-    drop(send);
-
-    let cleaned = stored_mls_group(&storage, &gid);
-    assert_eq!(cleaned.epoch(), source_epoch);
-    assert!(
-        cleaned.pending_commit().is_none(),
-        "cancelled send left an orphan MLS commit"
-    );
-    assert!(
-        storage
-            .list_group_evolutions_for_group(&gid)
-            .unwrap()
-            .is_empty(),
-        "cancelled send left Preparing intent"
-    );
-    assert_eq!(storage.get_group(&gid).unwrap(), original);
-    assert_eq!(
-        sorted_message_rows(&storage, &gid, EpochId(source_epoch.as_u64())),
-        source_messages
-    );
-    assert!(
-        storage
-            .list_outbound_fanouts_for_group(&gid)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(alice.epoch_state(&gid).unwrap().is_stable());
-    assert!(alice.drain_auto_publish().is_empty());
-    park.store(false, Ordering::SeqCst);
-    let SendResult::GroupEvolution { pending, .. } = alice
-        .send(SendIntent::SelfUpdate {
-            group_id: gid.clone(),
-        })
-        .await
-        .unwrap()
-    else {
-        panic!("retry stages normally")
-    };
-    alice.confirm_published(pending).await.unwrap();
-    assert_eq!(
-        alice.epoch(&gid).unwrap(),
-        EpochId(source_epoch.as_u64() + 1)
-    );
-    assert_eq!(
-        storage.list_group_evolutions_for_group(&gid).unwrap()[0].phase,
-        GroupEvolutionPhase::Confirmed
-    );
 }
 
 #[tokio::test]
@@ -1550,7 +1340,10 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
         } => (
             pending,
             msg.id,
-            welcomes.first().expect("invite produces a Welcome").clone(),
+            seal_and_bind(&mut alice, &welcomes)
+                .into_iter()
+                .next()
+                .expect("invite produces a Welcome"),
         ),
         _ => panic!("expected GroupEvolution"),
     };
@@ -1613,9 +1406,7 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
     // Capture a second authentic failed attempt for the historical raw-format
     // fixture. Neither fixture invents ids, origins or transport bytes.
     let SendResult::GroupEvolution {
-        pending,
-        mut welcomes,
-        ..
+        pending, welcomes, ..
     } = alice
         .send(SendIntent::Invite {
             group_id: gid.clone(),
@@ -1627,6 +1418,7 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
     else {
         panic!("historical invite attempt")
     };
+    let mut welcomes = seal_and_bind(&mut alice, &welcomes);
     let historical_welcome = welcomes.remove(0);
     let historical_row = storage.get_message(&historical_welcome.id).unwrap();
     alice.publish_failed(pending).await.unwrap();
@@ -1647,7 +1439,10 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
             pending, welcomes, ..
         } => (
             pending,
-            welcomes.first().expect("retry produces a Welcome").clone(),
+            seal_and_bind(&mut alice, &welcomes)
+                .into_iter()
+                .next()
+                .expect("retry produces a Welcome"),
         ),
         _ => panic!("expected GroupEvolution"),
     };
@@ -2063,8 +1858,8 @@ async fn welcome_wrapped_pre_merge_lands_recipient_at_post_stage_epoch() {
     };
 
     // Bob joins via the welcome BEFORE alice confirms.
-    let welcome = welcomes.into_iter().next().unwrap();
-    let bob_gid = bob.join_welcome(welcome).await.unwrap();
+    let welcome = seal_and_bind(&mut alice, &welcomes).remove(0);
+    let bob_gid = join_raw(&mut bob, welcome).await.unwrap();
     assert_eq!(bob_gid, gid);
     assert_eq!(bob.epoch(&gid).unwrap().0, 1);
     assert_eq!(bob.members(&gid).unwrap().len(), 2);
@@ -3292,18 +3087,17 @@ async fn confirmation_anchor_and_membership_failures_preserve_author_effects() {
             let SendResult::FoundingGroupCreated { welcomes } = created else {
                 panic!("current-profile founding creation");
             };
-            carol
-                .join_welcome(
-                    welcomes
-                        .into_iter()
-                        .find(|welcome| matches!(
-                            &welcome.envelope,
-                            TransportEnvelope::Welcome { recipient } if recipient == &carol.self_id()
-                        ))
-                        .unwrap(),
-                )
-                .await
+            let carol_id = carol.self_id();
+            let welcome = seal_and_bind(&mut alice, &welcomes)
+                .into_iter()
+                .find(|welcome| {
+                    matches!(
+                        &welcome.envelope,
+                        TransportEnvelope::Welcome { recipient } if recipient == &carol_id
+                    )
+                })
                 .unwrap();
+            join_raw(&mut carol, welcome).await.unwrap();
             alice.drain_events();
             carol.drain_events();
             let before_membership = alice.canonical_group_membership(&group_id).unwrap();
@@ -3900,9 +3694,7 @@ async fn rejoin_retries_failed_replay() {
 
         let key_package = alice.fresh_key_package().await.unwrap();
         let SendResult::GroupEvolution {
-            mut welcomes,
-            pending,
-            ..
+            welcomes, pending, ..
         } = bob
             .send(SendIntent::Invite {
                 group_id: group_id.clone(),
@@ -3914,11 +3706,12 @@ async fn rejoin_retries_failed_replay() {
         else {
             panic!("reinvite stages a Welcome");
         };
+        let mut welcomes = seal_and_bind(&mut bob, &welcomes);
         bob.confirm_published(pending).await.unwrap();
         let welcome = welcomes.remove(0);
         if matches!(route, Route::RetainedOffer) {
             assert!(matches!(
-                alice.ingest(welcome.clone()).await.unwrap(),
+                ingest_raw(&mut alice, welcome.clone()).await.unwrap(),
                 IngestOutcome::LocalState {
                     state: LocalIngestState::RejoinConfirmationRequired
                 }
@@ -3953,11 +3746,11 @@ async fn rejoin_retries_failed_replay() {
 
         fault.replay.arm(2);
         match route {
-            Route::Direct => assert_eq!(alice.join_welcome(welcome).await.unwrap(), group_id),
+            Route::Direct => assert_eq!(join_raw(&mut alice, welcome).await.unwrap(), group_id),
             Route::Inbox => {
                 let welcome_id = welcome.id.clone();
                 assert!(matches!(
-                    alice.ingest(welcome).await.unwrap(),
+                    ingest_raw(&mut alice, welcome).await.unwrap(),
                     IngestOutcome::Processed
                 ));
                 assert_eq!(
@@ -3966,7 +3759,11 @@ async fn rejoin_retries_failed_replay() {
                 );
             }
             Route::RetainedOffer => {
-                assert!(alice.retry_rejoins_after_trusted_removal().await.unwrap())
+                let mut retry = alice.rejoin_retry().unwrap();
+                let offer = retry.next_offer().unwrap().unwrap();
+                let unsealed = raw_unseal(offer.welcome());
+                assert!(offer.apply(Ok(unsealed)).await.unwrap());
+                assert!(retry.next_offer().unwrap().is_none());
             }
         }
         assert!(!storage.get_group(&group_id).unwrap().removed);
@@ -4040,8 +3837,8 @@ fn app_payload_for(engine: &impl CgkaEngine, body: &str) -> Vec<u8> {
 }
 
 async fn group_with_bob(
-    alice: &mut impl CgkaEngine,
-    bob: &mut impl CgkaEngine,
+    alice: &mut Engine<impl StorageProvider + 'static>,
+    bob: &mut Engine<impl StorageProvider + 'static>,
 ) -> cgka_traits::types::GroupId {
     let bob_kp = bob.fresh_key_package().await.unwrap();
     let (group_id, created) = alice
@@ -4058,9 +3855,10 @@ async fn group_with_bob(
     let SendResult::GroupCreated { pending, welcomes } = created else {
         panic!("expected a staged group creation")
     };
+    let welcomes = seal_and_bind(alice, &welcomes);
     alice.confirm_published(pending).await.unwrap();
     for welcome in welcomes {
-        bob.join_welcome(welcome).await.unwrap();
+        join_raw(bob, welcome).await.unwrap();
     }
     group_id
 }
@@ -4262,9 +4060,10 @@ async fn epoch_pinned_app_message_is_refused_when_the_send_selects_a_rival_at_th
     let SendResult::GroupCreated { pending, welcomes } = created else {
         panic!("expected a staged group creation")
     };
+    let welcomes = seal_and_bind(&mut winner, &welcomes);
     winner.confirm_published(pending).await.unwrap();
     for welcome in welcomes {
-        loser.join_welcome(welcome).await.unwrap();
+        join_raw(&mut loser, welcome).await.unwrap();
     }
     let source_epoch = loser.epoch(&group_id).unwrap();
 

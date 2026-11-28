@@ -168,7 +168,8 @@ async fn recovery_announced_key() {
             peers._dir.path().join("bob.sqlite"),
             key,
             pad32(b"cancel-bob"),
-            Box::new(nostr_peeler(b"cancel-bob")),
+            Box::new(transport_nostr_peeler::NostrMlsPeeler::default()),
+            Arc::new(nostr_sealer(b"cancel-bob")),
         )
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
             keys: deterministic_nostr_keys(b"cancel-bob"),
@@ -609,8 +610,8 @@ async fn rejoin_retry_epoch_poison() {
     source.epoch = EpochId(u64::MAX);
     // The selected account can authenticate an invented source epoch. The
     // recipient cannot independently attest its remote MLS state.
-    let wrapped = nostr_peeler(b"cancel-alice")
-        .wrap_group_recovery(&poisoned, &bob_id)
+    let wrapped = nostr_sealer(b"cancel-alice")
+        .seal_group_recovery(&poisoned, &bob_id)
         .await
         .unwrap();
     let accepted = peers
@@ -691,8 +692,8 @@ async fn rejoin_remote_epoch_budget() {
             panic!("expected selected coordinator Challenge")
         };
         source.epoch = EpochId(peers.before.0 + turn);
-        let wrapped = nostr_peeler(b"cancel-alice")
-            .wrap_group_recovery(&challenge, &bob_id)
+        let wrapped = nostr_sealer(b"cancel-alice")
+            .seal_group_recovery(&challenge, &bob_id)
             .await
             .unwrap();
         peers
@@ -813,8 +814,8 @@ async fn rejoin_commit_cooldown() {
         body: cgka_traits::GroupRecoveryBody::Request { device_key_hash },
     };
     let alice_id = peers.coordinator.self_id();
-    let wrapped = nostr_peeler(b"cancel-bob")
-        .wrap_group_recovery(&request, &alice_id)
+    let wrapped = nostr_sealer(b"cancel-bob")
+        .seal_group_recovery(&request, &alice_id)
         .await
         .unwrap();
     let result = peers
@@ -842,8 +843,8 @@ async fn rejoin_commit_cooldown() {
         peers.adapter.clone(),
         RecordingKeyPackages::default(),
     );
-    let wrapped = nostr_peeler(b"cancel-bob")
-        .wrap_group_recovery(&request, &alice_id)
+    let wrapped = nostr_sealer(b"cancel-bob")
+        .seal_group_recovery(&request, &alice_id)
         .await
         .unwrap();
     let retained = peers
@@ -864,8 +865,8 @@ async fn rejoin_commit_cooldown() {
         expires_at: now + 1_201,
         ..request
     };
-    let wrapped = nostr_peeler(b"cancel-bob")
-        .wrap_group_recovery(&request, &alice_id)
+    let wrapped = nostr_sealer(b"cancel-bob")
+        .seal_group_recovery(&request, &alice_id)
         .await
         .unwrap();
     let result = peers
@@ -908,8 +909,9 @@ async fn rejoin_two_admin_accounts() {
     let welcomes = match created.effects.publish.as_slice() {
         [PublishWork::FoundingGroupCreated { welcomes }] => welcomes.clone(),
         [PublishWork::GroupCreated { welcomes, pending }] => {
+            let welcomes = seal_and_bind(&mut alice, welcomes).await;
             alice.confirm_published(*pending).await.unwrap();
-            welcomes.clone()
+            welcomes
         }
         _ => panic!("expected founding publication"),
     };
@@ -987,8 +989,8 @@ async fn rejoin_two_admin_accounts() {
     .await
     .message;
     for admin in [&mut alice, &mut carol] {
-        let carrier = nostr_peeler(b"two-bob")
-            .wrap_group_recovery(&request, &admin.self_id())
+        let carrier = nostr_sealer(b"two-bob")
+            .seal_group_recovery(&request, &admin.self_id())
             .await
             .unwrap();
         admin
@@ -1242,7 +1244,8 @@ async fn rejoin_deferred_coordinator() {
             path,
             key,
             pad32(b"cancel-alice"),
-            Box::new(nostr_peeler(b"cancel-alice")),
+            Box::new(transport_nostr_peeler::NostrMlsPeeler::default()),
+            Arc::new(nostr_sealer(b"cancel-alice")),
         )
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
             keys: deterministic_nostr_keys(b"cancel-alice"),
