@@ -157,7 +157,8 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     refusal to overwrite prior campaign evidence.
 
 - **File:** `report_runner.rs`
-  - **Owns:** Report artifact runner, oracle evidence, and coverage matrix coverage.
+  - **Owns:** Report artifact runner, oracle evidence, coverage matrix coverage, and `--storage` over
+    `MDK_CONFORMANCE_SQLITE_STORAGE` precedence, checked in child processes of the test binary.
 
 - **File:** `route_assurance.rs`
   - **Owns:** Route inventory liveness against source markers, `../CONVERGENCE_ROUTE_MATRIX.md` drift, and
