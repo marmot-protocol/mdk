@@ -118,6 +118,13 @@ const KEY_PACKAGE_SIGNING_BUILD: &str = env!("CARGO_PKG_VERSION");
 const MAINTENANCE_EOSE_TIMEOUT_SECS: u64 = 5 * 60;
 const MAINTENANCE_POST_EOSE_GRACE_SECS: u64 = 15;
 const MAINTENANCE_QUIET_SECS: u64 = 60;
+/// Maximum brand-new `SelfUpdate` commits generated in one
+/// [`AccountDeviceRuntime::run_due_maintenance_holding`] pass. When many
+/// obligations fall due together (for example after an upgrade or device
+/// suspend), leaving excess due obligations untouched lets the host's
+/// maintenance schedule pace them across subsequent passes instead of firing
+/// an unbounded burst of commits at once.
+const MAX_SELF_UPDATES_PER_PASS: usize = 2;
 const PERIODIC_MIN_SECS: u64 = 24 * 24 * 60 * 60;
 const PERIODIC_MAX_SECS: u64 = 36 * 24 * 60 * 60;
 const COMPONENT_MIGRATION_RECHECK: Duration = Duration::from_secs(10 * 60);
@@ -3241,7 +3248,20 @@ where
         }
 
         let mut obligations = self.session.maintenance_obligations()?;
-        obligations.sort_by_key(|obligation| obligation.created_at);
+        obligations.sort_by_key(|obligation| {
+            let priority = match obligation.trigger {
+                MaintenanceTrigger::Manual => 0u8,
+                MaintenanceTrigger::PostJoin => 1,
+                MaintenanceTrigger::Periodic => 2,
+            };
+            (
+                obligation.attempt_count,
+                priority,
+                obligation.not_before.unwrap_or(obligation.created_at),
+                obligation.created_at,
+            )
+        });
+        let mut self_updates_started = 0usize;
         for mut obligation in obligations {
             if self
                 .pending_leaf_reconciliations
@@ -3566,6 +3586,11 @@ where
                 MaintenancePhase::Complete | MaintenancePhase::Failed => continue,
             }
 
+            if self_updates_started >= MAX_SELF_UPDATES_PER_PASS {
+                self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
+                continue;
+            }
+
             if self
                 .session
                 .has_pending_convergence_inputs(&obligation.group_id)?
@@ -3604,6 +3629,7 @@ where
             }
 
             let group_id = obligation.group_id.clone();
+            self_updates_started += 1;
             self.maintenance_activity
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
