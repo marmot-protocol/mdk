@@ -1,23 +1,24 @@
-# MDK 0.19.0 → 0.20.0-rc.2 Integration Guide
+# MDK 0.19.0 → 0.20.0-rc.3 Integration Guide
 
 ## Scope and provenance
 
 - **Baseline:** `v0.19.0` (`3fce95465cdea1edc8456dbd1c6691d1c8dc1f2e`)
-- **Target:** `0.20.0-rc.2` (`a3228a2c572f2c91bbc5948160bbe890f20888a2`)
+- **Target:** `0.20.0-rc.3` (`7847b7f7ae761d41dc07784cd0308c29127b7ff9`)
 - **Classified SemVer impact:** `minor`
 
 ## Impact triggers
 
-- UniFFI breaking ABI changes (10): changed UniFFI type `LocalSendStatusFfi`, changed UniFFI type `MarmotEventFfi`, changed UniFFI type `MarmotKitError`, changed UniFFI type `NotificationTrafficClassFfi`, changed UniFFI type `OnboardingIssueFfi`
-- C ABI breaking changes (10): changed C type `MarmotEvent`, changed C type `MarmotEvent_Tag`, changed C type `MarmotLocalSendStatus`, changed C type `MarmotNotificationTrafficClass`, changed C type `MarmotOnboardingIssue`
-- SQLite storage migrations (11): migrations.rs, 0219_agent_item_order.rs, 0220_chat_activity_creation_fallback.rs, 0221_agent_item_expired_targets.rs, 0222_small_state_broadcast_devices.rs
+- UniFFI breaking ABI changes (11): changed UniFFI type `LocalSendStatusFfi`, changed UniFFI type `MarmotEventFfi`, changed UniFFI type `MarmotKitError`, changed UniFFI type `MarmotOptions`, changed UniFFI type `NotificationTrafficClassFfi`
+- C ABI breaking changes (11): changed C type `MarmotClientOptions`, changed C type `MarmotEvent`, changed C type `MarmotEvent_Tag`, changed C type `MarmotLocalSendStatus`, changed C type `MarmotNotificationTrafficClass`
+- SQLite storage migrations (14): migrations.rs, migrations.rs, 0219_agent_item_order.rs, 0220_chat_activity_creation_fallback.rs, 0221_agent_item_expired_targets.rs
 - Pending changelog.d fragment contains `### Breaking changes`
-- Commit trailer `Release-Impact: minor` (3): 2376a640d (Start empty account databases from a migration baseline (#3609)), 3cb8e4a86 (Add unified opt-in onboarding flags across Rust, UniFFI, and C (#3775)), a3228a2c5 (Retire dead reconcile_subscription stack and bound dry-run NEG deadline (#3789))
+- Commit trailer `Release-Impact: minor` (8): 2376a640d (Start empty account databases from a migration baseline (#3609)), 3cb8e4a86 (Add unified opt-in onboarding flags across Rust, UniFFI, and C (#3775)), a3228a2c5 (Retire dead reconcile_subscription stack and bound dry-run NEG deadline (#3789))
 
 ## Storage migrations (required upgrade coordination)
 
 This release advances the SQLite account schema. Downgrade across these migrations is unsupported; update all processes opening the account database together:
 
+- `crates/nostr-directory/src/cache/migrations.rs`
 - `crates/storage-sqlite/src/base/migrations.rs`
 - `crates/storage-sqlite/src/base/migrations/0219_agent_item_order.rs`
 - `crates/storage-sqlite/src/base/migrations/0220_chat_activity_creation_fallback.rs`
@@ -28,22 +29,46 @@ This release advances the SQLite account schema. Downgrade across these migratio
 - `crates/storage-sqlite/src/base/migrations/0225_welcome_delivery_ledger.rs`
 - `crates/storage-sqlite/src/base/migrations/0226_local_submission_refused.rs`
 - `crates/storage-sqlite/src/base/migrations/0227_welcome_expiry_mark.rs`
+- `crates/storage-sqlite/src/base/migrations/0228_canonicalize_group_id_hex.rs`
 - `crates/storage-sqlite/src/base/migrations/baseline.sql`
+- `crates/storage-sqlite/src/shared/migrations.rs`
 
 ## Summary of changes
 
 ### Breaking changes
 
+- Added explicit local queue-backpressure variants (`SliceReply::Busy`, `SecondReply::Busy`, `IdsReply::Busy`, `SweepEnd::LocalBusy`, `CompareEnd::LocalBusy`, `DirectoryInspectionError::LocalBusy`, and internal `FiniteEnd::Busy`) so local finite-request admission timeouts are never misclassified as relay `Unreachable`/`TimedOut` faults or silent record absence.
 - Rust callers can inject an `EntropySource` for engine draws and kind-445 sealing and signing (mdk#3497).
   `NostrMlsPeeler::new` takes an entropy source and a wall clock. Use `Default` for system sources.
   Pass a clock to `NostrTransportEvent::new_unsigned`, or use `new_unsigned_at` with an explicit timestamp.
+- Added `follows_created_at: u64` to `nostr_directory::UserDirectoryRecord` and `storage_sqlite::PublicDirectoryUserRecord`, and `created_at: u64` to `nostr_directory::FetchedFollowList`, backed by schema migrations `0004_follows_created_at` (directory cache) and `0006_directory_follows_created_at` (shared storage).
+- `fs_private::create_dir_all_private` now routes Unix path creation through `prepare_directory_path`, refusing
+  user-owned symlinked ancestors and world-writable aliases such as `/tmp` on macOS (allowing only trusted root-owned
+  platform aliases and preserving the current directory `.` without altering its mode) (mdk#3799).
+- `marmot_account::AccountHome` now rejects Windows-reserved device names (`CON`, `CONIN$`, `CONOUT$`, `PRN`, `AUX`,
+  `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, and superscript variants), leading/trailing spaces, trailing dots, and
+  Windows-forbidden filename characters on newly created or imported account labels across all platforms (existing Unix
+  account records remain readable, updatable, and removable), `AccountHome::account_dir` now panics on unsafe
+  path-traversal labels (use `try_account_dir` for untrusted input), and local-file secret reads (`secret.json`) now
+  refuse group/world/executable/special permission bits with `PermissionDenied` (fix with `chmod 600`) (mdk#3799).
+- `MarmotAppEventError::Json` now carries a closed `MarmotAppEventJsonError` category instead of raw parser text,
+  `SecretBytes` is now a redacted-`Debug` zeroizing newtype returned by `open_history` and `open_with_recovery_key`,
+  `DeviceRosterV1::leaf_tag_key` is wrapped in `Zeroizing<[u8; 32]>`, and `GroupBlossomImageV1`,
+  `AppGroupImageComponent`, and `RecoveryWords` implement `Drop` and `ZeroizeOnDrop` (mdk#3796).
 - Removed the retired pre-#2660 `NostrSdkRelayClient::reconcile_subscription`, `NostrTransportAdapter::record_reconciliation`, and `NostrReconciliation*` types from `transport-nostr-adapter` (along with the doc-hidden `reconcile_inbox_history` / `reconcile_group_history` wrappers on `transport-nostr`). Account history recovery uses `sweep::run_sweep` and `compare::run_comparison` over `SdkSweepRelay`.
+- `storage-sqlite` now enforces `SqliteStorageOptions::cipher_compatibility` and
+  `SqlCipherHardening::cipher_compatibility` (`1..=4`) after `PRAGMA key` with no silent format fallback, and rejects
+  unsupported values outside `1..=4` before keying. Default `cipher_compatibility = 4` databases are unaffected; callers
+  that previously created a database with a non-default value (such as `3`) produced a SQLCipher v4 file on disk and
+  must reopen it with `cipher_compatibility = 4` (or migrate/rekey it offline).
 - `OutboundWelcomeStatus::PastDeadline` is a Welcome past its delivery deadline that is not marked expired yet;
   `Settled(WelcomeSettlement::Expired)` now means a Welcome marked expired, at any clock (mdk#3589).
 - `Engine::own_account_leaves_tagged_by` returns each leaf's signature key with the slot its tag read as.
 - `Engine::queue_app_message_with_audit_context` takes the intent's `only_to_members`.
 - Implement `EntropySource::fill_bytes` to supply engine randomness. The system default is `OsEntropy`.
   Direct callers of `Identity::load_or_generate` pass the MLS crypto provider used to generate new signers (mdk#3497).
+- `open_history`, `open_with_recovery_key`, and the corresponding `Engine` methods now return redacted-`Debug`
+  zeroizing `SecretBytes` instead of `Vec<u8>` (mdk#3796).
 - `LocalSendStatus` gains `RefusedNewMembers`, and `Queued` and `EngineOwned` carry the send's `message_id_hex`, so a
   host that lost the acceptance learns the event by asking rather than by handing the send again.
 - Kinds 1201 and 1202 take the shape of marmot-agents D-076, and the old shape is gone (D-051): an agent item
@@ -67,6 +92,8 @@ This release advances the SQLite account schema. Downgrade across these migratio
 - `AppError` gains `IncompatibleKeyPackage(Box<EngineError>)`. When a complete lookup finds only KeyPackages incompatible
   with a new direct chat's founding requirements, the start returns this variant in place of `AppError::Session`.
   Handle it in exhaustive matches. `as_engine_error` still exposes the cause (#3604).
+- `RecoveryWords` and `AppGroupImageComponent` now implement `Drop` and `ZeroizeOnDrop` to erase secret buffers on
+  drop; callers taking ownership of fields should borrow or use `std::mem::take` (mdk#3796).
 - `MarmotLocalSendStatus::state` gains `4`: refused because the group gained a member account the send leaves out.
   The struct gains a nullable `message_id_hex` after `summary`, the send's event while MDK holds it (states 0 and 1).
   Rebuild clients with the matching header and library.
@@ -76,6 +103,7 @@ This release advances the SQLite account schema. Downgrade across these migratio
   `MarmotTimelineUpdateTrigger`'s `AgentActivity` becomes `AgentItem` and `AgentOperation` is removed, which
   renumbers the later variants; `MarmotNotificationTrafficClass` loses `AgentActivity`. Rebuild clients with the
   matching header and library.
+- Add the public avatar acquisition option to `MarmotClientOptions`, changing its layout. Recompile C consumers with the matching header and library.
 - Add pinned retention fields to `MarmotTimelineReplyPreview`. Rebuild consumers with the matching header and library.
 - `LocalSendStatusFfi` gains `RefusedNewMembers`, for a send limited to member accounts that the group gained a member
   it leaves out. `Queued` and `EngineOwned` carry the send's `message_id_hex`.
@@ -118,6 +146,11 @@ This release advances the SQLite account schema. Downgrade across these migratio
   `storage-sqlite` need a wildcard arm (and may handle `MigrationBatchFinished`).
 - `MoveRejectedSlot` drops `tag_signature_key`: a move's carried `removed` records go into the destination with no
   key (marmot#520). Facts captured before keep reading; the stored key is ignored.
+- `SqliteStorageOptions::cipher_compatibility` and `SqlCipherHardening::cipher_compatibility` (`1..=4`) are now
+  enforced after `PRAGMA key` with no silent format fallback, and unsupported values outside `1..=4` are rejected before
+  keying. Default `cipher_compatibility = 4` databases are unaffected; callers that previously created a database with a
+  non-default value (such as `3`) produced a SQLCipher v4 file on disk and must reopen it with
+  `cipher_compatibility = 4` (or migrate/rekey it offline).
 - `StoredMessagePayload::OutboundWelcome` gains `expiry: Option<message::WelcomeExpiry>`, the durable expiry mark
   of an owed outbound Welcome (mdk#3589), stored as payload variant 16; a Welcome without one keeps its bytes, and a
   staged Welcome never carries one. `welcome_expiry` and `with_welcome_expiry` read and set it.
@@ -139,6 +172,10 @@ This release advances the SQLite account schema. Downgrade across these migratio
 - `RosterTagKeyStorage` gains `hold_roster_tag_keys_as_removed`, which marks a slot's unexpired keys as held as
   removed, unless one already is, without moving their sighting times or order: the engine calls it for a `removed`
   record that keeps no key (marmot#520). `SendIntent::RecordRemovedSlot` now carries a record with no `tag_signature_key`.
+- `MarmotAppEventError::Json` now carries a closed `MarmotAppEventJsonError` category instead of a raw `String`,
+  `SecretBytes` is now a zeroizing newtype with redacted `Debug` output, `DeviceRosterV1::leaf_tag_key` is
+  `Zeroizing<[u8; 32]>` with redacted `Debug` output, and `GroupBlossomImageV1` implements `Drop` and
+  `ZeroizeOnDrop` to erase key material on drop (mdk#3796).
 
 ### Added
 
@@ -157,6 +194,7 @@ This release advances the SQLite account schema. Downgrade across these migratio
   `Undeliverable` or `Cancelled`, with device and relay counts), and `InviteDeliveryChanged` reports each change, in
   MarmotKit and C (mdk#1706). `RelayAccepted` means a relay stored the Welcome, not that the recipient received it.
   Only invites sent after the upgrade are listed; an older Welcome stays in `pending_welcome_deliveries`.
+- Added `FiniteRequests::shutdown` in `transport-nostr-adapter` to reject new finite requests, retire active slots (suppressing unsent REQs and sending `CLOSE` for already-sent active requests on live clients), end active/waiting requests as `Disconnected`, and join tracked `send_msg(req)` and `CLOSE` cleanup tasks (also invoked by `NostrSdkRelayClient::shutdown`).
 - Hosts can tell a user that an inbox relay refused to serve their invitations: `check_account_relays` asks each of the
   account's inbox relays once for its gift wraps, on a connection of its own, and marks a relay `Healthy` when it
   answers, `Failing` when it gives an explicit policy refusal to the account's own key (authentication refused as
@@ -166,6 +204,10 @@ This release advances the SQLite account schema. Downgrade across these migratio
   account whose own key signs and on request; results belong to the running account and are never stored. A check no
   relay answered changes nothing. A request while a check runs is refused at once with the new `RelayCheckRunning`
   error (MarmotKit) or `MARMOT_STATUS_RELAY_CHECK_RUNNING` (C). In MarmotKit and C.
+- Added `fs_private::open_existing_regular_nofollow` to open existing regular files without following symlinks or
+  blocking on FIFOs, `media_store::format::checked_file_bytes` for overflow-checked encrypted file-length calculation,
+  and `marmot_account::AccountHome::try_account_dir` for fallible account-directory resolution (mdk#3799, mdk#2554).
+- Added `NostrSdkRelayClient::from_builder_with_account_signer` in `transport-nostr-adapter` so authenticated publish and receive SDK clients share one factory path.
 - `Engine::expire_sent_welcome` marks an outbound Welcome past its delivery deadline expired in one row write: the row
   becomes `Failed` with a `WelcomeExpiry` mark, so it reads `Settled(Expired)` whatever the clock, is never published
   or marked delivered, and is not re-owed when its commit confirms (mdk#3589). `record_sent_welcome_expiry` notes that
@@ -182,6 +224,13 @@ This release advances the SQLite account schema. Downgrade across these migratio
   `min_epoch..=group.epoch`, for active epoch-gap handoffs across partial advances.
 - `Engine::stored_outbound_welcome_status`, an outbound Welcome's status read from its stored rows without the
   live-group gate, for the sender's invite delivery view (mdk#1706).
+- Add NIP-46 remote-signing support to `wn` and `wnd`:
+  - `wn login --bunker-stdin` / `wn accounts nip46 login --bunker-stdin` read `bunker://` URIs from stdin (rejecting NIP-46 URIs on argv), review and confirm permissions (interactively or via `--approve-permissions`), connect, and log in via `MarmotAppRuntime::nip46_login` with optional `--default-relays` and `--bootstrap-relays` (publishing missing relay lists to the default relays).
+  - `wn login --nostrconnect` / `wn accounts nip46 login --nostrconnect` support client-initiated `nostrconnect://` pairing (printing the pairing offer URI before awaiting `connect` and login, both locally and streamed through `wnd`).
+  - `wn accounts nip46 register`, `status`, and `remove` manage existing NIP-46 external-signing sessions.
+  - `wn accounts list`, `wn accounts status`, and `wn whoami` report `external_signing` and `signing_mode` (`local`, `external`, or `public`).
+  - `wnd` startup restores persisted NIP-46 accounts independently via `MarmotAppRuntime::start()` without blocking local accounts, and one-shot `wn` commands resume sessions on demand via `nip46_resume`.
+  - All signing-capable `wn` and `wnd` operations (`messages`, `groups`, `chats`, `keys`, `profile`, `relays`, `sync`, `follows`, `media`, `devices`, and streaming subscriptions) now accept `external_signing` accounts while keeping `export-nsec` disabled.
 - `MarmotAppRuntime::account_relay_health` and `MarmotAppEvent::RelayHealthChanged`: the account's relay rows (roles,
   `RelayHealthState`, policy fault, liveness) and its inbox warnings, from held relay lists and the dial policy only.
   Only the `Unchecked` and `NotAllowed` states are produced yet.
@@ -214,6 +263,7 @@ This release advances the SQLite account schema. Downgrade across these migratio
 - `AppError::RelayCheckRunning`: a check requested while one of the account runs.
 - Add `OnboardingOptions::create_missing_inbox_list` and `OnboardingOptions::pass_device_notice_when_none_found` (both default `false`) plus `OnboardingSnapshot::created_inbox_list` (`OnboardingCreatedInboxList`) for existing-key onboarding (#3720, #3729).
 - Onboarding reports `OnboardingIssue::RateLimited` when a relay answers a lookup or publication with a `rate-limited:` refusal (#3721, #3723).
+- Let hosts disable background acquisition of public avatar URLs.
 - `WelcomeDeliveryProblem::InboxLookupFailed`: no usable inbox relay is known for the recipient and the latest lookup
   of their inbox relay list failed. `invite_deliveries` reports it as `last_problem`, and as `Undeliverable`'s cause
   when it was the last attempt's problem.
@@ -267,6 +317,7 @@ This release advances the SQLite account schema. Downgrade across these migratio
 - `MarmotKitError::RelayCheckRunning`: a check requested while one of the account runs.
 - Add `OnboardingOptionsFfi.create_missing_inbox_list` and `OnboardingOptionsFfi.pass_device_notice_when_none_found` (both default `false`) plus `OnboardingSnapshotFfi.created_inbox_list` (`OnboardingCreatedInboxListFfi`) for existing-key onboarding (#3720, #3729).
 - `OnboardingIssueFfi` appends `RateLimited` for relay `rate-limited:` refusals during onboarding lookups and publication (#3721, #3723).
+- Let hosts disable background acquisition of public avatar URLs.
 - Expose pinned message retention in reply previews.
 - `InviteDeliveryProblemFfi::InboxLookupFailed` (mdk#2261): no usable inbox relay is known for the recipient and MDK's
   latest lookup of their inbox relay list failed; MDK looks it up again at its next retry. A host that matches the enum
@@ -338,10 +389,12 @@ This release advances the SQLite account schema. Downgrade across these migratio
   KeyPackage: the engine counts a founder's link as made.
   The fallback that also searched for a leaf tagged with a self-signed device tag is gone, from both removal and the
   cleanup of chat leaves (`Engine::own_account_self_signed_tags` is removed).
+- Updated `DirectoryRelayPlane` in `transport-nostr` to track coalesced directory fetches with waiter-counted cancellation and bounded `MarmotRelayPlane::shutdown()` cleanup, and removed the unused idle `Client` from `NostrSdkDirectoryRelayFetcher::standalone()`.
 - Maintenance queues an MLS self-update as soon as it detects stale chat capabilities, instead of scheduling it up to
   five days out. The quiet period, contention jitter, and commit safety checks still apply.
 - `RelayHealthChanged` also fires when an inbox check changes a relay's state, never when one confirms it.
 - Replaced dated nightly pre-releases (`*-nightly.YYYYMMDD`, `nightly-meta/latest.json`) with daily canary-gated SemVer Release Candidates (`<track>-vX.Y.Z-rc.N`, `rc-meta:rc/latest.json` schema 2, `rc/signature_delta.json`) and one-click Stable promotion (`promote-release.yml` / `just promote-rc`).
+- Migrated strict directory reads (`fetch_directory_events_with_completion`) in `transport-nostr` onto chunked `FiniteRequests` using per-REQ raw-vs-admitted EVENT accounting (`raw_items == received_items`) and retired the duplicate `DirectoryWireTransport` wrapper.
 - `SendIntent::UnlinkDevice` may keep the removed leaf's signature key in the slot's `removed` record once that leaf
   has committed since its Add, and refuses any `removed` record while the removed leaf is still its link's KeyPackage
   leaf (mdk#3679). Receivers are unchanged.
@@ -440,6 +493,12 @@ This release advances the SQLite account schema. Downgrade across these migratio
 
 ### Fixed
 
+- `marmot-app` account workers now track, cancel, and drain all worker-spawned async and blocking tasks (media HTTP transfers, attachment and avatar store completion, housekeeping/sweep/migration passes, retry timers, and post-create catch-up) before teardown evicts caches or removes account directories, and pass already-open storage handles instead of reopening databases in background tasks.
+- `marmot-app` now acquires account teardown fences in one canonical order across `remove_account`, `deactivate_account`, and `reset_incomplete_account_setup`, preventing lock-order inversions and unfenced setup resets.
+- `marmot-app` now splits host group-scoped and account-wide worker channels so parking account-wide commands at `PARKED_LIMIT` during `CheckSignIns` no longer starves group commands, and bounds in-memory deferred worker command queues with channel backpressure.
+- `UnlinkedPublishGate` now caches per-account resolution without rescanning `account.json` on every call and always returns the shared account stop handle so recovery or `lift_failed_link_publish_stop` unblocks existing publishers after transient lookup errors.
+- Dropping `subscribe_messages`, `subscribe_timeline_messages`, `subscribe_chats`, `subscribe_group_state`, or `subscribe_notifications` now exits its background forwarding task immediately instead of leaking broadcast receivers until runtime shutdown.
+- Hardened low-level runtime hygiene in `marmot-app`: replaced unchecked mutex `.lock().unwrap()` calls in `client/sync.rs`, stopped emitting rejected or device-group-kind application messages into `SyncSummary.events`, and made reconnect `drain_deferred_hydration` cancellation-aware on shutdown.
 - `wn-agent` answers a control request it cannot read with an `error` response instead of closing the connection
   silently (mdk#2242): `unsupported_protocol` for a missing or wrong `marmot_agent_control`, `unknown_request` for an
   unknown `type`, and `invalid_request` for anything else, naming a missing or repeated field and echoing the request
@@ -487,10 +546,30 @@ This release advances the SQLite account schema. Downgrade across these migratio
   listed device at once, and adds it to a chat only after that chat's invitation decision went out. During a relay
   outage the chat can still show as an invitation until the decision is delivered. The account database advances to
   schema 222.
+- Admitted finite requests in `transport-nostr-adapter` against a shared global queued-byte budget (192 MiB default, FIFO reservation with single-request exclusivity above capacity and sharing-group reservation so `FiniteRequests::sharing` reserves its shared budget once plus one private frame per active relay) so concurrent sweeps and directory reads bound queued frame memory without starving peer relays.
+- Unified GroupContext admin-policy (`0x8003`) and group-lifecycle (`0x800c`) validation across Legacy and Current profiles, rejected caller-supplied `0x800c` overrides during group creation and `UpdateAppComponents`, rejected joining `Disbanded` Welcomes in both profiles, and tightened wire bounds on `DeviceRosterV1::devices` and `SiblingWelcome::decode` relay lists (#3795, #2455, #2456).
 - `AccountDeviceRuntime::key_package_network_maintenance_due` and `maintenance_due` no longer report KeyPackage publication work as continuously owed when zero writable KeyPackage publication endpoints are configured, while keeping private-material expiry deadlines scheduled (follow-up to #3777).
 - Expired KeyPackages can now be retired from local MLS storage after their lifetime elapses, and session maintenance no longer republishes, fans out, or retains expired pending or current KeyPackages (mdk#3730).
 - Fallback KeyPackage relay routing now excludes relays that the account's NIP-65 list explicitly declared as read-only when declared write relays are empty or unsafe, and persisted KeyPackage retries honor current relay policy without stranding empty-route intents (mdk#3730).
 - Background KeyPackage maintenance (startup cutover, worker maintenance, KeyPackage catch-up, and automatic group-recovery recipient Challenge publication) is now deferred while interactive onboarding is unfinished, unifying invite/group recovery and KeyPackage catch-up under `maintenance_passes` (mdk#3730).
+- Switched `transport-nostr`'s live directory notification forwarder from SDK first-seen `ClientNotification::Event` to per-message `ClientNotification::Message(RelayMessage::Event)` with independent supplied-bytes verification on every copy so SDK pool deduplication cannot hide later relay copies or rebuild replays.
+- Guarded `nostr-directory`'s cached KeyPackage and kind-3 contact-list ingestion against older or equal-second stale replays and existing KeyPackage deletion/replacement barriers, and cleared cached `entry.key_package` entries when live kind-5 deletions or newer malformed kind-30443 replacements fence them.
+- Hardened `media-store` local file handling and concurrency invariants (mdk#3799, mdk#2554): in-flight file tracking
+  now uses per-file reference counts so concurrent readers and sweeps do not drop active leases prematurely, cached
+  readers check a revocation generation before re-insertion (invalidated both before and after loss commits) and mark
+  missing files lost on reopen without swallowing catalog errors, reopen and trim paths reject symlinks and non-regular
+  files (clearing invalid wire checkpoints and continuing sweeps without opening them), writer buffers zeroize on drop
+  and honor poisoned state on flush, catalog sweeps verify regular files and valid layout sizes, and file-length/offset
+  math uses checked arithmetic.
+- Hardened `marmot-account` account-wipe cleanup and local secret I/O (mdk#3799, mdk#819, mdk#2145): account removal
+  now resolves shared-credential checks before the tombstone rename commit and unconditionally scrubs tombstoned local
+  secret files and removes the tombstone directory post-commit before propagating any independent secret-store deletion
+  error; Windows secret reads verify live handle linkage so scrubbed or moved-aside handles are rejected and retried;
+  tombstone roots use owner-only permissions; local secret reads reject symlinks and oversized files and pre-allocate
+  the bounded zeroizing buffer; and zero-scrub overwrites use bounded fixed chunks.
+- Hardened `fs-private` local directory, file, and Unix socket helpers (mdk#3799): directory and file opens pass
+  `O_NONBLOCK`, private file helpers verify regular files and tighten permissions before truncating, and private Unix
+  socket binds serialize staging within a process so concurrent same-PID binds cannot collide.
 - Odin hosts can statically link the Markdown parser without duplicate runtime symbols. The parser also builds for
   GNU Windows targets with LLVM-MinGW.
 - A finite history read whose caller stops polling it while its REQ waits to be queued no longer holds up live
@@ -499,7 +578,24 @@ This release advances the SQLite account schema. Downgrade across these migratio
 - Reconnecting a relay now immediately clears per-unit unreachable retry waits on that relay (while keeping timed
   probes for parked broken units intact), so live-fenced groups resume history recovery and message delivery without
   stalling for the 30-second unreachable retry wait.
+- Engine audit error details use a closed classifier without forwarding free-form error text, projection error display
+  omits raw message identifiers, symmetric key holders and group-image transfer types redact `Debug` output and erase
+  keys on drop, and SQLCipher salt reads enforce a size limit without including account paths in errors (mdk#3796).
+- `marmot-app`: Disappearing-message retention sweeps now query SQLite directly for groups with expiring rows instead of skipping groups whose current policy is `0` or omitting non-chat-list groups, so previously sent disappearing messages still expire after retention is turned off. `RetentionSweepReport.groups` now lists only visible groups that had expired rows at sweep time.
+- `marmot-app`: Backup passes now require complete multi-relay pointer discovery before condemning blobs or replacing pointers, and bound replacement pointer timestamps (including persisted replaceable-record floors) against excessive future clock skew.
+- `marmot-app`: Blossom uploads and deletions now complete host and dial-safety validation before signing BUD-01 authorization events.
+- `marmot-app`: Host-facing Welcome redelivery now enforces group visibility so internal device-group Welcomes remain hidden from host redelivery calls.
 - Bounded active dry-run NIP-77 comparisons in `transport-nostr-adapter` (`sync_watching_neg_cap_detailed`) by the caller's `deadline`, so a relay sending non-converging `NEG-MSG` frames that continually reset `idle_timeout` cannot hold a per-relay NEG permit indefinitely.
+- Hardened `storage-sqlite` database opening, deletion, compaction, and directory/media-catalog operations: SQLCipher
+  compatibility and busy-timeout pragmas now apply in the order SQLCipher requires, migration `0228` and all
+  `storage-sqlite` read/write boundaries canonicalize persisted `group_id_hex` values and checkpoint scopes to lowercase
+  ASCII, key-package eviction watermarks preserve stronger deletion barriers across batch evictions, read-then-write
+  storage transactions acquire immediate write locks under WAL contention, media-catalog paging and compaction recovery
+  handle limits, retries, and close interrupts cleanly, and secure pruning scrubs full UTF-8 byte lengths and removes
+  invalidated edits targeting pruned messages.
+- Swift bindings no longer deadlock when cancelling an async MarmotKit `Task` concurrently with a native `RustFuture::wake` (mdk#3821): `uniffiRustCallAsync` now dispatches native future cancellation off Swift's `onCancel` handler (avoiding lock-order inversion between `AsyncTask`'s `StatusRecordLock` and `uniffi_core::RustFuture`'s scheduler mutex) and checks `Task.isCancelled` before polling so a pre-cancelled or woken-after-cancel task does not issue another native poll.
+- Switched live kind-1059 inbox delivery in `transport-nostr-adapter` from SDK first-seen `ClientNotification::Event` to per-message `ClientNotification::Message(RelayMessage::Event)` with independent supplied-bytes verification, preventing SDK pool deduplication from hiding later relay copies or replays after retired attempts or queue drops.
+- Shut down authenticated publish SDK clients on eviction (once caller references drop), account deactivation, and `MarmotRelayPlane::shutdown()`, and shut down adapter-owned anonymous publish SDK clients when the last adapter clone drops or the account is deactivated (leaving held adapters usable across receive-plane shutdown); joined in-flight delivery spill writers and loss-marker persistence tasks during plane shutdown, and switched discarded NIP-46 signer transports from `disconnect()` to `shutdown()`.
 - An invite's Welcome whose recipient has no usable inbox relay (no kind-10050 list known, an empty one, or none this
   device may dial) is now delivered once the recipient's list can be found, without a re-invite (mdk#2261). After each
   paced retry that finds no route (10 minutes, doubling, at most 6 hours, and once per app start), MDK looks the
@@ -508,10 +604,23 @@ This release advances the SQLite account schema. Downgrade across these migratio
   lookup is checked when it starts and at each worker turn. A failed lookup shows as the new `InboxLookupFailed`
   problem in `invite_deliveries`, and the next attempt that finds no route records the existing v5
   `route_resolution_failed` reason.
+- `drain_events` no longer keeps the peak allocation of a large event backlog: a drain larger than one background
+  replay sweep (128 events) hands its buffer to the caller and leaves a bounded one behind, while routine drains still
+  reuse the buffer (mdk#3585).
 - Re-deferring an unopenable `PeelDeferred` row across an epoch sweep preserves its original arrival epoch instead of
   restamping it to the tip epoch.
 - Deferred-peel sweeps at the retry-budget or residence-budget cutoff attempt a newly arrived peel context once before
   deleting the row, so a commit that unlocks the row on the cutoff sweep decrypts instead of being discarded.
+- Replaced raw-pointer RAII cleanup guards (`PendingCommitCleanupGuard`, `NewGroupCleanupGuard`, and
+  `PreparingEvolutionGuard`) with `Arc<S>` stored on `Engine<S>`, eliminating raw-pointer aliasing UB and all `unsafe`
+  blocks in `cgka-engine` without changing public API signatures.
+- Validated and allocated pending-publish state before committing durable staging rows across all commit-staging paths,
+  ran `PendingCommitCleanupGuard`'s pending-commit and stored-proposal cleanup inside one storage transaction, and
+  retained ownership of failed `SelfRemove` staging cleanups across engine retries, outbound sends, and session-open
+  hydration (quarantining the group with `PendingCommitRecoveryFailed` if a storage fault persists until hydration
+  retry) so failed staging leaves neither orphaned SQLite records nor wedged proposal queues.
+- Audit error details use a closed classifier rather than forwarding raw error display strings, and
+  `OpenMlsProjectionError::Display` omits raw message identifiers (mdk#3796).
 - An invite's Welcome past its delivery deadline (mdk#3589) reads `Undeliverable` in `invite_deliveries` for good once
   MDK has seen the deadline pass with the Welcome owed (its commit confirmed), even if the device clock is set back, with one `InviteDeliveryChanged`: on the next
   start when the deadline passed while the app was closed, sent before the account worker's first turn. A relay attempt that started before the deadline and fails
@@ -563,11 +672,14 @@ This release advances the SQLite account schema. Downgrade across these migratio
   showing a chat the user never accepted. A sibling's accept or decline that arrived while the chat was deleted is
   re-applied when it comes back. A chat deleted before this release comes back accepted, as before.
 - Existing-key onboarding searches public records without prompting external signers. An inbox relay can request one authenticated check if anonymous checks fail. A stalled signer pauses for reconnection and retry, and repair signing has a deadline (#3725).
+- Existing-key setup offers signer reconnection when an external signer cannot authorize an inbox check. If a signed inbox check fails at a relay, Retry can try another relay already listed in the account's inbox declaration.
 - Preserve verified relay-list records returned before an incomplete, NIP-67, or `CLOSED` inspection end, classify persistent NIP-67 `auth` hints as `AuthenticationRequired`, classify `rate-limited:` and bare `error:` `CLOSED` reasons as transient, retry transient relay-list lookups once within `CHECK_WAIT`, and fail fast on bare `auth-required:` `CLOSED` replies without an `AUTH` challenge (#3721, #3724).
 - Reuse completed kind-10002 EOSE answers on the `Relays` step without redialing declared endpoints, and prevent incomplete lookups from overwriting a newer checkpointed relay list with an older copy or `None` (#3721, #3728).
 - Lossless one-click relay repair preserves invalid URLs, unknown markers, and long (>16) NIP-65 lists (marking long previews inconclusive), and copies allowed `r`-tag URLs into `relay` tags on kind-10050 inbox lists while keeping the 16-relay inbox cap (#3727).
 - Preserve an unapproved relay repair proposal as `inconclusive` under a bumped revision when one source fails during approval while an authoritative source still confirms the basis is newest (#3722).
 - Surface per-relay refusal findings on repair publication and initial KeyPackage publication; offer `CancelRepair` and `EditRelays` after definitive all-target repair refusals, and offer `EditRelays` to update NIP-65 write relays when initial KeyPackage publication is refused (#3723, #3747).
+- History-bundle file keys and group-image upload/download records redact `Debug` output and erase key material on
+  drop, and SQLCipher salt reads enforce a size cap and omit account paths from errors (mdk#3796).
 - An invitation answer refused while the device group's epoch settles goes out on the worker turn after it settles
   also when a maintenance pass in between ends early on a failed read, instead of waiting for the 15 s maintenance
   retry (mdk#3573).
@@ -607,6 +719,7 @@ This release advances the SQLite account schema. Downgrade across these migratio
   overlapping `set_audit_log_settings` calls end with the last stored value.
 - An admin's own message deletion now reports `deletionSource: Author`, and a member added back to a chat after being
   removed or leaving gets a "member added" `groupSystem` row naming who added them.
+- Swift `uniffiRustCallAsync` no longer ABBA-deadlocks when `Task.cancel()` races with `RustFuture::wake` (mdk#3821): cancellation is dispatched off Swift's `onCancel` handler so `rust_future_cancel` never acquires `RustFuture`'s mutex while `libswift_Concurrency` holds `AsyncTask`'s `StatusRecordLock`, and the poll loop checks `Task.isCancelled` before each native poll.
 - A chat's `activity_sort_at` is its latest message, read position or retained floor, and falls back to
   `conversation_created_at` only when it has none. A chat a linked device or a restore stored after it began, with
   older history imported, no longer sorts at the time this device stored it (mdk#3580). Migration 0220 re-sorts the
@@ -614,11 +727,24 @@ This release advances the SQLite account schema. Downgrade across these migratio
 - Migration 0222 adds `small_state_broadcast_devices`: the roster devices, slot and `linked_at`, that this device's
   last small-state broadcast was made for. `begin_small_state_broadcast` takes them and `SmallStateBroadcast` returns
   them as `devices`, so `SmallStateSchedule` and `SmallStateBroadcast` are no longer `Copy` (mdk#3556).
+- An agent item whose first event this device lacks is shown from the first edit of it this device received, not the
+  one with the earliest `created_at`. Any member can send such an edit and choose its timestamp, so a backdated one
+  could take the item from its agent.
+- Hardened SQLCipher open pragma ordering (`cipher_compatibility` after `PRAGMA key`, `busy_timeout` before keying),
+  key-package eviction watermark dominance, malformed directory profile resilience, lowercase hex canonicalization of
+  `group_id_hex` across migration `0228` and all read/write boundaries, immediate WAL write transactions, media-catalog
+  paging and busy retries, compaction recovery and close classification, secret zeroization, saturating SQLite integer
+  updates, chunked stale-component deletion, secure message pruning, and atomic multi-statement OpenMLS deletes.
+
+### Security
+
+- Enforced the local copy history floor (`join_epoch` and `local_copy_install_epoch`) before candidate-branch buffering and across convergence graph/pass seeding, atomically retained founding epoch anchors on group creation, and gated missing-anchor unrecoverable transitions on authenticated installed-copy lineage so unverified past-epoch headers outside a healthy group's retained history are rejected as stale instead of halting the group.
+- Enforced the local copy history floor (`join_epoch` and `local_copy_install_epoch`) before candidate-branch buffering and across convergence graph/pass seeding, atomically retained founding epoch anchors on group creation, and gated missing-anchor unrecoverable transitions on authenticated installed-copy lineage so unverified past-epoch headers outside a healthy group's retained history are rejected as stale instead of halting the group.
 
 ## Binding surface delta
 
 - **Baseline:** `v0.19.0` (`3fce95465cdea1edc8456dbd1c6691d1c8dc1f2e`)
-- **Target:** `a3228a2c572f2c91bbc5948160bbe890f20888a2` (classified `minor`, target `0.20.0`)
+- **Target:** `7847b7f7ae761d41dc07784cd0308c29127b7ff9` (classified `minor`, target `0.20.0`)
 
 ## UniFFI (`marmot-uniffi`)
 
@@ -627,6 +753,7 @@ This release advances the SQLite account schema. Downgrade across these migratio
 - Changed `LocalSendStatusFfi`
 - Changed `MarmotEventFfi`
 - Changed `MarmotKitError`
+- Changed `MarmotOptions`
 - Changed `NotificationTrafficClassFfi`
 - Changed `OnboardingIssueFfi`
 - Changed `OnboardingOptionsFfi`
@@ -672,6 +799,7 @@ This release advances the SQLite account schema. Downgrade across these migratio
 
 ### Removed or changed exported types (breaking)
 
+- Changed `MarmotClientOptions`
 - Changed `MarmotEvent`
 - Changed `MarmotEvent_Tag`
 - Changed `MarmotLocalSendStatus`
@@ -727,6 +855,7 @@ This release advances the SQLite account schema. Downgrade across these migratio
 
 Downgrade across these migrations is unsupported. Upgrade all processes sharing an account database together and keep a pre-upgrade backup/export.
 
+- `crates/nostr-directory/src/cache/migrations.rs`
 - `crates/storage-sqlite/src/base/migrations.rs`
 - `crates/storage-sqlite/src/base/migrations/0219_agent_item_order.rs`
 - `crates/storage-sqlite/src/base/migrations/0220_chat_activity_creation_fallback.rs`
@@ -737,4 +866,6 @@ Downgrade across these migrations is unsupported. Upgrade all processes sharing 
 - `crates/storage-sqlite/src/base/migrations/0225_welcome_delivery_ledger.rs`
 - `crates/storage-sqlite/src/base/migrations/0226_local_submission_refused.rs`
 - `crates/storage-sqlite/src/base/migrations/0227_welcome_expiry_mark.rs`
+- `crates/storage-sqlite/src/base/migrations/0228_canonicalize_group_id_hex.rs`
 - `crates/storage-sqlite/src/base/migrations/baseline.sql`
+- `crates/storage-sqlite/src/shared/migrations.rs`
